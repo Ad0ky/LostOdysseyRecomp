@@ -163,6 +163,9 @@ elseif(LO_TARGET_PLATFORM STREQUAL "switch")
         "${LO_RUNTIME_ROOT}/kernel/guest_address_space_switch.cpp")
     set_source_files_properties(${LO_SWITCH_NATIVE_SOURCES} PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
     set_target_properties(LostOdysseyRecomp PROPERTIES SUFFIX ".elf")
+    # Stand-ins for POSIX headers newlib lacks but third-party headers include
+    # (dxcapi.h -> dlfcn.h). Runtime only: SDL's own configure checks must not see them.
+    target_include_directories(LostOdysseyRecomp BEFORE PRIVATE ${LO_RUNTIME_ROOT}/os/switch/include)
     target_compile_definitions(LostOdysseyRecomp PRIVATE
         LO_SWITCH_DATA_ROOT="${LO_SWITCH_DATA_ROOT}"
         LO_SWITCH_DXC_IDENTITY="${LO_SWITCH_DXC_IDENTITY}")

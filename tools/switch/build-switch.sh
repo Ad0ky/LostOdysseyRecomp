@@ -113,7 +113,8 @@ cmake -S . -B "$build" -G Ninja \
     -DLO_SWITCH_NVK_LIBRARY="$NVK_LIBRARY"
 
 log "Build ($JOBS jobs)"
-cmake --build "$build" --target LostOdysseyRecomp -j "$JOBS"
+# -k 0: keep going after a failure so one run reports every failing file.
+cmake --build "$build" --target LostOdysseyRecomp -j "$JOBS" -- -k 0
 
 out="$root/out/switch"
 mkdir -p "$out"
