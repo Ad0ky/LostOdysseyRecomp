@@ -7,6 +7,9 @@
 #include <os/host_scheduling.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #include <SDL3/SDL.h>
 #include <cmath>
 
@@ -148,6 +151,12 @@ namespace apu
         void DriverMain()
         {
             os::SetCurrentThreadName("Audio Driver");
+#if LO_PLATFORM_SWITCH
+            // Above the game's threads (0x3B), below SDL's audio output
+            // (0x2A): the guest callback has to run every 5.3 ms even while
+            // movie decoding keeps all three cores busy.
+            os::switch_platform::SetCurrentThreadPriority(0x2C);
+#endif
             GuestThreadContext ctx(3);
             constexpr auto framePeriod = std::chrono::microseconds(1000000ull * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
             auto next = std::chrono::steady_clock::now();

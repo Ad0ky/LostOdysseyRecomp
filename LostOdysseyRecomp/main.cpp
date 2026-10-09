@@ -17,6 +17,9 @@
 #include <os/logger.h>
 #include <os/thread_name.h>
 #include <os/detach_thread.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_cpu_profiler.h>
+#endif
 #include <os/user_paths.h>
 #include <os/shader_log.h>
 #include <os/log_file.h>
@@ -135,6 +138,12 @@ static int RunGuest(uint32_t entry)
 #if LO_PLATFORM_SWITCH
     os::switch_platform::SetLoadingBoost(false);
     os::switch_platform::StartHandheldGpuBoost();
+    {
+        std::error_code ec;
+        const bool sampler = std::filesystem::exists(std::filesystem::path(LO_SWITCH_DATA_ROOT) / "cpu-profile", ec);
+        os::switch_cpu_profiler::Start(sampler);
+        LOG_INFO("switch: CPU profiler sampler {}", sampler ? "on (cpu-profile file present)" : "off");
+    }
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
     // Memory over time: the console has no swap, and the GPU shares this RAM.
@@ -143,8 +152,10 @@ static int RunGuest(uint32_t entry)
         for (;;)
         {
             std::this_thread::sleep_for(std::chrono::seconds(30));
-            LOG_INFO("switch: {}, guest committed {} MiB", os::switch_platform::MemorySummary(),
-                     GuestAddressSpace::CommittedBytes() >> 20);
+            std::string cpu;
+            os::switch_cpu_profiler::AppendThreadCpuUsage(cpu);
+            LOG_INFO("switch: {}, guest committed {} MiB; CPU {}", os::switch_platform::MemorySummary(),
+                     GuestAddressSpace::CommittedBytes() >> 20, cpu);
         }
     }));
 #endif

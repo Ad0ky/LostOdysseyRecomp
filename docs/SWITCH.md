@@ -147,6 +147,18 @@ In `sdmc:/switch/LostOdysseyRecomp/`:
   backtrace. Addresses marked `elf+0x…` resolve with
   `aarch64-none-elf-addr2line -e LostOdysseyRecomp.elf 0x…`.
 
+### CPU profile
+
+Create an empty file named `cpu-profile` in `sdmc:/switch/LostOdysseyRecomp/`
+and play: every 30 s `stderr.log` gets a `[cpu profile]` block with the
+hottest code of each thread (sampled every 2 ms; costs a little speed). Then,
+on the PC, with the `.elf` of the same build:
+
+    python tools/switch/switch-cpu-profile.py stderr.log --elf out/switch/LostOdysseyRecomp.elf
+
+Delete the file to turn sampling off. Per-thread CPU shares are logged every
+30 s either way (`switch: ... CPU ...` lines).
+
 ## How the port works
 
 | Area | Switch implementation |

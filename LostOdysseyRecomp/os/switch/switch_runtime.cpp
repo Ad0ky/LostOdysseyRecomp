@@ -13,6 +13,7 @@
 #include <exception>
 #include <typeinfo>
 #include <cstdlib>
+#include <malloc.h>
 #include <system_error>
 
 extern "C"
@@ -303,11 +304,20 @@ std::string MemorySummary()
             threadsLimit = u64(maximum);
         svcCloseHandle(limit);
     }
-    char text[160];
-    std::snprintf(text, sizeof(text), "memory %llu/%llu MiB, threads %llu/%llu",
+    // The heap is where nearly everything lives (guest memory chunks, NVK
+    // buffers, thread stacks); UsedMemorySize does not count it for us.
+    const struct mallinfo heap = mallinfo();
+    char text[192];
+    std::snprintf(text, sizeof(text), "heap in use %llu MiB (arena %llu MiB), process %llu/%llu MiB, threads %llu/%llu",
+        static_cast<unsigned long long>(size_t(heap.uordblks) >> 20), static_cast<unsigned long long>(size_t(heap.arena) >> 20),
         static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(total >> 20),
         static_cast<unsigned long long>(threadsUsed), static_cast<unsigned long long>(threadsLimit));
     return text;
+}
+
+void SetCurrentThreadPriority(int priority)
+{
+    svcSetThreadPriority(CUR_THREAD_HANDLE, u32(priority));
 }
 
 void SetLoadingBoost(bool enabled)

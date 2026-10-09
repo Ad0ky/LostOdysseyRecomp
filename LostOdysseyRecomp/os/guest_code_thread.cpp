@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <os/switch_platform.h>
+#include <os/switch_cpu_profiler.h>
 #endif
 
 namespace os
@@ -71,6 +72,9 @@ void* RunLaunch(void* argument)
     auto done = std::move(launch->done);
     delete launch;
     body();
+#if LO_PLATFORM_SWITCH
+    os::switch_cpu_profiler::UnregisterCurrentThread();
+#endif
     done->store(true, std::memory_order_release);
     return nullptr;
 }

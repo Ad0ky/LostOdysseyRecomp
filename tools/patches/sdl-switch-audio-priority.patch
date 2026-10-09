@@ -1,0 +1,17 @@
+diff --git a/src/thread/pthread/SDL_systhread.c b/src/thread/pthread/SDL_systhread.c
+index 1df1d55480..2bd8d32109 100644
+--- a/src/thread/pthread/SDL_systhread.c
++++ b/src/thread/pthread/SDL_systhread.c
+@@ -194,7 +194,11 @@ bool SDL_SYS_SetThreadPriority(SDL_ThreadPriority priority)
+     return true;
+ #elif SDL_PLATFORM_SWITCH
+     Result res;
+-    if (priority == SDL_THREAD_PRIORITY_HIGH) {
++    if (priority == SDL_THREAD_PRIORITY_TIME_CRITICAL) {
++        // Audio playback threads ask for this; it used to fall through to
++        // 0x3B and be starved by busy game threads (choppy, then no sound).
++        res = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2A);
++    } else if (priority == SDL_THREAD_PRIORITY_HIGH) {
+         res = svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);
+     } else {
+         // 0x3B = preemptive threading

@@ -33,6 +33,10 @@ namespace os::switch_platform
     // moves. Runs on its own thread; logs the result to stderr.
     void StartHandheldGpuBoost();
 
+    // Horizon thread priority of the calling thread (0x2C is above the 0x3B
+    // every pthread gets; lower numbers run first).
+    void SetCurrentThreadPriority(int priority);
+
     // Raises the CPU clock while loading (applet CPU boost), off when false.
     void SetLoadingBoost(bool enabled);
 }
