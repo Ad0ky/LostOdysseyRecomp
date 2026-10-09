@@ -147,10 +147,19 @@ In `sdmc:/switch/LostOdysseyRecomp/`:
   backtrace. Addresses marked `elf+0x…` resolve with
   `aarch64-none-elf-addr2line -e LostOdysseyRecomp.elf 0x…`.
 
+### Diagnostics switches (env.txt)
+
+The PC build reads its `LO_*` diagnostic switches from the environment. On the
+console put them in `sdmc:/switch/LostOdysseyRecomp/env.txt`, one `KEY=VALUE`
+per line (`#` starts a comment); `stderr.log` lists the ones applied. Useful
+ones: `LO_CPU_PROFILE=1` (below), `LO_FRAME_TIMING=1` (one line per second:
+command flush, waits, present), `LO_RENDER_TIMING=1` (per-frame timing with GPU
+timestamps).
+
 ### CPU profile
 
-Create an empty file named `cpu-profile` in `sdmc:/switch/LostOdysseyRecomp/`
-and play: every 30 s `stderr.log` gets a `[cpu profile]` block with the
+Put `LO_CPU_PROFILE=1` in env.txt (or create an empty file named
+`cpu-profile` in `sdmc:/switch/LostOdysseyRecomp/`) and play: every 30 s `stderr.log` gets a `[cpu profile]` block with the
 hottest code of each thread (sampled every 2 ms; costs a little speed). Then,
 on the PC, with the `.elf` of the same build:
 

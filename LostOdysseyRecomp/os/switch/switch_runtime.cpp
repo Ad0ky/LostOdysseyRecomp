@@ -272,6 +272,28 @@ void Initialize(const std::filesystem::path& dataRoot)
 
     // Keep running (and rendering) while the HOME menu overlay is open, and
     // never let the console sleep during long loads or cutscenes.
+    // The console has no environment: <dataRoot>/env.txt supplies the LO_*
+    // switches the PC build reads from it (one KEY=VALUE per line, # comments).
+    if (FILE* env = std::fopen((dataRoot / "env.txt").c_str(), "r"))
+    {
+        char line[512];
+        while (std::fgets(line, sizeof(line), env))
+        {
+            char* text = line;
+            while (*text == ' ' || *text == '\t') ++text;
+            size_t length = std::strlen(text);
+            while (length && (text[length - 1] == '\n' || text[length - 1] == '\r' || text[length - 1] == ' '))
+                text[--length] = 0;
+            char* equals = std::strchr(text, '=');
+            if (!*text || *text == '#' || !equals || equals == text)
+                continue;
+            *equals = 0;
+            setenv(text, equals + 1, 1);
+            std::fprintf(stderr, "env.txt: %s=%s\n", text, equals + 1);
+        }
+        std::fclose(env);
+    }
+
     appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
     appletSetAutoSleepDisabled(true);
 }

@@ -519,6 +519,13 @@ void os::switch_cpu_profiler::AppendThreadCpuUsage(std::string& out)
             continue;
 
         const uint64_t ticks = ThreadTicks(thread.handle);
+        if (ticks < thread.usageTicks)
+        {
+            // [Lost Odyssey] The thread exited without unregistering (a named
+            // std::thread) and its handle no longer answers: drop it.
+            thread.active = false;
+            continue;
+        }
         const uint64_t used = ticks - thread.usageTicks;
         thread.usageTicks = ticks;
 

@@ -140,9 +140,11 @@ static int RunGuest(uint32_t entry)
     os::switch_platform::StartHandheldGpuBoost();
     {
         std::error_code ec;
-        const bool sampler = std::filesystem::exists(std::filesystem::path(LO_SWITCH_DATA_ROOT) / "cpu-profile", ec);
+        const char* profile = getenv("LO_CPU_PROFILE"); // env.txt
+        const bool sampler = (profile && *profile && std::strcmp(profile, "0") != 0) ||
+            std::filesystem::exists(std::filesystem::path(LO_SWITCH_DATA_ROOT) / "cpu-profile", ec);
         os::switch_cpu_profiler::Start(sampler);
-        LOG_INFO("switch: CPU profiler sampler {}", sampler ? "on (cpu-profile file present)" : "off");
+        LOG_INFO("switch: CPU profiler sampler {}", sampler ? "on" : "off");
     }
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
