@@ -19,8 +19,8 @@ How it works:
 Run on Linux x64 from the repository root:
     python3 tools/switch/gen-builtin-spirv.py
 Re-run it whenever one of these shaders changes. A shader the Switch build
-cannot find is written to state/logs/missing-shaders on the SD card; add its
-source here.
+cannot find is written to state/logs/missing-shaders on the SD card: copy the
+file unchanged into tools/switch/extra-builtin-shaders/ and re-run.
 """
 import os
 import re
@@ -34,6 +34,9 @@ ROOT = Path(__file__).resolve().parents[2]
 GPU = ROOT / "LostOdysseyRecomp" / "gpu"
 DXC_DIR = ROOT / "tools" / "XenosRecomp" / "thirdparty" / "dxc-bin"
 OUTPUT = ROOT / "LostOdysseyRecomp" / "os" / "switch" / "builtin_spirv.inc"
+# Sources the console dumped to state/logs/missing-shaders (built at run time,
+# e.g. from a game shader), kept as <key>_<entry>_<profile>.hlsl.
+EXTRA = ROOT / "tools" / "switch" / "extra-builtin-shaders"
 KEY_SUFFIX = b"lo-dxc-vulkan12-dx-layout-v1"
 
 
@@ -168,6 +171,16 @@ def main():
             size = int(blob[profile_end + 1:size_end])
             source = blob[size_end + 1:size_end + 1 + size]
             pos = size_end + 1 + size
+            shaders.append((source, entry, profile))
+
+        for path in sorted(EXTRA.glob("*.hlsl")):
+            key_hex, rest = path.stem.split("_", 1)
+            parts = rest.rsplit("_", 3)  # profile is "<stage>_<major>_<minor>"
+            entry, profile = parts[0], "_".join(parts[1:])
+            source = path.read_bytes()
+            key = fnv1a64(source + b"\0" + entry.encode() + b"\0" + profile.encode() + KEY_SUFFIX)
+            if f"{key:016x}" != key_hex:
+                raise SystemExit(f"{path.name}: content hashes to {key:016x} (file changed after the dump?)")
             shaders.append((source, entry, profile))
 
         dxc = DXC_DIR / "bin" / "x64" / "dxc-linux"

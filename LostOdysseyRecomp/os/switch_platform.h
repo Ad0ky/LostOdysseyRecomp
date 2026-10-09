@@ -24,6 +24,9 @@ namespace os::switch_platform
     // Docked (true) or handheld (false).
     bool IsDocked();
 
+    // Process memory and thread usage, for failure logs ("used/total MiB ...").
+    std::string MemorySummary();
+
     // Raises the CPU clock while loading (applet CPU boost), off when false.
     void SetLoadingBoost(bool enabled);
 }

@@ -65,7 +65,11 @@ caches match.
   the NRO as SPIR-V: `LostOdysseyRecomp/os/switch/builtin_spirv.inc`, made by
   `tools/switch/gen-builtin-spirv.py` (Linux x64, pinned DXC). Re-run it after
   changing one of those shaders. A host shader the table lacks is written to
-  `state/logs/missing-shaders/` on the SD card so it can be added.
+  `state/logs/missing-shaders/` on the SD card; copy it unchanged into
+  `tools/switch/extra-builtin-shaders/` and re-run the script.
+- **Rect lists** are drawn with the precompiled geometry shader rather than
+  the PC default (a vertex-shader variant compiled per game shader), which
+  would need DXC. `LO_RECT_LIST_GS=0` switches back.
 - **Game shaders** come from the shader pack, `shaders/portable_vk.lospv`:
   - from a PC installation that has run with Vulkan: its
     `shaders/portable_vk.lospv`, or

@@ -192,6 +192,28 @@ bool IsDocked()
     return appletGetOperationMode() == AppletOperationMode_Console;
 }
 
+std::string MemorySummary()
+{
+    u64 used = 0, total = 0, threadsUsed = 0, threadsLimit = 0;
+    svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+    svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+    Handle limit = INVALID_HANDLE;
+    if (R_SUCCEEDED(svcGetInfo(reinterpret_cast<u64*>(&limit), InfoType_ResourceLimit, INVALID_HANDLE, 0)) && limit != INVALID_HANDLE)
+    {
+        s64 current = 0, maximum = 0;
+        if (R_SUCCEEDED(svcGetResourceLimitCurrentValue(&current, limit, LimitableResource_Threads)))
+            threadsUsed = u64(current);
+        if (R_SUCCEEDED(svcGetResourceLimitLimitValue(&maximum, limit, LimitableResource_Threads)))
+            threadsLimit = u64(maximum);
+        svcCloseHandle(limit);
+    }
+    char text[160];
+    std::snprintf(text, sizeof(text), "memory %llu/%llu MiB, threads %llu/%llu",
+        static_cast<unsigned long long>(used >> 20), static_cast<unsigned long long>(total >> 20),
+        static_cast<unsigned long long>(threadsUsed), static_cast<unsigned long long>(threadsLimit));
+    return text;
+}
+
 void SetLoadingBoost(bool enabled)
 {
     appletSetCpuBoostMode(enabled ? ApmCpuBoostMode_FastLoad : ApmCpuBoostMode_Normal);
