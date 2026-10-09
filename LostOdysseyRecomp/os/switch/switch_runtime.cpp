@@ -9,7 +9,10 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <cxxabi.h>
 #include <exception>
+#include <typeinfo>
+#include <cstdlib>
 #include <system_error>
 
 extern "C"
@@ -60,18 +63,52 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
     __builtin_unreachable();
 }
 
+void WriteAddress(FILE* file, const char* name, uint64_t value);
+
+// Frame-pointer chain from the caller of this function (host code keeps frame
+// pointers; the recompiled game code does not, so the chain may stop there).
+void WriteBacktrace(FILE* file, uintptr_t frame)
+{
+    std::fprintf(file, "backtrace:\n");
+    for (int depth = 0; depth < 48 && frame && (frame & 7) == 0; ++depth)
+    {
+        MemoryInfo info{};
+        u32 page = 0;
+        if (R_FAILED(svcQueryMemory(&info, &page, frame)) || !(info.perm & Perm_R))
+            break;
+        const auto* record = reinterpret_cast<const uintptr_t*>(frame);
+        WriteAddress(file, "  at", record[1]);
+        if (record[0] <= frame)
+            break;
+        frame = record[0];
+    }
+}
+
 void OnTerminate()
 {
     if (FILE* file = std::fopen(g_crashLogPath, "a"))
     {
-        std::fprintf(file, "std::terminate called");
-        if (auto exception = std::current_exception())
+        const std::time_t now = std::time(nullptr);
+        std::fprintf(file, "\n=== std::terminate, %s", std::ctime(&now));
+        if (const std::type_info* type = abi::__cxa_current_exception_type())
         {
-            try { std::rethrow_exception(exception); }
-            catch (const std::exception& error) { std::fprintf(file, ": %s", error.what()); }
-            catch (...) { std::fprintf(file, ": unknown exception"); }
+            int status = 0;
+            char* name = abi::__cxa_demangle(type->name(), nullptr, nullptr, &status);
+            std::fprintf(file, "exception type: %s\n", status == 0 && name ? name : type->name());
+            std::free(name);
+            if (auto exception = std::current_exception())
+            {
+                try { std::rethrow_exception(exception); }
+                catch (const std::exception& error) { std::fprintf(file, "what(): %s\n", error.what()); }
+                catch (...) {}
+            }
         }
-        std::fprintf(file, "\n");
+        else
+        {
+            std::fprintf(file, "no active exception (thread/noexcept/abort path)\n");
+        }
+        std::fprintf(file, "module %016" PRIxPTR "-%016" PRIxPTR "\n", g_moduleBase, g_moduleEnd);
+        WriteBacktrace(file, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
         std::fclose(file);
     }
     ExitWithLog();
