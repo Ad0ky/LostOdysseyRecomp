@@ -326,6 +326,10 @@ int main(int argc, char* argv[])
         if (strcmp(argv[i], "--quiet-kernel") == 0)
             os::logger::g_kernelTrace = false;
     }
+#if LO_PLATFORM_SWITCH
+    // One SD card line per guest file read and allocation: opt in (env.txt).
+    os::logger::g_kernelTrace = getenv("LO_KERNEL_TRACE") != nullptr;
+#endif
 
     {
         const auto now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());

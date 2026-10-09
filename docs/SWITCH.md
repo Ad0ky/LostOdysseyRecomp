@@ -154,7 +154,12 @@ console put them in `sdmc:/switch/LostOdysseyRecomp/env.txt`, one `KEY=VALUE`
 per line (`#` starts a comment); `stderr.log` lists the ones applied. Useful
 ones: `LO_CPU_PROFILE=1` (below), `LO_FRAME_TIMING=1` (one line per second:
 command flush, waits, present), `LO_RENDER_TIMING=1` (per-frame timing with GPU
-timestamps).
+timestamps), `LO_GPU_DRAW_TIMING_EVERY=300` (GPU time of every group of four
+draws, every 300th frame), `LO_KERNEL_TRACE=1` (guest kernel calls such as file
+reads; off by default on the console).
+
+The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
+written at least once a second; warnings and errors are written at once.
 
 ### CPU profile
 
