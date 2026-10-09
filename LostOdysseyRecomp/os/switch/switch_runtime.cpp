@@ -108,6 +108,7 @@ void OnTerminate()
             std::fprintf(file, "no active exception (thread/noexcept/abort path)\n");
         }
         std::fprintf(file, "module %016" PRIxPTR "-%016" PRIxPTR "\n", g_moduleBase, g_moduleEnd);
+        std::fprintf(file, "%s\n", os::switch_platform::MemorySummary().c_str());
         WriteBacktrace(file, reinterpret_cast<uintptr_t>(__builtin_frame_address(0)));
         std::fclose(file);
     }
@@ -157,8 +158,103 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
     ExitWithLog();
 }
 
+namespace
+{
+constexpr u32 kHandheldGpu460Memory1331 = 0x92220008;
+Thread g_apmThread;
+
+bool ReadClocks(u32& gpuHz, u32& memoryHz)
+{
+    gpuHz = memoryHz = 0;
+    if (R_FAILED(clkrstInitialize()))
+        return false;
+    bool ok = true;
+    ClkrstSession session{};
+    if (R_SUCCEEDED(clkrstOpenSession(&session, PcvModuleId_GPU, 3)))
+    {
+        ok &= R_SUCCEEDED(clkrstGetClockRate(&session, &gpuHz));
+        clkrstCloseSession(&session);
+    }
+    else
+        ok = false;
+    if (R_SUCCEEDED(clkrstOpenSession(&session, PcvModuleId_EMC, 3)))
+    {
+        ok &= R_SUCCEEDED(clkrstGetClockRate(&session, &memoryHz));
+        clkrstCloseSession(&session);
+    }
+    else
+        ok = false;
+    clkrstExit();
+    return ok;
+}
+
+// apmSetPerformanceConfiguration returns before pcv applies the clocks, so the
+// result is checked by polling. The apm session stays open for the process.
+void ApmThreadMain(void*)
+{
+    if (R_FAILED(apmInitialize()))
+    {
+        std::fprintf(stderr, "[apm] apm is not available; clocks unchanged.\n");
+        return;
+    }
+    ApmPerformanceMode mode = ApmPerformanceMode_Invalid;
+    if (R_FAILED(apmGetPerformanceMode(&mode)) || mode != ApmPerformanceMode_Normal)
+    {
+        std::fprintf(stderr, "[apm] Console is not in handheld mode; clocks unchanged.\n");
+        return;
+    }
+    u32 original = 0;
+    const bool hasOriginal = R_SUCCEEDED(apmGetPerformanceConfiguration(mode, &original));
+    u32 gpuBefore = 0, memoryBefore = 0;
+    if (!ReadClocks(gpuBefore, memoryBefore))
+    {
+        std::fprintf(stderr, "[apm] Unable to read clocks through clkrst; clocks unchanged.\n");
+        return;
+    }
+    if (R_FAILED(apmSetPerformanceConfiguration(mode, kHandheldGpu460Memory1331)))
+    {
+        std::fprintf(stderr, "[apm] Configuration 0x%08X is not available on this firmware.\n", kHandheldGpu460Memory1331);
+        return;
+    }
+    u32 gpuAfter = 0, memoryAfter = 0;
+    bool memoryStable = true;
+    for (int i = 0; i < 10; ++i)
+    {
+        svcSleepThread(150000000);
+        if (!ReadClocks(gpuAfter, memoryAfter))
+        {
+            memoryStable = false;
+            break;
+        }
+        const u32 delta = memoryAfter > memoryBefore ? memoryAfter - memoryBefore : memoryBefore - memoryAfter;
+        if (delta > 20000000)
+        {
+            memoryStable = false;
+            break;
+        }
+    }
+    if (!memoryStable)
+    {
+        if (hasOriginal)
+            apmSetPerformanceConfiguration(mode, original);
+        std::fprintf(stderr, "[apm] 0x%08X changed the memory clock (%.1f -> %.1f MHz); reverted to 0x%08X.\n",
+            kHandheldGpu460Memory1331, memoryBefore / 1e6, memoryAfter / 1e6, original);
+        return;
+    }
+    std::fprintf(stderr, "[apm] GPU %.1f -> %.1f MHz, memory stays at %.1f MHz (configuration 0x%08X).\n",
+        gpuBefore / 1e6, gpuAfter / 1e6, memoryAfter / 1e6, kHandheldGpu460Memory1331);
+}
+}
+
 namespace os::switch_platform
 {
+void StartHandheldGpuBoost()
+{
+    // A libnx thread: it ends on its own and is never joined.
+    if (R_SUCCEEDED(threadCreate(&g_apmThread, ApmThreadMain, nullptr, nullptr, 0x10000, 0x3B, -2)))
+        threadStart(&g_apmThread);
+}
+
 void Initialize(const std::filesystem::path& dataRoot)
 {
     std::error_code ec;

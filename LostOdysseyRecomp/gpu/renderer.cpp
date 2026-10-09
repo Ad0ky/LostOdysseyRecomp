@@ -1947,7 +1947,8 @@ namespace gpu::renderer
                 uint64_t vertexArenaAddress; // SPIR-V vertex fetch (common_hlsl.h)
             };
             static_assert(offsetof(SharedConstants,vertexArenaAddress)==xenos::VertexArenaAddressOffset);
-            static_assert(gpu::render_arena::kVertexArenaSize == 1073741824ull);
+            // The shaders clamp vertex fetches at 1 GiB (common_hlsl.h).
+            static_assert(gpu::render_arena::kVertexArenaSize <= 1073741824ull);
 
             static_assert(offsetof(SharedConstants,ndcScale)==160);
             static_assert(offsetof(SharedConstants,transfer)==240);
@@ -5171,8 +5172,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (driverCachePath.empty()) return;
                 if (driverCacheWrite.valid()) {
                     if (!wait && driverCacheWrite.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
-                    if (const auto error = driverCacheWrite.get(); !error.empty())
-                        LOG_WARNING("renderer: driver pipeline cache write: {}", error);
+                    // The writer's exceptions (bad_alloc copying a large driver
+                    // cache) surface here; a cache that cannot be saved is not fatal.
+                    try {
+                        if (const auto error = driverCacheWrite.get(); !error.empty())
+                            LOG_WARNING("renderer: driver pipeline cache write: {}", error);
+                    } catch (const std::exception& e) { LOG_WARNING("renderer: driver pipeline cache write: {}", e.what()); }
                 }
                 try {
                     driverCacheWrite = std::async(std::launch::async, [this] { return WriteDriverPipelineCache(); });

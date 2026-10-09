@@ -151,6 +151,10 @@ namespace apu
             GuestThreadContext ctx(3);
             constexpr auto framePeriod = std::chrono::microseconds(1000000ull * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
             auto next = std::chrono::steady_clock::now();
+            uint64_t ticks = 0, dispatches = 0, stalls = 0;
+            double waitedMs = 0;
+            auto lastReport = next;
+            auto nextReport = next + std::chrono::seconds(10);
             while (g_running)
             {
                 next += framePeriod;
@@ -167,14 +171,52 @@ namespace apu
                 }
                 else if (!g_outputChannels && g_device) // a request withdrawn before it was applied
                     g_outputChannels = g_channels;
+                // Wait for the device to drain, but not forever: an output
+                // that stops pulling (seen on Switch: no sound, one frame ever
+                // reported) must not also stop the guest's audio callbacks.
+                const auto waitStart = std::chrono::steady_clock::now();
+#if LO_PLATFORM_SWITCH
+                auto stallStart = waitStart;
+#endif
                 while (QueuedFrames() >= 4)
+                {
+#if LO_PLATFORM_SWITCH
+                    if (std::chrono::steady_clock::now() - stallStart > std::chrono::milliseconds(250))
+                    {
+                        std::lock_guard lock(g_deviceMutex);
+                        if (g_paused) // a paused device is meant to hold its queue
+                        {
+                            stallStart = std::chrono::steady_clock::now();
+                            continue;
+                        }
+                        if (g_stream) SDL_ClearAudioStream(g_stream);
+                        ++stalls;
+                        if (stalls == 1 || stalls % 100 == 0)
+                            LOG_WARNING("audio output is not draining ({} stalls); queue cleared", stalls);
+                        break;
+                    }
+#endif
                     os::scheduling::PreciseSleepFor(std::chrono::milliseconds(1));
+                }
+                waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
 
-                g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                const bool dispatched = g_client.Dispatch([&](uint32_t callback, uint32_t param)
                 {
                     ctx.ppcContext.r3.u64 = param;
                     g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
                 });
+                ++ticks;
+                if (dispatched) ++dispatches;
+                if (std::chrono::steady_clock::now() >= nextReport)
+                {
+                    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastReport).count();
+                    LOG_INFO("audio driver: {:.1f} s ticks={} dispatches={} submitted={} queued_frames={} drain_wait_ms={:.0f} stalls={}",
+                        elapsed, ticks, dispatches, g_framesSubmitted.load(), QueuedFrames(), waitedMs, stalls);
+                    ticks = dispatches = 0;
+                    waitedMs = 0;
+                    lastReport = std::chrono::steady_clock::now();
+                    nextReport = lastReport + std::chrono::seconds(10);
+                }
             }
         }
     }

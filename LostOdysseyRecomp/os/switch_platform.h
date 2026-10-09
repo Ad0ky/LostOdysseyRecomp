@@ -27,6 +27,12 @@ namespace os::switch_platform
     // Process memory and thread usage, for failure logs ("used/total MiB ...").
     std::string MemorySummary();
 
+    // Handheld only: asks apm for GPU 460.8 MHz with the memory clock kept at
+    // 1331.2 MHz (configuration 0x92220008, what commercial games use; from
+    // UnleashedRecomp-NX, ChanseyIsTheBest's fork). Reverts if the memory clock
+    // moves. Runs on its own thread; logs the result to stderr.
+    void StartHandheldGpuBoost();
+
     // Raises the CPU clock while loading (applet CPU boost), off when false.
     void SetLoadingBoost(bool enabled);
 }
