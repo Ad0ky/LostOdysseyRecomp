@@ -59,23 +59,24 @@ the Album applet it stops with a message that says so.
 The console has no shader compiler (DXC). It renders from shaders compiled on
 a PC, which it can use as they are: SPIR-V is the same for every Vulkan
 platform, and the port reports the PC's pinned compiler (`dxc-1.8`) so PC-made
-caches match. Two things go on the SD card:
+caches match.
 
-1. **The shader pack** (game shaders), `shaders/portable_vk.lospv`:
-   - from a PC installation that has run with Vulkan: its
-     `shaders/portable_vk.lospv`, or
-   - the `vulkan` pack listed in `index.json` of the
-     [`shader-packs` release](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/shader-packs),
-     renamed to `portable_vk.lospv`.
-2. **The PC's Vulkan shader cache**, `cache/shaders/`: the runtime's own host
-   shaders (presentation, menus, post-processing) are compiled at run time and
-   are not in the pack. Run the PC version **with the Vulkan renderer** (graphics
-   settings, or `LO_GRAPHICS_API=vulkan`), play past the title screen and into a scene, quit,
-   then copy its `cache/shaders` folder (next to `LostOdysseyRecomp.exe`) to
-   `sdmc:/switch/LostOdysseyRecomp/cache/shaders`. Game shaders the PC compiled
-   that the pack lacks are in there too.
+- **Host shaders** (presentation, menus, blits, SMAA, TAA, AO) are built into
+  the NRO as SPIR-V: `LostOdysseyRecomp/os/switch/builtin_spirv.inc`, made by
+  `tools/switch/gen-builtin-spirv.py` (Linux x64, pinned DXC). Re-run it after
+  changing one of those shaders. A host shader the table lacks is written to
+  `state/logs/missing-shaders/` on the SD card so it can be added.
+- **Game shaders** come from the shader pack, `shaders/portable_vk.lospv`:
+  - from a PC installation that has run with Vulkan: its
+    `shaders/portable_vk.lospv`, or
+  - the `vulkan` pack listed in `index.json` of the
+    [`shader-packs` release](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/shader-packs),
+    renamed to `portable_vk.lospv`.
+- Optional: a PC's Vulkan shader cache (`cache/shaders/`, after a Vulkan run)
+  copied to `sdmc:/switch/LostOdysseyRecomp/cache/shaders` adds game shaders
+  the PC compiled that the pack lacks.
 
-Both must come from the same game edition. A shader missing from both cannot be
+The pack and any PC cache must come from the same game edition. A shader missing from all of them cannot be
 compiled on the console: the renderer logs it (`shader pack: …`, shader
 compile failures in the log) and that draw does not render.
 
