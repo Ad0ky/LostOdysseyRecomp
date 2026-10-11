@@ -285,7 +285,7 @@ namespace gpu::renderer
         constexpr uint32_t kVertexFetchSlots = 96;
         constexpr uint32_t kTextureSlots = 32;
 
-        uint32_t Reg(uint32_t index) { return g_commandProcessor.ReadRegister(index); }
+        uint32_t Reg(uint32_t index) { return g_commandProcessor.ReadRegisterInline(index); }
         float RegF(uint32_t index) { uint32_t v = Reg(index); float f; memcpy(&f, &v, 4); return f; }
         uint8_t* Phys(uint32_t physicalAddress) { return static_cast<uint8_t*>(g_memory.Translate(0xA0000000u + (physicalAddress & 0x1FFFFFFF))); }
 
@@ -731,6 +731,9 @@ namespace gpu::renderer
             uint32_t rectListSkipped = 0;
 
             std::unordered_map<uint64_t, Shader> shaders[2];
+            // GetShader's last valid hit per stage; ClearShaders() forgets them.
+            struct LastShader { uint64_t hash = 0; Shader* entry = nullptr; } lastShader[2];
+            void ClearShaders() { shaders[0].clear(); shaders[1].clear(); lastShader[0] = lastShader[1] = {}; }
             // Keyed by the normalized pipeline key. sceneSerial: the scene in which
             // the pipeline was last drawn was recorded in its recipe.
             // origin/drawn: LO_RECORD_TIMING first-use attribution only.
@@ -739,6 +742,10 @@ namespace gpu::renderer
                 record_timing::Origin origin = record_timing::Origin::Unknown; bool drawn = false;
             };
             std::unordered_map<PipelineKey, PipelineSlot, PipelineKeyHash> pipelines;
+            // GetPipeline's last hit. Slots are never erased or replaced, and
+            // unordered_map nodes keep their address across rehashes.
+            PipelineKey lastPipelineKey{};
+            PipelineSlot* lastPipelineSlot = nullptr;
             std::unordered_map<PipelineKey, std::unique_ptr<RenderPipeline>, PipelineKeyHash> hdrPipelines;
             // Full state recipes are portable; driver blobs and object pointers
             // are never persisted. Render maps stay on the command thread.
@@ -1502,6 +1509,8 @@ namespace gpu::renderer
                 const char* stage = nullptr;
             };
             uint32_t textureReuploads = 0;
+            // LO_RENDER_TIMING: per-frame texture revalidation work (GetTexture hits).
+            uint32_t textureRehashes = 0, textureFullScans = 0, textureRehashChanges = 0;
             uint32_t dummyBindings = 0;
 
             // Separate opt-in diagnostics: ordinary frame timing must not pay
@@ -4222,7 +4231,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             // stored together, after every other count.
             void WriteOcclusionRecords(const std::vector<gpu::occlusion::Write>& writes)
             {
-                if (!writes.empty()) g_commandProcessor.AdvanceSyncEpoch();
+                if (!writes.empty()) g_commandProcessor.AdvanceSyncEpoch(CommandProcessor::SyncSource::Occlusion);
                 for (const auto& write : writes) {
                     if (!write.apply) continue;
                     auto* words = reinterpret_cast<uint32_t*>(Phys(write.address));
@@ -4980,7 +4989,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
             uint64_t ActualSamplerKey(uint32_t index) const
             {
-                const auto version = samplerState.Current();
+                const auto& version = samplerState.Current();
                 return version ? version->Key(index) : sampling::DefaultKey;
             }
 
@@ -6245,7 +6254,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             entry.valid = entry.shader != nullptr;
                             if (!entry.valid) throw std::runtime_error("cached shader device module creation failed");
                             ++modules;
-                        }, [&] { pendingModules.clear(); deferredModules = 0; shaders[0].clear(); shaders[1].clear(); }, [] {},
+                        }, [&] { pendingModules.clear(); deferredModules = 0; ClearShaders(); }, [] {},
                         [] { CheckPreparationCancel(); }, [](uint32_t done, uint32_t total) {
                             video::SetShaderPreparationProgress(done, total, video::PreparationStage::CachedShaders,
                                 video::PreparationUnit::Shaders);
@@ -6265,7 +6274,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         ResetTimers();
                         return;
                     } catch (const std::exception& e) {
-                        shaders[0].clear(); shaders[1].clear();
+                        ClearShaders();
                         if (video::ShaderPreparationSkipped()) throw xenos::preparation::Cancelled{};
                         LOG_INFO("renderer: startup bundle fallback: {}", e.what());
                     }
@@ -6642,6 +6651,11 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             {
                 if (debugShaderSources && !debugCaptureDir.empty())
                     debugShaderSources->Observe(!pixel, hash, words, count, frame);
+                // Consecutive draws usually keep a stage's shader. Map nodes keep
+                // their address; only ClearShaders() removes entries.
+                auto& last = lastShader[pixel ? 1 : 0];
+                if (last.entry && last.hash == hash && last.entry->valid && debugCaptureDir.empty())
+                    return last.entry;
                 auto& cache = shaders[pixel ? 1 : 0];
                 auto it = cache.find(hash);
                 if (it == cache.end()) {
@@ -6655,7 +6669,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
                         it->second.info.hlsl = xenos::TranslateShader(swapped.data(), count, pixel).hlsl;
                     }
-                    return it->second.valid ? &it->second : nullptr;
+                    last = {hash, &it->second};
+                    return &it->second;
                 }
 
                 Shader& entry = cache[hash];
@@ -7800,11 +7815,14 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         return SelectControllerAtlas(cached, bindingInfo);
                     }
                     cached->checkedFrame = frame;
+                    ++textureRehashes;
                     bool changed = replacementArrived || SampledGuestHash(*cached) != cached->guestHash;
                     if (!changed && frame >= cached->nextFullScanFrame) {
                         cached->nextFullScanFrame = frame + texture_cache::kFullScanInterval;
+                        ++textureFullScans;
                         changed = FullGuestHash(*cached) != cached->guestFullHash;
                     }
+                    if (changed && !replacementArrived) ++textureRehashChanges;
                     if (!changed) {
                         return SelectControllerAtlas(cached, bindingInfo);
                     }
@@ -8165,20 +8183,24 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             RenderPipeline* GetPipeline(const PipelineKey& drawKey, Shader* vs, Shader* ps, RenderFormat, RenderFormat, bool mayDefer = false)
             {
                 const PipelineKey key = gpu::pipeline_cache::Normalize(drawKey);
-                auto it = pipelines.find(key);
-                const auto hit = [&] {
-                    if (it->second.sceneSerial != sceneSerial) {
-                        it->second.sceneSerial = sceneSerial;
+                const auto hit = [&](PipelineSlot& slot) {
+                    if (slot.sceneSerial != sceneSerial) {
+                        slot.sceneSerial = sceneSerial;
                         NoteRecipeUse(key);
                     }
                     if (!unusedSiblings.empty() && unusedSiblings.erase(key)) ++workerStats.hits;
-                    return it->second.pipeline.get();
+                    lastPipelineKey = key;
+                    lastPipelineSlot = &slot;
+                    return slot.pipeline.get();
                 };
-                if (it != pipelines.end()) return hit();
+                // Consecutive draws often repeat the key; skip the map lookup.
+                if (lastPipelineSlot && key == lastPipelineKey) return hit(*lastPipelineSlot);
+                auto it = pipelines.find(key);
+                if (it != pipelines.end()) return hit(it->second);
                 ScopedTimer timer{ tPipeline, cpuTimingEnabled };
                 if (!prefetchPool.workers.empty()) {
                     HarvestPrefetch();
-                    if (it = pipelines.find(key); it != pipelines.end()) return hit();
+                    if (it = pipelines.find(key); it != pipelines.end()) return hit(it->second);
                 }
                 const bool defer = mayDefer && pipelineAsync;
                 const auto started = std::chrono::steady_clock::now();
@@ -8395,6 +8417,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     VertexStageTimer timer(vertexTiming.find, vertexTimingEnabled, address, bytes);
                     return vertexCache.find(key);
                 }();
+                bool changed = false;
                 if (it != vertexCache.end())
                 {
                     const bool matches = [&] {
@@ -8407,14 +8430,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         it->second.lastFrame = frame;
                         return it->second.offset;
                     }
-                    // Contents changed. Overwriting in place would corrupt draws
-                    // already recorded into an open command list, so allocate fresh.
+                    // Contents changed. Overwriting the arena copy in place would
+                    // corrupt draws already recorded into an open command list, so
+                    // allocate fresh; the entry itself is refreshed below.
                     if (it->second.slot == uint8_t(gpuSlot))
                         vertexRevalidations++;
-                    {
-                        VertexStageTimer timer(vertexTiming.erase, vertexTimingEnabled, address, bytes);
-                        vertexCache.erase(it);
-                    }
+                    changed = true;
                 }
 
                 // Allocate (16-byte aligned, 16 bytes of slack for the shader's
@@ -8425,11 +8446,37 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 const uint32_t otherSlot = (gpuSlot + 1) % kGpuSlots;
                 const uint32_t allocSlot = gpu::render_arena::VertexAllocSlot(
                     gpuSlot, Gpu().arenaOffset, gpuSlots[otherSlot].arenaOffset, needed);
-                if (allocSlot == gpu::render_arena::kGpuSlots)
+                if (allocSlot == gpu::render_arena::kGpuSlots) {
+                    if (changed) {
+                        VertexStageTimer timer(vertexTiming.erase, vertexTimingEnabled, address, bytes);
+                        vertexCache.erase(it);
+                    }
                     return UINT64_MAX;
+                }
                 uint64_t& local = gpuSlots[allocSlot].arenaOffset;
                 const uint64_t offset = gpu::render_arena::SlotBase(allocSlot) + local;
                 local += needed;
+                if (changed) {
+                    // Same key, same size: refresh the entry and reuse its snapshot
+                    // storage instead of erasing it and inserting a new allocation.
+                    auto& entry = it->second;
+                    entry.offset = offset;
+                    entry.lastFrame = frame;
+                    entry.slot = uint8_t(allocSlot);
+                    entry.validatedEpoch = g_commandProcessor.SyncEpoch();
+                    {
+                        VertexStageTimer timer(vertexTiming.capture, vertexTimingEnabled, address, bytes);
+                        vertexCache.Recapture(it, guest, bytes);
+                    }
+                    {
+                        VertexStageTimer timer(vertexTiming.copy, vertexTimingEnabled, address, bytes);
+                        geometry_prepare::CopyDwordsSwapped(arenaMapped + offset, guest, sizeDwords, endian);
+                        memset(arenaMapped + offset + bytes, 0, 16);
+                    }
+                    vertexUploads++;
+                    vertexBytesUploaded += bytes;
+                    return offset;
+                }
                 VertexEntry entry{ offset, {}, frame, uint8_t(allocSlot) };
                 entry.validatedEpoch = g_commandProcessor.SyncEpoch();
                 {
@@ -9011,8 +9058,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
                 SharedConstants shared{};
                 if (vulkan) shared.vertexArenaAddress = vertexArena->getDeviceAddress();
-                for (uint32_t i = 0; i < 8; i++) shared.bools[i] = Reg(REG_BOOL_CONSTANTS + i);
-                for (uint32_t i = 0; i < 32; i++) shared.loops[i] = Reg(REG_LOOP_CONSTANTS + i);
+                // One call per run of registers instead of one per word (same values).
+                g_commandProcessor.ReadRegisters(REG_BOOL_CONSTANTS, 8, shared.bools);
+                g_commandProcessor.ReadRegisters(REG_LOOP_CONSTANTS, 32, shared.loops);
                 shared.transfer[0] = Reg(REG_PA_SU_POINT_SIZE);
                 shared.transfer[1] = Reg(REG_PA_SU_POINT_MINMAX);
                 shared.transfer[2] = std::bit_cast<uint32_t>(pointSizeLimit);
@@ -9294,8 +9342,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 {
                     if (!((vs->info.vertexFetchSlotMask[slot >> 6] >> (slot & 63)) & 1))
                         continue;
-                    uint32_t d0 = Reg(REG_FETCH_CONSTANTS + slot * 2);
-                    uint32_t d1 = Reg(REG_FETCH_CONSTANTS + slot * 2 + 1);
+                    uint32_t vfetch[2];
+                    g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 2, 2, vfetch);
+                    const uint32_t d0 = vfetch[0], d1 = vfetch[1];
                     // A slot the shader reads but we cannot bind is a silent failure: the
                     // shader then fetches from arena offset 0, i.e. some other draw's data.
                     const char* skip = nullptr;
@@ -9471,7 +9520,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         if (!((s->info.textureSlotMask >> slot) & 1))
                             continue;
                         uint32_t fetch[6];
-                        for (int i = 0; i < 6; i++) fetch[i] = Reg(REG_FETCH_CONSTANTS + slot * 6 + i);
+                        g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 6, 6, fetch);
                         const uint32_t declared = s->info.textureDimension[slot];
                         const uint32_t bank = declared == 2 ? 1 : declared == 3 ? 2 : 0;
                         activeTextureSlots[bank] |= uint32_t(1) << slot;
@@ -10561,7 +10610,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         << ",\"exp_bias\":\"unknown\"}}\n";
                 }
                 recordProbe.Enter(record_timing::Phase::Pipeline);
-                const auto samplerVersion = samplerState.Current();
+                const auto& samplerVersion = samplerState.Current();
                 if (!samplerVersion) return;
                 const auto versionsBefore = Gpu().samplerVersions.size();
                 sampling::Retain(Gpu().samplerVersions, samplerVersion);
@@ -13214,7 +13263,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         destBase, destFormat, destEndian, x0, y0, copyWidth, copyHeight, destPitch, uint32_t(color->format), nonZero, drawsThisFrame);
                 }
                 uint8_t* dst = Phys(destBase);
-                g_commandProcessor.AdvanceSyncEpoch();
+                g_commandProcessor.AdvanceSyncEpoch(CommandProcessor::SyncSource::Resolve);
                 uint32_t pitchBlocks = (destPitch + 31) & ~31u;
                 for (uint32_t y = 0; y < copyHeight; y++)
                 {
@@ -13868,6 +13917,40 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 r.samplerBoundVersions = r.samplerTableAttempts = r.samplerTableCreates = 0;
                 r.samplerViewWrites = r.samplerWrites = 0;
                 r.samplerTableMs = 0;
+                {
+                    // What ended this frame's sync periods, and the per-frame revalidation
+                    // work of textures and zero-register constants.
+                    using S = CommandProcessor::SyncSource;
+                    static_assert(uint32_t(S::Count) == 13, "log fields follow SyncSource");
+                    static uint64_t before[uint32_t(S::Count)]{};
+                    uint64_t delta[uint32_t(S::Count)];
+                    for (uint32_t i = 0; i < uint32_t(S::Count); ++i) {
+                        const uint64_t now = g_commandProcessor.SyncSourceCount(S(i));
+                        delta[i] = now - before[i];
+                        before[i] = now;
+                    }
+                    auto& c0 = r.constantSnapshot[0];
+                    auto& c1 = r.constantSnapshot[1];
+                    LOG_INFO("render revalidation frame={} sync_batch={} sync_scratch={} sync_interrupt={} sync_swap={} "
+                        "sync_wait_reg_mem={} sync_reg_to_mem={} sync_mem_write={} sync_cond_write={} sync_event_shd={} "
+                        "sync_event_ext={} sync_event_zpd={} sync_occlusion={} sync_resolve={} texture_rehashes={} "
+                        "texture_full_scans={} texture_rehash_changes={} constant_mmio_block_checks={} "
+                        "constant_mmio_block_diffs={} constant_mmio_word_changes={}",
+                        r.frame, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8],
+                        delta[9], delta[10], delta[11], delta[12], r.textureRehashes, r.textureFullScans, r.textureRehashChanges,
+                        c0.mmioBlockChecks + c1.mmioBlockChecks, c0.mmioBlockDiffs + c1.mmioBlockDiffs,
+                        c0.mmioWordChanges + c1.mmioWordChanges);
+                    r.textureRehashes = r.textureFullScans = r.textureRehashChanges = 0;
+                    c0.mmioBlockChecks = c0.mmioBlockDiffs = c0.mmioWordChanges = 0;
+                    c1.mmioBlockChecks = c1.mmioBlockDiffs = c1.mmioWordChanges = 0;
+                }
+                if (r.nativeVulkan) {
+                    // Graphics pipeline rebinds plume skipped inside a render pass (all lists).
+                    static uint64_t skippedBefore = 0;
+                    const uint64_t skipped = plume::VulkanCommandList::skippedPipelineBinds.load(std::memory_order_relaxed);
+                    LOG_INFO("render binds frame={} pipeline_binds_skipped={}", r.frame, skipped - skippedBefore);
+                    skippedBefore = skipped;
+                }
                 const render_timing::CpuSegments cpu{r.drawsThisFrame, r.nShader, r.nPipeline, r.nTexture, r.nResolve,
                     r.tDraw, r.tConst, r.tSets, r.tVertex, r.tBind, r.tIndex, r.tRecord,
                     r.tShader, r.tPipeline, r.tTexture, r.tResolve, r.tFlush,
