@@ -23,6 +23,7 @@
 #include "sampler_palette.h"
 #include "texture_key.h"
 #include "texture_content.h"
+#include "guest_writes.h"
 #include "depth_format.h"
 #include "depth_clear_layout.h"
 #include "pending_clear.h"
@@ -442,8 +443,9 @@ namespace gpu::renderer
             uint32_t guestAddress = 0, guestBytes = 0;
             uint32_t mipAddress = 0, mipBytes = 0; // stored mip chain, if uploaded
             uint64_t guestHash = 0, guestFullHash = 0;
-            uint64_t checkedFrame = ~0ull;
+            uint64_t checkedFrame = ~0ull;      // last frame this texture was bound
             uint64_t nextFullScanFrame = 0;
+            uint32_t writeGeneration = 0;        // guest_writes generation at the last look
             uint64_t replacementPending = 0; // fingerprint of a mod replacement still being read
 
             // The source remains BC3. Only a verified controller atlas owns an
@@ -1448,7 +1450,6 @@ namespace gpu::renderer
                     resolved.erase(it);
             }
             bool resolveReadback = false; // LO_RESOLVE_READBACK=1: legacy CPU write-back into guest memory
-            bool textureRevalidate = true; // LO_TEXTURE_STATIC=1 disables re-hashing cached textures
             bool textureBcFallback = false; // BC1-BC3 decoded to RGBA8 on the CPU (no device support, or LO_TEXTURE_BC=0)
             // LO_TEXTURE_FINGERPRINT_LOG=<file>: one CSV row per distinct uploaded
             // texture, to match against --export-assets fingerprints.
@@ -2215,6 +2216,7 @@ namespace gpu::renderer
             ConstantBankSnapshot constantSnapshot[2];
             uint64_t constantSnapshotGeneration[2]{UINT64_MAX, UINT64_MAX};
             uint64_t constantSnapshotVersion[2]{};
+            uint64_t constantMmioEpoch[2]{}; // sync period of the last zero-register MMIO check
             uint32_t drawConstants[2][256 * 4]{};
             bool drawConstantsModified[2]{true, true};
 
@@ -2476,7 +2478,6 @@ namespace gpu::renderer
                 readback = device->createBuffer(RenderBufferDesc::ReadbackBuffer(kReadbackSize));
                 if (!readback) return InitFailure("readback.create", kReadbackSize);
                 resolveReadback = getenv("LO_RESOLVE_READBACK") != nullptr;
-                textureRevalidate = getenv("LO_TEXTURE_STATIC") == nullptr;
                 if (const char* sync = getenv("LO_MODS_TEXTURE_SYNC"); sync && *sync && strcmp(sync, "0") != 0)
                     textureReplacementSync = true;
                 if (const char* path = getenv("LO_TEXTURE_FINGERPRINT_LOG"); path && *path && !textureFingerprintLog) {
@@ -4302,7 +4303,6 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             // stored together, after every other count.
             void WriteOcclusionRecords(const std::vector<gpu::occlusion::Write>& writes)
             {
-                if (!writes.empty()) g_commandProcessor.AdvanceSyncEpoch(CommandProcessor::SyncSource::Occlusion);
                 for (const auto& write : writes) {
                     if (!write.apply) continue;
                     auto* words = reinterpret_cast<uint32_t*>(Phys(write.address));
@@ -8070,13 +8070,23 @@ void main()
                     HostTexture* cached = it->second.get();
                     // An original whose mod replacement was read since: re-create it.
                     const bool replacementArrived = cached->replacementPending && ReplacementArrived(*cached);
-                    // Titles stream texture data in after the first draw that uses
-                    // it, so a cached upload can be all zeroes forever. Re-hash the
-                    // guest bytes once per frame and re-upload when they change.
-                    if (!replacementArrived && (!textureRevalidate || cached->checkedFrame == frame || cached->guestBytes == 0)) {
-                        return SelectControllerAtlas(cached, bindingInfo);
+                    // Guest bytes get another look only when they can have changed
+                    // since the last one: in every frame for an untiled texture (its
+                    // layout is the CPU's; the movie decoder rewrites its linear planes
+                    // in place while they stay bound), after a kernel file read into the
+                    // texture's range (titles stream data in after the first draw that
+                    // uses it), or after a frame without this texture, during which its
+                    // memory may have been given other contents. Resolves into the range
+                    // already dropped the entry (InvalidateRange).
+                    bool examine = false;
+                    if (!replacementArrived && cached->guestBytes != 0 && cached->checkedFrame != frame) {
+                        const uint32_t written = GuestWriteGeneration(*cached);
+                        examine = !tiled || cached->checkedFrame + 1 < frame || written != cached->writeGeneration;
+                        cached->checkedFrame = frame;
+                        cached->writeGeneration = written;
                     }
-                    cached->checkedFrame = frame;
+                    if (!replacementArrived && !examine)
+                        return SelectControllerAtlas(cached, bindingInfo);
                     ++textureRehashes;
                     bool changed = replacementArrived || SampledGuestHash(*cached) != cached->guestHash;
                     if (!changed && frame >= cached->nextFullScanFrame) {
@@ -8227,6 +8237,8 @@ void main()
                 tex->guestAddress = sourceAddress;
                 tex->guestBytes = uint32_t(guestBytes);
                 tex->checkedFrame = frame;
+                // writeGeneration stays 0: a file read that landed before or during
+                // this upload makes the next bind look at the bytes once more.
                 if (controller_atlas::Candidate(dimension, format, originalWidth, originalHeight,
                         width, height, sourceMip)) {
                     auto rgba = controller_atlas::DecodeBc3(staging.data(), staging.size(), rowPitch);
@@ -8617,9 +8629,16 @@ void main()
                 return desc;
             }
 
+            // Newest kernel file read into the texture's base or mip range.
+            uint32_t GuestWriteGeneration(const HostTexture& tex) const
+            {
+                return std::max(gpu::guest_writes::Newest(tex.guestAddress, tex.guestBytes),
+                    tex.mipBytes ? gpu::guest_writes::Newest(tex.mipAddress, tex.mipBytes) : 0u);
+            }
+
             // Streamed mips are re-read with their base, so hash both ranges.
-            // The sampled hash runs every active frame; the full one covers
-            // writes outside the sampled windows on the staggered schedule.
+            // The sampled hash runs whenever the bytes get another look; the full
+            // one also covers writes outside the sampled windows when it is due.
             uint64_t SampledGuestHash(const HostTexture& tex) const
             {
                 return texture_cache::SampledGuestContentHash(Phys(tex.guestAddress), tex.guestBytes,
@@ -8637,17 +8656,15 @@ void main()
             // sync epoch. Between two sync points only an unsynchronized guest CPU
             // write racing the GPU can change memory a draw already read; such a
             // write is seen at the next epoch instead of at the next draw.
-            // LO_REVALIDATE_EVERY_DRAW=1 compares on every draw; LO_REVALIDATE_VERIFY=1
-            // compares skipped sources too and logs mismatches.
+            // LO_REVALIDATE_VERIFY=1 compares skipped sources too and logs mismatches.
             uint64_t revalidationChecks = 0, revalidationSkips = 0, revalidationMismatches = 0;
             uint64_t revalidationEpoch = 0;
             template<class Matches>
             bool SourceMatches(uint64_t& validatedEpoch, Matches&& matches, uint32_t address)
             {
-                static const bool everyDraw = [] { const char* v = getenv("LO_REVALIDATE_EVERY_DRAW"); return v && strcmp(v, "0") != 0; }();
                 static const bool verify = [] { const char* v = getenv("LO_REVALIDATE_VERIFY"); return v && strcmp(v, "0") != 0; }();
                 const uint64_t epoch = g_commandProcessor.SyncEpoch();
-                if (!everyDraw && validatedEpoch == epoch) {
+                if (validatedEpoch == epoch) {
                     ++revalidationSkips;
                     if (!verify || matches()) return true;
                     static uint32_t reported = 0;
@@ -9064,51 +9081,47 @@ void main()
                 auto& vsConstants = drawConstants[0];
                 auto& psConstants = drawConstants[1];
                 uint64_t constantGeneration[2]{};
-                // Preserve the full banks and zero-register MMIO fallback. The
-                // diagnostic switch provides a same-binary performance control.
-                static const bool legacyConstants = getenv("LO_LEGACY_CONSTANT_READS") != nullptr;
                 // Optional full comparison catches future paths outside the known
                 // zero-register MMIO fallback.
                 static const bool verifyConstants = getenv("LO_CONSTANT_SNAPSHOT_VERIFY") != nullptr;
-                if (legacyConstants) {
-                    for (uint32_t i = 0; i < 256 * 4; i++) vsConstants[i] = Reg(REG_ALU_CONSTANTS + i);
-                    for (uint32_t i = 0; i < 256 * 4; i++) psConstants[i] = Reg(REG_ALU_CONSTANTS + 256 * 4 + i);
-                    drawConstantsModified[0] = drawConstantsModified[1] = true;
-                } else {
-                    for (uint32_t bank = 0; bank < 2; ++bank) {
-                        const uint64_t generation = g_commandProcessor.ConstantGeneration(bank);
-                        auto& snapshot = constantSnapshot[bank];
-                        const bool refresh = generation != constantSnapshotGeneration[bank];
-                        uint64_t changedBlocks = g_commandProcessor.UpdateConstantSnapshot(bank, snapshot);
-                        constantSnapshotGeneration[bank] = generation;
-                        if (refresh || changedBlocks) ++constantSnapshotVersion[bank];
-                        if (verifyConstants) {
-                            uint32_t check[256 * 4];
-                            g_commandProcessor.ReadRegisters(REG_ALU_CONSTANTS + bank * 256 * 4, 256 * 4, check);
-                            if (std::memcmp(check, snapshot.values, sizeof(check)) != 0) {
-                                static uint32_t reported = 0;
-                                if (reported++ < 16)
-                                    LOG_ERROR("renderer: {} constants changed without a generation change or dirty block (frame {})",
-                                        bank ? "pixel" : "vertex", frame);
-                                std::memcpy(snapshot.values, check, sizeof(check));
-                                snapshot.valid = false;
-                                ++constantSnapshotVersion[bank];
-                                changedBlocks = ~0ull;
-                            }
+                for (uint32_t bank = 0; bank < 2; ++bank) {
+                    const uint64_t generation = g_commandProcessor.ConstantGeneration(bank);
+                    auto& snapshot = constantSnapshot[bank];
+                    const bool refresh = generation != constantSnapshotGeneration[bank];
+                    // A direct guest MMIO store reaches draws only across a sync
+                    // point, so the zero-register fallback is read once per period.
+                    const uint64_t epoch = g_commandProcessor.SyncEpoch();
+                    const bool checkMmio = constantMmioEpoch[bank] != epoch;
+                    constantMmioEpoch[bank] = epoch;
+                    uint64_t changedBlocks = g_commandProcessor.UpdateConstantSnapshot(bank, snapshot, checkMmio);
+                    constantSnapshotGeneration[bank] = generation;
+                    if (refresh || changedBlocks) ++constantSnapshotVersion[bank];
+                    if (verifyConstants) {
+                        uint32_t check[256 * 4];
+                        g_commandProcessor.ReadRegisters(REG_ALU_CONSTANTS + bank * 256 * 4, 256 * 4, check);
+                        if (std::memcmp(check, snapshot.values, sizeof(check)) != 0) {
+                            static uint32_t reported = 0;
+                            if (reported++ < 16)
+                                LOG_ERROR("renderer: {} constants changed without a generation change or dirty block (frame {})",
+                                    bank ? "pixel" : "vertex", frame);
+                            std::memcpy(snapshot.values, check, sizeof(check));
+                            snapshot.valid = false;
+                            ++constantSnapshotVersion[bank];
+                            changedBlocks = ~0ull;
                         }
-                        if (drawConstantsModified[bank]) {
-                            std::memcpy(drawConstants[bank], snapshot.values, sizeof(drawConstants[bank]));
-                            drawConstantsModified[bank] = false;
-                        } else {
-                            // An unmodified copy equals the snapshot outside the changed blocks.
-                            constexpr size_t kBlock = ConstantBankSnapshot::kBlockWords;
-                            for (uint64_t blocks = changedBlocks; blocks; blocks &= blocks - 1) {
-                                const size_t first = size_t(std::countr_zero(blocks)) * kBlock;
-                                std::memcpy(drawConstants[bank] + first, snapshot.values + first, kBlock * sizeof(uint32_t));
-                            }
-                        }
-                        constantGeneration[bank] = constantSnapshotVersion[bank];
                     }
+                    if (drawConstantsModified[bank]) {
+                        std::memcpy(drawConstants[bank], snapshot.values, sizeof(drawConstants[bank]));
+                        drawConstantsModified[bank] = false;
+                    } else {
+                        // An unmodified copy equals the snapshot outside the changed blocks.
+                        constexpr size_t kBlock = ConstantBankSnapshot::kBlockWords;
+                        for (uint64_t blocks = changedBlocks; blocks; blocks &= blocks - 1) {
+                            const size_t first = size_t(std::countr_zero(blocks)) * kBlock;
+                            std::memcpy(drawConstants[bank] + first, snapshot.values + first, kBlock * sizeof(uint32_t));
+                        }
+                    }
+                    constantGeneration[bank] = constantSnapshotVersion[bank];
                 }
                 // Player DoF/bloom settings edit the tone-map draw's constant copy.
                 // DoF weight w = curve^c4 * c5 (c5.x near, c5.y far) blends the
@@ -14199,7 +14212,7 @@ void main()
                     // What ended this frame's sync periods, and the per-frame revalidation
                     // work of textures and zero-register constants.
                     using S = CommandProcessor::SyncSource;
-                    static_assert(uint32_t(S::Count) == 13, "log fields follow SyncSource");
+                    static_assert(uint32_t(S::Count) == 11, "log fields follow SyncSource");
                     static uint64_t before[uint32_t(S::Count)]{};
                     uint64_t delta[uint32_t(S::Count)];
                     for (uint32_t i = 0; i < uint32_t(S::Count); ++i) {
@@ -14211,11 +14224,11 @@ void main()
                     auto& c1 = r.constantSnapshot[1];
                     LOG_INFO("render revalidation frame={} sync_batch={} sync_scratch={} sync_interrupt={} sync_swap={} "
                         "sync_wait_reg_mem={} sync_reg_to_mem={} sync_mem_write={} sync_cond_write={} sync_event_shd={} "
-                        "sync_event_ext={} sync_event_zpd={} sync_occlusion={} sync_resolve={} texture_rehashes={} "
+                        "sync_event_ext={} sync_resolve={} texture_rehashes={} "
                         "texture_full_scans={} texture_rehash_changes={} constant_mmio_block_checks={} "
                         "constant_mmio_block_diffs={} constant_mmio_word_changes={}",
                         r.frame, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8],
-                        delta[9], delta[10], delta[11], delta[12], r.textureRehashes, r.textureFullScans, r.textureRehashChanges,
+                        delta[9], delta[10], r.textureRehashes, r.textureFullScans, r.textureRehashChanges,
                         c0.mmioBlockChecks + c1.mmioBlockChecks, c0.mmioBlockDiffs + c1.mmioBlockDiffs,
                         c0.mmioWordChanges + c1.mmioWordChanges);
                     r.textureRehashes = r.textureFullScans = r.textureRehashChanges = 0;
