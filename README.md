@@ -80,12 +80,12 @@ Turn on **HDR** in Graphics and save. **HDR peak brightness** opens a calibratio
 | Display | Windowed or fullscreen, monitor and GPU choice, 16:9 and 21:9 resolutions (taller screens such as 16:10 are filled), [HDR](#hdr) and **Brightness / Gamma**. |
 | Anti-aliasing and upscaling | FXAA, SMAA, TAA, DLSS, FSR 3.1, XeSS (Windows Direct3D 12) and MetalFX (macOS). |
 | Graphics options | Shadow resolution 1×/2×/4×, SSAO/GTAO, anisotropic filtering, depth of field and bloom. |
-| Frame rate | 30/60/90/120 FPS and FreeSync / G-SYNC Compatible VRR. |
+| Frame rate | 30/60/90/120 FPS; VSync Off, On or FreeSync / G-SYNC Compatible VRR. |
 | Frame generation | DLSS, FSR or XeSS on Windows Direct3D 12; DLSS on Windows Vulkan. |
 | Shaders | Precompiled shaders downloaded on the first start, or compiled once and cached. |
-| Audio | Stereo or 5.1 surround. |
+| Audio | Stereo, 5.1 surround, or matrix surround for an AV receiver. Cutscene dialogue has its own volume. |
 | Input | Controllers, keyboard and rumble; touch controls on Android. |
-| Mods | Windows only: texture, menu and font replacements and PlayStation button prompts, installed by hand or with Mod Organizer 2. Other platforms may load mods but are not supported. See the [modding guide](docs/wiki/Modding.md). |
+| Mods | Windows only: texture, menu and font replacements, text translations and language packs, and PlayStation button prompts, installed by hand or with Mod Organizer 2. Other platforms may load mods but are not supported. See the [modding guide](docs/wiki/Modding.md). |
 | Debug menu | Render captures, Save Anywhere, encounter switches, teleport, fast-forward and cheats. See [Debug menu](#debug-menu). |
 
 ## Controls
@@ -178,7 +178,7 @@ More detail is in [file locations](docs/INSTALLING.md#file-locations).
 | :--- | :--- |
 | `--game <path>` | Use this game folder (with `default.xex` or `disc1/`) or `default.xex` file, skipping the importer. |
 | `--install` | Open the importer even when a game is already set up. |
-| `--setup` | Windows: run the first-launch setup again, then start the game. |
+| `--setup` | Windows: open the setup page, then start the game. |
 | `--prepare-shaders-only` | Prepare all shaders, then exit without starting the game. |
 
 ```bash

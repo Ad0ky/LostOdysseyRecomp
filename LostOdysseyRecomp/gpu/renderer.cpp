@@ -25,12 +25,14 @@
 #include "texture_content.h"
 #include "depth_format.h"
 #include "depth_clear_layout.h"
+#include "pending_clear.h"
 #include "draw_attachment_policy.h"
 #include "vulkan_object_trace.h"
 #include "occlusion_queries.h"
 #include "polygon_offset.h"
 #include "pipeline_cache.h"
 #include "driver_pipeline_cache.h"
+#include "pipeline_prepare_progress.h"
 #include "texture_layout.h"
 #include "controller_atlas.h"
 #include "bc_decode.h"
@@ -42,6 +44,7 @@
 #include "temporal_lifecycle.h"
 #include "motion_options.h"
 #include "motion_replay_gpu.h"
+#include "record_timing.h"
 #include "fsr_alpha_replay_gpu.h"
 #include "fsr_alpha_postprocess_gpu.h"
 #include "fsr_alpha_propagation_gpu.h"
@@ -158,6 +161,8 @@ namespace gpu::renderer
         // consumed by the renderer's scene prefetch once a frame.
         std::mutex g_scenePrefetchMutex;
         std::vector<uint32_t> g_scenePrefetchRequests;
+        // Static initialization: close enough to the process start for the log.
+        const auto g_launchTime = std::chrono::steady_clock::now();
         void RequestScenePrefetch(uint32_t tag)
         {
             std::lock_guard lock(g_scenePrefetchMutex);
@@ -293,7 +298,7 @@ namespace gpu::renderer
         constexpr uint32_t kVertexFetchSlots = 96;
         constexpr uint32_t kTextureSlots = 32;
 
-        uint32_t Reg(uint32_t index) { return g_commandProcessor.ReadRegister(index); }
+        uint32_t Reg(uint32_t index) { return g_commandProcessor.ReadRegisterInline(index); }
         float RegF(uint32_t index) { uint32_t v = Reg(index); float f; memcpy(&f, &v, 4); return f; }
         uint8_t* Phys(uint32_t physicalAddress) { return static_cast<uint8_t*>(g_memory.Translate(0xA0000000u + (physicalAddress & 0x1FFFFFFF))); }
 
@@ -387,6 +392,43 @@ namespace gpu::renderer
         }
 
         // ---- host resources -------------------------------------------------
+        // What cleared a target's verified tone-map producer after the tone-map
+        // drew it, logged per SR scene fallback segment. toneFrame also limits the
+        // full-screen alpha quad check to draws after this frame's tone-map.
+        // Keeps the first loss after the latest tone-map; count includes later ones.
+        struct SdrLossTrace
+        {
+            enum Kind : uint32_t { Other = 0, Draw = 1, TileTransfer = 2, ToneRejected = 3, Clear = 4, Promotion = 5 };
+            uint64_t toneFrame = ~0ull; // Last frame a tone-map drew the target.
+            uint64_t frame = ~0ull;     // First loss after that tone-map.
+            uint64_t vs = 0, ps = 0;
+            uint32_t kind = Other, blend = 0, fetch = 0, count = 0;
+            uint32_t colorMask = 0, depth = 0, quad = 0; // quad: 1 full-screen alpha quad, else 2 + reject code
+            void Tone(uint64_t now) { toneFrame = now; frame = ~0ull; count = 0; }
+            // True for the first loss after the tone-map; the caller adds detail.
+            bool Lost(uint64_t now, uint32_t why, uint32_t site = 0)
+            {
+                if (toneFrame != now) return false;
+                ++count;
+                if (frame == now) return false;
+                frame = now; kind = why; vs = ps = 0; blend = colorMask = depth = quad = 0; fetch = site;
+                return true;
+            }
+        };
+        const char* SdrLossName(const SdrLossTrace& loss, uint64_t frame)
+        {
+            if (loss.toneFrame != frame) return "no_tone_map";
+            if (loss.frame != frame) return "none";
+            switch (loss.kind) {
+            case SdrLossTrace::Draw: return "draw";
+            case SdrLossTrace::TileTransfer: return "tile_transfer";
+            case SdrLossTrace::ToneRejected: return "tone_rejected";
+            case SdrLossTrace::Clear: return "clear";
+            case SdrLossTrace::Promotion: return "promotion";
+            default: return "other";
+            }
+        }
+
         struct HostTexture
         {
             uint64_t allocationSerial = 0; // Render-target identity, never a recycled host pointer.
@@ -414,6 +456,8 @@ namespace gpu::renderer
             uint64_t guestHash = 0, guestFullHash = 0;
             uint64_t checkedFrame = ~0ull;
             uint64_t nextFullScanFrame = 0;
+            uint64_t replacementPending = 0; // fingerprint of a mod replacement still being read
+
             // The source remains BC3. Only a verified controller atlas owns an
             // optional, single-mip RGBA PlayStation child; retirement of the
             // source also retires its child after the GPU fence.
@@ -425,9 +469,13 @@ namespace gpu::renderer
             bool controllerAtlasPlayStationVariant = false;
             controller_atlas::Identity controllerAtlasIdentity = controller_atlas::Identity::Unknown;
             uint64_t clearedFrame = ~0ull;   // LO_CLEAR_RT debugging
+            // EDRAM clears not recorded yet: run when the target is next bound
+            // (BindTargets) or transitioned for any other use (Transition).
+            gpu::pending_clear::Queue pendingClear;
             uint64_t sdrProducerFrame = ~0ull;
             uint32_t qualifiedSdrWidth = 0;
             uint32_t qualifiedSdrHeight = 0;
+            SdrLossTrace sdrLoss;
             std::unique_ptr<HostTexture> hdrSidecar;
             uint64_t hdrFrame = ~0ull;
             bool hdrValid = false;
@@ -559,6 +607,11 @@ namespace gpu::renderer
                 std::vector<uint64_t> occlusionResults;
                 uint32_t occlusionUsed = 0;
                 uint32_t occlusionPoolsDirty = 0; // pools [0, n) need a reset before use
+                // Queries below occlusionPoolUsed may use host queries; the
+                // counted ones (occlusionCounting) are flagged in occlusionCounted.
+                uint32_t occlusionPoolUsed = 0;
+                std::vector<uint8_t> occlusionCounted;
+                uint32_t occlusionCountersDirty = 0; // counters [0, n) need zeroing before use
                 uint64_t occlusionBatch = 0;
                 draw_timing::Probe drawProbe;
                 std::unique_ptr<RenderBuffer> uploadRing;
@@ -655,6 +708,21 @@ namespace gpu::renderer
             gpu::occlusion::AdaptiveMode occlusionAdaptive;
             uint64_t nextOcclusionBatch = 1;
             bool hostOcclusion = false;
+            // Turnip drains the GPU at the end of every occlusion query (a WFI
+            // on a7xx), about 1 ms a frame for the ~350 queries in Uhra on an
+            // Adreno 750. There a measured draw with no pixel shader and no
+            // colour writes instead runs a fragment shader with early
+            // depth/stencil tests that adds the samples passing them, a wave at
+            // a time, to its query's counter: the same count with no query.
+            // Counters live in a host-visible buffer at set 0 binding 0 (unused
+            // by the SPIR-V shaders), kOcclusionQueriesPerSlot per GPU slot;
+            // the CPU zeroes them before reuse and reads them with the slot's
+            // other query results.
+            bool occlusionCounting = false;
+            std::unique_ptr<RenderBuffer> occlusionCounters;
+            uint32_t* occlusionCounterWords = nullptr;
+            std::unique_ptr<RenderShader> occlusionCountPs;
+            std::unordered_map<PipelineKey, std::unique_ptr<RenderPipeline>, PipelineKeyHash> countingPipelines;
 
             // Vertex buffers live in a persistent arena keyed by (address, size,
             // endian). A fetch constant may describe a multi-megabyte buffer for a
@@ -669,6 +737,7 @@ namespace gpu::renderer
             geometry_prepare::IndexCache indexCache;
             uint64_t indexCacheHits = 0, indexCacheMisses = 0;
             uint64_t uploadGenerations = 0; // Source of GpuSlot::uploadGeneration.
+            uint64_t uploadRingRewinds = 0; // Mid-frame Flush/Begin pairs forced by a full upload ring.
             std::array<uint64_t, kGpuSlots> motionArenaGeneration{};
             void ResetSlotArena(uint32_t i)
             {
@@ -707,10 +776,21 @@ namespace gpu::renderer
             uint32_t rectListSkipped = 0;
 
             std::unordered_map<uint64_t, Shader> shaders[2];
+            // GetShader's last valid hit per stage; ClearShaders() forgets them.
+            struct LastShader { uint64_t hash = 0; Shader* entry = nullptr; } lastShader[2];
+            void ClearShaders() { shaders[0].clear(); shaders[1].clear(); lastShader[0] = lastShader[1] = {}; }
             // Keyed by the normalized pipeline key. sceneSerial: the scene in which
             // the pipeline was last drawn was recorded in its recipe.
-            struct PipelineSlot { std::unique_ptr<RenderPipeline> pipeline; uint32_t sceneSerial = 0; };
+            // origin/drawn: LO_RECORD_TIMING first-use attribution only.
+            struct PipelineSlot {
+                std::unique_ptr<RenderPipeline> pipeline; uint32_t sceneSerial = 0;
+                record_timing::Origin origin = record_timing::Origin::Unknown; bool drawn = false;
+            };
             std::unordered_map<PipelineKey, PipelineSlot, PipelineKeyHash> pipelines;
+            // GetPipeline's last hit. Slots are never erased or replaced, and
+            // unordered_map nodes keep their address across rehashes.
+            PipelineKey lastPipelineKey{};
+            PipelineSlot* lastPipelineSlot = nullptr;
             std::unordered_map<PipelineKey, std::unique_ptr<RenderPipeline>, PipelineKeyHash> hdrPipelines;
             // Full state recipes are portable; driver blobs and object pointers
             // are never persisted. Render maps stay on the command thread.
@@ -753,20 +833,27 @@ namespace gpu::renderer
             // on the worker before building; such modules are never freed (plume's
             // pipeline libraries key on module handles). A draw that needs a queued
             // pipeline job takes it over, one that needs a running job waits for it.
+            // The startup set is built the same way, after everything else.
             // Declared before the pool so jobs outlive it.
             struct PrefetchBatch {
                 uint32_t tag = 0;
                 size_t planned = 0;
                 std::atomic<size_t> remaining{0}, failed{0};
+                std::atomic<size_t> taken{0}; // claimed by a draw and built there
+                bool startup = false;
                 std::chrono::steady_clock::time_point started;
             };
-            struct PrefetchJob {
+            struct PrefetchJob : std::enable_shared_from_this<PrefetchJob> {
                 enum State : int { Queued, Running, Done, Taken };
                 // Priority order. Draw: a skipped draw needs it. Scene: a scene that is
-                // loading. Sibling: shares a shader with a draw-time miss.
-                enum Kind : uint8_t { Draw, Scene, Sibling };
+                // loading. Sibling: shares a shader with a draw-time miss. Startup: the
+                // startup set, built in the background.
+                enum Kind : uint8_t { Draw, Scene, Sibling, Startup };
+                // The capped worker group a running job counts against.
+                enum Slot : uint8_t { NoSlot, DrawSlot, StartupSlot };
                 std::atomic<int> state{Queued};
                 Kind kind = Scene; // changed under the pool mutex
+                Slot slot = NoSlot; // under the pool mutex
                 PipelineKey key{};
                 RenderGraphicsPipelineDesc desc;
                 std::unique_ptr<RenderPipeline> pipeline;
@@ -779,12 +866,13 @@ namespace gpu::renderer
                 xenos::TranslatedShader info;
                 std::unique_ptr<RenderShader> module;
                 RenderShader* raw = nullptr;
-                // Sibling job whose shader is not loaded: the desc is made on the worker
-                // after the shader job (run there if still queued) has its module.
+                // Sibling or startup job whose shader is not loaded: the desc is made on
+                // the worker after the shader job (run there if still queued) has its module.
                 Shader* vs = nullptr;
                 Shader* ps = nullptr;
                 std::shared_ptr<PrefetchJob> needVs, needPs;
             };
+            static bool DrawTimeJob(PrefetchJob::Kind kind) { return kind == PrefetchJob::Draw || kind == PrefetchJob::Sibling; }
             // Worker-made modules whose hash got another module first; a build may
             // have used them, so they live as long as the shader map.
             std::vector<std::unique_ptr<RenderShader>> orphanShaders;
@@ -792,8 +880,12 @@ namespace gpu::renderer
             std::unordered_map<uint64_t, std::shared_ptr<PrefetchJob>> prefetchShaderJobs[2];
             // Recipes whose shader modules are still being made.
             std::vector<std::pair<PipelineKey, std::shared_ptr<PrefetchBatch>>> prefetchWaiting;
-            uint64_t prefetchHarvested = 0;
             bool scenePrefetchEnabled = false;
+            // Startup preparation: LO_PIPELINE_PREPARE_SYNC=1 (or --prepare-shaders-only)
+            // builds the startup set before Init returns, otherwise the workers build it
+            // while the game runs. startupBatch is cleared once it is done.
+            bool synchronousPreparation = false;
+            std::shared_ptr<PrefetchBatch> startupBatch;
             bool prefetchShadersChanged = false; // a draw took a shader job over
             std::unordered_set<PipelineKey, PipelineKeyHash> failedPrefetch;
             // Draw-time siblings: known recipes not built at the first miss, by shader.
@@ -818,31 +910,34 @@ namespace gpu::renderer
             struct WorkerStats { uint32_t queued = 0, built = 0, hits = 0, skipped = 0, shaders = 0; } workerStats; // this frame
             // Vulkan graphics pipeline libraries: a draw-time miss links per-shader
             // parts instead of compiling the whole pipeline. A background thread builds
-            // the parts for the shaders of known recipes. Declared after the shader
-            // and pipeline maps so it stops first.
+            // the parts for the shaders of known recipes (libraryPrecompile below).
             bool fastLinkPipelines = false;
+            struct PrefetchPool {
+                std::mutex mutex;
+                std::condition_variable wake, finished;
+                // One queue per job kind; siblings newest miss first. Entries that were
+                // taken over, dropped or moved to another queue stay until a worker skips them.
+                std::deque<std::shared_ptr<PrefetchJob>> draw, scene, siblings, startup;
+                size_t runningSmall = 0, smallCap = 1; // draw and sibling jobs
+                size_t runningStartup = 0, startupCap = 1;
+                // Finished jobs for the render thread to harvest.
+                std::vector<std::shared_ptr<PrefetchJob>> finishedJobs;
+                std::vector<std::thread> workers;
+                bool stop = false;
+                ~PrefetchPool()
+                {
+                    { std::lock_guard lock(mutex); stop = true; draw.clear(); scene.clear(); siblings.clear(); startup.clear(); }
+                    wake.notify_all();
+                    for (auto& worker : workers) worker.join();
+                }
+            } prefetchPool;
+            // Declared after the shader and pipeline maps and the pool so it stops
+            // first: it may wait for shader jobs the workers run.
             struct LibraryPrecompile {
                 std::atomic<bool> stop{false};
                 std::thread thread;
                 ~LibraryPrecompile() { stop = true; if (thread.joinable()) thread.join(); }
             } libraryPrecompile;
-            struct PrefetchPool {
-                std::mutex mutex;
-                std::condition_variable wake, finished;
-                // One queue per job kind; siblings newest miss first. Entries that were
-                // taken over or dropped stay until a worker skips them.
-                std::deque<std::shared_ptr<PrefetchJob>> draw, scene, siblings;
-                size_t runningSmall = 0, smallCap = 1; // draw and sibling jobs
-                std::vector<std::thread> workers;
-                bool stop = false;
-                std::atomic<uint64_t> completed{0};
-                ~PrefetchPool()
-                {
-                    { std::lock_guard lock(mutex); stop = true; draw.clear(); scene.clear(); siblings.clear(); }
-                    wake.notify_all();
-                    for (auto& worker : workers) worker.join();
-                }
-            } prefetchPool;
             std::unordered_map<RenderTargetKey, std::unique_ptr<HostTexture>, RenderTargetKeyHash> renderTargets;
             std::unordered_map<TextureKey, std::unique_ptr<HostTexture>, TextureKeyHash> textures;
 
@@ -861,6 +956,10 @@ namespace gpu::renderer
                 // Depth-writing draws in the frame that wrote it (depthDraws).
                 uint32_t sceneDraws = 0;
                 uint64_t sdrWriteOrdinal = 0;
+                // Source target state when the write was not SDR-qualified.
+                SdrLossTrace sdrLoss;
+                uint64_t sdrProducerFrame = ~0ull;
+                uint32_t sdrQualifiedWidth = 0, sdrQualifiedHeight = 0;
                 std::unique_ptr<HostTexture> hdrTex;
                 uint64_t hdrWriteOrdinal = 0;
                 uint64_t hdrFrame = ~0ull;
@@ -905,6 +1004,41 @@ namespace gpu::renderer
             uint64_t mvScratchBytes = 0;
             const temporal::MotionOptions motionOptions = temporal::MotionOptions::Environment();
             std::unique_ptr<temporal::MotionReplayGPU> motionReplay;
+            // LO_RECORD_TIMING: phase split of the record timer. The create
+            // counters below are bumped on slow paths only.
+            record_timing::Recorder recordTiming;
+            uint32_t recordFramebufferCreates = 0, recordOtherPipelineCreates = 0;
+            double recordOtherPipelineMs = 0;
+            static void ReadRecordCounters(const void* context, record_timing::Counters& out)
+            {
+                const auto& r = *static_cast<const Renderer*>(context);
+                out = {};
+                if (r.motionReplay) {
+                    const auto& mv = r.motionReplay->Work();
+                    out.mvTranslated = mv.translated; out.mvShaders = mv.shadersCreated;
+                    out.mvPipelines = mv.pipelinesCreated; out.mvPending = mv.pendingDraws; out.mvScene = mv.sceneBegins;
+                    out.mvTranslateMs = mv.translateMs; out.mvShaderMs = mv.shaderCreateMs;
+                    out.mvPipelineMs = mv.pipelineMs; out.mvSceneMs = mv.sceneMs;
+                }
+                out.framebuffers = r.recordFramebufferCreates;
+                out.otherPipelines = r.recordOtherPipelineCreates;
+                out.otherPipelineMs = r.recordOtherPipelineMs;
+            }
+            // Origin and first use of the game-state pipeline bound by this draw.
+            void NoteRecordPipeline(record_timing::DrawSample& sample, const PipelineKey& drawKey, const RenderPipeline* bound)
+            {
+                const auto it = pipelines.find(gpu::pipeline_cache::Normalize(drawKey));
+                if (it != pipelines.end() && it->second.pipeline.get() == bound) {
+                    sample.pipelineKnown = true;
+                    sample.origin = it->second.origin;
+                    sample.firstUse = !it->second.drawn;
+                    it->second.drawn = true;
+                }
+#if defined(LO_GPU_PLUME)
+                if (nativeVulkan && bound)
+                    sample.linked = static_cast<const VulkanGraphicsPipeline*>(bound)->linked;
+#endif
+            }
 #if defined(LO_GPU_PLUME)
             // Diagnostic-only, one requested real frame. No allocation/copy on
             // the default path; this is not a provider-ready or HUDless claim.
@@ -1338,6 +1472,76 @@ namespace gpu::renderer
             bool textureBcReplacementWarned = false; // one warning when BC replacements are skipped
             uint32_t textureReplacements = 0; // per stats window
             uint64_t textureReplacementsTotal = 0;
+            // Render-thread time replacements took this frame (file lookups,
+            // reads, uploads); ReportReplacementCost logs a frame that may hitch.
+            struct ReplacementCost
+            {
+                uint32_t reads = 0, misses = 0, uploads = 0;
+                uint64_t readBytes = 0, ringRewinds = 0;
+                double readMs = 0, missMs = 0, uploadMs = 0;
+                uint64_t slowestFingerprint = 0, slowestBytes = 0;
+                double slowestMs = 0;
+                // Background reads collected this frame (not render-thread time).
+                uint32_t arrived = 0;
+                uint64_t arrivedBytes = 0;
+                double arrivedMs = 0, longestWaitMs = 0;
+            } replacementCost;
+            // LOTEX2 files are read on a worker thread: on a hard disk the first
+            // frame of a map read ~270 MB on the render thread, over a second.
+            // A texture keeps its original until the payload arrives and its next
+            // lookup re-creates it. LO_MODS_TEXTURE_SYNC=1 reads in GetTexture.
+            bool textureReplacementSync = false;
+            struct ReplacementRead
+            {
+                uint64_t fingerprint = 0;
+                uint32_t format = 0, width = 0, height = 0;
+                bool blockCompressed = true;
+                std::chrono::steady_clock::time_point queued;
+                std::optional<modding::TextureData> data;
+                std::string error;
+                bool bcSkipped = false;
+                double ms = 0;
+            };
+            struct ReplacementReader
+            {
+                std::mutex mutex;
+                std::condition_variable wake;
+                std::deque<ReplacementRead> queue, done;
+                std::thread thread;
+                bool stop = false;
+                void Run()
+                {
+                    std::unique_lock lock(mutex);
+                    for (;;)
+                    {
+                        wake.wait(lock, [&] { return stop || !queue.empty(); });
+                        if (stop) return;
+                        ReplacementRead read = std::move(queue.front());
+                        queue.pop_front();
+                        lock.unlock();
+                        const auto start = std::chrono::steady_clock::now();
+                        // Every level must fit the upload ring with the draw headroom free.
+                        read.data = modding::ReadTextureReplacement(read.fingerprint, read.format, read.width, read.height,
+                            kUploadRingSize - kUploadHeadroom, &read.error, read.blockCompressed, &read.bcSkipped);
+                        read.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                        lock.lock();
+                        done.push_back(std::move(read));
+                    }
+                }
+                ~ReplacementReader()
+                {
+                    { std::lock_guard lock(mutex); stop = true; queue.clear(); }
+                    wake.notify_all();
+                    if (thread.joinable()) thread.join();
+                }
+            } replacementReader;
+            // Render thread only. Queued: requested, result not collected yet.
+            // Ready: read, waiting for its texture's next lookup (dropped after
+            // kReplacementReadyFrames). Missing: no file for the fingerprint.
+            static constexpr uint64_t kReplacementReadyFrames = 300;
+            struct ReadyReplacement { modding::TextureData data; uint32_t format, width, height; uint64_t frame; };
+            std::unordered_set<uint64_t> replacementsQueued, replacementsMissing;
+            std::unordered_map<uint64_t, ReadyReplacement> replacementsReady;
             uint64_t controllerAtlasFamilyFrame = ~0ull;
             bool controllerAtlasPlayStationFamily = false;
             uint64_t controllerAtlasTraceFrame = ~0ull;
@@ -1350,6 +1554,8 @@ namespace gpu::renderer
                 const char* stage = nullptr;
             };
             uint32_t textureReuploads = 0;
+            // LO_RENDER_TIMING: per-frame texture revalidation work (GetTexture hits).
+            uint32_t textureRehashes = 0, textureFullScans = 0, textureRehashChanges = 0;
             uint32_t dummyBindings = 0;
 
             // Separate opt-in diagnostics: ordinary frame timing must not pay
@@ -2197,12 +2403,11 @@ namespace gpu::renderer
                 cacheIdentity = xenos::cache::MakeIdentity(vulkan ? backend::Backend::Vulkan : backend::Backend::D3D12, xenos::DxcIdentity());
                 // Metal translates the same SPIR-V as Vulkan, so both read one pack.
                 uboConstants = xenos::cache::UsesUboConstants(cacheIdentity);
-                if (uboConstants) {
-                    // Their shaders and layouts expect the constant addresses.
-                    motionInitFailed = fsrAlphaInitFailed = true;
-                    LOG_INFO("renderer: guest shader constants in uniform buffers (set {}); motion-vector and FSR alpha replay off",
-                        kConstantSet);
-                }
+                if (uboConstants)
+                    LOG_INFO("renderer: guest shader constants in uniform buffers (set {})", kConstantSet);
+                // The motion-vector and FSR alpha replays translate guest shaders in the
+                // pointer form, with their own layouts, and compile them at run time.
+                if (!xenos::DxcAvailable()) motionInitFailed = fsrAlphaInitFailed = true;
 
                 try {
                     positionEvidence=std::make_unique<position_evidence::Collection>([ubo=uboConstants](std::span<const uint8_t> raw) {
@@ -2266,11 +2471,12 @@ namespace gpu::renderer
                 }
                 if (!hostOcclusion)
                     for (auto& g : gpuSlots) g.occlusionQueries.clear();
-                LOG_INFO("renderer: occlusion queries {} (precise={} per_batch={} LO_ZPD_MODE={})",
+                const char* countingState = InitOcclusionCounting();
+                LOG_INFO("renderer: occlusion queries {} (precise={} per_batch={} LO_ZPD_MODE={} fragment_counting={})",
                     !hostOcclusion ? "fake" : occlusionPolicy == gpu::occlusion::Policy::Strict ? "host-strict" :
                     occlusionPolicy == gpu::occlusion::Policy::Fast ? "host-fast" : "host-adaptive",
                     device->getCapabilities().occlusionQueryPrecise, kOcclusionQueriesPerSlot,
-                    getenv("LO_ZPD_MODE") ? getenv("LO_ZPD_MODE") : "unset");
+                    getenv("LO_ZPD_MODE") ? getenv("LO_ZPD_MODE") : "unset", countingState);
                 BindGpuSlot();
                 const auto vertexFlags = RenderBufferFlag::STORAGE |
                     (vulkan ? RenderBufferFlag::DEVICE_ADDRESSABLE : RenderBufferFlag::NONE);
@@ -2284,6 +2490,8 @@ namespace gpu::renderer
                 if (!readback) return InitFailure("readback.create", kReadbackSize);
                 resolveReadback = getenv("LO_RESOLVE_READBACK") != nullptr;
                 textureRevalidate = getenv("LO_TEXTURE_STATIC") == nullptr;
+                if (const char* sync = getenv("LO_MODS_TEXTURE_SYNC"); sync && *sync && strcmp(sync, "0") != 0)
+                    textureReplacementSync = true;
                 if (const char* path = getenv("LO_TEXTURE_FINGERPRINT_LOG"); path && *path && !textureFingerprintLog) {
                     textureFingerprintLog = std::fopen(path, "w");
                     if (textureFingerprintLog)
@@ -2381,6 +2589,11 @@ namespace gpu::renderer
                 for (uint32_t i = 0; i < (vulkan?1:kVertexFetchSlots); i++)
                     staticSet0->setBuffer(vfetchDescriptorBase + i, vertexArena.get(),
                         vulkan ? 16 : gpu::render_arena::kVertexArenaSize);
+                // SPIR-V shaders fetch vertices by device address; the slot's
+                // only reader is the occlusion counting shader.
+                if (occlusionCounting)
+                    staticSet0->setBuffer(vfetchDescriptorBase, occlusionCounters.get(),
+                        uint64_t(kGpuSlots) * kOcclusionQueriesPerSlot * sizeof(uint32_t));
                 defaultSampler = device->createSampler(sampling::Describe(sampling::DefaultKey));
                 if (!defaultSampler) return InitFailure("default_sampler.create");
                 for (uint32_t i = 0; i < kSamplerPalette; i++)
@@ -2587,6 +2800,8 @@ namespace gpu::renderer
             {
                 FlushMotionReplayQueue();
                 dst.sdrProducerFrame = ~0ull;
+                if (dst.sdrLoss.Lost(frame, SdrLossTrace::TileTransfer, (srcClass << 8) | dstClass))
+                    dst.sdrLoss.vs = src.allocationSerial;
                 dst.hdrValid = false;
                 consecutiveResolveCopies.Invalidate();
                 // Only the 32-bit classes share a word layout; wider ones are left alone.
@@ -2610,7 +2825,10 @@ namespace gpu::renderer
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
                 RenderDescriptorSet* set1 = AcquireSet(1);
                 set1->setTexture(0, src.texture.get(), RenderTextureLayout::SHADER_READ);
-                commandList->setFramebuffer(GetFramebuffer(&dst, nullptr));
+                // A transfer over the whole target (copy blend, all channels)
+                // replaces every pixel, so clears it still owes are dead.
+                if (w == dst.width && h == dst.height) dst.pendingClear.Drop();
+                BindTargets(&dst, nullptr);
                 RenderViewport viewport(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
                 commandList->setViewports(&viewport, 1);
                 RenderRect scissor{ 0, 0, int32_t(w), int32_t(h) };
@@ -2850,10 +3068,11 @@ namespace gpu::renderer
                 std::span<const RenderRect> rects = {}, bool limitToRects = false)
             {
                 destination.sdrProducerFrame = ~0ull;
+                destination.sdrLoss.Lost(frame, SdrLossTrace::Promotion, rgb ? 1 : 2);
                 auto* pipeline = GetSceneCopyPromotionPipeline(destination.format, rgb);
                 if (!pipeline || !set) return false;
                 Transition(destination, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                commandList->setFramebuffer(GetFramebuffer(&destination, nullptr));
+                BindTargets(&destination, nullptr);
                 RenderViewport viewport(0.0f, 0.0f, float(destination.width), float(destination.height));
                 const RenderRect full{0, 0, int32_t(destination.width), int32_t(destination.height)};
                 commandList->setViewports(viewport); commandList->setScissors(full);
@@ -2979,6 +3198,7 @@ namespace gpu::renderer
                 if (!SettleRestoreDebt()) return fail();
                 auto& low = *promotion.parkedLow;
                 low.sdrProducerFrame = ~0ull;
+                low.sdrLoss.Lost(frame, SdrLossTrace::Promotion, 3);
 #if defined(LO_GPU_PLUME)
                 HandleFsrAlphaRgbWriter(low, "promotion_resample_rgb");
 #endif
@@ -3625,7 +3845,7 @@ namespace gpu::renderer
                 commandList->clearColor(0, RenderColor(1, 1, 1, 1));
                 fgUiBindingExpected = true; // This diagnostic restores the same target.
                 Transition(source, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                commandList->setFramebuffer(GetFramebuffer(&source, nullptr));
+                BindTargets(&source, nullptr);
                 const RenderViewport originalViewport(0.0f, 0.0f, float(source.width), float(source.height));
                 const RenderRect originalScissor{0, 0, int32_t(source.width), int32_t(source.height)};
                 commandList->setViewports(originalViewport);
@@ -3684,7 +3904,7 @@ namespace gpu::renderer
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
                 auto* set = AcquireSet(1); // Does not submit or change GPU slots.
                 set->setTexture(0, hdrSource ? hdrSource : src.texture.get(), RenderTextureLayout::SHADER_READ);
-                commandList->setFramebuffer(GetFramebuffer(&dst, nullptr));
+                BindTargets(&dst, nullptr);
                 RenderViewport viewport(0.0f, 0.0f, 1280.0f, 720.0f);
                 RenderRect scissor{0, 0, 1280, 720};
                 commandList->setViewports(&viewport, 1);
@@ -3749,7 +3969,7 @@ namespace gpu::renderer
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
                 RenderDescriptorSet* set1 = AcquireSet(1);
                 set1->setTexture(0, src.texture.get(), RenderTextureLayout::SHADER_READ);
-                commandList->setFramebuffer(GetFramebuffer(&dst, nullptr));
+                BindTargets(&dst, nullptr);
                 RenderViewport viewport(static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(w), static_cast<float>(h));
                 commandList->setViewports(&viewport, 1);
                 RenderRect scissor{ int32_t(x0), int32_t(y0), int32_t(x0 + w), int32_t(y0 + h) };
@@ -4106,7 +4326,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             // stored together, after every other count.
             void WriteOcclusionRecords(const std::vector<gpu::occlusion::Write>& writes)
             {
-                if (!writes.empty()) g_commandProcessor.AdvanceSyncEpoch();
+                if (!writes.empty()) g_commandProcessor.AdvanceSyncEpoch(CommandProcessor::SyncSource::Occlusion);
                 for (const auto& write : writes) {
                     if (!write.apply) continue;
                     auto* words = reinterpret_cast<uint32_t*>(Phys(write.address));
@@ -4148,14 +4368,93 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 g_occlusionAwaited.store(awaited, std::memory_order_release);
             }
 
+            // See occlusionCounting. Returns the state for the startup log.
+            const char* InitOcclusionCounting()
+            {
+                if (!hostOcclusion || !nativeVulkan) return "no";
+                // Measured only there; other drivers' queries cost little.
+                const auto* native = static_cast<const VulkanDevice*>(device);
+                if (native->physicalDeviceProperties.apiVersion < VK_API_VERSION_1_2) return "no";
+                VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+                VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES, &subgroup};
+                VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+                vkGetPhysicalDeviceProperties2(native->physicalDevice, &properties);
+                if (driver.driverID != VK_DRIVER_ID_MESA_TURNIP) return "no";
+                VkPhysicalDeviceFeatures features{};
+                vkGetPhysicalDeviceFeatures(native->physicalDevice, &features);
+                if (!features.fragmentStoresAndAtomics) return "no (fragment atomics unsupported)";
+                if (!(subgroup.supportedStages & VK_SHADER_STAGE_FRAGMENT_BIT) ||
+                    !(subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BALLOT_BIT)) return "no (fragment ballot unsupported)";
+                // Helper invocations are left out: their atomics have no effect,
+                // but they may still take part in the wave's ballot.
+                static constexpr char kCountPs[] = R"HLSL(
+struct XePushConstantWords { uint2 VertexShaderConstants; uint2 SharedConstants; uint2 PixelShaderConstants; };
+[[vk::push_constant]] ConstantBuffer<XePushConstantWords> xePushWords;
+[[vk::binding(0, 0)]] RWByteAddressBuffer occlusionCounters;
+[[vk::ext_builtin_input(/* HelperInvocation */ 23)]] static const bool gl_HelperInvocation;
+[earlydepthstencil]
+void main()
+{
+    const bool counted = !gl_HelperInvocation;
+    const uint samples = WaveActiveCountBits(counted);
+    if (counted && WavePrefixCountBits(counted) == 0)
+        occlusionCounters.InterlockedAdd(xePushWords.PixelShaderConstants.x * 4, samples);
+}
+)HLSL";
+                const auto compiled = xenos::CompileCachedHlsl(kCountPs, "main", "ps_6_0", xenos::ShaderBinaryFormat::Spirv);
+                if (!compiled.ok) {
+                    LOG_WARNING("renderer: occlusion counting shader: {}", compiled.errors);
+                    return "no (shader compile failed)";
+                }
+                occlusionCountPs = device->createShader(compiled.bytecode.data(), compiled.bytecode.size(), "main", RenderShaderFormat::SPIRV);
+                const uint64_t bytes = uint64_t(kGpuSlots) * kOcclusionQueriesPerSlot * sizeof(uint32_t);
+                occlusionCounters = device->createBuffer(RenderBufferDesc::UploadBuffer(bytes, RenderBufferFlag::STORAGE));
+                occlusionCounterWords = occlusionCounters ? static_cast<uint32_t*>(occlusionCounters->map()) : nullptr;
+                if (!occlusionCountPs || !occlusionCounterWords) {
+                    occlusionCounterWords = nullptr;
+                    occlusionCounters.reset();
+                    occlusionCountPs.reset();
+                    return "no (resources)";
+                }
+                std::memset(occlusionCounterWords, 0, size_t(bytes));
+                for (auto& g : gpuSlots) g.occlusionCounted.assign(kOcclusionQueriesPerSlot, 0);
+                occlusionCounting = true;
+                return "yes";
+            }
+
+            // The counting pipeline for a measured draw, or null when the draw
+            // takes a host query: it has a pixel shader (which may discard) or
+            // colour writes (left undefined either way, but kept as they are).
+            RenderPipeline* CountingPipeline(const PipelineKey& key, Shader* vs, Shader* ps)
+            {
+                if (!occlusionCounting || ps || key.colorMask) return nullptr;
+                if (const auto known = countingPipelines.find(key); known != countingPipelines.end())
+                    return known->second.get(); // null after a failed creation: the query serves
+                ScopedTimer createTimer{ recordOtherPipelineMs, record_timing::Enabled() };
+                ++recordOtherPipelineCreates;
+                const auto started = std::chrono::steady_clock::now();
+                auto desc = DescribePipeline(key, vs, nullptr, false);
+                desc.pixelShader = occlusionCountPs.get();
+                auto& pipeline = countingPipelines[key];
+                pipeline = device->createGraphicsPipeline(desc);
+                if (!pipeline) LOG_WARNING("renderer: occlusion counting pipeline failed vs={:016x}; using a query", key.vs);
+                else if (countingPipelines.size() <= 16)
+                    LOG_INFO("renderer: occlusion counting pipeline {} vs={:016x} f{} {:.1f} ms", countingPipelines.size(), key.vs, frame,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                return pipeline.get();
+            }
+
             // The host query for a draw inside a guest occlusion query, or ~0u.
             uint32_t OcclusionQueryForDraw()
             {
                 if (!hostOcclusion || !occlusion.Active()) return ~0u;
                 if (Gpu().occlusionUsed >= kOcclusionQueriesPerSlot) { ++occlusionStats.capped; return ~0u; }
-                const uint32_t index = Gpu().occlusionUsed++;
-                Gpu().occlusionPoolsDirty = std::max(Gpu().occlusionPoolsDirty, index / kOcclusionPoolQueries + 1);
-                return index;
+                return Gpu().occlusionUsed++;
+            }
+            // OcclusionQueryForDraw will return a query and the draws can count.
+            bool OcclusionCountingPending()
+            {
+                return occlusionCounting && hostOcclusion && occlusion.Active() && Gpu().occlusionUsed < kOcclusionQueriesPerSlot;
             }
 
             // The slot's fence has completed, so its host queries are final.
@@ -4164,11 +4463,16 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (!s.occlusionUsed) return;
                 const auto readStart = std::chrono::steady_clock::now();
                 s.occlusionResults.resize(s.occlusionUsed);
-                for (uint32_t first = 0; first < s.occlusionUsed; first += kOcclusionPoolQueries) {
+                for (uint32_t first = 0; first < s.occlusionPoolUsed; first += kOcclusionPoolQueries) {
                     auto& pool = *s.occlusionQueries[first / kOcclusionPoolQueries];
                     pool.queryResults();
-                    std::copy_n(pool.getResults(), std::min(kOcclusionPoolQueries, s.occlusionUsed - first),
+                    std::copy_n(pool.getResults(), std::min(kOcclusionPoolQueries, s.occlusionPoolUsed - first),
                         s.occlusionResults.begin() + first);
+                }
+                if (s.occlusionCountersDirty) {
+                    const uint32_t* counters = occlusionCounterWords + size_t(&s - gpuSlots) * kOcclusionQueriesPerSlot;
+                    for (uint32_t i = 0; i < s.occlusionCountersDirty; ++i)
+                        if (s.occlusionCounted[i]) s.occlusionResults[i] = counters[i];
                 }
                 occlusionStats.readbackUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - readStart).count());
@@ -4431,6 +4735,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         for (uint32_t p = 0; p < Gpu().occlusionPoolsDirty; ++p)
                             commandList->resetQueryPool(Gpu().occlusionQueries[p].get(), 0, kOcclusionPoolQueries);
                         Gpu().occlusionPoolsDirty = 0;
+                        // The slot's fence has completed: its counters are free.
+                        if (const uint32_t dirty = std::exchange(Gpu().occlusionCountersDirty, 0)) {
+                            std::memset(occlusionCounterWords + size_t(gpuSlot) * kOcclusionQueriesPerSlot, 0, dirty * sizeof(uint32_t));
+                            std::fill_n(Gpu().occlusionCounted.begin(), dirty, uint8_t(0));
+                        }
+                        Gpu().occlusionPoolUsed = 0;
                         Gpu().occlusionUsed = 0;
                         Gpu().occlusionBatch = nextOcclusionBatch++;
                     }
@@ -4678,6 +4988,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (offset + size + keepFree > kUploadRingSize)
                 {
                     // Out of space mid-frame: finish what we have and start over.
+                    uploadRingRewinds++;
                     if (!Flush() || !Begin()) return UINT64_MAX;
                     offset = 0;
                     Gpu().uploadGeneration = ++uploadGenerations; // Rewound even if Begin did not recycle the slot.
@@ -4701,6 +5012,14 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     commandList->setGraphicsDescriptorSetDynamic(Gpu().constantSet.get(), kConstantSet, drawConstantOffsets, 3);
                 else
                     commandList->setGraphicsPushConstants(0, constantAddresses);
+            }
+
+            // The replays translate in the pointer form; the renderer's own text is the
+            // uniform-buffer form with uboConstants, so they translate the microcode again.
+            const xenos::TranslatedShader& ReplayTranslation(const xenos::TranslatedShader& info) const
+            {
+                static const xenos::TranslatedShader none;
+                return uboConstants ? none : info;
             }
 
             // Host shaders that read constants keep the push-constant addresses.
@@ -4801,6 +5120,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             }
             void Transition(HostTexture& tex, RenderTextureLayout layout, RenderBarrierStages stages)
             {
+                // Every use outside a pass that binds the target reads or
+                // partly overwrites it, so owed clears go first. Attachment
+                // writes leave them to the pass (BindTargets).
+                if (!tex.pendingClear.Empty() && layout != RenderTextureLayout::COLOR_WRITE &&
+                    layout != RenderTextureLayout::DEPTH_WRITE)
+                    RunPendingClears(tex);
                 if (layout == RenderTextureLayout::COLOR_WRITE || layout == RenderTextureLayout::COPY_DEST ||
                     layout == RenderTextureLayout::GENERAL || layout == RenderTextureLayout::DEPTH_WRITE)
                     MarkFgWritable(tex, "writable_transition");
@@ -4808,6 +5133,77 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     return;
                 commandList->barriers(stages, RenderTextureBarrier(tex.texture.get(), layout));
                 tex.layout = layout;
+            }
+
+            // ---- deferred EDRAM clears (pending_clear.h) -------------------------
+            // A clear of an EDRAM target is queued on the texture and recorded
+            // right before the texture's next use, so a clear that is replaced
+            // first never runs and the others start the next pass that binds the
+            // target (plume Vulkan: loadOp CLEAR) instead of a pass of their own.
+            // Callers keep the bookkeeping that describes the contents (HDR,
+            // SDR, AA, FSR alpha, restore debt) at the logical clear.
+            static bool IsDepthTarget(const HostTexture& tex) { return tex.format == RenderFormat::D32_FLOAT_S8_UINT; }
+
+            void QueueClear(HostTexture& tex, pending_clear::Op op)
+            {
+                MarkFgWritable(tex, "edram_clear");
+                if (tex.pendingClear.Size() >= pending_clear::Queue::kMaxOps) RunPendingClears(tex);
+                tex.pendingClear.Record(std::move(op), tex.width, tex.height);
+            }
+
+            // Records queued clears into the bound framebuffer, where the target
+            // is colour attachment 0 or the depth attachment.
+            void ReplayClears(const HostTexture& tex, const std::vector<pending_clear::Op>& ops)
+            {
+                static const bool traceClearCall = getenv("LO_TRACE_CLEAR_CALL") != nullptr;
+                thread_local std::vector<RenderRect> rects;
+                for (const auto& op : ops) {
+                    rects.clear();
+                    for (const auto& r : op.rects) rects.push_back({r.left, r.top, r.right, r.bottom});
+                    const RenderRect* data = rects.empty() ? nullptr : rects.data();
+                    if (IsDepthTarget(tex)) {
+                        if (traceClearCall)
+                            LOG_INFO("clear begin f{} allocation={} size={}x{} count={} z={}", frame, tex.allocationSerial, tex.width, tex.height, rects.size(), op.depth);
+                        commandList->clearDepthStencil((op.aspects & pending_clear::Depth) != 0,
+                            (op.aspects & pending_clear::Stencil) != 0, op.depth, op.stencil, data, uint32_t(rects.size()));
+                        if (traceClearCall) LOG_INFO("clear end");
+                    } else
+                        commandList->clearColor(0, RenderColor(op.color[0], op.color[1], op.color[2], op.color[3]),
+                            data, uint32_t(rects.size()));
+                }
+                consecutiveResolveCopies.Invalidate();
+            }
+
+            // Runs the queue on the target's own framebuffer, which stays bound.
+            void RunPendingClears(HostTexture& tex)
+            {
+                const auto ops = tex.pendingClear.Take();
+                const bool depthTarget = IsDepthTarget(tex);
+                const auto layout = depthTarget ? RenderTextureLayout::DEPTH_WRITE : RenderTextureLayout::COLOR_WRITE;
+                if (tex.layout != layout) {
+                    commandList->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(tex.texture.get(), layout));
+                    tex.layout = layout;
+                }
+                commandList->setFramebuffer(FramebufferFor(depthTarget ? nullptr : &tex, depthTarget ? &tex : nullptr));
+                ReplayClears(tex, ops);
+            }
+
+            // Binds colour/depth (either may be null) for a pass and starts it
+            // with their queued clears. A queue that does not fit the pass's
+            // render area (the colour extent when colour is bound) runs first on
+            // the target's own framebuffer.
+            RenderFramebuffer* BindTargets(HostTexture* color, HostTexture* depth)
+            {
+                const HostTexture* area = color ? color : depth;
+                for (HostTexture* tex : {color, depth})
+                    if (tex && !tex->pendingClear.Empty() &&
+                        !tex->pendingClear.FitsPass(tex->width, tex->height, area->width, area->height))
+                        RunPendingClears(*tex);
+                RenderFramebuffer* framebuffer = GetFramebuffer(color, depth);
+                commandList->setFramebuffer(framebuffer);
+                if (color && !color->pendingClear.Empty()) ReplayClears(*color, color->pendingClear.Take());
+                if (depth && !depth->pendingClear.Empty()) ReplayClears(*depth, depth->pendingClear.Take());
+                return framebuffer;
             }
 
             // ---- samplers ---------------------------------------------------------
@@ -4874,7 +5270,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
             uint64_t ActualSamplerKey(uint32_t index) const
             {
-                const auto version = samplerState.Current();
+                const auto& version = samplerState.Current();
                 return version ? version->Key(index) : sampling::DefaultKey;
             }
 
@@ -5037,6 +5433,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
             void PrepareKnownPipelines()
             {
+                const char* sync = getenv("LO_PIPELINE_PREPARE_SYNC");
+                synchronousPreparation = gpu::pipeline_prepare::g_synchronous || (sync && std::string_view(sync) != "0");
                 pipelineCacheEnabled = !shaderCacheDir.empty() && !getenv("LO_NO_PIPELINE_CACHE");
                 if (!pipelineCacheEnabled) return;
                 const std::string driverCache = LoadDriverPipelineCache();
@@ -5067,6 +5465,10 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 // Learning remains enabled when eager creation is skipped.
                 if (getenv("LO_NO_PIPELINE_PREPARE") || getenv("LO_NO_SHADER_PREPARE") ||
                     settings::GetConfig().skipShaderPrebuild || video::ShaderPreparationSkipped()) return;
+                if (!synchronousPreparation) {
+                    QueueStartupPipelines(driverCache);
+                    return;
+                }
                 struct Job { PipelineKey key; Shader* vs; Shader* ps; std::unique_ptr<RenderPipeline> pipeline; };
                 std::vector<Job> jobs;
                 size_t missingShaders = 0, failed = 0, deferred = 0;
@@ -5104,7 +5506,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         }, [&](size_t i) {
                             auto& job = jobs[i];
                             if (!job.pipeline) ++failed;
-                            else { preparedPipelineKeys.insert(job.key); pipelines.emplace(job.key, PipelineSlot{ std::move(job.pipeline) }); }
+                            else { preparedPipelineKeys.insert(job.key); pipelines.emplace(job.key, PipelineSlot{ std::move(job.pipeline), 0, record_timing::Origin::Prebuilt }); }
                             video::SetShaderPreparationProgress(uint32_t(++done), uint32_t(jobs.size()),
                                 video::PreparationStage::Pipelines, video::PreparationUnit::Pipelines);
                             return !video::ShaderPreparationSkipped();
@@ -5123,6 +5525,65 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 SaveDriverPipelineCache(true);
             }
 
+            // Default startup: the startup set goes to the pipeline workers behind every
+            // other job and the game starts at once. Recipes drawn outside any scene
+            // (title, menus) go first. Pack shaders without a module are made by the
+            // jobs that need them (or by a draw that needs one first).
+            void QueueStartupPipelines(const std::string& driverCache)
+            {
+                const auto started = std::chrono::steady_clock::now();
+                auto batch = std::make_shared<PrefetchBatch>();
+                batch->startup = true;
+                batch->started = started;
+                std::vector<std::shared_ptr<PrefetchJob>> jobs, later;
+                size_t missingShaders = 0, deferred = 0, loading = 0;
+                for (const auto& [key, entry] : knownRecipes) {
+                    if (!PrebuildAtStartup(entry)) { ++deferred; continue; }
+                    Shader* vs = nullptr;
+                    Shader* ps = nullptr;
+                    std::shared_ptr<PrefetchJob> job;
+                    switch (FindRecipeShaders(key, vs, ps, nullptr)) {
+                    case RecipeShaderState::Unavailable: break;
+                    case RecipeShaderState::Ready: job = MakePipelineJob(key, vs, ps, batch, PrefetchJob::Startup); break;
+                    case RecipeShaderState::Loading:
+                        job = MakeLoadingJob(key, vs, ps, batch, PrefetchJob::Startup, nullptr);
+                        loading += job != nullptr;
+                        break;
+                    }
+                    if (!job) { ++missingShaders; continue; }
+                    (entry.scenes.Contains(gpu::pipeline_cache::kNoScene) ? jobs : later).push_back(std::move(job));
+                }
+                const size_t outsideScenes = jobs.size();
+                jobs.insert(jobs.end(), later.begin(), later.end());
+                batch->planned = jobs.size();
+                batch->remaining = batch->planned;
+                if (!jobs.empty()) startupBatch = batch;
+                QueuePrefetchJobs(jobs);
+                gpu::pipeline_prepare::Publish(0, uint32_t(jobs.size()));
+                LOG_INFO("renderer: pipeline preparation: background, {} recipes, {} queued ({} drawn outside scenes first, {} need pack shader modules), {} missing shaders, {} left to scene prefetch, {} workers, setup {:.0f} ms, driver cache {}",
+                    knownRecipes.size(), jobs.size(), outsideScenes, loading, missingShaders, deferred, prefetchPool.workers.size(),
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), driverCache);
+            }
+
+            // Render thread, once a frame after the harvest: publishes the background
+            // preparation's progress for the bar and logs its end.
+            void UpdateStartupPreparation()
+            {
+                if (!startupBatch) return;
+                const size_t planned = startupBatch->planned, remaining = startupBatch->remaining;
+                gpu::pipeline_prepare::Publish(uint32_t(planned - remaining), uint32_t(planned));
+                if (remaining) return;
+                const auto now = std::chrono::steady_clock::now();
+                const size_t failed = startupBatch->failed, taken = startupBatch->taken;
+                LOG_INFO("renderer: pipeline preparation: background done, {} recipes, {} built by the workers, {} at draw time, {} failed, {:.0f} ms, {:.1f} s after launch",
+                    planned, planned - failed - taken, taken, failed,
+                    std::chrono::duration<double, std::milli>(now - startupBatch->started).count(),
+                    std::chrono::duration<double>(now - g_launchTime).count());
+                startupBatch.reset();
+                // The driver cache now holds the startup set.
+                SaveDriverPipelineCache(false);
+            }
+
             // Turns on fast-linked draw-time pipelines and builds the libraries for the
             // shaders of the known recipes on a background thread.
             void StartLibraryPrecompile()
@@ -5131,43 +5592,70 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 LOG_INFO("renderer: graphics pipeline libraries {}", fastLinkPipelines ? "on" :
                     device->getCapabilities().fastLinkPipelines ? "off (LO_NO_PIPELINE_LIBRARY)" : "unsupported");
                 if (!fastLinkPipelines) return;
-                std::vector<RenderGraphicsPipelineDesc> descs;
-                descs.reserve(knownRecipes.size());
-                // Corpus recipes left to scene prefetch get their libraries too. Their
-                // shader modules are made here, before the library thread starts.
+                // Corpus recipes left to scene prefetch get their libraries too. A recipe
+                // whose pack shaders have no module yet gets them from the shader jobs the
+                // startup jobs and draws share, on the library thread unless someone else
+                // got there first. LO_PIPELINE_PREPARE_SYNC=1 makes them all here first.
                 const auto started = std::chrono::steady_clock::now();
-                std::vector<std::pair<bool, uint64_t>> load;
+                if (synchronousPreparation) {
+                    std::vector<std::pair<bool, uint64_t>> load;
+                    for (const auto& [key, entry] : knownRecipes) {
+                        Shader* vs = nullptr;
+                        Shader* ps = nullptr;
+                        FindRecipeShaders(key, vs, ps, &load);
+                    }
+                    std::sort(load.begin(), load.end());
+                    load.erase(std::unique(load.begin(), load.end()), load.end());
+                    const size_t modules = load.size();
+                    LoadPackShaders(std::move(load));
+                    if (modules)
+                        LOG_INFO("renderer: pipeline libraries: {} shader modules for known recipes, {:.0f} ms", modules,
+                            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                }
+                struct Item { RenderGraphicsPipelineDesc desc; PipelineKey key; Shader* vs; Shader* ps; std::shared_ptr<PrefetchJob> needVs, needPs; };
+                std::vector<Item> items;
+                items.reserve(knownRecipes.size());
+                size_t loading = 0;
                 for (const auto& [key, entry] : knownRecipes) {
                     Shader* vs = nullptr;
                     Shader* ps = nullptr;
-                    FindRecipeShaders(key, vs, ps, &load);
+                    const auto state = FindRecipeShaders(key, vs, ps, nullptr);
+                    if (state == RecipeShaderState::Ready) {
+                        auto desc = DescribePipeline(key, vs, ps, false);
+                        desc.fastLink = true;
+                        items.push_back({desc, key, vs, ps, {}, {}});
+                    } else if (state == RecipeShaderState::Loading && !synchronousPreparation &&
+                               !(key.prim == 8 && rectListExpansion && (!vs || !vs->rectList))) {
+                        Item item{{}, key, vs, ps, {}, {}};
+                        bool created = false;
+                        if (!vs) item.needVs = PackShaderJob(false, key.vs, PrefetchJob::Startup, created);
+                        if (key.ps && !ps) item.needPs = PackShaderJob(true, key.ps, PrefetchJob::Startup, created);
+                        items.push_back(std::move(item));
+                        ++loading;
+                    }
                 }
-                std::sort(load.begin(), load.end());
-                load.erase(std::unique(load.begin(), load.end()), load.end());
-                const size_t modules = load.size();
-                LoadPackShaders(std::move(load));
-                if (modules)
-                    LOG_INFO("renderer: pipeline libraries: {} shader modules for known recipes, {:.0f} ms", modules,
-                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
-                for (const auto& [key, entry] : knownRecipes) {
-                    Shader* vs = nullptr;
-                    Shader* ps = nullptr;
-                    if (FindRecipeShaders(key, vs, ps, nullptr) != RecipeShaderState::Ready) continue;
-                    auto desc = DescribePipeline(key, vs, ps, false);
-                    desc.fastLink = true;
-                    descs.push_back(desc);
-                }
-                if (descs.empty()) return;
-                libraryPrecompile.thread = std::thread([this, descs = std::move(descs)] {
+                if (items.empty()) return;
+                if (loading) LOG_INFO("renderer: pipeline libraries: {} recipes, {} make their shader modules on the library thread", items.size(), loading);
+                libraryPrecompile.thread = std::thread([this, items = std::move(items)] {
                     os::SetCurrentThreadName("Pipeline Libraries");
                     const auto started = std::chrono::steady_clock::now();
+                    std::unique_ptr<xenos::portable_pack::Reader> reader;
+                    bool readerTried = false;
                     size_t done = 0, failed = 0;
-                    for (const auto& desc : descs) {
+                    for (const auto& item : items) {
                         if (libraryPrecompile.stop) break;
-                        if (!device->prepareGraphicsPipelineLibraries(desc)) ++failed;
                         ++done;
+                        if (!item.needVs && !item.needPs) {
+                            if (!device->prepareGraphicsPipelineLibraries(item.desc)) ++failed;
+                            continue;
+                        }
+                        if (!std::exchange(readerTried, true)) reader = OpenPackReader();
+                        if ((item.needVs && !NeedShaderJob(*item.needVs, reader.get())) ||
+                            (item.needPs && !NeedShaderJob(*item.needPs, reader.get()))) { ++failed; continue; }
+                        auto desc = DescribeWithShaderJobs(item.key, item.vs, item.ps, item.needVs.get(), item.needPs.get(), true);
+                        if (!device->prepareGraphicsPipelineLibraries(desc)) ++failed;
                     }
-                    LOG_INFO("renderer: pipeline libraries for {} of {} recipes, {} failed, {:.0f} ms", done, descs.size(), failed,
+                    LOG_INFO("renderer: pipeline libraries for {} of {} recipes, {} failed, {:.0f} ms", done, items.size(), failed,
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
                 });
             }
@@ -5384,24 +5872,83 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             {
                 if (!batch) return; // a sibling or draw job
                 if (failed) ++batch->failed;
-                if (--batch->remaining == 0)
+                // The startup batch's end is logged by UpdateStartupPreparation.
+                if (--batch->remaining == 0 && !batch->startup)
                     LOG_INFO("renderer: scene prefetch {:08x} done: {} recipes, {} failed or dropped, {:.0f} ms",
                         batch->tag, batch->planned, size_t(batch->failed),
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - batch->started).count());
             }
 
-            // Scene jobs compile full pipelines; sibling and draw jobs build what a
-            // draw-time miss would (fast-linked with pipeline libraries).
+            // Scene and startup jobs compile full pipelines; sibling and draw jobs build
+            // what a draw-time miss would (fast-linked with pipeline libraries).
             std::shared_ptr<PrefetchJob> MakePipelineJob(const PipelineKey& key, Shader* vs, Shader* ps,
                 const std::shared_ptr<PrefetchBatch>& batch, PrefetchJob::Kind kind = PrefetchJob::Scene)
             {
                 auto job = std::make_shared<PrefetchJob>();
                 job->key = key;
                 job->kind = kind;
-                job->desc = DescribeForCreation(key, vs, ps, false, kind != PrefetchJob::Scene && fastLinkPipelines);
+                job->desc = DescribeForCreation(key, vs, ps, false, DrawTimeJob(kind) && fastLinkPipelines);
                 job->batch = batch;
                 prefetchJobs.emplace(key, job);
                 return job;
+            }
+
+            // The job that makes a pack shader's module, created with kind when there
+            // is none yet (created is then true; the caller queues it or leaves it to
+            // the jobs that need it, which run it themselves).
+            std::shared_ptr<PrefetchJob> PackShaderJob(bool pixel, uint64_t hash, PrefetchJob::Kind kind, bool& created)
+            {
+                auto& slot = prefetchShaderJobs[pixel ? 1 : 0][hash];
+                created = !slot;
+                if (created) {
+                    slot = std::make_shared<PrefetchJob>();
+                    slot->kind = kind;
+                    slot->shader = true;
+                    slot->pixel = pixel;
+                    slot->hash = hash;
+                    slot->pack = portableShaderPack;
+                }
+                return slot;
+            }
+
+            // A pipeline job for a recipe whose pack shaders have no module yet: the
+            // worker makes them first (FindRecipeShaders returned Loading). Null for a
+            // rect-list recipe without its VS variant: that is built at the first draw.
+            std::shared_ptr<PrefetchJob> MakeLoadingJob(const PipelineKey& key, Shader* vs, Shader* ps,
+                const std::shared_ptr<PrefetchBatch>& batch, PrefetchJob::Kind kind,
+                std::vector<std::shared_ptr<PrefetchJob>>* newShaderJobs)
+            {
+                if (key.prim == 8 && rectListExpansion && (!vs || !vs->rectList)) return nullptr;
+                auto job = std::make_shared<PrefetchJob>();
+                job->key = key;
+                job->kind = kind;
+                job->desc.fastLink = DrawTimeJob(kind) && fastLinkPipelines;
+                job->vs = vs;
+                job->ps = ps;
+                job->batch = batch;
+                bool created = false;
+                if (!vs) {
+                    job->needVs = PackShaderJob(false, key.vs, kind, created);
+                    if (created && newShaderJobs) newShaderJobs->push_back(job->needVs);
+                }
+                if (key.ps && !ps) {
+                    job->needPs = PackShaderJob(true, key.ps, kind, created);
+                    if (created && newShaderJobs) newShaderJobs->push_back(job->needPs);
+                }
+                prefetchJobs.emplace(key, job);
+                return job;
+            }
+
+            // The desc of a pipeline job whose shaders may still be pack jobs: their
+            // modules stand in for the shader map entries. Any thread.
+            RenderGraphicsPipelineDesc DescribeWithShaderJobs(const PipelineKey& key, Shader* vs, Shader* ps,
+                const PrefetchJob* needVs, const PrefetchJob* needPs, bool fastLink)
+            {
+                static Shader unloaded;
+                auto desc = DescribeForCreation(key, vs ? vs : &unloaded, key.ps ? (ps ? ps : &unloaded) : nullptr, false, fastLink);
+                if (needVs) desc.vertexShader = needVs->raw;
+                if (needPs) desc.pixelShader = needPs->raw;
+                return desc;
             }
 
             // Siblings go to the front, the first one first; the oldest ones beyond
@@ -5419,6 +5966,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     for (const auto& job : jobs) {
                         if (job->kind == PrefetchJob::Draw) prefetchPool.draw.push_back(job);
                         else if (job->kind == PrefetchJob::Scene) prefetchPool.scene.push_back(job);
+                        else if (job->kind == PrefetchJob::Startup) prefetchPool.startup.push_back(job);
                     }
                     auto& siblings = prefetchPool.siblings;
                     while (siblings.size() > kMaxSiblings) {
@@ -5451,14 +5999,20 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     auto batch = std::make_shared<PrefetchBatch>();
                     batch->tag = tag;
                     batch->started = started;
-                    std::vector<std::shared_ptr<PrefetchJob>> jobs;
+                    std::vector<std::shared_ptr<PrefetchJob>> jobs, promoted;
                     std::vector<std::pair<bool, uint64_t>> load;
                     size_t tagged = 0, ready = 0, queued = 0, unavailable = 0, waiting = 0;
                     for (const auto& [key, entry] : knownRecipes) {
                         if (!entry.scenes.Contains(tag)) continue;
                         ++tagged;
                         if (pipelines.contains(key)) { ++ready; continue; }
-                        if (prefetchJobs.contains(key)) { ++queued; continue; }
+                        if (const auto found = prefetchJobs.find(key); found != prefetchJobs.end()) {
+                            // A startup job still queued moves ahead with this scene.
+                            if (found->second->kind == PrefetchJob::Startup && found->second->state == PrefetchJob::Queued)
+                                promoted.push_back(found->second);
+                            ++queued;
+                            continue;
+                        }
                         Shader* vs = nullptr;
                         Shader* ps = nullptr;
                         switch (FindRecipeShaders(key, vs, ps, &load)) {
@@ -5470,27 +6024,26 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     // Shader jobs go first: the waiting recipes need them.
                     std::vector<std::shared_ptr<PrefetchJob>> shaderJobs;
                     for (const auto& [pixel, hash] : load) {
-                        auto& slot = prefetchShaderJobs[pixel ? 1 : 0][hash];
-                        if (slot && slot->kind == PrefetchJob::Sibling && slot->state == PrefetchJob::Queued) {
-                            // A sibling's shader job may have been dropped from its queue.
-                            std::lock_guard lock(prefetchPool.mutex);
-                            slot->kind = PrefetchJob::Scene;
+                        bool created = false;
+                        const auto slot = PackShaderJob(pixel, hash, PrefetchJob::Scene, created);
+                        // A sibling's shader job may have been dropped from its queue; a
+                        // startup one waits at the back or in no queue at all.
+                        if (created || ((slot->kind == PrefetchJob::Sibling || slot->kind == PrefetchJob::Startup) &&
+                                        slot->state == PrefetchJob::Queued))
                             shaderJobs.push_back(slot);
-                        }
-                        if (slot) continue;
-                        slot = std::make_shared<PrefetchJob>();
-                        slot->shader = true;
-                        slot->pixel = pixel;
-                        slot->hash = hash;
-                        slot->pack = portableShaderPack;
-                        shaderJobs.push_back(slot);
+                    }
+                    if (!shaderJobs.empty() || !promoted.empty()) {
+                        std::lock_guard lock(prefetchPool.mutex);
+                        for (const auto& job : shaderJobs) job->kind = PrefetchJob::Scene;
+                        for (const auto& job : promoted) job->kind = PrefetchJob::Scene;
                     }
                     batch->planned = jobs.size() + waiting;
                     batch->remaining = batch->planned;
-                    LOG_INFO("renderer: scene prefetch {:08x}: {} recipes, {} ready, {} already queued, {} unavailable shaders, {} new jobs, {} waiting for {} shaders, setup {:.1f} ms",
-                        tag, tagged, ready, queued, unavailable, jobs.size(), waiting, shaderJobs.size(),
+                    LOG_INFO("renderer: scene prefetch {:08x}: {} recipes, {} ready, {} already queued ({} moved from startup), {} unavailable shaders, {} new jobs, {} waiting for {} shaders, setup {:.1f} ms",
+                        tag, tagged, ready, queued, promoted.size(), unavailable, jobs.size(), waiting, shaderJobs.size(),
                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
                     QueuePrefetchJobs(shaderJobs);
+                    QueuePrefetchJobs(promoted);
                     QueuePrefetchJobs(jobs);
                 }
             }
@@ -5503,10 +6056,17 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 size_t count = std::max<size_t>(1, std::min<size_t>(xenos::preparation::HostWorkerCap(logical), logical / 2));
                 if (const char* value = getenv("LO_PIPELINE_PREFETCH_WORKERS")) count = std::max<size_t>(1, strtoul(value, nullptr, 10));
                 prefetchPool.smallCap = std::max<size_t>(1, std::min(drawWorkerCap, count));
+                // Startup jobs leave one worker free for scene and draw-time jobs. On Metal
+                // they get the draw-time share only: their shader modules are MSL compiles,
+                // which held up the render thread's own modules when siblings made them (P4).
+                prefetchPool.startupCap = video::IsMetal() ? prefetchPool.smallCap : std::max<size_t>(1, count - 1);
+                if (const char* value = getenv("LO_PIPELINE_STARTUP_WORKERS"))
+                    prefetchPool.startupCap = std::clamp<size_t>(strtoul(value, nullptr, 10), 1, count);
                 for (size_t i = 0; i < count; ++i)
                     prefetchPool.workers.emplace_back([this] { PrefetchWorker(); });
-                LOG_INFO("renderer: pipeline workers: {}, {} for draw-time jobs; siblings {}, skipped draws {}", count,
-                    prefetchPool.smallCap, !pipelineSiblings ? "off" : video::IsMetal() && !getenv("LO_PIPELINE_SIBLINGS") ? "off on Metal" : "on",
+                LOG_INFO("renderer: pipeline workers: {}, {} for draw-time jobs, {} for startup preparation; siblings {}, skipped draws {}", count,
+                    prefetchPool.smallCap, prefetchPool.startupCap,
+                    !pipelineSiblings ? "off" : video::IsMetal() && !getenv("LO_PIPELINE_SIBLINGS") ? "off on Metal" : "on",
                     pipelineAsync ? "on (LO_PIPELINE_ASYNC)" : "off");
             }
 
@@ -5515,21 +6075,29 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             std::shared_ptr<PrefetchJob> NextPrefetchJob()
             {
                 auto& pool = prefetchPool;
-                for (auto* queue : { &pool.draw, &pool.scene, &pool.siblings }) {
+                for (auto* queue : { &pool.draw, &pool.scene, &pool.siblings, &pool.startup }) {
                     while (!queue->empty()) {
                         const auto& front = queue->front();
-                        const bool drawTime = front->kind != PrefetchJob::Scene;
-                        // A job promoted for a skipped draw runs from the draw queue.
-                        if (front->state != PrefetchJob::Queued || (queue != &pool.draw && front->kind == PrefetchJob::Draw)) {
+                        const auto kind = front->kind;
+                        // A job moved to another queue (for a skipped draw, a loading scene)
+                        // runs from there.
+                        const auto* home = kind == PrefetchJob::Draw ? &pool.draw : kind == PrefetchJob::Scene ? &pool.scene :
+                            kind == PrefetchJob::Sibling ? &pool.siblings : &pool.startup;
+                        if (front->state != PrefetchJob::Queued || home != queue) {
                             queue->pop_front();
                             continue;
                         }
-                        if (drawTime && pool.runningSmall >= pool.smallCap) break;
+                        const auto slot = DrawTimeJob(kind) ? PrefetchJob::DrawSlot :
+                            kind == PrefetchJob::Startup ? PrefetchJob::StartupSlot : PrefetchJob::NoSlot;
+                        if (slot == PrefetchJob::DrawSlot && pool.runningSmall >= pool.smallCap) break;
+                        if (slot == PrefetchJob::StartupSlot && pool.runningStartup >= pool.startupCap) break;
                         auto job = std::move(queue->front());
                         queue->pop_front();
                         int expected = PrefetchJob::Queued;
                         if (!job->state.compare_exchange_strong(expected, PrefetchJob::Running)) continue; // taken by a draw
-                        if (drawTime) ++pool.runningSmall;
+                        job->slot = slot;
+                        if (slot == PrefetchJob::DrawSlot) ++pool.runningSmall;
+                        if (slot == PrefetchJob::StartupSlot) ++pool.runningStartup;
                         return job;
                     }
                 }
@@ -5543,12 +6111,10 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 bool readerTried = false;
                 for (;;) {
                     std::shared_ptr<PrefetchJob> job;
-                    bool drawTime = false;
                     {
                         std::unique_lock lock(prefetchPool.mutex);
                         prefetchPool.wake.wait(lock, [&] { return prefetchPool.stop || (job = NextPrefetchJob()) != nullptr; });
                         if (prefetchPool.stop) return;
-                        drawTime = job->kind != PrefetchJob::Scene;
                     }
                     if (job->shader || job->needVs || job->needPs)
                         if (!std::exchange(readerTried, true)) reader = OpenPackReader();
@@ -5559,18 +6125,16 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         try { job->pipeline = device->createGraphicsPipeline(job->desc); }
                         catch (const std::exception& e) { LOG_WARNING("renderer: scene prefetch: {}", e.what()); }
                     } else if ((!job->needVs || NeedShaderJob(*job->needVs, pack)) && (!job->needPs || NeedShaderJob(*job->needPs, pack))) {
-                        // Rect-list siblings never reach here with an unloaded VS.
-                        static Shader unloaded;
-                        auto desc = DescribeForCreation(job->key, job->vs ? job->vs : &unloaded,
-                            job->key.ps ? (job->ps ? job->ps : &unloaded) : nullptr, false, job->desc.fastLink);
-                        if (job->needVs) desc.vertexShader = job->needVs->raw;
-                        if (job->needPs) desc.pixelShader = job->needPs->raw;
-                        try { job->pipeline = device->createGraphicsPipeline(desc); }
-                        catch (const std::exception& e) { LOG_WARNING("renderer: pipeline worker: {}", e.what()); }
+                        // MakeLoadingJob made no job for a rect-list recipe without its VS variant.
+                        try {
+                            job->pipeline = device->createGraphicsPipeline(DescribeWithShaderJobs(job->key, job->vs, job->ps,
+                                job->needVs.get(), job->needPs.get(), job->desc.fastLink));
+                        } catch (const std::exception& e) { LOG_WARNING("renderer: pipeline worker: {}", e.what()); }
                     }
-                    FinishJob(*job, drawTime);
-                    if (drawTime) prefetchPool.wake.notify_all(); // a capped job may start now
-                    if (!job->shader) FinishPrefetchRecipe(job->batch.get(), !job->pipeline);
+                    // Before FinishJob: the render thread may take the pipeline right after.
+                    const bool failed = !job->shader && !job->pipeline;
+                    if (FinishJob(*job)) prefetchPool.wake.notify_all(); // a capped job may start now
+                    if (!job->shader) FinishPrefetchRecipe(job->batch.get(), failed);
                 }
             }
 
@@ -5589,16 +6153,22 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 }
             }
 
-            void FinishJob(PrefetchJob& job, bool drawTime)
+            // Any thread: marks a job done and hands it to the render thread's harvest.
+            // True when it freed a capped worker slot.
+            bool FinishJob(PrefetchJob& job)
             {
+                bool freed = false;
                 {
                     // Under the mutex so a waiting draw cannot miss the wakeup.
                     std::lock_guard lock(prefetchPool.mutex);
                     job.state = PrefetchJob::Done;
-                    ++prefetchPool.completed;
-                    if (drawTime) --prefetchPool.runningSmall;
+                    prefetchPool.finishedJobs.push_back(job.shared_from_this());
+                    if (job.slot == PrefetchJob::DrawSlot) --prefetchPool.runningSmall;
+                    if (job.slot == PrefetchJob::StartupSlot) --prefetchPool.runningStartup;
+                    freed = std::exchange(job.slot, PrefetchJob::NoSlot) != PrefetchJob::NoSlot;
                 }
                 prefetchPool.finished.notify_all();
+                return freed;
             }
 
             // Any thread: the module of a shader job another job needs, running the job
@@ -5608,7 +6178,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 int expected = PrefetchJob::Queued;
                 if (job.state.compare_exchange_strong(expected, PrefetchJob::Running)) {
                     LoadShaderJob(job, reader);
-                    FinishJob(job, false);
+                    FinishJob(job);
                 } else {
                     std::unique_lock lock(prefetchPool.mutex);
                     prefetchPool.finished.wait(lock, [&] { return job.state == PrefetchJob::Done; });
@@ -5653,31 +6223,42 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             // that were waiting for them and moves finished pipelines into the draw cache.
             void HarvestPrefetch()
             {
-                const uint64_t completed = prefetchPool.completed;
-                if (completed == prefetchHarvested && !prefetchShadersChanged) return;
-                prefetchHarvested = completed;
+                std::vector<std::shared_ptr<PrefetchJob>> finished;
+                {
+                    std::lock_guard lock(prefetchPool.mutex);
+                    finished.swap(prefetchPool.finishedJobs);
+                }
+                if (finished.empty() && !prefetchShadersChanged) return;
                 bool shadersArrived = std::exchange(prefetchShadersChanged, false);
-                for (int pixel = 0; pixel < 2; ++pixel)
-                    for (auto it = prefetchShaderJobs[pixel].begin(); it != prefetchShaderJobs[pixel].end(); ) {
-                        auto& job = *it->second;
-                        if (job.state != PrefetchJob::Done) { ++it; continue; }
-                        // A draw may have made the same module meanwhile.
-                        PublishShaderJob(job);
-                        shadersArrived = true;
-                        it = prefetchShaderJobs[pixel].erase(it);
+                // Jobs a draw took over or waited for are already gone from the maps.
+                for (const auto& done : finished) {
+                    auto& job = *done;
+                    if (job.shader) {
+                        auto& jobs = prefetchShaderJobs[job.pixel ? 1 : 0];
+                        if (const auto it = jobs.find(job.hash); it != jobs.end() && it->second == done) {
+                            // A draw may have made the same module meanwhile.
+                            PublishShaderJob(job);
+                            shadersArrived = true;
+                            jobs.erase(it);
+                        }
+                        continue;
                     }
-                for (auto it = prefetchJobs.begin(); it != prefetchJobs.end(); ) {
-                    auto& job = *it->second;
-                    if (job.state != PrefetchJob::Done) { ++it; continue; }
+                    const auto it = prefetchJobs.find(job.key);
+                    if (it == prefetchJobs.end() || it->second != done) continue;
                     for (const auto* need : { &job.needVs, &job.needPs })
                         if (*need) PublishShaderJob(**need);
                     if (!job.pipeline) failedPrefetch.insert(job.key);
-                    else if (pipelines.try_emplace(job.key, PipelineSlot{ std::move(job.pipeline) }).second &&
-                             job.kind == PrefetchJob::Sibling) {
-                        ++workerStats.built;
-                        if (pipelineMissVerbose) unusedSiblings.insert(job.key);
+                    else if (pipelines.try_emplace(job.key, PipelineSlot{ std::move(job.pipeline), 0,
+                                 job.kind == PrefetchJob::Scene ? record_timing::Origin::ScenePrefetch :
+                                 job.kind == PrefetchJob::Sibling ? record_timing::Origin::Sibling :
+                                 job.kind == PrefetchJob::Startup ? record_timing::Origin::Prebuilt : record_timing::Origin::DrawJob }).second) {
+                        if (job.kind == PrefetchJob::Sibling) {
+                            ++workerStats.built;
+                            if (pipelineMissVerbose) unusedSiblings.insert(job.key);
+                        }
+                        if (job.batch && job.batch->startup) preparedPipelineKeys.insert(job.key);
                     }
-                    it = prefetchJobs.erase(it);
+                    prefetchJobs.erase(it);
                 }
                 if (!shadersArrived) return;
                 std::vector<std::shared_ptr<PrefetchJob>> jobs;
@@ -5724,6 +6305,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 int expected = PrefetchJob::Queued;
                 if (job->state.compare_exchange_strong(expected, PrefetchJob::Taken)) {
                     prefetchJobs.erase(found);
+                    if (job->batch) ++job->batch->taken;
                     FinishPrefetchRecipe(job->batch.get(), false);
                     take = JobTake::Claimed;
                     return nullptr;
@@ -5745,7 +6327,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (!job->pipeline) return nullptr;
                 ++prefetchServed;
                 take = JobTake::Served;
-                auto& slot = pipelines.try_emplace(key, PipelineSlot{ std::move(job->pipeline) }).first->second;
+                auto& slot = pipelines.try_emplace(key, PipelineSlot{ std::move(job->pipeline), 0, record_timing::Origin::Served }).first->second;
                 return slot.pipeline.get();
             }
 
@@ -5773,22 +6355,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 const auto vsFamily = siblingIndex.byVs.find(key.vs);
                 const auto psFamily = key.ps ? siblingIndex.byPs.find(key.ps) : siblingIndex.byPs.end();
                 if (vsFamily == siblingIndex.byVs.end() && psFamily == siblingIndex.byPs.end()) return;
+                // New shader jobs are queued with the siblings.
                 std::vector<std::shared_ptr<PrefetchJob>> jobs, shaderJobs;
                 size_t picked = 0;
-                // The shader job for a pack shader, queued with the siblings if new.
-                const auto shaderJob = [&](bool pixel, uint64_t hash) {
-                    auto& slot = prefetchShaderJobs[pixel ? 1 : 0][hash];
-                    if (!slot) {
-                        slot = std::make_shared<PrefetchJob>();
-                        slot->kind = PrefetchJob::Sibling;
-                        slot->shader = true;
-                        slot->pixel = pixel;
-                        slot->hash = hash;
-                        slot->pack = portableShaderPack;
-                        shaderJobs.push_back(slot);
-                    }
-                    return slot;
-                };
                 const auto consider = [&](uint32_t index) {
                     const auto& [sibling, entry] = siblingIndex.recipes[index];
                     if (sibling == key || pipelines.contains(sibling) || prefetchJobs.contains(sibling) ||
@@ -5799,17 +6368,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     case RecipeShaderState::Unavailable: return;
                     case RecipeShaderState::Ready: jobs.push_back(MakePipelineJob(sibling, vs, ps, nullptr, PrefetchJob::Sibling)); break;
                     case RecipeShaderState::Loading: {
-                        // Rect-list variants are built from guest microcode at the first draw.
-                        if (sibling.prim == 8 && rectListExpansion && !vs) return;
-                        auto job = std::make_shared<PrefetchJob>();
-                        job->key = sibling;
-                        job->kind = PrefetchJob::Sibling;
-                        job->desc.fastLink = fastLinkPipelines;
-                        job->vs = vs;
-                        job->ps = ps;
-                        if (!vs) job->needVs = shaderJob(false, sibling.vs);
-                        if (sibling.ps && !ps) job->needPs = shaderJob(true, sibling.ps);
-                        prefetchJobs.emplace(sibling, job);
+                        auto job = MakeLoadingJob(sibling, vs, ps, nullptr, PrefetchJob::Sibling, &shaderJobs);
+                        if (!job) return;
                         jobs.push_back(std::move(job));
                         break;
                     }
@@ -5979,7 +6539,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             entry.valid = entry.shader != nullptr;
                             if (!entry.valid) throw std::runtime_error("cached shader device module creation failed");
                             ++modules;
-                        }, [&] { pendingModules.clear(); deferredModules = 0; shaders[0].clear(); shaders[1].clear(); }, [] {},
+                        }, [&] { pendingModules.clear(); deferredModules = 0; ClearShaders(); }, [] {},
                         [] { CheckPreparationCancel(); }, [](uint32_t done, uint32_t total) {
                             video::SetShaderPreparationProgress(done, total, video::PreparationStage::CachedShaders,
                                 video::PreparationUnit::Shaders);
@@ -5999,7 +6559,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         ResetTimers();
                         return;
                     } catch (const std::exception& e) {
-                        shaders[0].clear(); shaders[1].clear();
+                        ClearShaders();
                         if (video::ShaderPreparationSkipped()) throw xenos::preparation::Cancelled{};
                         LOG_INFO("renderer: startup bundle fallback: {}", e.what());
                     }
@@ -6376,6 +6936,11 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             {
                 if (debugShaderSources && !debugCaptureDir.empty())
                     debugShaderSources->Observe(!pixel, hash, words, count, frame);
+                // Consecutive draws usually keep a stage's shader. Map nodes keep
+                // their address; only ClearShaders() removes entries.
+                auto& last = lastShader[pixel ? 1 : 0];
+                if (last.entry && last.hash == hash && last.entry->valid && debugCaptureDir.empty())
+                    return last.entry;
                 auto& cache = shaders[pixel ? 1 : 0];
                 auto it = cache.find(hash);
                 if (it == cache.end()) {
@@ -6389,7 +6954,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
                         it->second.info.hlsl = xenos::TranslateShader(swapped.data(), count, pixel, uboConstants).hlsl;
                     }
-                    return it->second.valid ? &it->second : nullptr;
+                    last = {hash, &it->second};
+                    return &it->second;
                 }
 
                 Shader& entry = cache[hash];
@@ -6951,6 +7517,11 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             {
                 if (color) MarkFgWritable(*color, "color_framebuffer");
                 if (depth) MarkFgWritable(*depth, "depth_framebuffer");
+                return FramebufferFor(color, depth);
+            }
+
+            RenderFramebuffer* FramebufferFor(HostTexture* color, HostTexture* depth)
+            {
                 const std::pair<const RenderTexture*, const RenderTexture*> key(
                     color ? color->texture.get() : nullptr, depth ? depth->texture.get() : nullptr);
                 if (lastFramebuffer && key == lastFramebufferKey)
@@ -6971,6 +7542,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 }
                 const RenderTexture* colors[1] = { key.first };
                 RenderFramebufferDesc desc(colors, color ? 1u : 0u, key.second);
+                ++recordFramebufferCreates;
                 auto fb = device->createFramebuffer(desc);
                 RenderFramebuffer* result = fb.get();
                 framebuffers.emplace(key, std::move(fb));
@@ -7051,15 +7623,43 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 return false;
             }
 
-            std::optional<modding::TextureData> LoadTextureReplacement(uint64_t fingerprint, uint32_t format, uint32_t width, uint32_t height)
+            // A notice for each frame whose replacements held the render thread
+            // for 4 ms or more (half a 120 fps frame), so hitches can be lined
+            // up with mod file reads and uploads without Debug log.
+            void ReportReplacementCost()
             {
-                if (textureReplacementFailures.contains(fingerprint)) return {};
-                std::string error;
-                bool bcSkipped = false;
-                // Every level must fit the upload ring with the draw headroom free.
-                // Without device BC (textureBcFallback) DDS payloads stay unread.
-                auto data = modding::ReadTextureReplacement(fingerprint, format, width, height,
-                    kUploadRingSize - kUploadHeadroom, &error, !textureBcFallback, &bcSkipped);
+                auto& c = replacementCost;
+                if (const double ms = c.readMs + c.missMs + c.uploadMs; ms >= 4.0)
+                    LOG_NOTICE("[mods] frame {}: texture replacements took {:.1f} ms: {} read ({:.1f} MB in {:.1f} ms, slowest {:016x} {:.1f} MB in {:.1f} ms), "
+                        "{} without a file ({:.1f} ms), {} uploaded ({:.1f} ms, {} upload ring flushes)",
+                        frame, ms, c.reads, c.readBytes / 1048576.0, c.readMs, c.slowestFingerprint, c.slowestBytes / 1048576.0, c.slowestMs,
+                        c.misses, c.missMs, c.uploads, c.uploadMs, c.ringRewinds);
+                if (c.arrived)
+                    LOG_INFO("[mods] frame {}: {} texture replacements read in the background ({:.1f} MB in {:.1f} ms, slowest {:016x} {:.1f} MB in {:.1f} ms, longest wait {:.0f} ms), {} queued",
+                        frame, c.arrived, c.arrivedBytes / 1048576.0, c.arrivedMs, c.slowestFingerprint, c.slowestBytes / 1048576.0, c.slowestMs,
+                        c.longestWaitMs, replacementsQueued.size());
+                c = {};
+            }
+
+            static uint64_t ReplacementBytes(const modding::TextureData& data)
+            {
+                uint64_t bytes = 0;
+                for (const auto& level : data.levels) bytes += level.size();
+                return bytes;
+            }
+
+            void NoteSlowestReplacement(uint64_t fingerprint, uint64_t bytes, double ms)
+            {
+                auto& cost = replacementCost;
+                if (ms <= cost.slowestMs) return;
+                cost.slowestMs = ms;
+                cost.slowestFingerprint = fingerprint;
+                cost.slowestBytes = bytes;
+            }
+
+            // A read without a payload and with a reason keeps the original for the run.
+            void NoteReplacementFailure(uint64_t fingerprint, const std::string& error, bool bcSkipped)
+            {
                 if (bcSkipped)
                 {
                     textureReplacementFailures.insert(fingerprint);
@@ -7067,12 +7667,126 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         LOG_WARNING("[mods] BC texture replacements (LOTEX2 type 2) skipped, keeping the originals: {} (first {:016x})",
                             video::TextureCompressionBC() ? "LO_TEXTURE_BC=0" : "device has no BC support", fingerprint);
                 }
-                else if (!data && !error.empty())
+                else if (!error.empty())
                 {
                     textureReplacementFailures.insert(fingerprint);
                     LOG_WARNING("[mods] {}", error);
                 }
+            }
+
+            std::optional<modding::TextureData> LoadTextureReplacement(uint64_t fingerprint, uint32_t format, uint32_t width, uint32_t height)
+            {
+                if (textureReplacementFailures.contains(fingerprint)) return {};
+                std::string error;
+                bool bcSkipped = false;
+                // Every level must fit the upload ring with the draw headroom free.
+                // Without device BC (textureBcFallback) DDS payloads stay unread.
+                const auto start = std::chrono::steady_clock::now();
+                auto data = modding::ReadTextureReplacement(fingerprint, format, width, height,
+                    kUploadRingSize - kUploadHeadroom, &error, !textureBcFallback, &bcSkipped);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                auto& cost = replacementCost;
+                if (data)
+                {
+                    const uint64_t bytes = ReplacementBytes(*data);
+                    cost.reads++;
+                    cost.readBytes += bytes;
+                    cost.readMs += ms;
+                    NoteSlowestReplacement(fingerprint, bytes, ms);
+                }
+                else
+                {
+                    cost.misses++; // mostly no file for this fingerprint
+                    cost.missMs += ms;
+                }
+                if (!data) NoteReplacementFailure(fingerprint, error, bcSkipped);
                 return data;
+            }
+
+            // The payload for a fresh upload of a replaceable texture, valid until
+            // the frame ends. In the background (the default) it is null until the
+            // reader has the file; the texture keeps the fingerprint meanwhile.
+            const modding::TextureData* FindTextureReplacement(HostTexture& tex, uint64_t fingerprint,
+                uint32_t format, uint32_t width, uint32_t height)
+            {
+                if (textureReplacementFailures.contains(fingerprint) || replacementsMissing.contains(fingerprint)) return nullptr;
+                auto it = replacementsReady.find(fingerprint);
+                if (it == replacementsReady.end() && textureReplacementSync)
+                {
+                    auto data = LoadTextureReplacement(fingerprint, format, width, height);
+                    if (!data)
+                    {
+                        if (!textureReplacementFailures.contains(fingerprint)) replacementsMissing.insert(fingerprint);
+                        return nullptr;
+                    }
+                    it = replacementsReady.insert_or_assign(fingerprint, ReadyReplacement{std::move(*data), format, width, height, frame}).first;
+                }
+                if (it != replacementsReady.end())
+                {
+                    // The reader checked the header against the first request.
+                    if (it->second.format != format || it->second.width != width || it->second.height != height) return nullptr;
+                    it->second.frame = frame; // textures sharing the image take it too
+                    return &it->second.data;
+                }
+                tex.replacementPending = fingerprint;
+                if (replacementsQueued.insert(fingerprint).second)
+                {
+                    auto& reader = replacementReader;
+                    {
+                        std::lock_guard lock(reader.mutex);
+                        // Without device BC (textureBcFallback) DDS payloads stay unread.
+                        reader.queue.push_back({fingerprint, format, width, height, !textureBcFallback, std::chrono::steady_clock::now()});
+                    }
+                    if (!reader.thread.joinable()) reader.thread = std::thread([&reader] { reader.Run(); });
+                    reader.wake.notify_one();
+                }
+                return nullptr;
+            }
+
+            // Whether a texture showing its original should be re-created, which
+            // takes the payload: read, or dropped unused and so requested again.
+            bool ReplacementArrived(HostTexture& tex)
+            {
+                const uint64_t fingerprint = tex.replacementPending;
+                if (replacementsQueued.contains(fingerprint)) return false;
+                if (replacementsMissing.contains(fingerprint) || textureReplacementFailures.contains(fingerprint))
+                {
+                    tex.replacementPending = 0;
+                    return false;
+                }
+                return true;
+            }
+
+            // Frame end: takes the reader's results and drops payloads no lookup
+            // used for kReplacementReadyFrames.
+            void CollectTextureReplacements()
+            {
+                std::deque<ReplacementRead> done;
+                {
+                    std::lock_guard lock(replacementReader.mutex);
+                    done.swap(replacementReader.done);
+                }
+                const auto now = std::chrono::steady_clock::now();
+                auto& cost = replacementCost;
+                for (auto& read : done)
+                {
+                    replacementsQueued.erase(read.fingerprint);
+                    if (!read.data)
+                    {
+                        if (read.bcSkipped || !read.error.empty()) NoteReplacementFailure(read.fingerprint, read.error, read.bcSkipped);
+                        else replacementsMissing.insert(read.fingerprint);
+                        continue;
+                    }
+                    const uint64_t bytes = ReplacementBytes(*read.data);
+                    cost.arrived++;
+                    cost.arrivedBytes += bytes;
+                    cost.arrivedMs += read.ms;
+                    cost.longestWaitMs = std::max(cost.longestWaitMs, std::chrono::duration<double, std::milli>(now - read.queued).count());
+                    NoteSlowestReplacement(read.fingerprint, bytes, read.ms);
+                    replacementsReady.insert_or_assign(read.fingerprint,
+                        ReadyReplacement{std::move(*read.data), read.format, read.width, read.height, frame});
+                }
+                std::erase_if(replacementsReady, [&](const auto& entry) { return frame - entry.second.frame > kReplacementReadyFrames; });
             }
 
             enum class ReplacementUpload { Uploaded, Skipped, Failed };
@@ -7382,22 +8096,27 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (it != textures.end())
                 {
                     HostTexture* cached = it->second.get();
+                    // An original whose mod replacement was read since: re-create it.
+                    const bool replacementArrived = cached->replacementPending && ReplacementArrived(*cached);
                     // Titles stream texture data in after the first draw that uses
                     // it, so a cached upload can be all zeroes forever. Re-hash the
                     // guest bytes once per frame and re-upload when they change.
-                    if (!textureRevalidate || cached->checkedFrame == frame || cached->guestBytes == 0) {
+                    if (!replacementArrived && (!textureRevalidate || cached->checkedFrame == frame || cached->guestBytes == 0)) {
                         return SelectControllerAtlas(cached, bindingInfo);
                     }
                     cached->checkedFrame = frame;
-                    bool changed = SampledGuestHash(*cached) != cached->guestHash;
+                    ++textureRehashes;
+                    bool changed = replacementArrived || SampledGuestHash(*cached) != cached->guestHash;
                     if (!changed && frame >= cached->nextFullScanFrame) {
                         cached->nextFullScanFrame = frame + texture_cache::kFullScanInterval;
+                        ++textureFullScans;
                         changed = FullGuestHash(*cached) != cached->guestFullHash;
                     }
+                    if (changed && !replacementArrived) ++textureRehashChanges;
                     if (!changed) {
                         return SelectControllerAtlas(cached, bindingInfo);
                     }
-                    textureReuploads++;
+                    if (!replacementArrived) textureReuploads++;
                     Gpu().retiredTextures.push_back(std::move(it->second));
                     textures.erase(it);
                 }
@@ -7584,10 +8303,15 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 tex->guestFullHash = FullGuestHash(*tex);
                 tex->nextFullScanFrame = texture_cache::FirstFullScanFrame(frame, tex->guestAddress);
                 if (replaceable && !tex->controllerAtlasRecognized && AnyNonZero(staging.data(), rowPitch, baseRowBytes, blocksY))
-                    if (auto replacement = LoadTextureReplacement(fingerprint, format, width, height))
+                    if (const auto* replacement = FindTextureReplacement(*tex, fingerprint, format, width, height))
                     {
+                        const auto uploadStart = std::chrono::steady_clock::now();
+                        const uint64_t rewinds = uploadRingRewinds;
                         const auto uploaded = UploadTextureReplacement(*tex, *replacement, fingerprint, format, width, height,
                             uint32_t(levels.size()));
+                        replacementCost.uploads++;
+                        replacementCost.uploadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - uploadStart).count();
+                        replacementCost.ringRewinds += uploadRingRewinds - rewinds;
                         if (uploaded == ReplacementUpload::Failed)
                         {
                             Gpu().retiredTextures.push_back(std::move(tex));
@@ -7749,20 +8473,24 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             RenderPipeline* GetPipeline(const PipelineKey& drawKey, Shader* vs, Shader* ps, RenderFormat, RenderFormat, bool mayDefer = false)
             {
                 const PipelineKey key = gpu::pipeline_cache::Normalize(drawKey);
-                auto it = pipelines.find(key);
-                const auto hit = [&] {
-                    if (it->second.sceneSerial != sceneSerial) {
-                        it->second.sceneSerial = sceneSerial;
+                const auto hit = [&](PipelineSlot& slot) {
+                    if (slot.sceneSerial != sceneSerial) {
+                        slot.sceneSerial = sceneSerial;
                         NoteRecipeUse(key);
                     }
                     if (!unusedSiblings.empty() && unusedSiblings.erase(key)) ++workerStats.hits;
-                    return it->second.pipeline.get();
+                    lastPipelineKey = key;
+                    lastPipelineSlot = &slot;
+                    return slot.pipeline.get();
                 };
-                if (it != pipelines.end()) return hit();
+                // Consecutive draws often repeat the key; skip the map lookup.
+                if (lastPipelineSlot && key == lastPipelineKey) return hit(*lastPipelineSlot);
+                auto it = pipelines.find(key);
+                if (it != pipelines.end()) return hit(it->second);
                 ScopedTimer timer{ tPipeline, cpuTimingEnabled };
                 if (!prefetchPool.workers.empty()) {
                     HarvestPrefetch();
-                    if (it = pipelines.find(key); it != pipelines.end()) return hit();
+                    if (it = pipelines.find(key); it != pipelines.end()) return hit(it->second);
                 }
                 const bool defer = mayDefer && pipelineAsync;
                 const auto started = std::chrono::steady_clock::now();
@@ -7797,7 +8525,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 RenderPipeline* result = pipeline.get();
                 // A failed speculative creation must not poison the draw cache.
                 if (result) {
-                    pipelines.emplace(key, PipelineSlot{ std::move(pipeline), sceneSerial });
+                    pipelines.emplace(key, PipelineSlot{ std::move(pipeline), sceneSerial, record_timing::Origin::Created });
                     NoteRecipeUse(key);
                 }
                 return result;
@@ -7979,6 +8707,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     VertexStageTimer timer(vertexTiming.find, vertexTimingEnabled, address, bytes);
                     return vertexCache.find(key);
                 }();
+                bool changed = false;
                 if (it != vertexCache.end())
                 {
                     const bool matches = [&] {
@@ -7991,14 +8720,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         it->second.lastFrame = frame;
                         return it->second.offset;
                     }
-                    // Contents changed. Overwriting in place would corrupt draws
-                    // already recorded into an open command list, so allocate fresh.
+                    // Contents changed. Overwriting the arena copy in place would
+                    // corrupt draws already recorded into an open command list, so
+                    // allocate fresh; the entry itself is refreshed below.
                     if (it->second.slot == uint8_t(gpuSlot))
                         vertexRevalidations++;
-                    {
-                        VertexStageTimer timer(vertexTiming.erase, vertexTimingEnabled, address, bytes);
-                        vertexCache.erase(it);
-                    }
+                    changed = true;
                 }
 
                 // Allocate (16-byte aligned, 16 bytes of slack for the shader's
@@ -8009,11 +8736,37 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 const uint32_t otherSlot = (gpuSlot + 1) % kGpuSlots;
                 const uint32_t allocSlot = gpu::render_arena::VertexAllocSlot(
                     gpuSlot, Gpu().arenaOffset, gpuSlots[otherSlot].arenaOffset, needed);
-                if (allocSlot == gpu::render_arena::kGpuSlots)
+                if (allocSlot == gpu::render_arena::kGpuSlots) {
+                    if (changed) {
+                        VertexStageTimer timer(vertexTiming.erase, vertexTimingEnabled, address, bytes);
+                        vertexCache.erase(it);
+                    }
                     return UINT64_MAX;
+                }
                 uint64_t& local = gpuSlots[allocSlot].arenaOffset;
                 const uint64_t offset = gpu::render_arena::SlotBase(allocSlot) + local;
                 local += needed;
+                if (changed) {
+                    // Same key, same size: refresh the entry and reuse its snapshot
+                    // storage instead of erasing it and inserting a new allocation.
+                    auto& entry = it->second;
+                    entry.offset = offset;
+                    entry.lastFrame = frame;
+                    entry.slot = uint8_t(allocSlot);
+                    entry.validatedEpoch = g_commandProcessor.SyncEpoch();
+                    {
+                        VertexStageTimer timer(vertexTiming.capture, vertexTimingEnabled, address, bytes);
+                        vertexCache.Recapture(it, guest, bytes);
+                    }
+                    {
+                        VertexStageTimer timer(vertexTiming.copy, vertexTimingEnabled, address, bytes);
+                        geometry_prepare::CopyDwordsSwapped(arenaMapped + offset, guest, sizeDwords, endian);
+                        memset(arenaMapped + offset + bytes, 0, 16);
+                    }
+                    vertexUploads++;
+                    vertexBytesUploaded += bytes;
+                    return offset;
+                }
                 VertexEntry entry{ offset, {}, frame, uint8_t(allocSlot) };
                 entry.validatedEpoch = g_commandProcessor.SyncEpoch();
                 {
@@ -8235,7 +8988,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         if (fgUiBindingExpected && fgUiCapture) fgUiCapture->Reject("debug_clear_rt");
                         static const bool loud = strcmp(clearTargets, "magenta") == 0;
                         color->clearedFrame = frame;
-                        commandList->setFramebuffer(GetFramebuffer(color, nullptr));
+                        BindTargets(color, nullptr);
                         commandList->clearColor(0, loud ? RenderColor(1.0f, 0.0f, 1.0f, 1.0f) : RenderColor(0.0f, 0.0f, 0.0f, 0.0f));
                         color->hdrValid = false;
 #if defined(LO_GPU_PLUME)
@@ -8437,11 +9190,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         frameSrOptions.dlssNeuralRenderingTuning = {config.dlssNrStyle, config.dlssNrIntensity / 100.0f,
                             config.dlssNrGlobalTone / 100.0f, config.dlssNrLocalTone / 100.0f, config.dlssNrStructure / 100.0f,
                             config.dlssNrSkin / 100.0f, config.dlssNrAutoMask};
+                        frameSrOptions.dlssModel = config.dlssModel;
                     }
                     PollTaaDiagnostic();
                     PollTaaLive();
-                    const char* dlssProbeValue = std::getenv("LO_DLSS_INPUT_PROBE");
-                    const auto route=temporal::RouteConsumer(activePlan,dlssProbeValue&&std::string_view(dlssProbeValue)=="1");
+                    static const bool dlssInputProbe = [] { const char* value = std::getenv("LO_DLSS_INPUT_PROBE"); return value && std::string_view(value) == "1"; }();
+                    const auto route=temporal::RouteConsumer(activePlan,dlssInputProbe);
                     const auto mode=route.effectiveAA;
                     if(sceneAAMode!=mode) {if(temporalHistory)temporalHistory->Reset();temporalSupportedFrame=~0ull;++temporalEpoch;}
                     sceneAAMode=mode;
@@ -8594,8 +9348,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
                 SharedConstants shared{};
                 if (vulkan) shared.vertexArenaAddress = vertexArena->getDeviceAddress();
-                for (uint32_t i = 0; i < 8; i++) shared.bools[i] = Reg(REG_BOOL_CONSTANTS + i);
-                for (uint32_t i = 0; i < 32; i++) shared.loops[i] = Reg(REG_LOOP_CONSTANTS + i);
+                // One call per run of registers instead of one per word (same values).
+                g_commandProcessor.ReadRegisters(REG_BOOL_CONSTANTS, 8, shared.bools);
+                g_commandProcessor.ReadRegisters(REG_LOOP_CONSTANTS, 32, shared.loops);
                 shared.transfer[0] = Reg(REG_PA_SU_POINT_SIZE);
                 shared.transfer[1] = Reg(REG_PA_SU_POINT_MINMAX);
                 shared.transfer[2] = std::bit_cast<uint32_t>(pointSizeLimit);
@@ -8877,8 +9632,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 {
                     if (!((vs->info.vertexFetchSlotMask[slot >> 6] >> (slot & 63)) & 1))
                         continue;
-                    uint32_t d0 = Reg(REG_FETCH_CONSTANTS + slot * 2);
-                    uint32_t d1 = Reg(REG_FETCH_CONSTANTS + slot * 2 + 1);
+                    uint32_t vfetch[2];
+                    g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 2, 2, vfetch);
+                    const uint32_t d0 = vfetch[0], d1 = vfetch[1];
                     // A slot the shader reads but we cannot bind is a silent failure: the
                     // shader then fetches from arena offset 0, i.e. some other draw's data.
                     const char* skip = nullptr;
@@ -8934,6 +9690,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 // cannot justify treating an arbitrary fullscreen-looking draw as a copy.
                 uint32_t fullCopyReason=0;std::string fullCopyVertices;float fullCopyBounds[4]{};
                 bool fullSceneCopy = false;
+                uint32_t alphaQuad = 0; // SdrLossTrace::quad for a later tone-map loss.
                 {
                     render_batch::CpuTimer<> sceneCopyTimer(cpuTimingEnabled);
                     // The fade quad (PS 234e writes c0) is depth tested against the scene.
@@ -8989,6 +9746,17 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         static uint32_t fadeLogs = 0;
                         if (fadeLogs++ < 4) LOG_INFO("renderer: AO scene fade frame={} alpha={} left={}", frame, alpha, sceneFadeTransmittance);
                     }
+                    // A full-screen alpha quad over this frame's tone-map output (the game's
+                    // 0.3-0.45 s camera/menu crossfade) keeps the scene SDR-qualified.
+                    if (!fullSceneCopy && color && color->sdrLoss.toneFrame == frame && key.vs == 0x8bbd4da701845d16ull)
+                        alphaQuad = fullScreenQuad(key.ps, RenderBlend::SRC_ALPHA, RenderBlend::INV_SRC_ALPHA, 0) ? 1 : 2 + fullCopyReason;
+                    // The crossfade quad (PS 2ef7: captured RGB, alpha c0.x) covers the live
+                    // scene that AO darkens later; AO fades out under it like under 234e.
+                    if (alphaQuad == 1 && key.ps == 0x2ef725fa9031545bull) {
+                        if (sceneFadeFrame != frame) { sceneFadeFrame = frame; sceneFadeTransmittance = 1; }
+                        const float alpha = std::bit_cast<float>(psConstants[0]);
+                        sceneFadeTransmittance *= 1 - (alpha > 0 ? std::min(alpha, 1.0f) : 0.0f);
+                    }
                 if(key.vs==0x8bbd4da701845d16ull&&key.ps==0xcda578aef1724fdcull) {
                     static const uint64_t start=getenv("LO_SCENE_AA_LOG_START_FRAME")?strtoull(getenv("LO_SCENE_AA_LOG_START_FRAME"),nullptr,10):~0ull;
                     if(frame>=start&&frame-start<128)SHADER_LOG_INFO("scene-aa", None, "renderer scene AA guard f{} full={} reason={} mode={} jitter={} blend={:#x} mask={} vtx={} prim={} n={} cull={:#x} ctl={:#x} vp=({},{},{},{}) extent={}x{} fetch95={:08x},{:08x} quad={} ",frame,fullSceneCopy,fullCopyReason,sceneAAMode,temporalJitter,key.blend,key.colorMask,shared.vtxFmt,info.primitiveType,info.indexCount,key.modeCull,Reg(REG_RB_COLORCONTROL),viewport.x,viewport.y,viewport.width,viewport.height,pitch,rtHeight,Reg(REG_FETCH_CONSTANTS+190),Reg(REG_FETCH_CONSTANTS+191),fullCopyVertices);
@@ -9042,7 +9810,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         if (!((s->info.textureSlotMask >> slot) & 1))
                             continue;
                         uint32_t fetch[6];
-                        for (int i = 0; i < 6; i++) fetch[i] = Reg(REG_FETCH_CONSTANTS + slot * 6 + i);
+                        g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 6, 6, fetch);
                         const uint32_t declared = s->info.textureDimension[slot];
                         const uint32_t bank = declared == 2 ? 1 : declared == 3 ? 2 : 0;
                         activeTextureSlots[bank] |= uint32_t(1) << slot;
@@ -9313,20 +10081,48 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                                 const bool frameMatches = source && source->frame == frame;
                                 const bool extentMatches = tex->width == rasterViewport.width && tex->height == rasterViewport.height;
 
+                                // A run of rejected scene copies is one fallback segment:
+                                // its first two frames name what cleared the producer.
+                                // Bounded: a scene that alternates every frame stops here.
+                                static uint64_t sdrRejectFirst = ~0ull, sdrRejectLast = ~0ull;
+                                static uint32_t sdrRejectLogs = 0;
+                                const auto sdrRejectLog = [] {
+                                    if (sdrRejectLogs >= 256) return false;
+                                    if (++sdrRejectLogs == 256)
+                                        LOG_INFO("renderer: DLSS SDR consumer segment logging stopped after 256 lines");
+                                    return true;
+                                };
                                 if (viewMatches && frameMatches && ordinalMatches && extentMatches && isRbSwapIdentity) {
                                     qualifiedEncoding = temporal::ColorEncoding::Sdr;
+                                    if (sdrRejectLast != ~0ull) {
+                                        if (sdrRejectLog()) LOG_INFO("renderer: DLSS SDR consumer resumed frame={} rejected_frames={} first={} last={}",
+                                            frame, sdrRejectLast - sdrRejectFirst + 1, sdrRejectFirst, sdrRejectLast);
+                                        sdrRejectFirst = sdrRejectLast = ~0ull;
+                                    }
                                 } else {
-                                    const uint32_t rejectKey =
-                                        (uint32_t(viewMatches) << 0) | (uint32_t(frameMatches) << 1) |
-                                        (uint32_t(ordinalMatches) << 2) | (uint32_t(extentMatches) << 3) |
-                                        (uint32_t(isRbSwapIdentity) << 4);
-                                    static uint32_t lastLoggedConsumerRejectKey = ~0u;
-                                    if (lastLoggedConsumerRejectKey != rejectKey) {
-                                        lastLoggedConsumerRejectKey = rejectKey;
-                                        LOG_INFO("renderer: DLSS SDR consumer rejected frame={} view_match={} frame_match={} ordinal_match={} extent_match={} rb_identity={} sdr_ord={} ord={} copy_ord={}",
-                                            frame, viewMatches, frameMatches, ordinalMatches, extentMatches, isRbSwapIdentity,
+                                    if (sdrRejectLast == ~0ull || frame > sdrRejectLast + 1) {
+                                        if (sdrRejectLast != ~0ull && sdrRejectLog())
+                                            LOG_INFO("renderer: DLSS SDR consumer gap frame={} rejected_frames={} first={} last={}",
+                                                frame, sdrRejectLast - sdrRejectFirst + 1, sdrRejectFirst, sdrRejectLast);
+                                        sdrRejectFirst = frame;
+                                    }
+                                    sdrRejectLast = frame;
+                                    if (frame - sdrRejectFirst < 2 && sdrRejectLog()) {
+                                        const SdrLossTrace loss = source ? source->sdrLoss : SdrLossTrace{};
+                                        const uint64_t lossFrame = source ? source->frame : frame;
+                                        LOG_INFO("renderer: DLSS SDR consumer rejected frame={} segment_frame={} view_match={} frame_match={} ordinal_match={} extent_match={} rb_identity={} sdr_ord={} ord={} copy_ord={} loss={} losses={} loss_vs={:016x} loss_ps={:016x} loss_blend={:#x} loss_fetch={:#x} loss_mask={} loss_depth={:#x} loss_quad={} producer_this_frame={} qualified={}x{} resolve={}x{} write=({},{} {}x{}) dest_fmt={} hdr_extended={}",
+                                            frame, frame - sdrRejectFirst, viewMatches, frameMatches, ordinalMatches, extentMatches, isRbSwapIdentity,
                                             source ? source->sdrWriteOrdinal : 0, source ? source->writeOrdinal : 0,
-                                            temporalSceneCopy ? temporalSceneCopy->ordinal : 0);
+                                            temporalSceneCopy ? temporalSceneCopy->ordinal : 0,
+                                            SdrLossName(loss, lossFrame), loss.toneFrame == lossFrame ? loss.count : 0,
+                                            loss.vs, loss.ps, loss.blend, loss.fetch, loss.colorMask, loss.depth, loss.quad,
+                                            source && source->sdrProducerFrame == lossFrame,
+                                            source ? source->sdrQualifiedWidth : 0, source ? source->sdrQualifiedHeight : 0,
+                                            source && source->tex ? source->tex->width : 0, source && source->tex ? source->tex->height : 0,
+                                            source ? source->writeX : 0, source ? source->writeY : 0,
+                                            source ? source->writeWidth : 0, source ? source->writeHeight : 0,
+                                            source ? source->destFormat : 0,
+                                            source && source->hdrTex && source->hdrWriteOrdinal == source->writeOrdinal);
                                     }
                                 }
 
@@ -9927,6 +10723,15 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
                 // Record.
                 ScopedTimer recordTimer{ tRecord, cpuTimingEnabled };
+                const bool recordProbeOn = record_timing::Enabled();
+                if (recordProbeOn) recordTiming.SetCounterReader(&ReadRecordCounters, this);
+                record_timing::Probe recordProbe{ recordTiming, recordProbeOn, drawsThisFrame };
+                if (auto* sample = recordProbe.Sample()) {
+                    sample->vs = key.vs; sample->ps = key.ps;
+                    sample->indexCount = indexCount; sample->primitive = info.primitiveType;
+                    sample->rtBase = colorInfo & 0xFFF; sample->rtFormat = (colorInfo >> 16) & 0xF;
+                    sample->depth = depth != nullptr;
+                }
                 RenderRect scissor(int32_t(scissorTl & 0x3FFF), int32_t((scissorTl >> 16) & 0x3FFF), int32_t(scissorBr & 0x3FFF), int32_t((scissorBr >> 16) & 0x3FFF));
                 uint32_t windowOffset = Reg(REG_PA_SC_WINDOW_OFFSET);
                 if (!(scissorTl & 0x80000000u) && windowOffset)
@@ -9938,6 +10743,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 scissor.top = std::clamp(scissor.top, 0, int32_t(rasterTarget->guestHeight)); scissor.bottom = std::clamp(scissor.bottom, 0, int32_t(rasterTarget->guestHeight));
                 const RenderRect guestScissor = scissor;
                 bool scenePromotionActivated = false;
+                recordProbe.Enter(record_timing::Phase::Promote);
                 if (dlssSrRequested && dlssSceneCopyInputs && fullSceneCopy && !depth
 #if defined(LO_GPU_PLUME)
                     && (dlssController || temporalUpscaler)
@@ -9997,10 +10803,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 // 2x-scaled while the actual depth raster target is fixed-size.
                 // Keeping that unused attachment makes VkFramebuffer invalid
                 // (04533/04534); reducing the depth draw's viewport would hide it.
-                RenderFramebuffer* framebuffer = GetFramebuffer(depthOnlyRaster && !depthOnlyKeepsColor ? nullptr : color, depth);
-                commandList->setFramebuffer(framebuffer);
+                recordProbe.Enter(record_timing::Phase::Framebuffer);
+                if (auto* sample = recordProbe.Sample()) { sample->width = rasterTarget->width; sample->height = rasterTarget->height; }
+                RenderFramebuffer* framebuffer = BindTargets(depthOnlyRaster && !depthOnlyKeepsColor ? nullptr : color, depth);
                 commandList->setViewports(&rasterViewport, 1);
                 commandList->setScissors(&scissor, 1);
+                recordProbe.Enter(record_timing::Phase::Trace);
                 if (p2Evidence.is_open() && ps &&
                     (key.ps == 0xb4b4d54a7a2d6b96ull || key.ps == 0xcda578aef1724fdcull))
                 {
@@ -10090,14 +10898,20 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         << ",\"blend_control\":" << key.blend << ",\"color_mask\":" << key.colorMask
                         << ",\"exp_bias\":\"unknown\"}}\n";
                 }
-                const auto samplerVersion = samplerState.Current();
+                recordProbe.Enter(record_timing::Phase::Pipeline);
+                const auto& samplerVersion = samplerState.Current();
                 if (!samplerVersion) return;
                 const auto versionsBefore = Gpu().samplerVersions.size();
                 sampling::Retain(Gpu().samplerVersions, samplerVersion);
                 if (render_timing::Enabled()) samplerBoundVersions += Gpu().samplerVersions.size() - versionsBefore;
                 set0 = vulkan ? staticSet0.get() : samplerVersion->descriptors.get();
                 RenderDescriptorSet* set4 = vulkan ? samplerVersion->descriptors.get() : nullptr;
-                commandList->setPipeline(pipeline);
+                // A draw that an occlusion query will measure binds its counting
+                // variant here instead, so a run of query boxes keeps one binding;
+                // OcclusionQueryForDraw takes the counter at the draw.
+                RenderPipeline* countingPipeline = OcclusionCountingPending() ? CountingPipeline(key, vs, ps) : nullptr;
+                commandList->setPipeline(countingPipeline ? countingPipeline : pipeline);
+                if (auto* sample = recordProbe.Sample()) NoteRecordPipeline(*sample, key, pipeline);
                 // The command list keeps the constant for later rebinds of this
                 // pipeline, e.g. after the motion-vector replay.
                 if (UsesBlendConstant(key.blend))
@@ -10122,6 +10936,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     }
                 }
                 commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                recordProbe.Enter(record_timing::Phase::Sets);
                 if (vulkan) {
                     const uint64_t base = uploadRing->getDeviceAddress();
                     constantAddresses[0] = base + vsOffset;
@@ -10142,6 +10957,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 commandList->setGraphicsDescriptorSet(set3, 3);
                 if(vulkan) commandList->setGraphicsDescriptorSet(set4,4);
 
+                recordProbe.Enter(record_timing::Phase::Trace);
                 // Expanded rect-list indices already include the offset.
                 int32_t baseVertex = info.primitiveType == 8 && rectListExpansion ? 0 : int32_t(Reg(REG_VGT_INDX_OFFSET));
                 static uint32_t drawLogs = 0;
@@ -10269,11 +11085,28 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         RegF(REG_ALU_CONSTANTS + 255 * 4), RegF(REG_ALU_CONSTANTS + 255 * 4 + 1), RegF(REG_ALU_CONSTANTS + 255 * 4 + 2), RegF(REG_ALU_CONSTANTS + 255 * 4 + 3));
                 }
                 // Inside a guest occlusion query, count exactly this draw's samples.
+                recordProbe.Enter(record_timing::Phase::Occlusion);
                 const uint32_t occlusionIndex = OcclusionQueryForDraw();
-                RenderQueryPool* occlusionPool = occlusionIndex != ~0u
+                if (countingPipeline && occlusionIndex == ~0u) {
+                    commandList->setPipeline(pipeline);
+                    countingPipeline = nullptr;
+                }
+                RenderQueryPool* occlusionPool = occlusionIndex != ~0u && !countingPipeline
                     ? Gpu().occlusionQueries[occlusionIndex / kOcclusionPoolQueries].get() : nullptr;
-                if (occlusionPool)
+                if (countingPipeline) {
+                    // A draw without a pixel shader leaves the pixel constant
+                    // address unused; the counting shader takes its counter there.
+                    const uint64_t counter = uint64_t(gpuSlot) * kOcclusionQueriesPerSlot + occlusionIndex;
+                    commandList->setGraphicsPushConstants(0, &counter, 2 * sizeof(uint64_t), sizeof(counter));
+                    Gpu().occlusionCounted[occlusionIndex] = 1;
+                    Gpu().occlusionCountersDirty = std::max(Gpu().occlusionCountersDirty, occlusionIndex + 1);
+                }
+                else if (occlusionPool) {
+                    Gpu().occlusionPoolsDirty = std::max(Gpu().occlusionPoolsDirty, occlusionIndex / kOcclusionPoolQueries + 1);
+                    Gpu().occlusionPoolUsed = std::max(Gpu().occlusionPoolUsed, occlusionIndex + 1);
                     commandList->beginOcclusionQuery(occlusionPool, occlusionIndex % kOcclusionPoolQueries);
+                }
+                recordProbe.Enter(record_timing::Phase::Draw);
                 if (useIndices)
                 {
                     RenderIndexBufferView view(RenderBufferReference(uploadRing, preparedIndexOffset), uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
@@ -10284,13 +11117,19 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 {
                     commandList->drawInstanced(indexCount, 1, uint32_t(baseVertex), 0);
                 }
-                if (occlusionPool) {
+                recordProbe.Enter(record_timing::Phase::Occlusion);
+                // A counted draw leaves its variant bound: the next draw binds and
+                // pushes its own, and nothing later in this draw's recording runs
+                // without a pixel shader.
+                if (occlusionPool)
                     commandList->endOcclusionQuery(occlusionPool, occlusionIndex % kOcclusionPoolQueries);
+                if (countingPipeline || occlusionPool) {
                     const HostTexture* measured = depth ? depth : color;
                     occlusion.DrawMeasured({Gpu().occlusionBatch, occlusionIndex, gpu::occlusion::SampleScale(
                         measured->guestWidth, measured->guestHeight, measured->width, measured->height, (surfaceInfo >> 16) & 3)});
                     LogOcclusionDraw(occlusionIndex, ps != nullptr, measured);
                 }
+                recordProbe.Enter(record_timing::Phase::Hdr);
                 // Keep the guest SDR target untouched. The verified tone-map draw
                 // starts an extended-gamma FP16 copy; later UI/fade draws reproduce
                 // their original blend against it. Any unknown writer invalidates
@@ -10348,7 +11187,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             }
                             if (color->hdrSidecar && color->hdrSidecar->texture) {
                                 Transition(*color->hdrSidecar, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                                commandList->setFramebuffer(GetFramebuffer(color->hdrSidecar.get(), nullptr));
+                                BindTargets(color->hdrSidecar.get(), nullptr);
                                 commandList->clearColor(0, RenderColor(0, 0, 0, 1));
                                 auto* hdrCopySource=sceneAAOutput && textureBindings[0][0]==sceneAAOutput.get() && sceneAAHdrFrame==frame ? sceneAAHdrOutput.get() :
                                     sceneTaaSdrOutput && textureBindings[0][0]==sceneTaaSdrOutput && sceneTaaHdrFrame==frame ? sceneTaaHdrOutput :
@@ -10473,12 +11312,16 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             hdrDesc.depthEnabled = hdrDesc.depthWriteEnabled = hdrDesc.stencilEnabled = false;
                             hdrDesc.depthTargetFormat = RenderFormat::UNKNOWN;
                             auto& hdrPipeline = hdrPipelines[key];
-                            if (!hdrPipeline) hdrPipeline = device->createGraphicsPipeline(hdrDesc);
+                            if (!hdrPipeline) {
+                                ScopedTimer createTimer{ recordOtherPipelineMs, record_timing::Enabled() };
+                                ++recordOtherPipelineCreates;
+                                hdrPipeline = device->createGraphicsPipeline(hdrDesc);
+                            }
                             if (!hdrPipeline) reject = "pipeline_creation";
                             else {
                                 auto& sidecar = *color->hdrSidecar;
                                 Transition(sidecar, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                                commandList->setFramebuffer(GetFramebuffer(&sidecar, nullptr));
+                                BindTargets(&sidecar, nullptr);
                                 if (tone) commandList->clearColor(0, RenderColor(0, 0, 0, 1));
                                 commandList->setViewports(&rasterViewport, 1);
                                 commandList->setScissors(&scissor, 1);
@@ -10515,6 +11358,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         }
                     }
                 }
+                recordProbe.Enter(record_timing::Phase::FgUi);
                 if (fgUiBindingExpected && fgUiCapture) {
                     auto capture = fgUiCapture;
                     if (capture->Valid() && (capture->frame != frame ||
@@ -10549,7 +11393,12 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             auto replayDesc = desc;
                             replayDesc.depthEnabled = replayDesc.depthWriteEnabled = replayDesc.stencilEnabled = false;
                             replayDesc.depthTargetFormat = RenderFormat::UNKNOWN;
-                            auto replayPipeline = device->createGraphicsPipeline(replayDesc);
+                            std::unique_ptr<RenderPipeline> replayPipeline;
+                            {
+                                ScopedTimer createTimer{ recordOtherPipelineMs, record_timing::Enabled() };
+                                ++recordOtherPipelineCreates;
+                                replayPipeline = device->createGraphicsPipeline(replayDesc);
+                            }
                             if (!replayPipeline) capture->Reject("replay_pipeline_creation_failed");
                             else {
                                 RenderPipeline* replay = replayPipeline.get();
@@ -10590,11 +11439,13 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     }
                     fgUiBindingExpected = false;
                 }
+                recordProbe.Enter(record_timing::Phase::Trace);
                 // These are recorded draws. Verify the pointer survived all
                 // shader bindings and descriptor acquisition, including slot>0.
                 if (traceControllerAtlas)
                     TraceControllerAtlasRecorded(controllerAtlasCandidates, textureBindings, key.vs, key.ps);
   #if defined(LO_GPU_PLUME)
+                recordProbe.Enter(record_timing::Phase::FsrAlpha);
                 bool alphaReplayRecorded = false;
                 // Controlled P2 collection: this raw R8 mask is deliberately
                 // independent of the later scene-copy/SDK inputs. Only the six
@@ -10622,7 +11473,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     if (alphaDesc.depthEnabled && !alphaDesc.depthWriteEnabled &&
                         alphaDesc.depthFunction == RenderComparisonFunction::GREATER_EQUAL &&
                         !alphaDesc.stencilEnabled && !alphaDesc.geometryShader && key.prim != 8) {
-                        auto* alphaPipeline = fsrAlphaReplay->Prepare(key, alphaDesc, vs->info, ps->info,
+                        auto* alphaPipeline = fsrAlphaReplay->Prepare(key, alphaDesc, ReplayTranslation(vs->info), ReplayTranslation(ps->info),
                             vsWords, vsCount, psWords, psCount);
                         if (alphaPipeline) {
                             fsr_alpha::FrameIdentity identity{};
@@ -10890,7 +11741,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         samplerSupported) {
                         alphaPostprocessReason = "shader_pending";
                         auto* maskPipeline = fsrAlphaPostprocess->Prepare(key, pointSlots, postDesc,
-                            vs->info, ps->info, vsWords, vsCount, psWords, psCount);
+                            ReplayTranslation(vs->info), ReplayTranslation(ps->info), vsWords, vsCount, psWords, psCount);
                         if (!maskPipeline && !fsrAlphaPostprocess->LastError().empty())
                             alphaPostprocessReason = "shader_or_pipeline_failed";
                         if (maskPipeline) {
@@ -11220,12 +12071,14 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         TraceFsrAlphaBridge(std::move(event));
                     }
                 }
+                recordProbe.Enter(record_timing::Phase::SceneDlss);
                 if (scenePromotionActivated)
                     RecordSceneCopyDlss(color, rasterTarget);
                 if (video::GpuWorkStopped()) return;
  #endif
                 drawsThisFrame++;
 
+                recordProbe.Enter(record_timing::Phase::MvTrack);
                 if (motionDepthWrite) {
                     const auto logFirstMotionFailure = [&](const char* reason, uint32_t reasonCode) {
                         if (!motionOptions.log) return;
@@ -11330,12 +12183,14 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             }
                         }
                         mvTimer.AddTo(mvTrackCpuMs);
+                        recordProbe.Enter(record_timing::Phase::MvPrepare);
                         if (motionReplay && motionReplay->UsableThisFrame()) {
                             const auto w = uint32_t(rasterViewport.width), h = uint32_t(rasterViewport.height);
                             // Cold start: allocate/clear real MV targets without previous or pipeline.
                             const auto prepared = motionReplay->PrepareSceneDraw(commandList, depth->allocationSerial, depth->texture.get(), w, h,
                                 key, DescribePipeline(key, vs, ps, false),
                                 vsWords, vsCount, ps ? psWords : nullptr, ps ? psCount : 0);
+                            recordProbe.Enter(record_timing::Phase::MvDraw);
                             if (!prepared.sceneReady || prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Failed) {
                                 logFirstMotionFailure(prepared.sceneReady ? "replay_pipeline_failed" : "replay_scene_failed", 3);
                                 motionReplay->AbortFrame();
@@ -11375,6 +12230,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         }
                     }
                 }
+                recordProbe.Enter(record_timing::Phase::Tail);
                 // Offline vertex replay: capture one frame of relative-addressed
                 // draws with their constants, indices and current guest streams.
                 // Stream files are swapped CPU snapshots, not upload-heap reads.
@@ -11602,6 +12458,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                                 }
                             }
                         }
+                        color->sdrLoss.Tone(frame);
                         if (quadOk) {
                             color_qualification::MarkHostTextureProducer(
                                 color->sdrProducerFrame, color->qualifiedSdrWidth, color->qualifiedSdrHeight,
@@ -11610,6 +12467,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                             if (color->hdrFrame == frame) color->hdrValid = false;
                             color_qualification::InvalidateHostTextureProducer(
                                 color->sdrProducerFrame, color->qualifiedSdrWidth, color->qualifiedSdrHeight);
+                            if (color->sdrLoss.Lost(frame, SdrLossTrace::ToneRejected, uint32_t(rejectReason))) {
+                                color->sdrLoss.vs = key.vs; color->sdrLoss.ps = key.ps; color->sdrLoss.blend = key.blend;
+                            }
                             static color_qualification::ProducerRejectReason lastLoggedProducerReject = color_qualification::ProducerRejectReason::None;
                             if (lastLoggedProducerReject != rejectReason) {
                                 lastLoggedProducerReject = rejectReason;
@@ -11620,10 +12480,16 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                                     slot95ArenaOffset, slot95StreamBytes);
                             }
                         }
-                    } else if ((key.colorMask & 7) != 0) {
-                        // Any other draw writing RGB invalidates producer status
+                    } else if ((key.colorMask & 7) != 0 && alphaQuad != 1) {
+                        // Any other draw writing RGB invalidates producer status. A
+                        // full-screen alpha quad (crossfade) leaves it display-encoded SDR.
                         color_qualification::InvalidateHostTextureProducer(
                             color->sdrProducerFrame, color->qualifiedSdrWidth, color->qualifiedSdrHeight);
+                        if (color->sdrLoss.Lost(frame, SdrLossTrace::Draw, Reg(REG_FETCH_CONSTANTS + 1))) {
+                            auto& loss = color->sdrLoss;
+                            loss.vs = key.vs; loss.ps = key.ps; loss.blend = key.blend;
+                            loss.colorMask = key.colorMask; loss.depth = key.depthControl; loss.quad = alphaQuad;
+                        }
                     }
                 }
                 if(sceneAARecorded||temporalAARecorded) {
@@ -11745,9 +12611,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                                 continue;
                             if (tex.get() == restoreDebt.target) DropRestoreDebt(); // The fill replaces every pixel.
                             RenderColor value = UnpackGuestWord(word, k.format);
-                            Transition(*tex, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                            commandList->setFramebuffer(GetFramebuffer(tex.get(), nullptr));
-                            commandList->clearColor(0, value);
+                            const float rgba[4] = {value.r, value.g, value.b, value.a};
+                            QueueClear(*tex, pending_clear::ColorOp(rgba));
                             tex->hdrValid = false;
 #if defined(LO_GPU_PLUME)
                             HandleFsrAlphaRgbWriter(*tex, "depth_color_tile_clear");
@@ -11758,11 +12623,13 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 #endif
                             tex->aaProvenance.Invalidate(frame,tex->allocationSerial,true);
                             tex->sdrProducerFrame = ~0ull;
+                            tex->sdrLoss.Lost(frame, SdrLossTrace::Clear, 1);
                             if (loggedFills++ < 12)
                                 LOG_INFO("renderer: depth fill (base={:#x} pitch={} msaa={} rect {}x{} z={} word={:#x}) wiped colour view class {} pitch {} to ({:g},{:g},{:g},{:g})",
                                     depthInfo & 0xFFF, pitch, (surfaceInfo >> 16) & 3, maxX, maxY, rectZ, word, k.format, k.pitch, value.r, value.g, value.b, value.a);
                         }
-                        // Re-bind the fill's own framebuffer for the draw that follows.
+                        // Re-bind the fill's own framebuffer for the draw that follows
+                        // (QueueClear may have run a full queue on another one).
                         commandList->setFramebuffer(framebuffer);
                     }
 
@@ -11779,30 +12646,25 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         HostTexture* target = renderTargets[k].get();
                         if (k.depth)
                         {
-                            Transition(*target, RenderTextureLayout::DEPTH_WRITE, RenderBarrierStage::GRAPHICS);
-                            commandList->setFramebuffer(GetFramebuffer(nullptr, target));
                             const DepthClearRect sourceRect{int32_t(std::ceil(minX)), int32_t(std::ceil(minY)),
                                 int32_t(std::ceil(maxX)), int32_t(std::ceil(maxY))};
                             auto mapped = MapDepthClear(pitch, (surfaceInfo >> 16) & 3, sourceRect,
                                 k.pitch, target->guestHeight, target->depthMsaa);
                             if (vulkan) CoalesceDepthClearRects(mapped);
-                            std::vector<RenderRect> clearRects;
+                            std::vector<pending_clear::Rect> clearRects;
                             clearRects.reserve(mapped.size());
                             for (const auto& r : mapped) clearRects.push_back({int32_t(target->ScaleX(uint32_t(r.left))), int32_t(target->ScaleY(uint32_t(r.top))),
                                 int32_t(target->ScaleX(uint32_t(r.right))), int32_t(target->ScaleY(uint32_t(r.bottom)))});
-                            // A zero rectangle count means a whole-resource clear in
-                            // the graphics API, so an empty mapping must be skipped.
+                            const size_t regions = clearRects.size();
+                            // An empty rectangle list would mean the whole texture,
+                            // so an empty mapping is skipped.
                             if (!clearRects.empty())
                             {
-                                static const bool traceClearCall = getenv("LO_TRACE_CLEAR_CALL") != nullptr;
-                                if (traceClearCall)
-                                    LOG_INFO("clear begin f{} base={} pitch={} size={}x{} count={} z={}", frame, k.base, k.pitch, target->width, target->height, clearRects.size(), rectZ);
                                 FlushMotionReplayQueue();
-                                commandList->clearDepthStencil(true, false, rectZ, 0, clearRects.data(), uint32_t(clearRects.size()));
-                                if (traceClearCall) LOG_INFO("clear end");
+                                QueueClear(*target, pending_clear::DepthOp(true, false, rectZ, 0, std::move(clearRects)));
                             }
                             if (logged++ < 8 || frame == captureFrame)
-                                LOG_INFO("renderer: depth clear f{} rect (pitch {}, {}x{} .. {}x{}) -> depth base={:#x} pitch={} size={}x{} to {} msaa={}->{} regions={}", frame, pitch, minX, minY, maxX, maxY, k.base, k.pitch, target->width, target->height, rectZ, (surfaceInfo >> 16) & 3, target->depthMsaa, clearRects.size());
+                                LOG_INFO("renderer: depth clear f{} rect (pitch {}, {}x{} .. {}x{}) -> depth base={:#x} pitch={} size={}x{} to {} msaa={}->{} regions={}", frame, pitch, minX, minY, maxX, maxY, k.base, k.pitch, target->width, target->height, rectZ, (surfaceInfo >> 16) & 3, target->depthMsaa, regions);
                             continue;
                         }
                         if (target->format != color->format || nx1 <= nx0 || ny1 <= ny0)
@@ -11820,7 +12682,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         Transition(*target, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
                         if (otherDepth)
                             Transition(*otherDepth, RenderTextureLayout::DEPTH_WRITE, RenderBarrierStage::GRAPHICS);
-                        commandList->setFramebuffer(GetFramebuffer(target, otherDepth));
+                        BindTargets(target, otherDepth);
                         // Viewport such that the rectangle's NDC bounds land on the full texture.
                         const float vpW = 2.0f * float(target->width) / (nx1 - nx0);
                         const float vpH = 2.0f * float(mappedRows) / (ny1 - ny0);
@@ -11841,6 +12703,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 #endif
                         if ((key.colorMask & 7) != 0) {
                             target->sdrProducerFrame = ~0ull;
+                            target->sdrLoss.Lost(frame, SdrLossTrace::Clear, 2);
                             target->hdrValid = false;
                         }
                         if (logged++ < 8)
@@ -12036,6 +12899,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 if (fgUiCapture && fgUiCapture->frame == frame && !fgUiCapture->finalRecorded)
                     ExportFgUiCapture(fgUiCapture);
                 OcclusionFrameEnd();
+                if (record_timing::Enabled()) recordTiming.EndFrame(frame);
                 ++frame; drawsThisFrame = 0; drops = {};
             }
             frame_generation::ResolveIdentity FgIdentity(const ResolvedSurface& rs) const
@@ -12427,7 +13291,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                     // Initialize only on allocation, preserving later partial
                     // resolves and their untouched destination pixels.
                     Transition(*rs.tex, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                    commandList->setFramebuffer(GetFramebuffer(rs.tex.get(), nullptr));
+                    BindTargets(rs.tex.get(), nullptr);
                     commandList->clearColor(0, RenderColor(0, 0, 0, 0));
                     static uint32_t created = 0;
                     if (created++ < 16)
@@ -12478,6 +13342,10 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 } else {
                     color_qualification::InvalidateSurfaceResolved(rs.sdrWriteOrdinal);
                 }
+                rs.sdrLoss = color.sdrLoss;
+                rs.sdrProducerFrame = color.sdrProducerFrame;
+                rs.sdrQualifiedWidth = color.qualifiedSdrWidth;
+                rs.sdrQualifiedHeight = color.qualifiedSdrHeight;
                 rs.hdrWriteOrdinal = 0;
                 rs.hdrGain = false;
                 // A promoted (upscaled) target has no sidecar of its own; keep the
@@ -12705,7 +13573,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         destBase, destFormat, destEndian, x0, y0, copyWidth, copyHeight, destPitch, uint32_t(color->format), nonZero, drawsThisFrame);
                 }
                 uint8_t* dst = Phys(destBase);
-                g_commandProcessor.AdvanceSyncEpoch();
+                g_commandProcessor.AdvanceSyncEpoch(CommandProcessor::SyncSource::Resolve);
                 uint32_t pitchBlocks = (destPitch + 31) & ~31u;
                 for (uint32_t y = 0; y < copyHeight; y++)
                 {
@@ -12772,17 +13640,16 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 {
                     consecutiveResolveCopies.Invalidate();
                     uint32_t clear = Reg(REG_RB_COLOR_CLEAR);
-                    RenderColor c(float((clear >> 16) & 0xFF) / 255.0f, float((clear >> 8) & 0xFF) / 255.0f, float(clear & 0xFF) / 255.0f, float(clear >> 24) / 255.0f);
-                    Transition(*color, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                    commandList->setFramebuffer(GetFramebuffer(color, nullptr));
-                    RenderRect rect{ int32_t(color->ScaleX(x0)), int32_t(color->ScaleY(y0)), int32_t(color->ScaleX(x1)), int32_t(color->ScaleY(y1)) };
-                    commandList->clearColor(0, c, &rect, 1);
+                    const float c[4] = {float((clear >> 16) & 0xFF) / 255.0f, float((clear >> 8) & 0xFF) / 255.0f, float(clear & 0xFF) / 255.0f, float(clear >> 24) / 255.0f};
+                    QueueClear(*color, pending_clear::ColorOp(c, {{int32_t(color->ScaleX(x0)), int32_t(color->ScaleY(y0)),
+                        int32_t(color->ScaleX(x1)), int32_t(color->ScaleY(y1))}}));
                     color->hdrValid = false;
 #if defined(LO_GPU_PLUME)
                     HandleFsrAlphaRgbWriter(*color, "resolve_color_clear");
 #endif
                     color->aaProvenance.Invalidate(frame,color->allocationSerial,x0==0&&y0==0&&x1==color->guestWidth&&y1==color->guestHeight);
                     color->sdrProducerFrame = ~0ull;
+                    color->sdrLoss.Lost(frame, SdrLossTrace::Clear, 3);
                 }
                 if (copyControl & 0x200)
                     ClearDepthTarget(pitch, rtHeight);
@@ -12795,10 +13662,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 uint32_t depthInfo = Reg(REG_RB_DEPTH_INFO);
                 HostTexture* depth = GetRenderTarget(depthInfo & 0xFFF, (depthInfo >> 16) & 1, pitch, rtHeight, true);
                 if (!depth || !depth->texture) return;
-                Transition(*depth, RenderTextureLayout::DEPTH_WRITE, RenderBarrierStage::GRAPHICS);
-                commandList->setFramebuffer(GetFramebuffer(nullptr, depth));
                 uint32_t clear = Reg(REG_RB_DEPTH_CLEAR);
-                commandList->clearDepthStencil(true, true, float(clear >> 8) / 16777215.0f, clear & 0xFF);
+                QueueClear(*depth, pending_clear::DepthOp(true, true, float(clear >> 8) / 16777215.0f, clear & 0xFF));
             }
 
             void ClearMovieBars(uint32_t surfaceInfo, uint32_t colorInfo,
@@ -12852,7 +13717,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 
                 consecutiveResolveCopies.Invalidate();
                 Transition(*color, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
-                commandList->setFramebuffer(GetFramebuffer(color, nullptr));
+                BindTargets(color, nullptr);
                 commandList->clearColor(0, RenderColor(0.0f, 0.0f, 0.0f, 1.0f), bars.data(), count);
                 color->hdrValid = false;
 #if defined(LO_GPU_PLUME)
@@ -12860,6 +13725,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 #endif
                 color->aaProvenance.Invalidate(frame, color->allocationSerial, false);
                 color->sdrProducerFrame = ~0ull;
+                color->sdrLoss.Lost(frame, SdrLossTrace::Clear, 4);
             }
         };
 
@@ -12916,6 +13782,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
 #endif
             g_renderer->SavePipelineRecipes(true);
             g_renderer->SaveDriverPipelineCache(true);
+            gpu::pipeline_prepare::Publish(0, 0);
             std::lock_guard lock(g_exitFlushMutex);
             delete g_renderer;
             g_renderer = nullptr;
@@ -13277,6 +14144,8 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             static auto lastFrame = std::chrono::steady_clock::now();
             if (!g_renderer->Flush()) return;
             g_renderer->PublishDlssFrameOutcome();
+            g_renderer->CollectTextureReplacements();
+            g_renderer->ReportReplacementCost();
             {
                 auto& r = *g_renderer;
                 if (r.motionOptions.log && r.frame % 120 == 0) {
@@ -13354,6 +14223,40 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 r.samplerBoundVersions = r.samplerTableAttempts = r.samplerTableCreates = 0;
                 r.samplerViewWrites = r.samplerWrites = 0;
                 r.samplerTableMs = 0;
+                {
+                    // What ended this frame's sync periods, and the per-frame revalidation
+                    // work of textures and zero-register constants.
+                    using S = CommandProcessor::SyncSource;
+                    static_assert(uint32_t(S::Count) == 13, "log fields follow SyncSource");
+                    static uint64_t before[uint32_t(S::Count)]{};
+                    uint64_t delta[uint32_t(S::Count)];
+                    for (uint32_t i = 0; i < uint32_t(S::Count); ++i) {
+                        const uint64_t now = g_commandProcessor.SyncSourceCount(S(i));
+                        delta[i] = now - before[i];
+                        before[i] = now;
+                    }
+                    auto& c0 = r.constantSnapshot[0];
+                    auto& c1 = r.constantSnapshot[1];
+                    LOG_INFO("render revalidation frame={} sync_batch={} sync_scratch={} sync_interrupt={} sync_swap={} "
+                        "sync_wait_reg_mem={} sync_reg_to_mem={} sync_mem_write={} sync_cond_write={} sync_event_shd={} "
+                        "sync_event_ext={} sync_event_zpd={} sync_occlusion={} sync_resolve={} texture_rehashes={} "
+                        "texture_full_scans={} texture_rehash_changes={} constant_mmio_block_checks={} "
+                        "constant_mmio_block_diffs={} constant_mmio_word_changes={}",
+                        r.frame, delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8],
+                        delta[9], delta[10], delta[11], delta[12], r.textureRehashes, r.textureFullScans, r.textureRehashChanges,
+                        c0.mmioBlockChecks + c1.mmioBlockChecks, c0.mmioBlockDiffs + c1.mmioBlockDiffs,
+                        c0.mmioWordChanges + c1.mmioWordChanges);
+                    r.textureRehashes = r.textureFullScans = r.textureRehashChanges = 0;
+                    c0.mmioBlockChecks = c0.mmioBlockDiffs = c0.mmioWordChanges = 0;
+                    c1.mmioBlockChecks = c1.mmioBlockDiffs = c1.mmioWordChanges = 0;
+                }
+                if (r.nativeVulkan) {
+                    // Graphics pipeline rebinds plume skipped inside a render pass (all lists).
+                    static uint64_t skippedBefore = 0;
+                    const uint64_t skipped = plume::VulkanCommandList::skippedPipelineBinds.load(std::memory_order_relaxed);
+                    LOG_INFO("render binds frame={} pipeline_binds_skipped={}", r.frame, skipped - skippedBefore);
+                    skippedBefore = skipped;
+                }
                 const render_timing::CpuSegments cpu{r.drawsThisFrame, r.nShader, r.nPipeline, r.nTexture, r.nResolve,
                     r.tDraw, r.tConst, r.tSets, r.tVertex, r.tBind, r.tIndex, r.tRecord,
                     r.tShader, r.tPipeline, r.tTexture, r.tResolve, r.tFlush,
@@ -13370,7 +14273,9 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                 double frameMs = std::chrono::duration<double, std::milli>(now - lastFrame).count();
                 lastFrame = now;
                 Renderer& r = *g_renderer;
-                if (frameMs > 150.0 || (r.frame % 60) == 0)
+                // LO_GPU_STATS_HITCH_MS: also log every frame slower than this.
+                static const double hitchMs = [] { const char* v = getenv("LO_GPU_STATS_HITCH_MS"); return v && *v ? std::max(1.0, atof(v)) : 150.0; }();
+                if (frameMs > hitchMs || (r.frame % 60) == 0)
                     LOG_INFO("renderer frame {}: {:.0f} ms, draws {} ({:.0f} ms: const {:.0f} sets {:.0f} vertex {:.0f} bind {:.0f} index {:.0f} record {:.0f} rt {:.0f} taa {:.0f} nested_flush {:.0f} shader_lookup {:.0f} pipeline_lookup {:.0f} scene_copy {:.0f}), shaders {} ({:.0f} ms), pipelines {} ({:.0f} ms), textures {} ({:.0f} ms, {} KB), vertex uploads {}+{} ({} KB, arena {} MB), resolves {} ({:.0f} ms), gpu wait {:.0f} ms",
                         r.frame, frameMs, r.drawsThisFrame, r.tDraw, r.tConst, r.tSets, r.tVertex, r.tBind, r.tIndex, r.tRecord, r.tRt, r.tTaa, r.tNestedFlush, r.tShaderLookup, r.tPipelineLookup, r.tSceneCopy, r.nShader, r.tShader, r.nPipeline, r.tPipeline, r.nTexture, r.tTexture, r.texBytes / 1024,
                         r.vertexUploads, r.vertexRevalidations, r.vertexBytesUploaded / 1024, r.Gpu().arenaOffset >> 20, r.nResolve, r.tResolve, r.tFlush);
@@ -13488,6 +14393,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             g_renderer->ReportPipelineMisses();
             g_renderer->UpdateSceneTag();
             g_renderer->HarvestPrefetch();
+            g_renderer->UpdateStartupPreparation();
             g_renderer->ProcessScenePrefetch();
             g_renderer->SavePipelineRecipes();
             if (stats && g_renderer->frame % 600 == 0)

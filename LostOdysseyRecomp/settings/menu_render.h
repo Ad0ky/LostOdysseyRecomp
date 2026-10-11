@@ -30,6 +30,10 @@ struct MenuRow
     // Show only the selected choice between arrows, as rows with more than
     // five choices do; for long names such as GPUs and displays.
     bool singleValue = false;
+    // Muted text at the start of the value column (Mods page: version and
+    // author). The choice cells then take the last ModsCellsWidth; with no
+    // choices and no value the text has the whole column.
+    std::wstring detail;
     bool operator==(const MenuRow &) const = default;
 };
 struct MenuSnapshot
@@ -51,10 +55,24 @@ struct MenuSnapshot
     HdrCalibration calibration;
     BrightnessCalibration brightness;
     NeuralRenderingTuning neuralRendering;
+    // Audio tab speaker test (Rear angle row): the 5.1 layout is drawn under
+    // the rows with the surrounds at speakerRear and the path a matrix decoder
+    // gives the test sound; the marker that follows it is a layer (DrawSpeakerMarker).
+    bool speakerLayout = false;
+    int speakerRear = 110;
+    // A list page opened from a tab row (System → Mods): the tab bar shows this
+    // title instead of the tabs and keyLegend sits in the header. With reorder,
+    // the focused row has move up / move down cells (ModsMoveLeft).
+    std::wstring pageTitle, keyLegend;
+    bool reorder = false;
     std::shared_ptr<const menu_assets::Assets> assets;
     // Only the panels, without title, tabs, rows or help: what the content
     // fades in over when the menu opens.
     bool backdropOnly = false;
+    // Only help, a key then its label, at the title menu's lower right as
+    // straight alpha: the Settings legend (title_entry.cpp). The raster is
+    // just TitleHintBounds of the output.
+    bool titleHint = false;
 };
 // The list cursor arrow, top-left corner in the 1280x720 layout.
 struct MenuArrow
@@ -73,7 +91,14 @@ struct MenuRect
 };
 // The list arrow at a layout position, and the output pixels it can cover.
 void DrawMenuArrow(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, int x, int y);
+// The output pixels of the title menu's Settings legend: with titleHint,
+// RasterizeMenu returns only this rectangle, row by row.
+MenuRect TitleHintBounds(uint32_t width, uint32_t height);
 MenuRect MenuArrowBounds(uint32_t width, uint32_t height, int x, int y);
+// The speaker test marker where a matrix decoder puts the test sound at
+// `position` along its circle (apu::SpeakerPan) with the surrounds encoded for
+// `rearAngle`, framing the speaker it rests on, and the output pixels it covers.
+MenuRect DrawSpeakerMarker(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, float position, float rearAngle);
 
 // Presentation-only menu motion (#151), timed like the retail Configuration and
 // camp menus (recorded frame by frame on psvita, 2026-10-09). Menu logic and

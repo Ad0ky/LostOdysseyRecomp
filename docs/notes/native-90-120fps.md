@@ -11,9 +11,13 @@
 | 原生目标 | 已识别游戏Present调用的interval | 宿主目标周期 | 宿主VSync策略 |
 |---|---|---|---|
 | 30 FPS | 保留2 | 33.333 ms | 保留该交换链原有策略 |
-| 60 FPS | 2→1，保留原实现 | 16.667 ms | 保留该交换链原有策略 |
+| 60 FPS | 2→0（immediate） | 16.667 ms | 保留该交换链原有策略 |
 | 90 FPS | 2→0（immediate） | 11.111 ms | 请求关闭，由宿主deadline限帧 |
 | 120 FPS | 2→0（immediate） | 8.333 ms | 请求关闭，由宿主deadline限帧 |
+
+2026-10-10 起 60 FPS 档也改为 immediate。原来的 interval 1 下，单帧超过 16.667 ms 就要等下一个虚拟 VBlank，帧率直接掉到 30 FPS（Steam Deck 玩家看到帧率和 GPU 占用都只剩一半）。现在由宿主 deadline 限帧，慢帧只损失超出的那部分时间；宿主 VSync 策略不变，不会因此撕裂。30 FPS 档仍保留原版 interval 2。
+
+同日新增 Graphics → VSync（关／开／FreeSync / G-SYNC Compatible，`vsync=0/1` 加原有的 `variable_refresh_rate`），上表的宿主 VSync 一列改为跟随该设置：开时每个原生档位都保留交换链原有的同步策略（包括 90/120），关时一律 immediate，30 FPS 的 guest interval 也改为 immediate。没有 `vsync` 键的旧配置按原行为迁移：`frame_rate` 不高于 60 为开，90/120 为关。macOS 的 Metal 始终同步，菜单只提供 ProMotion 开关。
 
 间隔修改仍严格限定在调用者`0x827B4A4C`、原始interval=2的路径；其他调用者、其他interval及标志位不变，原函数仍只转发一次。游戏时间增量、PPC timebase、内核计时、音频时钟均不缩放，虚拟VBlank仍为60 Hz。原有deadline算法保持不变；慢帧不额外等待一个完整周期，长暂停后不集中补发过期帧。
 

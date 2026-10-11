@@ -24,20 +24,28 @@ struct Identity {
     std::string options;
     std::string variant = "guest-microcode";
 };
-// Translated SPIR-V reads the Xenos constants through device addresses unless
-// this is set; then it reads dynamic uniform buffers in descriptor set 5
-// (common_hlsl.h). The Switch always uses uniform buffers. LO_VK_UBO_CONSTANTS=1
-// selects them for Vulkan on Windows and Linux, to export the Switch pack and to
-// run that form under validation layers. Metal and DXIL never use them.
+// Translated SPIR-V reads the Xenos constants through device addresses, except on
+// the Switch: there it reads dynamic uniform buffers in descriptor set 5
+// (common_hlsl.h). The Switch has no shader compiler, so its pack is exported on
+// a PC (build_packs.py --renderer switch). LO_VK_UBO_CONSTANTS=1 asks for that
+// form; the shader pack tools follow it, and the runtime only while it exports a
+// pack (LO_SHADER_EXPORT_PACK). Play on Windows, Linux and Android ignores it.
+// Metal and DXIL never use uniform buffers.
+inline bool UboConstantsRequested() {
+#if LO_PLATFORM_MACOS
+    return false;
+#else
+    const char* value = std::getenv("LO_VK_UBO_CONSTANTS");
+    return value && *value && std::string_view(value) != "0";
+#endif
+}
 inline bool UboConstants() {
 #if LO_PLATFORM_SWITCH
     return true;
-#elif LO_PLATFORM_MACOS
-    return false;
 #else
     static const bool selected = [] {
-        const char* value = std::getenv("LO_VK_UBO_CONSTANTS");
-        return value && *value && std::string_view(value) != "0";
+        const char* exportPath = std::getenv("LO_SHADER_EXPORT_PACK");
+        return exportPath && *exportPath && UboConstantsRequested();
     }();
     return selected;
 #endif

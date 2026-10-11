@@ -8,33 +8,87 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 
 ### English
 
+- At 60 FPS, scenes that can't quite hold 60 no longer drop straight to 30, for example on Steam Deck.
+- New VSync setting in Settings → Graphics: Off, On or FreeSync / G-SYNC Compatible. It replaces the FreeSync / G-SYNC Compatible switch.
+- New Voice volume in Settings → Audio: cutscene dialogue has its own volume instead of following Sound effects. Voices in battle still follow Sound effects (#394).
+- A new install now starts at the original 720p and 30 FPS. Render resolution and Frame rate in Settings → Graphics raise them; saved settings keep their values.
+- Less CPU time per frame on the render thread, for a slightly higher frame rate where the CPU sets the limit, such as on Android.
+- Saving and loading no longer hold each message on screen for 3 seconds, and Continue on the title screen no longer waits an extra second.
+- Android: slightly higher frame rate; the final upscale to the screen is cheaper.
+- Android (Turnip driver): slightly higher frame rate; visibility checks no longer pause the GPU.
+- Slightly higher frame rate, mostly with Vulkan.
+
+### 简体中文
+
+- 60 FPS 下，跑不满 60 的场景不再直接掉到 30（例如 Steam Deck）。
+- 设置 → 图形新增“垂直同步”：关、开或 FreeSync / G-SYNC Compatible，取代原来的 FreeSync / G-SYNC Compatible 开关。
+- 设置 → 声音新增“语音音量”：过场动画的对白有了自己的音量，不再跟随音效音量。战斗中的语音仍跟随音效音量（#394）。
+- 新安装默认为原版的 720p、30 FPS，可在 设置 → 图形 的“渲染分辨率”和“帧率”调高；已保存的设置不变。
+- 渲染线程每帧占用的 CPU 时间更少，在 CPU 决定帧率的设备上（例如 Android）帧率略有提升。
+- 存档和读档时，提示信息不再固定停留 3 秒；标题画面选 Continue 后也不再多等 1 秒。
+- Android：放大到屏幕这一步更省，帧率略有提升。
+- Android（Turnip 驱动）：可见性检测不再让 GPU 停顿，帧率略有提升。
+- 帧率略有提升，Vulkan 下更明显。
+
+## [v0.9.22](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.22) — 2026-10-10
+
+### English
+
+- DLSS now uses its newer model (M by default) and no longer flickers on light shafts and caustics, such as underwater on the world map. Settings → Graphics adds DLSS model (M or L).
+- HDR settings are hidden while HDR is off.
+- DLSS, FSR, XeSS and MetalFX no longer switch off during the game's screen fades (camera cuts, menus, battle intros, victory shots), so the picture stays sharp and ambient occlusion and frame generation stay on.
+- Fixed short stutters with DLSS frame generation, mostly in battles, on Vulkan and Direct3D 12.
 - Fixed a Vulkan crash a few seconds after startup on NVIDIA GPUs when ReShade's `dxgi.dll` is in the game folder; ReShade still works with Direct3D 12 (#323).
 - With DLSS, FSR, XeSS or MetalFX on, a Render resolution above the output now supersamples: the upscaler outputs at that resolution and the picture is scaled down to the window or screen (#332).
+- On Windows, 5.1 surround no longer drops to stereo on outputs that report stereo but take a 5.1 mix, such as optical outputs with Dolby Digital Live or DTS, or after the speaker setup changes while the game runs (#174).
+- New Matrix surround choice in Settings → Audio → Audio output: the 5.1 mix is encoded into stereo, over any stereo connection such as optical, for an AV receiver's Pro Logic II, Dolby Surround or Neural:X mode to spread back to surround speakers. Rear angle sets where the rear channels sound, 90°–150° (110° is the Pro Logic II standard); while it is selected, a test sound circles the speakers on a 5.1 layout (#174).
 - The HDR page's scene preview now follows the peak brightness with DLSS, FSR or XeSS on.
 - New DLSS 5 neural rendering setting in Settings → Graphics on Windows with DLSS: Off or 1×–4× passes. Confirm on it opens a tuning page with model, intensity, tone, structure, skin and character mask, previewed live on the current scene. It needs an RTX GPU and your own nvngx_dlssnr.dll next to the game; the game does not include it.
 - Settings → Graphics now lists upscaling, DLSS 5 neural rendering and frame generation together in one group.
 - Mod Organizer 2 support: a game plugin lets MO2 manage the mods in the game's `mods/` folder. Mod folders reached through symbolic links now load too.
 - The Settings menu now moves like the game's own menus: the cursor arrow slides between rows and sways while idle, the rows fade in one after another when it opens, prompts dim the screen behind them, and it fades out before closing (#151).
-- Mod authors can export the game's textures (PNG with their mod keys) and CG movies from their own game data with `--export-assets`, or from a new Mod Organizer 2 tool.
-- Experimental, Windows only: mods can replace the textures the game draws, at the original size or up to 8x larger. See the modding guide.
+- Mod authors can export the game's textures (PNG with their mod keys), CG movies and text (JSON, the starting point for translations) from their own game data with `--export-assets`, or from a new Mod Organizer 2 tool.
+- Experimental, Windows only: mods can replace the textures the game draws, at the original size or up to 8x larger. Replacements load in the background, so a new texture can show the original for a moment. See the modding guide.
+- Experimental, Windows only: mods can translate the game's text (menus, item and skill names and descriptions, battle messages, dialogue, subtitles), including text longer than the original. See the modding guide.
+- Experimental, Windows only: a translation mod can be a language pack, a new choice in Settings → System → Game language (#369). `--export-language-pack` and the Mod Organizer 2 tool export one ready to translate and clean it for sharing.
 - New Culling setting in Settings → Graphics, 0%–200%. 100% is the original. Lower values keep characters and objects at the screen edges visible until they are fully off screen; higher values hide them sooner (#342).
 - Optional diagnostics on Windows now send a short summary of the previous session's log (errors, crashes, hangs, rendering mismatches and map names) instead of TAA shader data. The game asks again before sending anything.
 - The log now keeps only notices, warnings and errors. Turn on Settings → System → Debug log for the full log.
+- Windows no longer opens the setup page at the first launch: the game starts with default settings, which Settings changes (`--setup` still opens the page). Opening Settings no longer asks about log collection; the first launch still asks once.
+- Settings opens from the title menu with Y (S on the keyboard), shown at the bottom right, so settings can be changed before loading a save. Options stored in the save are hidden there.
+- Fixed hitches the first time you enter an area, such as the world map.
+- Startup no longer waits for pipeline preparation; it continues in the background with a progress bar at the bottom of the screen.
+- Mods can now ship as one folder with their own overlay files and a name, version and author; Mod Organizer 2 installs them as they are.
+- Settings → System → Mods lists installed mods: turn them on or off and change their order (applies after a restart).
 
 ### 简体中文
 
+- DLSS 改用新模型（默认 M），光柱、焦散等不再闪烁（例如世界地图的水下）。设置 → 图形新增“DLSS 模型”（M 或 L）。
+- HDR 关闭时不再显示 HDR 的子设置。
+- 游戏画面淡化时（镜头切换、菜单、战斗开场、胜利镜头），DLSS、FSR、XeSS 和 MetalFX 不再中断，画面保持清晰，环境光遮蔽和帧生成也不再中断。
+- 修复开启 DLSS 帧生成时的短暂卡顿（多见于战斗），Vulkan 和 Direct3D 12 都已修复。
 - 修复游戏目录里有 ReShade 的 `dxgi.dll` 时，NVIDIA 显卡使用 Vulkan 启动几秒后崩溃的问题；ReShade 在 Direct3D 12 下仍可使用（#323）。
 - 开启 DLSS、FSR、XeSS 或 MetalFX 时，高于输出的渲染分辨率现在会超采样：超分输出为该分辨率，再缩小到窗口或屏幕（#332）。
+- Windows 上，报告为立体声但接受 5.1 混音的输出（如开启 Dolby Digital Live 或 DTS 的光纤输出），以及游戏运行中改了扬声器配置后，5.1 环绕声不再退回立体声（#174）。
+- 设置 → 声音 → 音频输出新增“矩阵环绕声”：把 5.1 混音编入立体声，经光纤等任何立体声连接交给 AV 功放的 Pro Logic II、Dolby Surround 或 Neural:X 模式还原到环绕扬声器。“后方角度”设置后方声道听起来所在的位置，90°–150°（110° 为 Pro Logic II 标准）；选中这一行时，测试声音会在 5.1 布局图上绕着扬声器转圈（#174）。
 - 开启 DLSS、FSR 或 XeSS 时，HDR 页的场景预览现在会随峰值亮度变化。
 - Windows 上开启 DLSS 时，设置 → 图形新增“DLSS 5 神经渲染”：关闭或 1×–4× 次。在这一行按确认会打开调整页，可调模型、强度、色调、结构、皮肤和角色遮罩，并在当前场景上实时预览。需要 RTX 显卡，并把自备的 nvngx_dlssnr.dll 放在游戏旁边，游戏不附带。
 - 设置 → 图形里，超分、DLSS 5 神经渲染和帧生成现在排在同一组。
 - 支持 Mod Organizer 2：游戏插件让 MO2 管理游戏 `mods/` 文件夹里的 Mod。通过符号链接放入的 Mod 文件夹现在也能加载。
 - 设置菜单的动画现在和游戏原版菜单一致：光标箭头在行间滑动、停住时左右轻摆，打开时各行依次淡入，弹出提示时背后画面变暗，关闭前先淡出（#151）。
-- Mod 作者可以用 `--export-assets` 从自己的游戏数据导出纹理（PNG，附 Mod key）和 CG 视频，也可以用新的 Mod Organizer 2 工具导出。
-- 实验性，仅 Windows：Mod 可以替换游戏绘制的纹理，可以和原图同尺寸，也可以最多大 8 倍。见 Mod 指南。
+- Mod 作者可以用 `--export-assets` 从自己的游戏数据导出纹理（PNG，附 Mod key）、CG 视频和文本（JSON，用作翻译的起点），也可以用新的 Mod Organizer 2 工具导出。
+- 实验性，仅 Windows：Mod 可以替换游戏绘制的纹理，可以和原图同尺寸，也可以最多大 8 倍。替换纹理在后台读取，新出现的纹理可能先短暂显示原图。见 Mod 指南。
+- 实验性，仅 Windows：Mod 可以翻译游戏文本（菜单、物品和技能的名称与说明、战斗消息、对话、字幕），译文可以比原文长。见 Mod 指南。
+- 实验性，仅 Windows：翻译 Mod 可以做成语言包，作为设置 → 系统 → 游戏语言里的新选项（#369）。`--export-language-pack` 和 Mod Organizer 2 工具可以导出待翻译的语言包，并在分享前清理。
 - 设置 → 图形新增“剔除”，0%–200%。100% 为原版。调低后，画面边缘的角色和物体会一直显示到完全离开画面；调高则更早隐藏（#342）。
 - Windows 上的可选诊断改为发送上一次运行日志的摘要（错误、崩溃、卡死、渲染不匹配和地图名），不再发送 TAA 着色器数据。发送前会重新询问。
 - 日志默认只保留提示、警告和错误。需要完整日志时，在设置 → 系统打开“调试日志”。
+- Windows 第一次启动不再打开设置页面：游戏以默认设置启动，在设置里修改（`--setup` 仍可打开该页面）。打开设置时不再询问日志收集；第一次启动仍会询问一次。
+- 标题菜单按 Y（键盘 S）可打开设置，提示显示在右下角，不用先读档。存在存档里的选项在这里隐藏。
+- 修复首次进入某个区域（例如世界地图）时的卡顿。
+- 启动时不再等待管线准备，改为在后台进行，屏幕底部显示进度条。
+- Mod 现在可以作为一个独立文件夹发布，自带 overlay 文件和名称、版本、作者信息；Mod Organizer 2 可以直接安装。
+- 设置 → 系统 → Mod 列出已安装的 Mod：可以开关、调整顺序（重启后生效）。
 
 ## [v0.9.0](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.0) — 2026-10-08
 

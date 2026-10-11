@@ -18,10 +18,21 @@ std::string TextValue(std::string text)
     while (!text.empty() && (text.back() == '\r' || text.back() == '\n')) text.pop_back();
     return text.size() <= 256 && text.find_first_of("\r\n") == std::string::npos ? text : std::string{};
 }
+// A language pack id as the mods loader accepts it, in lower case; anything else selects no pack.
+std::string PackId(std::string text)
+{
+    for (auto &c : text) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+    const bool valid = text.size() <= 128 && text != "." && text != ".." &&
+        std::all_of(text.begin(), text.end(), [](char c) {
+            return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        });
+    return valid ? text : std::string{};
+}
 Config Validate(Config value)
 {
     value.gpuDevice = TextValue(std::move(value.gpuDevice));
     value.displayName = TextValue(std::move(value.displayName));
+    value.gameLanguagePack = PackId(std::move(value.gameLanguagePack));
     if (value.displayName.empty() || value.displayIndex > 63) value.displayIndex = 0;
     if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative &&
         value.internalResolution != 720 && value.internalResolution != 1080 &&
@@ -37,6 +48,8 @@ Config Validate(Config value)
     value.depthOfFieldPercent = std::min(value.depthOfFieldPercent, 100u);
     value.cullingPercent = std::min(value.cullingPercent, 200u);
     value.vibrationPercent = std::min(value.vibrationPercent, 100u);
+    value.audioMatrixRear = std::clamp((value.audioMatrixRear + 5) / 10 * 10, 90u, 150u);
+    value.voiceVolume = std::min(value.voiceVolume, 100u);
     if (value.buttonPrompts > 2) value.buttonPrompts = 0;
     value.hdrPaperWhiteNits = std::clamp(value.hdrPaperWhiteNits, 80u, 400u);
     value.hdrPeakNits = std::clamp(value.hdrPeakNits, 80u, 10000u);
@@ -45,6 +58,7 @@ Config Validate(Config value)
     value.displayGamma = std::clamp(value.displayGamma, 50u, 150u);
     if (!gpu::upscaling::KnownUpscaler(value.upscaler)) value.upscaler = gpu::upscaling::Upscaler::Off;
     value.dlssQuality = gpu::upscaling::NormalizeDlssQuality(value.dlssQuality);
+    if (value.dlssModel > 1) value.dlssModel = 0;
     value.fsrQuality = gpu::upscaling::NormalizeFsrQuality(value.fsrQuality);
     value.fsrSharpnessPercent = std::min(value.fsrSharpnessPercent, 100u);
     value.dlssNeuralRendering = std::min(value.dlssNeuralRendering, DlssNeuralRenderingMaxPasses);
@@ -85,7 +99,7 @@ Config Validate(Config value)
         value.gameLanguage = 1;
     if (uint32_t(value.windowMode) > 1)
         value.windowMode = WindowMode::Windowed;
-    if (value.audioOutput > AudioOutputSurround)
+    if (value.audioOutput > AudioOutputMatrix)
         value.audioOutput = AudioOutputStereo;
     if (!gpu::backend::Known(value.graphicsBackend))
 #ifdef _WIN32
@@ -125,13 +139,17 @@ Config Validate(Config value)
     value.frameGenerationProvider = framegen::Provider::Off;
     value.hdr = false;
 #endif
+#if LO_PLATFORM_MACOS
+    // Metal always keeps display sync; the menu offers only ProMotion there.
+    value.vsync = true;
+#endif
     return value;
 }
 Config Read()
 {
     Config value;
     bool hasAntialiasing = false;
-    bool hasHdrPeakAuto = false, hasHdrPeakNits = false, hasAspectRatio = false;
+    bool hasHdrPeakAuto = false, hasHdrPeakNits = false, hasAspectRatio = false, hasVsync = false;
     const auto path = os::user_paths::SettingsPath();
     std::ifstream input(path);
     std::string key;
@@ -148,9 +166,10 @@ Config Read()
         if (name == "aspect_ratio") hasAspectRatio = true;
         uint32_t number = 0;
         const auto digits = key.substr(equal + 1);
-        if (name == "gpu_device" || name == "display_name")
+        if (name == "gpu_device" || name == "display_name" || name == "game_language_pack")
         {
-            (name == "gpu_device" ? value.gpuDevice : value.displayName) = TextValue(digits);
+            (name == "gpu_device" ? value.gpuDevice : name == "display_name" ? value.displayName : value.gameLanguagePack) =
+                TextValue(digits);
             continue;
         }
         if (name == "display_brightness" || name == "dlss_nr_skin")
@@ -218,6 +237,8 @@ Config Read()
             value.upscaler = gpu::upscaling::Upscaler(number);
         else if (key == "dlss_quality")
             value.dlssQuality = gpu::upscaling::DlssQuality(number);
+        else if (key == "dlss_model")
+            value.dlssModel = number;
         else if (key == "fsr_quality")
             value.fsrQuality = gpu::upscaling::FsrQuality(number);
         else if (key == "fsr_sharpness")
@@ -250,6 +271,11 @@ Config Read()
             value.frameGenerationTargetFps = number;
         else if (key == "variable_refresh_rate")
             value.variableRefreshRate = number == 1;
+        else if (key == "vsync" && number <= 1)
+        {
+            value.vsync = number == 1;
+            hasVsync = true;
+        }
         else if (key == "frame_rate")
             value.frameRate = number;
         else if (key == "hdr" && number <= 1)
@@ -282,6 +308,10 @@ Config Read()
             value.fastForwardRate = number;
         else if (key == "audio_output")
             value.audioOutput = number;
+        else if (key == "audio_matrix_rear")
+            value.audioMatrixRear = number;
+        else if (key == "voice_volume")
+            value.voiceVolume = number;
         else if (key == "automatic_updates")
         {
             // Unknown values keep the safe package default (enabled).
@@ -297,6 +327,8 @@ Config Read()
     // Before the Aspect ratio setting, a 21:9 output resolution was the
     // Widescreen switch; keep that shape.
     if (!hasAspectRatio) value.aspectRatio = gpu::aspect_ratio::Migrated(value.width, value.height);
+    // Before the VSync setting, 90/120 FPS presented without display sync.
+    if (!hasVsync) value.vsync = value.frameRate <= 60;
     return Validate(value);
 }
 Config &Current()
@@ -366,6 +398,16 @@ uint32_t GameLanguage()
     static const uint32_t language = GetConfig().gameLanguage;
     return language;
 }
+std::string GameLanguagePack()
+{
+    static const std::string pack = [] {
+        const auto id = GetConfig().gameLanguagePack;
+        for (const auto &choice : GameLanguageChoices())
+            if (!id.empty() && choice.pack == id && choice.id == GameLanguage()) return id;
+        return std::string{};
+    }();
+    return pack;
+}
 static bool WriteConfig(const Config &value)
 {
     const auto path = os::user_paths::SettingsPath();
@@ -374,6 +416,7 @@ static bool WriteConfig(const Config &value)
     const auto temporary = path.parent_path() / (path.filename().string() + ".tmp");
     std::ofstream output(temporary, std::ios::trunc);
     output << "ui_language=" << value.uiLanguage << "\ngame_language=" << value.gameLanguage
+           << "\ngame_language_pack=" << value.gameLanguagePack
            << "\nwidth=" << value.width << "\nheight=" << value.height << "\nwindow_mode=" << uint32_t(value.windowMode)
            << "\naspect_ratio=" << uint32_t(value.aspectRatio)
            << "\ndisplay_name=" << value.displayName << "\ndisplay_index=" << value.displayIndex
@@ -396,6 +439,7 @@ static bool WriteConfig(const Config &value)
            << "\nvibration=" << value.vibrationPercent
            << "\nbutton_prompts=" << value.buttonPrompts
             << "\nupscaler=" << uint32_t(value.upscaler) << "\ndlss_quality=" << uint32_t(value.dlssQuality)
+           << "\ndlss_model=" << value.dlssModel
            << "\nfsr_quality=" << uint32_t(value.fsrQuality)
            << "\nfsr_sharpness=" << value.fsrSharpnessPercent
            << "\ndlss_neural_rendering=" << value.dlssNeuralRendering
@@ -403,6 +447,7 @@ static bool WriteConfig(const Config &value)
            << "\ndlss_nr_intensity=" << value.dlssNrIntensity << "\ndlss_nr_global_tone=" << value.dlssNrGlobalTone
            << "\ndlss_nr_local_tone=" << value.dlssNrLocalTone << "\ndlss_nr_structure=" << value.dlssNrStructure
            << "\ndlss_nr_skin=" << value.dlssNrSkin << "\ndlss_nr_auto_mask=" << (value.dlssNrAutoMask ? 1 : 0)
+           << "\nvsync=" << (value.vsync ? 1 : 0)
            << "\nvariable_refresh_rate=" << (value.variableRefreshRate ? 1 : 0)
            << "\nhdr=" << (value.hdr ? 1 : 0)
            << "\nhdr_paper_white_nits=" << value.hdrPaperWhiteNits
@@ -416,6 +461,8 @@ static bool WriteConfig(const Config &value)
            << "\nfxaa=" << value.fxaa << "\nautomatic_updates=" << value.automaticUpdates
            << "\ndebug_log=" << (value.debugLog ? 1 : 0)
            << "\naudio_output=" << value.audioOutput
+           << "\naudio_matrix_rear=" << value.audioMatrixRear
+           << "\nvoice_volume=" << value.voiceVolume
            << "\nskip_shader_prebuild=" << (value.skipShaderPrebuild ? 1 : 0)
            << "\nsave_anywhere=" << (value.saveAnywhere ? 1 : 0)
            << "\nno_random_encounters=" << (value.noRandomEncounters ? 1 : 0)
@@ -459,7 +506,7 @@ bool SaveAudioOutput(uint32_t output)
     std::lock_guard lock(mutex);
     // Merge with the persisted settings, not a pending graphics preview.
     auto persisted = Read();
-    persisted.audioOutput = output <= AudioOutputSurround ? output : AudioOutputStereo;
+    persisted.audioOutput = output <= AudioOutputMatrix ? output : AudioOutputStereo;
     if (!WriteConfig(persisted)) return false;
     Current().audioOutput = persisted.audioOutput;
     return true;

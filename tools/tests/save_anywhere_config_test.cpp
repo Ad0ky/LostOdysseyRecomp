@@ -95,8 +95,18 @@ int wmain(int argc, wchar_t** argv)
     Check(settings::Read().audioOutput == settings::AudioOutputStereo, "missing audio output key keeps stereo");
     Write("audio_output=1\n");
     Check(settings::Read().audioOutput == settings::AudioOutputSurround, "5.1 audio output read from INI");
-    Write("audio_output=2\n");
-    Check(settings::Read().audioOutput == settings::AudioOutputStereo, "unknown audio output falls back to stereo");
+    Check(settings::Read().audioMatrixRear == 110, "missing rear angle keeps Pro Logic II's 110 degrees");
+    Write("audio_output=2\naudio_matrix_rear=124\n");
+    Check(settings::Read().audioOutput == settings::AudioOutputMatrix && settings::Read().audioMatrixRear == 120,
+          "matrix surround read from INI, rear angle rounded to a 10 degree step");
+    Write("audio_output=3\naudio_matrix_rear=400\n");
+    Check(settings::Read().audioOutput == settings::AudioOutputStereo && settings::Read().audioMatrixRear == 150,
+          "unknown audio output falls back to stereo, rear angle capped at 150");
+    Check(settings::Read().voiceVolume == 100, "missing voice volume keeps 100");
+    Write("voice_volume=64\n");
+    Check(settings::Read().voiceVolume == 64, "voice volume read from INI");
+    Write("voice_volume=300\n");
+    Check(settings::Read().voiceVolume == 100, "voice volume is bounded to 100");
 
     Write("shadow_resolution=2\nambient_occlusion=1\n");
     Check(settings::Read().shadowResolution == 2 && settings::Read().ambientOcclusion == 1,

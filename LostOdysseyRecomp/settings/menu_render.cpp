@@ -4,6 +4,7 @@
 #include "translations.h"
 #include "../host_ui/rasterizer.h"
 #include "../hid/controller_glyphs.h"
+#include "../apu/test_signal.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -37,7 +38,17 @@ namespace
         Canvas(uint32_t *pixels, uint32_t w, uint32_t h)
             : dib(pixels), width(w), height(h), scale(std::min(w / 1280.0, h / 720.0)),
               offsetX((w - 1280 * scale) * 0.5), offsetY((h - 720 * scale) * 0.5) {}
+        // A part of a larger output: its scale, shifted so layout coordinates apply.
+        Canvas(uint32_t *pixels, uint32_t w, uint32_t h, const Canvas &output, int left, int top)
+            : dib(pixels), width(w), height(h), scale(output.scale),
+              offsetX(output.offsetX - left), offsetY(output.offsetY - top) {}
     };
+
+    // The title menu's Settings legend: key, then label, in this layout box
+    // with a margin for the outline.
+    constexpr int kHintX = 1036, kHintY = 646, kHintKey = 22, kHintWidth = 180, kHintHeight = 28;
+    constexpr int kHintLeft = kHintX - 8, kHintTop = kHintY - 4, kHintRight = kHintX + kHintWidth + 8,
+                  kHintBottom = kHintY + kHintHeight + 4;
 
     void Line(const Canvas &c, int x1, int y1, int x2, int y2, uint32_t color, int thickness = 1)
     {
@@ -113,6 +124,50 @@ namespace
 
     // Visible list slots, as drawn below.
     constexpr int ListTop = 150, ListRowHeight = 43, ListArrowX = 38, ListArrowOffset = 10, ListColumnRight = 366;
+
+    // Speaker test layout in the free space under the Audio rows: a ring
+    // around the listener with an anchor and a label box per speaker, at the
+    // test sound's angles (degrees clockwise from the front).
+    constexpr int SpeakerDivider = ListTop + settings::AudioRowCount * ListRowHeight + 13;
+    constexpr double RingX = 706, RingY = SpeakerDivider + 129, RingRadiusX = 160, RingRadiusY = 80;
+    constexpr double LabelRadiusX = 196, LabelRadiusY = 104, LabelWidth = 52, LabelHeight = 28;
+    constexpr const wchar_t *SpeakerLabels[5] = {L"L", L"C", L"R", L"SR", L"SL"}; // apu::SpeakerPan order
+
+    std::array<double, 2> RingPoint(double degrees, double rx, double ry)
+    {
+        const double radians = degrees * 0.017453292519943295;
+        return {RingX + rx * std::sin(radians), RingY - ry * std::cos(radians)};
+    }
+
+    // Coverage-blended ellipse in layout coordinates: a band `thickness` wide
+    // along the outline, or filled when thickness is 0.
+    void Ellipse(const Canvas &c, double cx, double cy, double rx, double ry, double thickness, uint32_t color)
+    {
+        const double reach = thickness / 2 + 1;
+        const auto span = [&](double from, double to, double offset, uint32_t limit) {
+            return std::array<int, 2>{std::clamp(int(std::floor(offset + from * c.scale)), 0, int(limit)),
+                                      std::clamp(int(std::ceil(offset + to * c.scale)), 0, int(limit))};
+        };
+        const auto [x0, x1] = span(cx - rx - reach, cx + rx + reach, c.offsetX, c.width);
+        const auto [y0, y1] = span(cy - ry - reach, cy + ry + reach, c.offsetY, c.height);
+        const uint32_t alpha = color >> 24, rgb = color & 0xFFFFFFu;
+        for (int py = y0; py < y1; ++py)
+            for (int px = x0; px < x1; ++px)
+            {
+                const double x = (px + 0.5 - c.offsetX) / c.scale - cx, y = (py + 0.5 - c.offsetY) / c.scale - cy;
+                const double k = std::sqrt(x * x / (rx * rx) + y * y / (ry * ry));
+                const double g = std::sqrt(x * x / (rx * rx * rx * rx) + y * y / (ry * ry * ry * ry));
+                // First-order distance to the outline, negative inside.
+                double d = g > 0 ? (k - 1) * k / g : -std::min(rx, ry);
+                if (thickness > 0)
+                    d = std::abs(d) - thickness / 2;
+                const double coverage = std::clamp(0.5 - d * c.scale, 0.0, 1.0);
+                if (coverage <= 0)
+                    continue;
+                uint32_t &p = c.dib[size_t(py) * c.width + px];
+                p = ColorBlend(p, rgb | (uint32_t(alpha * coverage + 0.5) << 24));
+            }
+    }
 }
 
 void settings::DrawMenuArrow(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, int x, int y)
@@ -120,6 +175,17 @@ void settings::DrawMenuArrow(std::vector<uint32_t> &pixels, uint32_t width, uint
     if (!width || !height || pixels.size() != size_t(width) * height)
         return;
     Arrow(Canvas(pixels.data(), width, height), x, y);
+}
+
+settings::MenuRect settings::TitleHintBounds(uint32_t width, uint32_t height)
+{
+    // Rounded like RasterizeMenu's own rectangles.
+    const Canvas c(nullptr, width, height);
+    const auto edge = [](double value, uint32_t limit) {
+        return size_t(std::clamp(int(std::lround(value)), 0, int(limit)));
+    };
+    return {edge(c.offsetX + kHintLeft * c.scale, width), edge(c.offsetY + kHintTop * c.scale, height),
+            edge(c.offsetX + kHintRight * c.scale, width), edge(c.offsetY + kHintBottom * c.scale, height)};
 }
 
 settings::MenuRect settings::MenuArrowBounds(uint32_t width, uint32_t height, int x, int y)
@@ -131,6 +197,42 @@ settings::MenuRect settings::MenuArrowBounds(uint32_t width, uint32_t height, in
     };
     return {edge(std::floor(c.offsetX + (x - 1) * c.scale), width), edge(std::floor(c.offsetY + (y - 1) * c.scale), height),
             edge(std::ceil(c.offsetX + (x + 38) * c.scale), width), edge(std::ceil(c.offsetY + (y + 24) * c.scale), height)};
+}
+
+settings::MenuRect settings::DrawSpeakerMarker(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, float position,
+                                               float rearAngle)
+{
+    if (!width || !height || pixels.size() != size_t(width) * height)
+        return {};
+    const Canvas c(pixels.data(), width, height);
+    const uint32_t ink = MakeColor(255, 242, 242, 237);
+    double left = 1e9, top = 1e9, right = -1e9, bottom = -1e9;
+    const auto cover = [&](double x0, double y0, double x1, double y1) {
+        left = std::min(left, x0); top = std::min(top, y0);
+        right = std::max(right, x1); bottom = std::max(bottom, y1);
+    };
+    // Resting on a speaker: frame its label.
+    if (const float rest = std::round(position); std::abs(position - rest) < 1e-4f)
+    {
+        const auto [x, y] = RingPoint(apu::SpeakerPan::SpeakerAngle(int(rest) % 5, rearAngle), LabelRadiusX, LabelRadiusY);
+        const int x0 = int(std::lround(x - LabelWidth / 2)) - 4, y0 = int(std::lround(y - LabelHeight / 2)) - 4;
+        const int x1 = x0 + int(LabelWidth) + 8, y1 = y0 + int(LabelHeight) + 8;
+        Line(c, x0, y0, x1, y0, ink, 2);
+        Line(c, x0, y1, x1, y1, ink, 2);
+        Line(c, x0, y0, x0, y1, ink, 2);
+        Line(c, x1, y0, x1, y1 + 1, ink, 2);
+        cover(x0 - 2, y0 - 2, x1 + 3, y1 + 3);
+    }
+    // A bright dot with a soft halo where the decoder puts the sound: on the
+    // ring when focused, nearer the listener when spread out.
+    const auto decoded = apu::SpeakerPan::Decoded(position, rearAngle);
+    const auto [x, y] = RingPoint(decoded.degrees, RingRadiusX * decoded.focus, RingRadiusY * decoded.focus);
+    Ellipse(c, x, y, 15, 15, 0, (ink & 0xFFFFFFu) | (70u << 24));
+    Ellipse(c, x, y, 6.5, 6.5, 0, ink);
+    cover(x - 17, y - 17, x + 17, y + 17);
+    const auto edge = [](double value, uint32_t limit) { return size_t(std::clamp(value, 0.0, double(limit))); };
+    return {edge(std::floor(c.offsetX + left * c.scale), width), edge(std::floor(c.offsetY + top * c.scale), height),
+            edge(std::ceil(c.offsetX + right * c.scale), width), edge(std::ceil(c.offsetY + bottom * c.scale), height)};
 }
 
 double settings::menu_motion::RowFade(double t)
@@ -168,10 +270,21 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 
     // Cross-platform software rasterizer: logical design canvas is 1280x720.
     // If output dimensions differ, scale and center onto the output buffer.
+    // The title hint rasterizes only its own rectangle of the output.
+    const Canvas output(nullptr, width, height);
+    const MenuRect hint = current.titleHint ? TitleHintBounds(width, height) : MenuRect{};
+    if (current.titleHint)
+    {
+        width = uint32_t(hint.x1 - hint.x0);
+        height = uint32_t(hint.y1 - hint.y0);
+        if (!width || !height)
+            return false;
+    }
     pixels.assign(size_t(width) * height, 0xFF000000u);
     uint32_t *dib = pixels.data();
 
-    const Canvas canvas(dib, width, height);
+    const Canvas canvas = current.titleHint ? Canvas(dib, width, height, output, int(hint.x0), int(hint.y0))
+                                            : Canvas(dib, width, height);
     const double scale = canvas.scale;
     const double offsetX = canvas.offsetX;
     const double offsetY = canvas.offsetY;
@@ -367,8 +480,11 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 #ifdef LO_MENU_RENDER_TRACE
                 LoMenuRenderTrace(value, true);
 #endif
+                // Measure spaces the way they are drawn below, or right-aligned
+                // and centered text with spaces runs past its box.
                 double advance = 0;
-                for (const auto c : value) advance += int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
+                for (const auto c : value)
+                    advance += c == L' ' ? font.height * 0.3 : int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
                 const double desired = size >= 32 ? size * 1.25 : size * 1.30;
                 const double ratio = std::min({desired / font.height, double(h) / font.height, std::max(1.0, double(w - 8)) / std::max(1.0, advance)});
                 double left = x;
@@ -496,6 +612,36 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         }
         else text(x, y, 24, 24, std::wstring(1, letter), 15, ink, true, 1, outline, 12);
     };
+
+    if (current.titleHint)
+    {
+        // The key on its own, so a PlayStation face does not move the label off
+        // the menu font. Drawn over black and over white: the difference is
+        // the coverage, so the legend keeps the font's outline in straight alpha.
+        const uint32_t face = MakeColor(255, 196, 197, 194);
+        const auto legend = [&] {
+            text(kHintX, kHintY, kHintKey, kHintHeight, current.help.substr(0, 1), 18, face, false, 1, outline, 12);
+            text(kHintX + kHintKey, kHintY, kHintWidth - kHintKey, kHintHeight, current.help.substr(1), 18, face,
+                 false, 0, outline, 12);
+        };
+        legend();
+        const std::vector<uint32_t> overBlack = pixels;
+        std::fill(pixels.begin(), pixels.end(), 0xFFFFFFFFu);
+        legend();
+        for (size_t i = 0; i < pixels.size(); ++i)
+        {
+            auto &p = pixels[i];
+            const uint32_t b = overBlack[i];
+            int spread = 0;
+            for (int c = 0; c < 3; ++c) spread += int((p >> (8 * c)) & 255) - int((b >> (8 * c)) & 255);
+            const int alpha = std::clamp(255 - spread / 3, 0, 255);
+            const auto channel = [&](int c) {
+                return uint8_t(alpha ? std::min(255, int((b >> (8 * c)) & 255) * 255 / alpha) : 0);
+            };
+            p = host_ui::PackRgba(channel(0), channel(1), channel(2), uint8_t(alpha));
+        }
+        return true;
+    }
 
     if (current.neuralRendering.open)
     {
@@ -664,7 +810,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         for (int i = 0; i < 4; ++i)
         {
             cell(buttons[i].x, 610, buttons[i].w, 40, page.focus == i + 2);
-            text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, buttons[i].label, 19, ink, false, 1, outline, 14);
+            text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, buttons[i].label, 19,
+                 i == 1 && !page.originalPattern ? muted : ink, false, 1, outline, 14);
         }
         text(160, 666, 960, 32,
              Translate(current.language, L"D-pad: select / adjust · A: choose · B: back · LB / RB: scene / pattern",
@@ -817,7 +964,15 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 
     const wchar_t *enTabs[] = {L"Gameplay", L"Audio", L"Graphics", L"System"};
     const wchar_t *zhTabs[] = {L"遊戲", L"聲音", L"圖像", L"系統"};
-    for (int i = 0; i < MenuTabCount; ++i)
+    if (!current.pageTitle.empty())
+    {
+        // A page opened from a row: one selected cell in place of the tabs.
+        cell(386, 110, 640, 32, true);
+        text(394, 110, 624, 32, current.pageTitle, 17, selectedInk, true, 1, MakeColor(255, 222, 223, 219), 12);
+        if (!current.keyLegend.empty())
+            text(380, 52, 880, 32, current.keyLegend, 18, ink, false, 2, outline, 13);
+    }
+    for (int i = 0; i < MenuTabCount && current.pageTitle.empty(); ++i)
     {
         constexpr int tabWidth = MenuTabWidth;
         const int x = 386 + i * tabWidth;
@@ -883,6 +1038,22 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             continue;
         }
 
+        if (focused && current.reorder)
+        {
+            // Move up / move down for the pointer, beside the value column. The
+            // triangles are drawn: the menu fonts have no ▲ / ▼.
+            for (int i = 0; i < 2; ++i)
+            {
+                const int x = ModsMoveLeft + i * (ModsMoveWidth + ModsMoveGap);
+                cell(x, y, ModsMoveWidth, rowHeight - 2, false);
+                const int cx = x + ModsMoveWidth / 2, top = y + 13;
+                for (int step = 0; step < 14; ++step)
+                {
+                    const int half = (i ? 13 - step : step) * 3 / 4;
+                    line(cx - half, top + step, cx + half + 1, top + step, ink);
+                }
+            }
+        }
         std::vector<std::wstring> fallback;
         const std::vector<std::wstring> *choices = &row.choices;
         if (choices->empty())
@@ -891,6 +1062,26 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             choices = &fallback;
         }
         const int selected = std::clamp(row.selectedChoice, 0, int(choices->size()) - 1);
+        if (!row.detail.empty())
+        {
+            // Detail text first, then the choices in the last ModsCellsWidth.
+            const bool cells = !(row.choices.empty() && row.value.empty());
+            const int cellsLeft = choiceLeft + choiceWidth - (cells ? ModsCellsWidth : 0);
+            text(choiceLeft + 8, y, cellsLeft - choiceLeft - 16, rowHeight - 2, row.detail, 20,
+                 row.enabled ? muted : disabled, false, 0, outline, 13);
+            const int count = cells ? int(choices->size()) : 0;
+            for (int option = 0; option < count; ++option)
+            {
+                const int left = cellsLeft + ModsCellsWidth * option / count;
+                const int right = cellsLeft + ModsCellsWidth * (option + 1) / count;
+                const bool currentChoice = option == selected;
+                cell(left, y, right - left, rowHeight - 2, focused && currentChoice);
+                text(left + 7, y, right - left - 14, rowHeight - 2, (*choices)[option], 22,
+                     !row.enabled ? disabled : currentChoice ? (focused ? selectedInk : ink) : muted,
+                     false, 1, focused && currentChoice ? MakeColor(255, 222, 223, 219) : outline, 13);
+            }
+            continue;
+        }
         if (row.controllerButtons && choices->size() >= 2)
         {
             for (int option = 0; option < 2; ++option)
@@ -937,6 +1128,44 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             text(left + 7, y, right - left - 14, rowHeight - 2, (*choices)[option], 22,
                  !row.enabled ? disabled : currentChoice ? (focused ? selectedInk : ink) : muted,
                  false, 1, focused && currentChoice ? MakeColor(255, 222, 223, 219) : outline, 13);
+        }
+    }
+
+    // Speaker test under the Audio rows: a ring around the listener with the
+    // five speakers; DrawSpeakerMarker adds the dot that follows the sound.
+    if (current.speakerLayout)
+    {
+        line(choiceLeft, SpeakerDivider, choiceLeft + choiceWidth, SpeakerDivider, MakeColor(255, 173, 176, 177));
+        Ellipse(canvas, RingX, RingY, RingRadiusX, RingRadiusY, 2, MakeColor(255, 128, 131, 130));
+        // The path a matrix decoder gives the test sound at this phase, as
+        // evenly spaced dots; where it jumps the dots leave a gap.
+        double travelled = 0, lastX = 0, lastY = 0;
+        for (int i = 0; i <= 2000; ++i)
+        {
+            const auto decoded = apu::SpeakerPan::Decoded(i / 400.0f, float(current.speakerRear));
+            const auto [x, y] = RingPoint(decoded.degrees, RingRadiusX * decoded.focus, RingRadiusY * decoded.focus);
+            const double step = i ? std::hypot(x - lastX, y - lastY) : 7;
+            travelled = step > 30 ? 7 : travelled + step;
+            lastX = x;
+            lastY = y;
+            if (travelled < 7)
+                continue;
+            travelled = 0;
+            Ellipse(canvas, x, y, 1.5, 1.5, 0, MakeColor(170, 214, 220, 224));
+        }
+        // The listener from above, facing the center speaker.
+        Ellipse(canvas, RingX, RingY + 4, 15, 7, 0, muted);
+        Ellipse(canvas, RingX, RingY - 3, 6.5, 6.5, 0, ink);
+        for (int i = 0; i < 5; ++i)
+        {
+            const double angle = apu::SpeakerPan::SpeakerAngle(i, float(current.speakerRear));
+            const auto [ax, ay] = RingPoint(angle, RingRadiusX, RingRadiusY);
+            Ellipse(canvas, ax, ay, 4, 4, 0, muted);
+            const auto [lx, ly] = RingPoint(angle, LabelRadiusX, LabelRadiusY);
+            const int x = int(std::lround(lx - LabelWidth / 2)), y = int(std::lround(ly - LabelHeight / 2));
+            fill(x, y, int(LabelWidth), int(LabelHeight), MakeColor(255, 66, 69, 69));
+            cell(x, y, int(LabelWidth), int(LabelHeight), false);
+            text(x, y, int(LabelWidth), int(LabelHeight), SpeakerLabels[i], 18, ink, false, 1, outline, 12);
         }
     }
 
