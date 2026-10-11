@@ -317,6 +317,12 @@ void Initialize(const std::filesystem::path& dataRoot)
 
     appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
     appletSetAutoSleepDisabled(true);
+    appletLockExit();
+}
+
+void AllowExit()
+{
+    appletUnlockExit();
 }
 
 void ShowError(const std::string& summary, const std::string& details)
