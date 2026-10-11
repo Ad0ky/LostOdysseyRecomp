@@ -1,7 +1,11 @@
 #include "asset_export.h"
+#include "fpi_index.h"
 #include "mod_api.h"
+#include "text_format.h"
 #include "xenos_texture.h"
 #include <gpu/shader/cpx_decode.h>
+#include <settings/language_selection.h>
+#include <settings/quit_text_hook.h>
 #include <gpu/texture_layout.h>
 #include <lzokay.hpp>
 #include <xxhash.h>
@@ -99,16 +103,6 @@ void WriteFile(const fs::path &file, const void *data, size_t size)
     if (!output || !output.write(static_cast<const char *>(data), std::streamsize(size)) || !output.flush())
         throw OutputError("cannot write " + Utf8(file));
 }
-uint32_t Le32(std::span<const uint8_t> b, size_t p)
-{
-    Require(p <= b.size() && 4 <= b.size() - p, "FPI read out of bounds");
-    return uint32_t(b[p]) | uint32_t(b[p + 1]) << 8 | uint32_t(b[p + 2]) << 16 | uint32_t(b[p + 3]) << 24;
-}
-uint16_t Le16(std::span<const uint8_t> b, size_t p)
-{
-    Require(p <= b.size() && 2 <= b.size() - p, "FPI read out of bounds");
-    return uint16_t(b[p] | uint16_t(b[p + 1]) << 8);
-}
 
 // ---- Disc index (LO.fpi) -------------------------------------------------
 
@@ -120,39 +114,6 @@ struct Disc
     std::vector<fs::path> archives; // empty path: archive file missing
     std::vector<uint64_t> archiveSizes;
     std::vector<Entry> entries;
-};
-
-struct FpiNames
-{
-    std::span<const uint8_t> bytes;
-    uint32_t dictionary = 0, extensions = 0;
-    std::string Unpack(size_t offset) const
-    {
-        // Base-40 filename alphabet of the FPI dictionary (see settings/menu_assets.cpp).
-        constexpr char alphabet[] = "\0" "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_.\\";
-        auto word = Le16(bytes, offset); const auto count = word % 40;
-        Require(word / 1600 < 40, "invalid FPI name");
-        std::string value;
-        value += alphabet[word / 40 % 40]; value += alphabet[word / 1600];
-        for (unsigned i = 0; i < count; ++i)
-        {
-            word = Le16(bytes, offset + 2 + 2 * i); Require(word / 1600 < 40, "invalid FPI name");
-            value += alphabet[word % 40]; value += alphabet[word / 40 % 40]; value += alphabet[word / 1600];
-        }
-        if (const auto end = value.find('\0'); end != std::string::npos) value.resize(end);
-        return Lower(std::move(value));
-    }
-    std::string Name(uint32_t bits) const
-    {
-        if (!(bits & 0x3ffff)) return {};
-        constexpr const char *suffix[] = {"", "_sndw", "_scrw", "_mapw", "_lvdw", "_navw", "_colw", "_camw",
-            "_map", "_cam", "_bx", "_mw", "_a", "_d", "_f", "_m", "_p", "_u", "_w", "_0", "_1", "_2", "_00", "_01",
-            "_0mw", "_nav", "_elgt", "_000a0", "_010a0", "_020a0", "_030a0", "_040a0"};
-        auto name = Unpack(size_t(dictionary) + (bits & 0x3ffff) * 2) + suffix[(bits >> 18) & 31];
-        if (const auto ext = (bits >> 23) & 31)
-            name += "." + Unpack(size_t(dictionary) + Le16(bytes, size_t(extensions) + (ext - 1) * 2) * 2);
-        return name;
-    }
 };
 
 bool SafeRelative(std::string_view path)
@@ -169,63 +130,39 @@ bool SafeRelative(std::string_view path)
     return true;
 }
 
-Disc ReadDisc(const fs::path &root)
+// index: LO.fpi on a disc, or a DLC's LODLC00x.fpi, whose one archive is the
+// .fpi file itself (index and data in one file).
+Disc ReadDisc(const fs::path &root, const fs::path &index = "LO.fpi")
 {
     Disc disc; disc.root = root;
-    const auto fpi = root / "LO.fpi";
+    const auto fpi = root / index;
     std::error_code error;
     const auto size = fs::file_size(fpi, error);
-    Require(!error && size >= 64 && size <= 4 * 1024 * 1024, "LO.fpi missing or invalid");
-    std::vector<uint8_t> bytes(size_t(size), 0);
-    {
-        std::ifstream input(fpi, std::ios::binary);
-        Require(input && input.read(reinterpret_cast<char *>(bytes.data()), std::streamsize(bytes.size())), "LO.fpi unreadable");
-    }
-    Require(Le32(bytes, 8) == 0x10000, "unsupported LO.fpi version");
-    disc.number = bytes[20];
-    FpiNames names{bytes, Le32(bytes, 40), Le32(bytes, 44)};
-    const uint32_t count = Le16(bytes, 26), begin = Le32(bytes, 32);
-    Require(count && count <= 64 && begin >= 64 && begin <= bytes.size() && size_t(count) * 48 <= bytes.size() - begin,
-            "invalid LO.fpi archive table");
+    Require(!error && size >= 64, "FPI index missing or invalid");
+    std::vector<uint8_t> bytes(64, 0);
+    std::ifstream input(fpi, std::ios::binary);
+    Require(input && input.read(reinterpret_cast<char *>(bytes.data()), 64), "FPI index unreadable");
+    // The index is the first `used` sectors; a DLC's file goes on with its data.
+    const auto used = fpi::IndexSize(bytes);
+    Require(used <= size, "FPI index missing or invalid");
+    bytes.resize(size_t(used));
+    Require(bool(input.read(reinterpret_cast<char *>(bytes.data()) + 64, std::streamsize(used - 64))), "FPI index unreadable");
+    const auto parsed = fpi::Read(bytes);
+    disc.number = parsed.disc;
     // Archive names are lower case; match files case-insensitively for case-sensitive file systems.
     std::map<std::string, fs::path> files;
     for (const auto &item : fs::directory_iterator(root, error))
         files.emplace(Lower(Utf8(item.path().filename())), item.path());
-    for (uint32_t i = 0; i < count; ++i)
+    for (const auto &name : parsed.archives)
     {
-        const auto ar = size_t(begin) + i * 48;
-        const auto it = files.find(names.Name(Le32(bytes, ar + 24)));
+        const auto it = files.find(name);
         uint64_t archiveSize = 0;
         if (it != files.end()) archiveSize = fs::file_size(it->second, error);
         const bool present = it != files.end() && !error;
         disc.archives.push_back(present ? it->second : fs::path{});
         disc.archiveSizes.push_back(present ? archiveSize : 0);
-        const auto base = ar + Le32(bytes, ar + 4);
-        Require(base <= bytes.size(), "invalid LO.fpi archive record");
-        struct Folder { uint32_t index, count, depth; std::string path; };
-        const auto prefix = names.Name(Le32(bytes, ar + 20));
-        std::vector<Folder> pending{{0, Le16(bytes, ar + 2), 0, prefix.empty() ? "" : prefix + "/"}};
-        std::set<uint32_t> visited;
-        while (!pending.empty())
-        {
-            const auto folder = std::move(pending.back()); pending.pop_back();
-            Require(folder.depth < 64 && uint64_t(folder.index) + folder.count <= 65536, "invalid LO.fpi folder");
-            for (uint32_t j = 0; j < folder.count; ++j)
-            {
-                const auto index = folder.index + j;
-                Require(visited.insert(index).second, "LO.fpi folder cycle");
-                const auto p = base + size_t(index) * 24;
-                Require(p <= bytes.size() && 24 <= bytes.size() - p, "LO.fpi record out of bounds");
-                const auto bits = Le32(bytes, p);
-                auto path = folder.path + names.Name(bits);
-                std::replace(path.begin(), path.end(), '\\', '/');
-                if (bits & 0x10000000)
-                    pending.push_back({Le32(bytes, p + 20), Le16(bytes, p + 14), folder.depth + 1, path + "/"});
-                else
-                    disc.entries.push_back({std::move(path), i, uint64_t(Le32(bytes, p + 8) & 0xffffff) * 2048, Le32(bytes, p + 16)});
-            }
-        }
     }
+    for (const auto &file : parsed.files) disc.entries.push_back({file.path, file.archive, file.offset, file.size});
     return disc;
 }
 
@@ -592,9 +529,11 @@ std::string FileStem(std::string_view object)
 // ---- Export run ------------------------------------------------------------
 
 struct Row { std::string key, file; uint32_t width = 0, height = 0; const char *format = ""; uint64_t fingerprint = 0, fingerprintTiled = 0; };
+struct TextRow { std::string path, language, source; text::Format format = text::Format::None; size_t entries = 0; bool roundTrip = false; };
 struct Stats
 {
     std::vector<Row> rows;
+    std::vector<TextRow> texts;
     std::map<std::string, uint64_t> formats, skipped, examples;
     std::vector<std::string> notes;
     uint64_t textureBytes = 0, movies = 0, movieBytes = 0, packages = 0, notPackages = 0;
@@ -606,6 +545,7 @@ struct Stats
     void Merge(Stats &&other)
     {
         std::move(other.rows.begin(), other.rows.end(), std::back_inserter(rows));
+        std::move(other.texts.begin(), other.texts.end(), std::back_inserter(texts));
         for (const auto &[k, v] : other.formats) formats[k] += v;
         for (const auto &[k, v] : other.skipped) skipped[k] += v;
         for (auto &note : other.notes)
@@ -623,13 +563,97 @@ struct Stats
 
 struct Job
 {
-    enum class Kind { Package, Movie } kind;
+    enum class Kind { Package, Movie, Text } kind;
     std::string path;     // FPI path, lower case with forward slashes
     fs::path archive;
     uint64_t offset = 0;
     uint32_t size = 0;
     std::string movieName; // output file name for movies
+    text::Format textFormat = text::Format::None;
+    std::string source = "base"; // text: the disc set, or the DLC index that overrides the file
 };
+
+void AppendJsonString(std::string &out, std::string_view value)
+{
+    out += '"';
+    for (const char c : value)
+    {
+        switch (c)
+        {
+        case '"': out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:
+            if (uint8_t(c) < 0x20)
+            {
+                char escape[8];
+                std::snprintf(escape, sizeof(escape), "\\u%04x", unsigned(uint8_t(c)));
+                out += escape;
+            }
+            else out += c;
+        }
+    }
+    out += '"';
+}
+
+// text/<member path>.json: {"key": "text", ...} in the file's own order. A
+// language pack carries the same files with translated values. referenceRoot,
+// when set, gets a second copy to compare a translated pack with.
+void ExportText(const Job &job, const fs::path &textRoot, const fs::path &referenceRoot, Stats &stats)
+{
+    std::vector<uint8_t> bytes;
+    try
+    {
+        bytes = ReadExtent(job.archive, job.offset, job.size);
+        if (bytes.size() >= 3 && std::memcmp(bytes.data(), "cpx", 3) == 0)
+            Require(cpx::Decode(bytes, bytes), "invalid CPX stream");
+    }
+    catch (const std::exception &error) { stats.Skipped("text_unreadable", job.path + ": " + error.what()); return; }
+    std::vector<text::Entry> entries;
+    bool roundTrip = false;
+    try
+    {
+        entries = text::Parse(job.textFormat, bytes);
+        // Rebuilding with nothing and with every original string must give the
+        // file back unchanged, or an import of this file could not be trusted.
+        text::Replacements same;
+        for (const auto &entry : entries) same.emplace(entry.key, entry.text);
+        if (same.size() != entries.size()) throw std::runtime_error("duplicate keys");
+        roundTrip = text::Rebuild(job.textFormat, bytes, {}) == bytes && text::Rebuild(job.textFormat, bytes, same) == bytes;
+    }
+    catch (const std::exception &error) { stats.Skipped("text_unreadable", job.path + ": " + error.what()); return; }
+    // Still exported (the text is right), but listed: importing it is not safe.
+    if (!roundTrip && stats.examples["text_round_trip_failed"]++ < 5) stats.notes.push_back("text_round_trip_failed: " + job.path);
+    // The game shows the port's Quit to Desktop texts for these IDs
+    // (settings/quit_text_hook.h); export those, so a translation fits the row.
+    if (job.textFormat == text::Format::MenuDat)
+    {
+        const auto language = settings::language::IdFromCode(text::Language(job.path));
+        for (auto &entry : entries)
+            for (const auto id : settings::quit_text::TextIds)
+                if (language && entry.key == "id." + std::to_string(id))
+                    entry.text = text::EncodeUnits(settings::quit_text::Text(id, language));
+    }
+    std::string json = "{";
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        json += i ? ",\n  " : "\n  ";
+        AppendJsonString(json, entries[i].key);
+        json += ": ";
+        AppendJsonString(json, entries[i].text);
+    }
+    json += entries.empty() ? "}\n" : "\n}\n";
+    for (const auto &root : {textRoot, referenceRoot})
+    {
+        if (root.empty()) continue;
+        const auto file = root / FromUtf8(job.path + ".json");
+        CreateDirectories(file.parent_path());
+        WriteFile(file, json.data(), json.size());
+    }
+    stats.texts.push_back({job.path, text::Language(job.path), job.source, job.textFormat, entries.size(), roundTrip});
+}
 
 void ExportPackage(const Job &job, const fs::path &textures, Stats &stats, bool pngs)
 {
@@ -782,6 +806,12 @@ std::string Csv(std::string_view value)
 }
 }
 
+// The DLC replaces some text files: on the discs the DLC dungeon lines are
+// placeholders, and lines only the DLC has are missing.
+constexpr const char *kNoDlcWarning =
+    "no DLC found, so the DLC dungeon text is the discs' unfinished version; "
+    "export from a game with the DLC installed if you have it";
+
 std::optional<Request> ParseArguments(int argc, char **argv)
 {
     bool option = false;
@@ -791,7 +821,8 @@ std::optional<Request> ParseArguments(int argc, char **argv)
         const std::string_view argument = argv[i];
         if (!argument.starts_with("--export-")) continue;
         option = true;
-        const bool known = argument == "--export-assets" || argument == "--export-kinds" || argument == "--export-filter";
+        const bool known = argument == "--export-assets" || argument == "--export-kinds" || argument == "--export-filter" ||
+                           argument == "--export-language" || argument == "--export-language-pack";
         if (!known) { parsed.error = "unknown option " + std::string(argument); continue; }
         if (i + 1 >= argc || std::string_view(argv[i + 1]).starts_with("--"))
         {
@@ -805,9 +836,26 @@ std::optional<Request> ParseArguments(int argc, char **argv)
             parsed.output = FromUtf8(value);
         }
         else if (argument == "--export-filter") parsed.filter = Lower(value);
+        else if (argument == "--export-language")
+        {
+            parsed.language = Lower(value);
+            if (!settings::language::IdFromCode(parsed.language))
+                parsed.error = "unknown language '" + value + "' (expected int, jpn, deu, fra, spa, ita, kor, chi or sch)";
+        }
+        else if (argument == "--export-language-pack")
+        {
+            // The id rules of language.ini (modding/mod_api.h).
+            parsed.languagePack = Lower(value);
+            const auto &id = parsed.languagePack;
+            if (id.empty() || id.size() > 128 || id == "." || id == ".." ||
+                !std::all_of(id.begin(), id.end(), [](char c) {
+                    return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+                }))
+                parsed.error = "--export-language-pack needs an id of letters, digits, '-', '_' or '.', such as pt-br";
+        }
         else
         {
-            parsed.textures = parsed.movies = parsed.pngs = false;
+            parsed.textures = parsed.movies = parsed.pngs = parsed.text = false;
             size_t begin = 0;
             while (begin <= value.size())
             {
@@ -816,13 +864,20 @@ std::optional<Request> ParseArguments(int argc, char **argv)
                 if (kind == "textures") parsed.textures = parsed.pngs = true;
                 else if (kind == "fingerprints") parsed.textures = true; // index.csv without PNG files
                 else if (kind == "movies") parsed.movies = true;
-                else parsed.error = "unknown export kind '" + kind + "' (expected textures,fingerprints,movies)";
+                else if (kind == "text") parsed.text = true;
+                else parsed.error = "unknown export kind '" + kind + "' (expected textures,fingerprints,movies,text)";
                 begin = end + 1;
             }
         }
     }
     if (!option) return std::nullopt;
     if (parsed.output.empty() && parsed.error.empty()) parsed.error = "--export-assets <output folder> is required";
+    if (!parsed.languagePack.empty())
+    {
+        parsed.textures = parsed.movies = parsed.pngs = false;
+        parsed.text = true;
+        if (parsed.language.empty()) parsed.language = "int";
+    }
     return parsed;
 }
 
@@ -857,6 +912,30 @@ int Run(const Request &request, const fs::path &gameRoot)
     }
     std::stable_sort(discs.begin(), discs.end(), [](const Disc &a, const Disc &b) { return a.number < b.number; });
 
+    // DLC indexes (game/dlc/<content id>/LODLC00x.fpi) override some text files;
+    // the game looks them up before the discs. With several, the highest number wins.
+    std::vector<Disc> dlcs;
+    std::vector<std::string> dlcNames;
+    if (request.text)
+    {
+        std::vector<fs::path> indexes;
+        for (const auto &folder : fs::directory_iterator(boot.parent_path() / "dlc", error))
+            for (const auto &file : fs::directory_iterator(folder.path(), error))
+                if (Lower(Utf8(file.path().extension())) == ".fpi" && file.is_regular_file(error)) indexes.push_back(file.path());
+        std::sort(indexes.begin(), indexes.end(), [](const fs::path &a, const fs::path &b) {
+            return Lower(Utf8(a.filename())) < Lower(Utf8(b.filename()));
+        });
+        for (const auto &index : indexes)
+        {
+            try
+            {
+                dlcs.push_back(ReadDisc(index.parent_path(), index.filename()));
+                dlcNames.push_back(Lower(Utf8(index.stem())));
+            }
+            catch (const std::exception &failure) { discNotes.push_back(Utf8(index) + ": " + failure.what()); }
+        }
+    }
+
     // Output: a new or empty folder outside the game data.
     auto output = fs::absolute(request.output, error).lexically_normal();
     if (error) return Fail("invalid output folder " + Utf8(request.output));
@@ -869,11 +948,16 @@ int Run(const Request &request, const fs::path &gameRoot)
             return Fail("output folder " + Utf8(output) + " is not empty");
     }
     const auto textures = output / "textures", movies = output / "movies";
+    const auto pack = request.languagePack.empty() ? fs::path{} : output / FromUtf8(request.languagePack);
+    const auto texts = pack.empty() ? output / "text" : pack / "text";
+    // The untranslated copy that language-clean compares the pack with.
+    const auto reference = pack.empty() ? fs::path{} : output / "original" / "text";
     try
     {
         CreateDirectories(output);
         if (request.textures) CreateDirectories(textures);
         if (request.movies) CreateDirectories(movies);
+        if (request.text) CreateDirectories(texts);
     }
     catch (const std::exception &failure) { return Fail(failure.what()); }
 
@@ -883,14 +967,49 @@ int Run(const Request &request, const fs::path &gameRoot)
     std::vector<Job> jobs;
     std::map<std::string, uint32_t> seen; // path -> stored size
     std::set<std::string> movieNames;
+    // Text files a DLC replaces: path -> (DLC, its entry); later DLCs win.
+    std::map<std::string, std::pair<size_t, const Entry *>> overrides;
+    for (size_t i = 0; i < dlcs.size(); ++i)
+        for (const auto &entry : dlcs[i].entries)
+            if (text::Detect(entry.path) != text::Format::None) overrides[entry.path] = {i, &entry};
+    auto addText = [&](const Disc &disc, const Entry &entry, const std::string &source) {
+        const auto &archive = disc.archives[entry.archive];
+        if (archive.empty() || entry.offset > disc.archiveSizes[entry.archive] ||
+            entry.size > disc.archiveSizes[entry.archive] - entry.offset || !SafeRelative(entry.path))
+        {
+            total.Skipped("text_unreadable", entry.path + ": archive missing, extent out of range or unsafe path");
+            return;
+        }
+        Job job{Job::Kind::Text, entry.path, archive, entry.offset, entry.size, {}};
+        job.textFormat = text::Detect(entry.path);
+        job.source = source;
+        jobs.push_back(std::move(job));
+    };
     for (const auto &disc : discs)
         for (const auto &entry : disc.entries)
         {
             const auto extension = entry.path.substr(std::min(entry.path.rfind('.'), entry.path.size()));
             const bool package = extension == ".xxx" || extension == ".upk" || extension == ".umap" || extension == ".u";
             const bool movie = extension == ".wmv";
-            if (!((package && request.textures) || (movie && request.movies))) continue;
+            const bool textFile = request.text && text::Detect(entry.path) != text::Format::None;
+            if (!((package && request.textures) || (movie && request.movies) || textFile)) continue;
             if (!request.filter.empty() && entry.path.find(request.filter) == std::string::npos) continue;
+            if (textFile)
+            {
+                if (!request.language.empty() && text::Language(entry.path) != request.language) continue;
+                // One copy per path, as for packages below.
+                if (const auto it = seen.find(entry.path); it != seen.end())
+                {
+                    if (it->second != entry.size && !overrides.count(entry.path))
+                        total.Skipped("text_variant_on_later_disc", "disc" + std::to_string(disc.number) + ":" + entry.path);
+                    continue;
+                }
+                seen.emplace(entry.path, entry.size);
+                if (const auto it = overrides.find(entry.path); it != overrides.end())
+                    addText(dlcs[it->second.first], *it->second.second, dlcNames[it->second.first]);
+                else addText(disc, entry, "base");
+                continue;
+            }
             if (const auto it = seen.find(entry.path); it != seen.end())
             {
                 if (it->second != entry.size)
@@ -923,6 +1042,11 @@ int Run(const Request &request, const fs::path &gameRoot)
             }
             jobs.push_back(std::move(job));
         }
+    // Text files only a DLC has.
+    for (const auto &[path, source] : overrides)
+        if ((request.filter.empty() || path.find(request.filter) != std::string::npos) &&
+            (request.language.empty() || text::Language(path) == request.language) && seen.emplace(path, 0).second)
+            addText(dlcs[source.first], *source.second, dlcNames[source.first]);
     // Largest first keeps the four workers busy until the end.
     std::stable_sort(jobs.begin(), jobs.end(), [](const Job &a, const Job &b) { return a.size > b.size; });
 
@@ -943,6 +1067,7 @@ int Run(const Request &request, const fs::path &gameRoot)
             try
             {
                 if (jobs[index].kind == Job::Kind::Package) ExportPackage(jobs[index], textures, local, request.pngs);
+                else if (jobs[index].kind == Job::Kind::Text) ExportText(jobs[index], texts, reference, local);
                 else ExportMovie(jobs[index], movies, local);
             }
             catch (const std::exception &failure)
@@ -986,12 +1111,45 @@ int Run(const Request &request, const fs::path &gameRoot)
             }
             WriteFile(textures / "index.csv", csv.data(), csv.size());
         }
+        std::map<std::string, size_t> textFormats;
+        size_t textEntries = 0, textFailed = 0;
+        if (request.text)
+        {
+            std::sort(total.texts.begin(), total.texts.end(), [](const TextRow &a, const TextRow &b) { return a.path < b.path; });
+            std::string csv = "path,language,format,source,entries,round_trip\n";
+            for (const auto &row : total.texts)
+            {
+                csv += Csv(row.path) + "," + row.language + "," + text::Name(row.format) + "," + row.source + "," +
+                       std::to_string(row.entries) + "," + (row.roundTrip ? "ok" : "failed") + "\n";
+                ++textFormats[text::Name(row.format)];
+                textEntries += row.entries;
+                textFailed += !row.roundTrip;
+            }
+            WriteFile(texts / "index.csv", csv.data(), csv.size());
+        }
+        if (!pack.empty())
+        {
+            const std::string ini =
+                "; A language pack made by --export-assets. Set name to what Settings shows for the\n"
+                "; language, translate the values in text/, then copy this folder into the game's mods folder.\n"
+                "id=" + request.languagePack + "\nname=" + request.languagePack + "\nbase=" + request.language + "\n";
+            WriteFile(pack / "language.ini", ini.data(), ini.size());
+        }
         const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         std::string summary = "Lost Odyssey asset export\n";
         summary += "game: " + Utf8(boot) + "\ndiscs:";
         for (const auto &disc : discs) summary += " " + std::to_string(disc.number) + " (" + Utf8(disc.root) + ")";
-        summary += std::string("\nkinds:") + (request.textures ? " textures" : "") + (request.movies ? " movies" : "");
+        if (!dlcNames.empty())
+        {
+            summary += "\ndlc:";
+            for (const auto &name : dlcNames) summary += " " + name;
+        }
+        summary += std::string("\nkinds:") + (request.textures ? " textures" : "") + (request.movies ? " movies" : "") +
+                   (request.text ? " text" : "");
         summary += "\nfilter: " + (request.filter.empty() ? std::string("(none)") : request.filter);
+        summary += "\ntext language: " + (request.language.empty() ? std::string("(all)") : request.language);
+        if (!pack.empty()) summary += "\nlanguage pack: " + request.languagePack;
+        if (!pack.empty() && dlcNames.empty()) summary += std::string("\nwarning: ") + kNoDlcWarning;
         char line[256];
         std::snprintf(line, sizeof(line), "\nelapsed_seconds: %.1f\nthreads: %u\n", elapsed, threads);
         summary += line;
@@ -1001,6 +1159,9 @@ int Run(const Request &request, const fs::path &gameRoot)
         summary += "movies: " + std::to_string(total.movies) + " (" + std::to_string(total.movieBytes) + " bytes)\n";
         summary += "packages read: " + std::to_string(total.packages) + " (" + std::to_string(total.notPackages) +
                    " package-named files were not UE3 packages)\n";
+        summary += "text files: " + std::to_string(total.texts.size()) + " (" + std::to_string(textEntries) +
+                   " strings; rebuild check failed for " + std::to_string(textFailed) + ")\n";
+        for (const auto &[format, count] : textFormats) summary += "  " + format + ": " + std::to_string(count) + "\n";
         summary += "\nskipped: " + std::to_string(total.SkippedTotal()) + "\n";
         for (const auto &[reason, count] : total.skipped) summary += "  " + reason + ": " + std::to_string(count) + "\n";
         if (!total.notes.empty() || !discNotes.empty())
@@ -1013,8 +1174,11 @@ int Run(const Request &request, const fs::path &gameRoot)
     }
     catch (const std::exception &failure) { return Fail(failure.what()); }
 
-    std::printf("exported %zu textures, %llu movies, skipped %llu\n", total.rows.size(),
-                static_cast<unsigned long long>(total.movies), static_cast<unsigned long long>(total.SkippedTotal()));
+    std::printf("exported %zu textures, %llu movies, %zu text files, skipped %llu\n", total.rows.size(),
+                static_cast<unsigned long long>(total.movies), total.texts.size(),
+                static_cast<unsigned long long>(total.SkippedTotal()));
+    if (!pack.empty() && dlcNames.empty()) std::printf("warning: %s\n", kNoDlcWarning);
+    if (!pack.empty()) std::printf("language pack ready to translate: %s\n", Utf8(pack).c_str());
     std::fflush(stdout);
     return 0;
 }

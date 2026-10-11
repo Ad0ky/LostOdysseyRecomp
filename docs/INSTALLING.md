@@ -29,7 +29,7 @@ Download the package for your platform, import the game from your own discs, and
 
 You need Windows x64 and a CPU with AVX. The game uses Direct3D 12 by default; Vulkan can be chosen in the settings.
 
-1. Download `LostOdysseyRecomp-windows-x64-v0.9.0.zip` from the [latest release](https://github.com/freefrank/LostOdysseyRecomp/releases/latest).
+1. Download `LostOdysseyRecomp-windows-x64-v0.9.22.zip` from the [latest release](https://github.com/freefrank/LostOdysseyRecomp/releases/latest).
 2. Extract the whole ZIP to a writable folder outside `Program Files`.
 3. Run `LostOdysseyRecomp.exe`. The importer opens when no game is found.
 4. Choose the languages and graphics options. The game may offer to download precompiled shaders first; see [Shader preparation](#shader-preparation).
@@ -73,17 +73,17 @@ Linux uses Vulkan. Steam Deck and other Linux hardware have had limited testing.
 
 ### AppImage
 
-Download `LostOdysseyRecomp-linux-x64-v0.9.0.AppImage`, then run:
+Download `LostOdysseyRecomp-linux-x64-v0.9.22.AppImage`, then run:
 
 ```bash
-chmod +x LostOdysseyRecomp-linux-x64-v0.9.0.AppImage
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage
+chmod +x LostOdysseyRecomp-linux-x64-v0.9.22.AppImage
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage
 ```
 
 Import the game in the importer, or start it with a game folder directly:
 
 ```bash
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage --game /path/to/game
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage --game /path/to/game
 ```
 
 The AppImage keeps saves and settings in your user folders; see [file locations](#file-locations).
@@ -100,7 +100,7 @@ flatpak install --user flathub org.freedesktop.Platform//26.08
 Then install and run the downloaded bundle:
 
 ```bash
-flatpak --user install --bundle LostOdysseyRecomp-linux-x64-v0.9.0.flatpak
+flatpak --user install --bundle LostOdysseyRecomp-linux-x64-v0.9.22.flatpak
 flatpak run io.github.freefrank.LostOdysseyRecomp
 ```
 
@@ -112,7 +112,7 @@ The importer can read dumps anywhere on your computer, including `/media`, `/run
 
 You need an Apple Silicon Mac with macOS 15 or later. The app is not notarized, so macOS blocks the first launch.
 
-1. Download `LostOdysseyRecomp-macos-arm64-v0.9.0.dmg` and open it.
+1. Download `LostOdysseyRecomp-macos-arm64-v0.9.22.dmg` and open it.
 2. Drag `LostOdysseyRecomp.app` onto the Applications link, then eject the disk image.
 3. Open `LostOdysseyRecomp` from Applications. macOS blocks it the first time. Open **System Settings → Privacy & Security**, scroll to Security and choose **Open Anyway** next to the app (the button appears only after a blocked launch). Choose **Open** when macOS asks again; it may ask for your password. Later launches need no approval.
 4. The importer opens when no game is found; see [Importing game data](#automatic-content-import).
@@ -149,9 +149,9 @@ Only one tablet has been tested so far.
 
 ## First launch and settings
 
-On Windows, the first-launch page sets the interface language, game language and graphics options; run `LostOdysseyRecomp.exe --setup` to open it again. Linux and macOS start with default settings, which you change on the in-game Settings page. Settings tells you when a change needs a restart.
+The game starts with default settings, which you change on the in-game Settings page: press Y (S on the keyboard) on the title menu, or open System → Settings from the camp menu in game. Options stored in the save (text speed, captions, voice and music volume and the like) only appear in game. On Windows, `LostOdysseyRecomp.exe --setup` opens a setup page for the interface language, game language and graphics options before the game starts. Settings tells you when a change needs a restart.
 
-In Graphics, **Display mode** is Windowed or Fullscreen. On a PC with several monitors or graphics cards, **Display** picks the monitor and **GPU** the graphics card (a GPU change applies after a restart). After you switch the display, the game asks whether to keep it and goes back after 5 seconds without an answer. On Windows, Win+Shift+Left/Right also moves the game to the next monitor. **Aspect ratio** is Auto, where the game fills the window, or 16:9, 21:9 or 4:3, which keep that shape and add black bars when the screen has another shape. In Gameplay, **Vibration** sets the rumble strength. In Audio, **Audio output** chooses Stereo or 5.1 surround; for 5.1, set your speakers to 5.1 or 7.1 in the system sound settings first, otherwise the game stays on stereo. On Windows that option is only in Control Panel → Sound → Playback: select the device, click Configure and choose 5.1 or 7.1 Surround.
+In Graphics, **Display mode** is Windowed or Fullscreen. On a PC with several monitors or graphics cards, **Display** picks the monitor and **GPU** the graphics card (a GPU change applies after a restart). After you switch the display, the game asks whether to keep it and goes back after 5 seconds without an answer. On Windows, Win+Shift+Left/Right also moves the game to the next monitor. **Aspect ratio** is Auto, where the game fills the window, or 16:9, 21:9 or 4:3, which keep that shape and add black bars when the screen has another shape. In Gameplay, **Vibration** sets the rumble strength. In Audio, **Voice volume** sets the volume of cutscene dialogue on its own; in the original game it follows Sound effects, and voices in battle still do. **Audio output** chooses Stereo or 5.1 surround; for 5.1, set your speakers to 5.1 or 7.1 in the system sound settings first, otherwise the game stays on stereo. On Windows that option is only in Control Panel → Sound → Playback: select the device, click Configure and choose 5.1 or 7.1 Surround. **Matrix surround** needs no speaker setup: it encodes the 5.1 mix into stereo for an AV receiver's Pro Logic II, Dolby Surround or Neural:X mode, and **Rear angle** sets where the rear channels sound (90°–150°, 110° by default); while that row is selected, a test sound circles the speakers on a 5.1 layout.
 
 The interface language and the game language are separate. USA/Europe discs have English, Japanese, German, French, Spanish and Italian; the Asian set has English, Japanese, Korean, Traditional Chinese and Simplified Chinese. A game language your discs don't have falls back to English.
 
@@ -217,7 +217,7 @@ Saves cannot be moved back to a console.
 | :--- | :--- |
 | `--game <path>` | Use this game: a folder with `default.xex` or `disc1/`, or the `default.xex` file. Skips the importer; exits with an error if no `default.xex` is found. |
 | `--install` | Open the importer even when a game is set up, then exit. |
-| `--setup` | Run the first-launch setup again, then start the game (Windows; elsewhere it only saves the current settings). |
+| `--setup` | Open the setup page, then start the game (Windows; elsewhere it only saves the current settings). |
 | `--setup-only` | Like `--setup`, then exit. |
 | `--prepare-shaders-only` | Prepare all shaders, then exit without starting the game. |
 | `--quiet-kernel` | Leave kernel trace lines out of the log. |
@@ -226,7 +226,7 @@ Write `--game <path>` as two arguments; `--game=<path>` and unknown arguments ar
 
 ```bash
 LostOdysseyRecomp.exe --game "D:\Games\Lost Odyssey"
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage --game ~/Games/LostOdyssey
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage --game ~/Games/LostOdyssey
 flatpak run io.github.freefrank.LostOdysseyRecomp --game ~/Games/LostOdyssey
 LostOdysseyRecomp.app/Contents/MacOS/LostOdysseyRecomp --game ~/Games/LostOdyssey
 ```

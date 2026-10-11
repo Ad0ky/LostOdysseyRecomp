@@ -80,12 +80,12 @@
 | 显示 | 窗口或全屏，可选显示器和 GPU，16:9 和 21:9 分辨率（16:10 等更高的屏幕会被画面铺满），[HDR](#hdr) 和**亮度 / Gamma**。 |
 | 抗锯齿与超分 | FXAA、SMAA、TAA、DLSS、FSR 3.1、XeSS（Windows Direct3D 12）和 MetalFX（macOS）。 |
 | 图像选项 | 阴影分辨率 1×／2×／4×、SSAO／GTAO、各向异性过滤、景深和泛光。 |
-| 帧率 | 30／60／90／120 FPS，以及 FreeSync／G-SYNC Compatible VRR。 |
+| 帧率 | 30／60／90／120 FPS；垂直同步可选关、开或 FreeSync／G-SYNC Compatible VRR。 |
 | 插帧 | Windows Direct3D 12 上可用 DLSS、FSR 或 XeSS；Windows Vulkan 上可用 DLSS。 |
 | 着色器 | 首次启动下载预编译着色器，或在本机编译一次并缓存。 |
-| 声音 | 立体声或 5.1 环绕声。 |
+| 声音 | 立体声、5.1 环绕声，或交给 AV 功放还原的矩阵环绕声。过场对白有单独的音量。 |
 | 输入 | 手柄、键盘和震动；Android 上有触摸按键。 |
-| Mod | 仅 Windows：纹理、菜单和字体替换，以及 PlayStation 按键提示，可手动安装或用 Mod Organizer 2 管理。其他平台也可能加载 Mod，但不提供支持。见 [Mod 指南](docs/wiki/Modding.md)。 |
+| Mod | 仅 Windows：纹理、菜单和字体替换、文本翻译和语言包，以及 PlayStation 按键提示，可手动安装或用 Mod Organizer 2 管理。其他平台也可能加载 Mod，但不提供支持。见 [Mod 指南](docs/wiki/Modding.md)。 |
 | 调试菜单 | 渲染捕获、随时存档、遇敌开关、传送、快进和修改。见[调试菜单](#调试菜单)。 |
 
 ## 操作按键
@@ -178,7 +178,7 @@ Windows ZIP 是**便携式**的，所有文件都留在解压目录里。AppImag
 | :--- | :--- |
 | `--game <路径>` | 使用指定的游戏文件夹（含 `default.xex` 或 `disc1/`）或 `default.xex` 文件，跳过导入器。 |
 | `--install` | 即使已经设置好游戏也打开导入器。 |
-| `--setup` | Windows：重新运行首次启动设置，然后进入游戏。 |
+| `--setup` | Windows：打开设置页面，然后进入游戏。 |
 | `--prepare-shaders-only` | 预先准备全部着色器，然后不启动游戏直接退出。 |
 
 ```bash

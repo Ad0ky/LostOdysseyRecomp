@@ -40,6 +40,10 @@ bool MenuFlowDisplayModeFailed();
 inline uint64_t DisplayMoveCount() { return 0; }
 inline uint64_t BeginDisplayRevert(const settings::Config& c) { return MenuFlowBeginDisplayChange(c); }
 }
+// The Mods page's Open mods folder records the request instead of starting Explorer.
+#include <settings/mods_page.h>
+namespace settings::mods_page { bool MenuFlowOpenFolder(const std::filesystem::path& folder); }
+#define OpenFolder MenuFlowOpenFolder
 #define GetConfig MenuFlowGetConfig
 #define SaveConfig MenuFlowSaveConfig
 #define SaveAudioOutput MenuFlowSaveAudioOutput
@@ -58,6 +62,7 @@ inline uint64_t BeginDisplayRevert(const settings::Config& c) { return MenuFlowB
 #include "../../LostOdysseyRecomp/settings/menu.cpp"
 #undef SDL_PushEvent
 #undef Translate
+#undef OpenFolder
 #undef GetConfig
 #undef SaveConfig
 #undef SaveAudioOutput
@@ -100,6 +105,14 @@ namespace {
 uint32_t vibrationStrength = 100;
 unsigned vibrationPreviews = 0;
 uint32_t promptStyle = 0;
+unsigned modsFolderOpens = 0;
+std::filesystem::path modsFolderOpened;
+}
+bool settings::mods_page::MenuFlowOpenFolder(const std::filesystem::path& folder)
+{
+    ++modsFolderOpens;
+    modsFolderOpened = folder;
+    return true;
 }
 namespace hid {
 bool UsesPlayStationPrompts() { return false; }
@@ -108,9 +121,16 @@ void SetPromptStyle(uint32_t style) { promptStyle = style; }
 void PreviewVibration() { ++vibrationPreviews; }
 }
 namespace apu {
-bool menuFlowSurround = false;
-void SetSurround(bool surround) { menuFlowSurround = surround; }
-uint32_t OutputChannels() { return menuFlowSurround ? 6 : 2; }
+Output menuFlowOutput = Output::Stereo;
+uint32_t menuFlowMatrixRear = 110;
+uint32_t menuFlowVoiceVolume = 100;
+bool menuFlowTestSignal = false;
+void SetOutput(Output output) { menuFlowOutput = output; }
+void SetMatrixRearAngle(uint32_t degrees) { menuFlowMatrixRear = degrees; }
+void SetVoiceVolume(uint32_t percent) { menuFlowVoiceVolume = percent; }
+void SetTestSignal(bool on) { menuFlowTestSignal = on; }
+float TestSignalPosition() { return menuFlowTestSignal ? 0.0f : -1.0f; }
+uint32_t OutputChannels() { return menuFlowOutput == Output::Surround ? 6 : 2; }
 }
 
 namespace {
@@ -121,7 +141,7 @@ std::vector<char> calls;
 settings::Config currentConfig{}, diskConfig{};
 unsigned saves = 0, previews = 0, requests = 0;
 bool saveFails = false, modeFailed = false;
-unsigned quitEventAttempts = 0, mainMenuRequests = 0;
+unsigned quitEventAttempts = 0, mainMenuRequests = 0, defaultsCalls = 0;
 gpu::video::DisplayChangeTracker displayChanges;
 void Require(bool condition, const char* message)
 {
@@ -230,7 +250,7 @@ extern "C" PPC_FUNC(MenuFlowClose)
     ctx.r3.u64 = 0; ctx.r31.u64 = 0;
 }
 extern "C" PPC_FUNC(MenuFlowOriginalLanguage) { (void)ctx; (void)base; }
-extern "C" PPC_FUNC(MenuFlowDefaults) { (void)ctx; (void)base; }
+extern "C" PPC_FUNC(MenuFlowDefaults) { (void)ctx; (void)base; ++defaultsCalls; }
 
 std::string Utf8(const std::wstring& text)
 {
@@ -396,6 +416,26 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::pending = 4; Tick(base);
     Require(settings::edit.dlssQuality == DlssQuality::Balanced, "DLSS left from Quality selects Balanced");
     settings::edit.dlssQuality = DlssQuality::Quality;
+    settings::pending = 2; Tick(base);
+    Require(settings::row == int(GraphicsRow::DlssModel), "DLSS model directly follows DLSS quality");
+    {
+        const auto& model = settings::snapshot.rows[int(GraphicsRow::DlssModel)];
+        Require(!model.hidden && model.enabled && model.choices == std::vector<std::wstring>{L"M", L"L"} &&
+                model.selectedChoice == 0 && model.value == L"M", "DLSS model offers M (default) and L with DLSS");
+    }
+    Require(settings::snapshot.help == L"M: steadier and sharper than older DLSS models at a moderate cost. L: the steadiest image with the least ghosting, but slower, especially on RTX 20 and 30 series.",
+            "DLSS model help explains the cost of each model");
+    settings::pending = 8; Tick(base);
+    Require(settings::edit.dlssModel == 1 && settings::snapshot.rows[int(GraphicsRow::DlssModel)].value == L"L",
+            "DLSS model right selects L");
+    settings::pending = 8; Tick(base);
+    Require(settings::edit.dlssModel == 0, "DLSS model right wraps to M");
+    settings::pending = 4; Tick(base);
+    Require(settings::edit.dlssModel == 1, "DLSS model left wraps to L");
+    settings::edit.dlssModel = 0;
+    settings::pending = 2; Tick(base);
+    Require(settings::row == int(GraphicsRow::DlssNeuralRendering),
+            "down from the DLSS model skips the hidden FSR sharpness to DLSS 5 neural rendering");
     settings::row = int(GraphicsRow::AntiAliasing);
     settings::pending = 0;
     Tick(base);
@@ -403,6 +443,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     Tick(base);
     Require(settings::edit.upscaler == Upscaler::Fsr && !settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden,
             "FSR can be selected independently on D3D12");
+    Require(settings::snapshot.rows[int(GraphicsRow::DlssModel)].hidden, "FSR hides the DLSS model");
     settings::row = int(GraphicsRow::DlssQuality);
     settings::edit.fsrQuality = gpu::upscaling::FsrQuality::Quality;
     settings::pending = 0; Tick(base);
@@ -424,7 +465,8 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::row = int(GraphicsRow::AntiAliasing);
     settings::pending = 8;
     Tick(base);
-    Require(settings::edit.upscaler == Upscaler::Off && settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden, "DLSS can be turned off on D3D12");
+    Require(settings::edit.upscaler == Upscaler::Off && settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden &&
+            settings::snapshot.rows[int(GraphicsRow::DlssModel)].hidden, "DLSS can be turned off on D3D12");
     Require(settings::snapshot.notice == needsVulkan + L" The Off choice is not applied yet.",
             "turning DLSS off before it is applied does not claim the plan is off");
     for (int i = 0; i < 4; ++i) { settings::pending = 8; Tick(base); } // Off -> FXAA -> SMAA -> TAA -> DLSS
@@ -1219,7 +1261,7 @@ int main(int argc, char** argv)
             settings::row = int(GraphicsRow::AntiAliasing);
             settings::pending = 2; Tick(base); // D-pad down
             Require(settings::row == int(GraphicsRow::FrameGeneration),
-                    "down from Upscaler skips hidden quality, sharpness and neural rendering rows to FG");
+                    "down from Upscaler skips hidden quality, model, sharpness and neural rendering rows to FG");
             settings::pending = 1; Tick(base); // D-pad up
             Require(settings::row == int(GraphicsRow::AntiAliasing),
                     "up from FG skips the hidden upscaler rows back to Upscaler");
@@ -1422,11 +1464,12 @@ int main(int argc, char** argv)
             diskConfig = priorDisk;
             std::puts("PASS Graphics FG section: provider/input navigation, DLSS multiplier bounds, FSR fixed 2x, shared Save, System isolation, mouse/scroll and four-tab navigation");
         }
-        // FSR sharpness follows quality; Save is always last. Off disables
-        // RCAS, and percent changes are bounded.
+        // FSR sharpness follows quality and the DLSS-only model row; Save is
+        // always last. Off disables RCAS, and percent changes are bounded.
         {
             static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count) &&
-                          int(GraphicsRow::FsrSharpness) == int(GraphicsRow::DlssQuality) + 1);
+                          int(GraphicsRow::DlssModel) == int(GraphicsRow::DlssQuality) + 1 &&
+                          int(GraphicsRow::FsrSharpness) == int(GraphicsRow::DlssModel) + 1);
             settings::tab = 2;
             settings::status.clear();
             settings::edit = currentConfig;
@@ -1440,7 +1483,8 @@ int main(int argc, char** argv)
             Require(settings::row == int(GraphicsRow::Backend), "navigation skips hidden FSR sharpness");
             settings::edit.upscaler = gpu::upscaling::Upscaler::Dlss;
             settings::pending = 0; Tick(base);
-            Require(settings::snapshot.rows[int(GraphicsRow::FsrSharpness)].hidden, "DLSS hides FSR sharpness");
+            Require(settings::snapshot.rows[int(GraphicsRow::FsrSharpness)].hidden &&
+                    !settings::snapshot.rows[int(GraphicsRow::DlssModel)].hidden, "DLSS hides FSR sharpness and shows the model");
             settings::edit.upscaler = gpu::upscaling::Upscaler::Fsr;
             settings::row = int(GraphicsRow::FsrSharpness);
             settings::pending = 0; Tick(base);
@@ -1470,6 +1514,20 @@ int main(int argc, char** argv)
             Require(saves == beforeSave + 1 && diskConfig.fsrSharpnessPercent == 64 &&
                     currentConfig.fsrSharpnessPercent == 64, "existing Save action persists FSR sharpness");
             std::puts("PASS FSR sharpness menu visibility, 0/100 bounds, description, stable ids and Save");
+        }
+        // Reopening drops an unsaved DLSS choice; focus leaves the now hidden model row.
+        {
+            const auto priorCurrent = currentConfig;
+            currentConfig.upscaler = gpu::upscaling::Upscaler::Off;
+            settings::tab = 2;
+            settings::row = int(GraphicsRow::DlssModel);
+            settings::active = false;
+            PPC_STORE_U32(Menu + 4, 4);
+            settings::pending = 0; Tick(base);
+            Require(settings::active && settings::row == int(GraphicsRow::FrameGeneration),
+                    "reopening on the hidden DLSS model row moves focus to the next visible row");
+            currentConfig = priorCurrent;
+            settings::edit = currentConfig;
         }
         // DLSS 5 neural rendering shows with DLSS only and cycles Off, 1x-4x.
         {
@@ -1551,22 +1609,60 @@ int main(int argc, char** argv)
             Require(settings::edit.vibrationPercent == 0 && saves == beforeSaves + 1, "left at 0 does not wrap");
             settings::pending = 2; Tick(base);
             Require(settings::row == settings::GameRestoreRow, "the game actions follow Vibration");
-            // Audio output closes the Audio tab: Right switches to 5.1 live and saves at once.
+            // Voice volume follows Sound effects: a host slider in the retail volume
+            // steps, saved at once, with a guest apply so the game refreshes its gains.
             settings::tab = 1;
             settings::row = settings::AudioEffectsRow;
             settings::pending = 2; Tick(base);
-            Require(settings::row == settings::AudioOutputRow && settings::snapshot.rows.size() == size_t(settings::AudioRowCount) &&
+            Require(settings::row == settings::AudioVoiceVolumeRow && settings::snapshot.rows.size() == size_t(settings::AudioRowCount) &&
+                    settings::snapshot.rows[settings::AudioVoiceVolumeRow].name == L"Voice volume" &&
+                    settings::snapshot.rows[settings::AudioVoiceVolumeRow].sliderPercent == 100,
+                    "Voice volume follows Sound effects at 100%");
+            Require(settings::snapshot.help.find(L"Spoken dialogue in cutscenes") != std::wstring::npos, "Voice volume help");
+            settings::pending = 8; Tick(base);
+            Require(settings::edit.voiceVolume == 100 && saves == beforeSaves + 1 && applies == beforeApplies,
+                    "right at 100 clamps without saving");
+            settings::pending = 4; Tick(base);
+            Require(settings::edit.voiceVolume == 96 && diskConfig.voiceVolume == 96 && apu::menuFlowVoiceVolume == 96 &&
+                    saves == beforeSaves + 2 && applies == beforeApplies + 1 && diskConfig.width != settings::edit.width &&
+                    settings::snapshot.rows[settings::AudioVoiceVolumeRow].sliderPercent == 96,
+                    "left lowers by 4, saves alone, applies live and re-applies the guest volumes");
+            // Audio output follows Voice volume: Right switches to 5.1 live and saves at once.
+            settings::pending = 2; Tick(base);
+            Require(settings::row == settings::AudioOutputRow &&
                     settings::snapshot.rows[settings::AudioOutputRow].name == L"Audio output" &&
                     settings::snapshot.rows[settings::AudioOutputRow].selectedChoice == 0,
-                    "Audio tab ends with Audio output after Sound effects, Stereo by default");
+                    "Audio output follows Voice volume, Stereo by default");
             settings::pending = 8; Tick(base);
             Require(settings::edit.audioOutput == settings::AudioOutputSurround && diskConfig.audioOutput == settings::AudioOutputSurround &&
-                    apu::menuFlowSurround && saves == beforeSaves + 2 && applies == beforeApplies &&
+                    apu::menuFlowOutput == apu::Output::Surround && saves == beforeSaves + 3 && applies == beforeApplies + 1 &&
                     diskConfig.width != settings::edit.width, "audio output switches live and saves alone");
+            // Rear angle closes the Audio tab and only moves with Matrix surround.
             settings::pending = 2; Tick(base);
-            Require(settings::row == settings::AudioVoiceRow, "down from Audio output wraps to Voice language");
+            Require(settings::row == settings::AudioRearAngleRow && !settings::snapshot.rows[settings::AudioRearAngleRow].enabled &&
+                    !apu::menuFlowTestSignal, "Rear angle follows Audio output, disabled and silent without Matrix surround");
+            settings::pending = 8; Tick(base);
+            Require(settings::edit.audioMatrixRear == 110 && saves == beforeSaves + 3, "disabled Rear angle ignores Right");
+            settings::pending = 1; Tick(base);
+            settings::pending = 8; Tick(base);
+            Require(settings::edit.audioOutput == settings::AudioOutputMatrix && apu::menuFlowOutput == apu::Output::Matrix &&
+                    diskConfig.audioOutput == settings::AudioOutputMatrix && saves == beforeSaves + 4 && !apu::menuFlowTestSignal,
+                    "Right again selects Matrix surround; no test noise on Audio output");
+            settings::pending = 2; Tick(base);
+            Require(apu::menuFlowTestSignal, "test noise plays while Rear angle is focused");
+            Require(settings::snapshot.speakerLayout, "the speaker layout shows under the rows");
+            settings::pending = 8; Tick(base);
+            Require(settings::snapshot.rows[settings::AudioRearAngleRow].enabled &&
+                    settings::snapshot.rows[settings::AudioRearAngleRow].value == L"120°" &&
+                    settings::edit.audioMatrixRear == 120 && diskConfig.audioMatrixRear == 120 && apu::menuFlowMatrixRear == 120 &&
+                    settings::snapshot.speakerRear == 120 &&
+                    saves == beforeSaves + 5 && applies == beforeApplies + 1 && diskConfig.width != settings::edit.width,
+                    "Rear angle steps 10 degrees, applies live and saves alone");
+            settings::pending = 2; Tick(base);
+            Require(settings::row == settings::AudioVoiceRow && !apu::menuFlowTestSignal && !settings::snapshot.speakerLayout,
+                    "down from Rear angle wraps to Voice language and stops the test noise and layout");
             settings::edit = currentConfig;
-            std::puts("PASS Gameplay Vibration slider and Audio output: bounds, immediate save, live apply, Graphics edits untouched");
+            std::puts("PASS Gameplay Vibration, Voice volume and Audio output: bounds, immediate save, live apply, Graphics edits untouched");
         }
         // The host Settings game tab is reached from the retail System menu.
         // Only explicit dialog confirmation may request the guest title transition.
@@ -1658,6 +1754,11 @@ int main(int argc, char** argv)
             settings::tab = 3;
             settings::row = settings::SystemCollectionRow;
             settings::pending = 2; Tick(base);
+            Require(settings::row == settings::SystemModsRow && settings::snapshot.rows[settings::SystemModsRow].name == L"Mods" &&
+                    settings::snapshot.rows[settings::SystemModsRow].value == L"Open" &&
+                    settings::graphics_menu::IsAction(3, settings::SystemModsRow),
+                    "the Mods action follows the TAA collection row on System");
+            settings::pending = 2; Tick(base);
             Require(settings::row == settings::SystemImportRow && settings::snapshot.scroll == 0 &&
                     settings::snapshot.rows.size() == size_t(settings::SystemRowCount) &&
                     settings::snapshot.rows[settings::SystemImportRow].name == L"Import discs & DLC" &&
@@ -1721,6 +1822,280 @@ int main(int argc, char** argv)
             Require(!settings::restart::Requested() && !settings::importPrompt,
                     "idle ticks do not create a second import request");
             std::puts("PASS import action: gamepad/mouse focus, cancel-first dialog, translations, guarded restart request, previews");
+        }
+        // System → Mods over a real mods folder and mod-list.ini through the mod API.
+        {
+            const auto root = std::filesystem::temp_directory_path() / "lo-menu-flow-mods";
+            std::filesystem::remove_all(root);
+            const auto write = [&](const std::filesystem::path& file, const std::string& text) {
+                std::filesystem::create_directories(file.parent_path());
+                std::ofstream(file, std::ios::binary) << text;
+            };
+            write(root / "mods/alpha/mod.ini",
+                  "api_version=2\nid=alpha\nname=Alpha Pack\nversion=1.0\nauthor=Ann\ndescription=First test mod.\npriority=10\n");
+            write(root / "mods/alpha/overlay/textures/fp-0123456789abcdef.lotex2", "x");
+            write(root / "mods/beta/mod.ini", "api_version=2\nid=beta\nname=Beta\npriority=5\n");
+            write(root / "mods/gamma/mod.ini", "api_version=2\nid=gamma\nname=Gamma\nenabled=false\npriority=1\n");
+            write(root / "mods/broken/mod.ini", "api_version=9\n");
+            write(root / "mods/pt-br/language.ini", "id=pt-br\nname=Brasil\nbase=int\n");
+            const auto list = root / "mod-list.ini";
+            modding::Initialize(root / "mods", list);
+            const auto readList = [&] {
+                std::ifstream file(list, std::ios::binary);
+                std::string text, line, lines;
+                while (std::getline(file, line))
+                    if (!line.empty() && line[0] != '#') lines += line + "\n";
+                return lines;
+            };
+            const auto rowY = [](int row) { return float(150 + (row - settings::snapshot.scroll) * 43 + 20); };
+            PPC_STORE_U32(Menu + 4, 4);
+            settings::edit.uiLanguage = 0;
+            settings::tab = 3;
+            settings::row = settings::SystemModsRow;
+            settings::pending = 0x1000; Tick(base);
+            const int open = settings::mods_page::CanOpenFolder ? 5 : -1, save = open >= 0 ? 6 : 5;
+            {
+                const auto& rows = settings::snapshot.rows;
+                Require(settings::modsOpen && settings::snapshot.pageTitle == L"Mods" && settings::snapshot.row == 0 &&
+                        rows.size() == size_t(save + 1) && !settings::snapshot.keyLegend.empty(),
+                        "A on System Mods opens the Mods page");
+                Require(rows[0].name == L"Alpha Pack" && rows[0].detail == L"1.0 - Ann" &&
+                        rows[0].choices == std::vector<std::wstring>{L"On", L"Off"} && rows[0].selectedChoice == 0 &&
+                        rows[1].name == L"Beta" && rows[1].detail == L"beta" &&
+                        rows[2].name == L"Gamma" && !rows[2].enabled && rows[2].value == L"mod.ini: Off" && rows[2].detail == L"! gamma" &&
+                        rows[3].name == L"broken" && !rows[3].enabled && rows[3].value == L"Error" && rows[3].detail == L"! —" &&
+                        rows[4].name == L"Brasil" && rows[4].detail == L"Language pack: English" && rows[4].choices.empty() &&
+                        (open < 0 || rows[size_t(open)].name == L"Open mods folder") && rows[size_t(save)].name == L"Save mod list",
+                        "mods in effective order with version and author, a mod off in mod.ini, a rejected mod, the language pack, the actions");
+                Require(settings::snapshot.help == L"First test mod." &&
+                        settings::snapshot.notice == L"Folder: alpha     Overlay files: 1" && settings::snapshot.reorder,
+                        "help shows the description, the folder and the file count");
+            }
+            settings::pending = 2; Tick(base);
+            Require(settings::snapshot.help == L"No description." && settings::snapshot.notice == L"Folder: beta",
+                    "a mod without description");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::snapshot.rows[1].selectedChoice == 1, "A turns a mod off");
+            settings::pending = 0x100; Tick(base);
+            Require(settings::modsFocus == 0 && settings::snapshot.rows[0].name == L"Beta" &&
+                    settings::snapshot.rows[1].name == L"Alpha Pack", "LB moves the focused mod up and focus follows it");
+            settings::pending = 0x100; Tick(base);
+            Require(settings::snapshot.rows[0].name == L"Beta", "the first mod stays first");
+            settings::pending = 2; Tick(base);
+            settings::pending = 2; Tick(base);
+            Require(settings::snapshot.help == L"Its mod.ini turns it off (enabled=false)." && settings::snapshot.reorder,
+                    "a mod off in mod.ini says so and can still move");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::snapshot.rows[2].value == L"mod.ini: Off", "its switch does nothing");
+            settings::pending = 2; Tick(base);
+            Require(settings::snapshot.help == L"Not loaded: api_version must be 1 or 2" && !settings::snapshot.reorder,
+                    "a rejected mod shows its first problem and cannot move");
+            settings::pending = 0x1000; Tick(base);
+            settings::pending = 0x200; Tick(base);
+            Require(settings::snapshot.rows[3].name == L"broken" && settings::snapshot.rows[3].value == L"Error",
+                    "A and RB leave a rejected mod alone");
+            settings::pending = 2; Tick(base);
+            Require(settings::snapshot.help == L"A language pack. Choose it in System → Game language." &&
+                    settings::snapshot.notice == L"Folder: pt-br" && !settings::snapshot.reorder, "a language pack is read-only");
+            // Pointer: select Alpha, then its move up cell.
+            settings::PointerClick(200, rowY(1), false); Tick(base);
+            Require(settings::modsFocus == 1 && settings::snapshot.reorder, "pointer selects a mod");
+            settings::PointerClick(float(settings::ModsMoveLeft + 10), rowY(1), false); Tick(base);
+            Require(settings::modsFocus == 0 && settings::snapshot.rows[0].name == L"Alpha Pack", "the move up cell moves the mod");
+            settings::pending = 0x200; Tick(base);
+            Require(settings::modsFocus == 1 && settings::snapshot.rows[1].name == L"Alpha Pack", "RB moves it back down");
+            settings::PointerClick(700, rowY(0), false); Tick(base);
+            Require(settings::modsFocus == 0 && settings::snapshot.rows[0].selectedChoice == 0, "a click on the switch turns Beta on");
+            settings::pending = 8; Tick(base);
+            Require(settings::snapshot.rows[0].selectedChoice == 1, "right turns it off again");
+            // Leaving with changes asks first; Cancel is the default.
+            settings::pending = 0x2000; Tick(base);
+            Require(settings::modsDiscardPrompt && settings::snapshot.dialogSelection == 1 &&
+                    settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Discard changes", L"Cancel"},
+                    "B with unsaved changes asks before leaving");
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::modsDiscardPrompt && settings::modsOpen, "Cancel keeps the page");
+            if (open >= 0)
+            {
+                settings::modsFocus = open;
+                settings::pending = 0x1000; Tick(base);
+                Require(modsFolderOpens == 1 && modsFolderOpened == modding::Root() &&
+                        settings::snapshot.notice == settings::PathText(modding::Root()), "Open mods folder opens the mods root");
+            }
+            // Start goes to Save, and saves when pressed there.
+            settings::modsFocus = 0;
+            settings::pending = 0x10; Tick(base);
+            Require(settings::modsFocus == save && !std::filesystem::exists(list), "Start moves to Save without saving");
+            settings::pending = 0x10; Tick(base);
+            Require(readList() == "beta=off\nalpha=on\ngamma=on\n", "Save writes the order and switches to mod-list.ini");
+#ifdef _WIN32
+            Require(settings::restartPrompt && settings::savedRestartPrompt && settings::restartForMods &&
+                    settings::snapshot.dialogMessage == L"Mod list saved. Restart now?" &&
+                    settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Restart now", L"Later"},
+                    "a changed mod list offers the restart");
+            settings::pending = 2; Tick(base);
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::restartPrompt && !settings::restartForMods && !settings::restart::Requested() &&
+                    settings::modsOpen && settings::snapshot.help == L"Saved. Changes take effect after restarting.",
+                    "Later stays on the page");
+#else
+            Require(settings::restartPrompt && settings::snapshot.dialogMessage == L"Mod list saved. Restart the game to apply the changes.",
+                    "a changed mod list asks for a manual restart");
+            settings::pending = 0x1000; Tick(base);
+#endif
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::modsOpen && settings::tab == 3 && settings::row == settings::SystemModsRow,
+                    "B without changes returns to the System tab");
+            // Reopened before the restart, the page shows the saved order.
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::snapshot.rows[0].name == L"Beta" && settings::snapshot.rows[0].selectedChoice == 1,
+                    "the saved order shows until the restart applies it");
+            // Back to the order this run started with: saved without a restart.
+            settings::pending = 0x1000; Tick(base);
+            settings::pending = 0x200; Tick(base);
+            settings::pending = 0x10; Tick(base);
+            settings::pending = 0x10; Tick(base);
+            Require(readList() == "alpha=on\nbeta=on\ngamma=on\n" && !settings::restartPrompt &&
+                    settings::snapshot.help == L"Mod list saved.", "saving the running order needs no restart");
+            // Escape leaves too.
+            Require(settings::CalibrationKey(27), "Escape belongs to the Mods page");
+            settings::pending = 0; Tick(base);
+            Require(!settings::modsOpen, "Escape leaves the Mods page");
+            for (const auto& [language, title] : {std::pair{1u, L"Mod"}, std::pair{2u, L"MOD"}, std::pair{3u, L"모드"}, std::pair{4u, L"Mod"}})
+            {
+                settings::edit.uiLanguage = language;
+                settings::pending = 0; Tick(base);
+                Require(settings::snapshot.rows[settings::SystemModsRow].name == title, "translated Mods row");
+            }
+            settings::edit.uiLanguage = 0;
+            settings::pending = 0x1000; Tick(base);
+            auto preview = settings::snapshot;
+            preview.assets.reset();
+            std::vector<uint32_t> pixels;
+            Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "Mods page preview");
+            const auto evidence = std::filesystem::current_path() / "out" / "mods-page-preview";
+            std::filesystem::create_directories(evidence);
+            WriteBmp(evidence / "mods-page.bmp", pixels);
+            settings::pending = 0x2000; Tick(base);
+            // No mods: one line says where they go.
+            modding::Initialize(root / "empty", root / "empty-list.ini");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::snapshot.rows.size() == size_t(open >= 0 ? 2 : 1) && settings::snapshot.rows[0].name == L"No mods installed" &&
+                    settings::snapshot.help == L"Put each mod in its own folder inside the mods folder, then restart the game." &&
+                    !settings::snapshot.reorder, "the empty page says where mods go");
+            settings::pending = 0x10; Tick(base);
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::modsOpen, "the empty page has no Save and B leaves");
+            modding::Shutdown();
+            std::filesystem::remove_all(root);
+            std::puts("PASS Mods page: listing, switches, LB/RB and pointer moves, read-only rows, discard prompt, Open folder, Save + restart, saved order, empty page");
+        }
+        // Opened from the title menu (title_entry.cpp) no game is loaded: the
+        // retail Gameplay and Audio options, Restore, Quit and the retail
+        // calibration are out of reach, focus lands on visible rows and nothing
+        // reaches the guest config.
+        {
+            settings::edit.uiLanguage = 0;
+            settings::status.clear();
+            settings::tab = 0;
+            settings::row = 0;
+            settings::MarkTitleEntry();
+            const uint32_t textSpeed = PPC_LOAD_U32(ConfigData), flags = PPC_LOAD_U32(ConfigData + 4);
+            const unsigned beforeApplies = applies, beforeDefaults = defaultsCalls, beforeRequests = mainMenuRequests;
+            settings::pending = 0; Tick(base);
+            Require(settings::row == settings::GamePromptRow, "title mode focuses the first visible Gameplay row");
+            for (int r = 0; r < settings::GameRowCount; ++r)
+                Require(settings::snapshot.rows[size_t(r)].hidden ==
+                            (r != settings::GamePromptRow && r != settings::GameVibrationRow),
+                        "title mode hides the retail options, Restore and Quit");
+            settings::pending = 1; Tick(base);
+            Require(settings::row == settings::GameVibrationRow, "Up wraps past the hidden rows");
+            settings::pending = 2; Tick(base);
+            Require(settings::row == settings::GamePromptRow, "Down wraps past the hidden rows");
+            settings::row = settings::GameVibrationRow;
+            settings::PointerClick(100, 150 + 20, false); Tick(base);
+            Require(settings::row == settings::GamePromptRow, "the first list slot is Button prompts");
+            // A stale focus on a hidden row edits nothing and moves to a visible row.
+            for (int r : {0, settings::GameRetailRowCount - 1, settings::GameRestoreRow, settings::GameMainMenuRow})
+            {
+                settings::row = r;
+                settings::pending = 8; Tick(base);
+                Require(settings::row == settings::GamePromptRow, "focus leaves a hidden row");
+                settings::row = r;
+                settings::pending = 0x1000; Tick(base);
+            }
+            Require(PPC_LOAD_U32(ConfigData) == textSpeed && PPC_LOAD_U32(ConfigData + 4) == flags &&
+                    applies == beforeApplies && defaultsCalls == beforeDefaults &&
+                    !settings::mainMenuPrompt && settings::snapshot.dialogChoices.empty(),
+                    "hidden rows write nothing to the guest config");
+            // Audio keeps Voice volume, Audio output and Rear angle, which are
+            // in settings.ini: Voice language, Music and Sound effects live in
+            // the save as well.
+            const uint32_t voice = PPC_LOAD_U32(ConfigData + 24), music = PPC_LOAD_U32(ConfigData + 8),
+                           effects = PPC_LOAD_U32(ConfigData + 12), brightness = PPC_LOAD_U32(ConfigData + 16),
+                           contrast = PPC_LOAD_U32(ConfigData + 20);
+            const uint32_t voiceVolume = settings::edit.voiceVolume;
+            settings::pending = 0x200; Tick(base);
+            Require(settings::tab == 1 && settings::row == settings::AudioVoiceVolumeRow, "Audio opens on Voice volume");
+            for (int r = 0; r < settings::AudioRowCount; ++r)
+                Require(settings::snapshot.rows[size_t(r)].hidden == (r < settings::AudioVoiceVolumeRow),
+                        "title mode hides Voice language, Music and Sound effects");
+            settings::pending = 1; Tick(base);
+            Require(settings::row == settings::AudioRearAngleRow, "Up from Voice volume wraps past the hidden rows");
+            for (int r : {settings::AudioVoiceRow, settings::AudioMusicRow, settings::AudioEffectsRow})
+                for (uint16_t press : {uint16_t(4), uint16_t(8)})
+                {
+                    settings::row = r;
+                    settings::pending = press; Tick(base);
+                    Require(settings::row == settings::AudioVoiceVolumeRow, "focus leaves a hidden Audio row");
+                }
+            Require(PPC_LOAD_U32(ConfigData + 24) == voice && PPC_LOAD_U32(ConfigData + 8) == music &&
+                    PPC_LOAD_U32(ConfigData + 12) == effects && applies == beforeApplies &&
+                    settings::edit.voiceVolume == voiceVolume,
+                    "hidden Audio rows write nothing to the guest config");
+            // The brightness page stays, but Original pattern would hand input
+            // to the retail list, which writes the save's brightness.
+            settings::pending = 0x200; Tick(base);
+            settings::row = int(GraphicsRow::Brightness);
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::brightnessOpen && !settings::snapshot.brightness.originalPattern,
+                    "title mode brightness page marks Original pattern unavailable");
+            settings::brightnessFocus = 2;
+            settings::pending = 8; Tick(base);
+            Require(settings::brightnessFocus == 4, "Right steps over Original pattern");
+            settings::pending = 4; Tick(base);
+            Require(settings::brightnessFocus == 2, "Left steps over Original pattern");
+            settings::pending = 2; Tick(base);
+            Require(settings::brightnessFocus == 4, "Down steps over Original pattern");
+            settings::brightnessClick = 3; Tick(base);
+            Require(settings::brightnessOpen && settings::brightnessFocus == 4, "a click on Original pattern does nothing");
+            settings::brightnessFocus = 3;
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::brightnessOpen && settings::active && !settings::bypass && settings::cancelPolls == 0 &&
+                    !settings::returnToBrightness && PPC_LOAD_U32(ConfigData + 16) == brightness &&
+                    PPC_LOAD_U32(ConfigData + 20) == contrast,
+                    "the retail calibration list is never reached");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::brightnessOpen && settings::active, "B leaves the brightness page");
+            settings::pending = 0x100; Tick(base);
+            settings::pending = 0x100; Tick(base);
+            Require(settings::tab == 0 && settings::row == settings::GamePromptRow, "back on Gameplay's first visible row");
+            settings::pending = 0x200; Tick(base);
+            settings::pending = 0x100; Tick(base);
+            Require(settings::tab == 0 && settings::row == settings::GamePromptRow, "a tab switch lands on a visible row");
+            settings::pending = 0x2000; Tick(base);
+            Require(settings::closing && !settings::active && applies == beforeApplies + 1,
+                    "Back closes with the usual apply");
+            Tick(base); Tick(base);
+            Poll(0, true); Poll(0, false);
+            Require(PPC_LOAD_U32(Menu + 4) == 1 && !settings::titleEntry, "the idle task ends title mode");
+            PPC_STORE_U32(Menu + 4, 4); Tick(base); Poll(0, true);
+            Require(settings::active && settings::row == settings::GamePromptRow &&
+                    std::none_of(settings::snapshot.rows.begin(), settings::snapshot.rows.end(),
+                                 [](const settings::MenuRow& row) { return row.hidden; }) &&
+                    mainMenuRequests == beforeRequests,
+                    "a later open from a game shows every Gameplay row");
+            std::puts("PASS title-menu Settings: hidden retail Gameplay and Audio rows, Restore, Quit and Original pattern, visible focus, guest config untouched");
         }
         if (argc == 3)
         {
@@ -1795,15 +2170,29 @@ int main(int argc, char** argv)
             settings::edit.antialiasing = 0;
             settings::edit.upscaler = gpu::upscaling::Upscaler::Off;
             settings::edit.frameGenerationProvider = framegen::Provider::Off;
+            settings::edit.hdr = false;
             settings::row = int(GraphicsRow::Hdr);
             settings::pending = 0; Tick(base);
             Require(settings::snapshot.rows[int(GraphicsRow::Hdr)].enabled &&
                     settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].enabled &&
                     settings::snapshot.rows[int(GraphicsRow::HdrPeak)].enabled,
                     "D3D12 exposes HDR controls");
+            Require(!settings::snapshot.rows[int(GraphicsRow::Hdr)].hidden &&
+                    settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].hidden &&
+                    settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden,
+                    "HDR off hides paper white and peak brightness");
+            settings::pending = 2; Tick(base);
+            Require(settings::row == int(GraphicsRow::Brightness), "down from HDR off skips the hidden HDR levels");
+            settings::pending = 1; Tick(base);
+            Require(settings::row == int(GraphicsRow::Hdr), "up from Brightness skips the hidden HDR levels");
             settings::pending = 8; Tick(base);
             Require(settings::edit.hdr && settings::snapshot.rows[int(GraphicsRow::Hdr)].value == L"On",
                     "HDR toggle updates the pending preference");
+            Require(!settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].hidden &&
+                    !settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden,
+                    "turning HDR on shows its levels before saving");
+            settings::pending = 2; Tick(base);
+            Require(settings::row == int(GraphicsRow::HdrPaperWhite), "down from HDR on reaches paper white");
             settings::row = int(GraphicsRow::HdrPaperWhite);
             settings::edit.hdrPaperWhiteNits = 400;
             settings::pending = 8; Tick(base);
@@ -1891,6 +2280,24 @@ int main(int argc, char** argv)
                     "Vulkan HDR controls are available for runtime capability detection");
             settings::pending = 8; Tick(base);
             Require(!settings::edit.hdr, "Vulkan HDR preference can be changed");
+            Require(settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].hidden &&
+                    settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden, "turning HDR off hides its levels");
+            // Reopening drops an unsaved HDR choice; focus leaves the now hidden peak row.
+            {
+                const auto priorCurrent = currentConfig;
+                currentConfig.hdr = false;
+                settings::edit.hdr = true;
+                settings::row = int(GraphicsRow::HdrPeak);
+                settings::pending = 0; Tick(base);
+                Require(settings::row == int(GraphicsRow::HdrPeak) && !settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden,
+                        "unsaved HDR on keeps focus on peak brightness");
+                settings::active = false;
+                PPC_STORE_U32(Menu + 4, 4);
+                settings::pending = 0; Tick(base);
+                Require(settings::active && !settings::edit.hdr && settings::row == int(GraphicsRow::Brightness),
+                        "reopening with HDR off moves focus from peak brightness to Brightness");
+                currentConfig = priorCurrent;
+            }
             settings::SetHdrDisplayInfo({});
             settings::edit = previousEdit;
             settings::pending = 0; Tick(base);
@@ -1932,6 +2339,14 @@ int main(int argc, char** argv)
             sharpness.fsrSharpnessPercent = 0;
             Require(settings::SaveConfig(sharpness) && settings::Read().fsrSharpnessPercent == 0,
                     "Off roundtrips as zero");
+            writeIni("upscaler=1\n");
+            Require(settings::Read().dlssModel == 0, "a missing dlss_model defaults to M");
+            writeIni("upscaler=1\ndlss_model=2\n");
+            Require(settings::Read().dlssModel == 0, "an unknown DLSS model falls back to M");
+            settings::Config model{};
+            model.upscaler = gpu::upscaling::Upscaler::Dlss;
+            model.dlssModel = 1;
+            Require(settings::SaveConfig(model) && settings::Read().dlssModel == 1, "DLSS model L roundtrips through the INI");
             writeIni("frame_generation_provider=1\nframe_generation_mode=0\nframe_generation_multiplier=6\n");
             const auto maxFg = settings::Read();
             Require(maxFg.frameGenerationProvider == framegen::Provider::Dlss &&

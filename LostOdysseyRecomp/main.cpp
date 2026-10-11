@@ -11,6 +11,7 @@
 #include <gpu/command_processor.h>
 #include <gpu/renderer.h>
 #include <gpu/video.h>
+#include <gpu/pipeline_prepare_progress.h>
 #include <apu/audio.h>
 #include <apu/xma.h>
 #include <hid/hid.h>
@@ -41,6 +42,8 @@
 #include "install/host.h"
 #include "modding/mod_api.h"
 #include "modding/asset_export.h"
+#include "modding/text_overlay.h"
+#include "settings/language_selection.h"
 
 #ifdef _WIN32
 #include <timeapi.h>
@@ -163,7 +166,9 @@ static int RunGuest(uint32_t entry)
         return 1;
     }
     XexLoader::StartTimeStampThread();
-    apu::Init(settings::GetConfig().audioOutput == settings::AudioOutputSurround);
+    apu::SetMatrixRearAngle(settings::GetConfig().audioMatrixRear);
+    apu::SetVoiceVolume(settings::GetConfig().voiceVolume);
+    apu::Init(apu::Output(settings::GetConfig().audioOutput));
     apu::xma::Init();
     if (getenv("LO_HEADLESS"))
         hid::Init(); // otherwise the video thread initialises it
@@ -421,13 +426,15 @@ int main(int argc, char* argv[])
         // existing data directory to map its virtual files onto.
         std::error_code ec;
         std::filesystem::create_directories(modsRoot, ec);
-        modding::Initialize(modsRoot);
+        // The in-game mod order lives beside settings.ini, outside the folder
+        // a manager may virtualize (MO2 sends writes there to its Overwrite).
+        modding::Initialize(modsRoot, std::filesystem::absolute(os::user_paths::SettingsPath(), ec).parent_path() / "mod-list.ini");
         if (modding::Enabled())
         {
             std::string ids;
             for (const auto& id : modding::ModIds()) ids += fmt::format("{}{}", ids.empty() ? "" : ", ", id);
             const auto mode = modding::Mode();
-            LOG_NOTICE("mods: {} (mode {}), standalone mods: {}, overlay folder: {}",
+            LOG_NOTICE("mods: {} (mode {}), mod folders (highest first): {}, overlay folder: {}",
                 FileSystem::PathUtf8(modding::Root()),
                 mode == modding::ResolutionMode::Overlay ? "overlay"
                     : mode == modding::ResolutionMode::Standalone ? "standalone" : "combined",
@@ -436,6 +443,17 @@ int main(int argc, char* argv[])
         }
         for (const auto& d : modding::Diagnostics())
             LOG_WARNING("mods: {}:{}: {}", FileSystem::PathUtf8(d.manifest), d.line, d.message);
+        for (const auto& pack : modding::LanguagePacks())
+        {
+            const auto base = settings::language::IdFromCode(pack.base);
+            if (!base)
+            {
+                LOG_WARNING("mods: language pack {} skipped: base {} is not a game language code", pack.id, pack.base);
+                continue;
+            }
+            settings::LanguagePacks.push_back({pack.id, pack.name, base});
+            LOG_NOTICE("mods: language pack {} ({}, base {}) in {}", pack.id, pack.name, pack.base, FileSystem::PathUtf8(pack.folder));
+        }
     }
 
 #if defined(_WIN32) || defined(__linux__) || defined(__APPLE__)
@@ -533,19 +551,33 @@ int main(int argc, char* argv[])
     }
     settings::ConfigureGameLanguages(gameRoot / "default.xex");
     os::log_collection::Initialize();
-    if(requestedSetup || (!getenv("LO_BACKGROUND") && !getenv("LO_HEADLESS") && !std::filesystem::exists(os::user_paths::SettingsPath()))) {
-        if(!settings::FirstRunSetup(&gameRoot)) return 0;
+    // The setup window opens only on request (--setup, --setup-only). A first
+    // launch starts with the defaults, which the in-game Settings change, and
+    // still asks about log collection once.
+    const bool firstLaunch = !getenv("LO_BACKGROUND") && !getenv("LO_HEADLESS") &&
+                             !std::filesystem::exists(os::user_paths::SettingsPath());
+    if(requestedSetup && !settings::FirstRunSetup(&gameRoot)) return 0;
+    if(firstLaunch && !requestedSetup && !settings::SaveConfig(settings::GetConfig()))
+        LOG_WARNING("settings: the default settings could not be written");
+    if(requestedSetup || firstLaunch)
         os::log_collection::PromptFirstRun(settings::GetConfig().uiLanguage);
-        if(setupOnly) return 0;
-    }
+    if(setupOnly) return 0;
     os::log_collection::StartUpload(sessionLog);
     {
         const auto& c = settings::GetConfig();
-        LOG_NOTICE("settings: backend={} output={}x{} window={} render_resolution={} aa={} upscaler={} dlss_quality={} fsr_quality={} "
-                   "frame_rate={} fg_provider={} fg_multiplier={} hdr={} ao={} shadow_resolution={} debug_log={}",
+        LOG_NOTICE("settings: backend={} output={}x{} window={} render_resolution={} aa={} upscaler={} dlss_quality={} dlss_model={} "
+                   "fsr_quality={} frame_rate={} vsync={} vrr={} fg_provider={} fg_multiplier={} hdr={} ao={} shadow_resolution={} debug_log={}",
                    int(c.graphicsBackend), c.width, c.height, int(c.windowMode), c.internalResolution, c.antialiasing,
-                   int(c.upscaler), int(c.dlssQuality), int(c.fsrQuality), c.frameRate, int(c.frameGenerationProvider),
+                   int(c.upscaler), int(c.dlssQuality), c.dlssModel ? 'L' : 'M', int(c.fsrQuality), c.frameRate, c.vsync,
+                   c.variableRefreshRate, int(c.frameGenerationProvider),
                    c.frameGenerationMultiplier, c.hdr, c.ambientOcclusion, c.shadowResolution, c.debugLog);
+        const auto pack = settings::GameLanguagePack();
+        modding::text_overlay::SelectLanguagePack(pack);
+        if (!pack.empty())
+            LOG_NOTICE("settings: game language {} with language pack {}", settings::GameLanguage(), pack);
+        else if (!c.gameLanguagePack.empty())
+            LOG_WARNING("settings: language pack {} is not installed for game language {}; using the game's text",
+                        c.gameLanguagePack, c.gameLanguage);
     }
     if (g_memory.base == nullptr)
     {
@@ -624,6 +656,8 @@ int main(int argc, char* argv[])
     // starting guest threads or opening game saves/profiles. This also provides
     // a bounded cache warmup command for portable installations.
     if (prepareShadersOnly) {
+        // Pipelines too: background preparation would be dropped at the exit below.
+        gpu::pipeline_prepare::g_synchronous = true;
         const bool prepared = gpu::video::Init() && !getenv("LO_NO_RENDERER");
         LOG_INFO("shader preparation only: {}, guest not started", prepared ? "complete" : "failed");
         fflush(stdout);

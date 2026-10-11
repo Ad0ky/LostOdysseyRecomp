@@ -1,6 +1,8 @@
 #include <stdafx.h>
 #include "audio.h"
 #include "audio_callback.h"
+#include "matrix_surround.h"
+#include "test_signal.h"
 #include <cpu/guest_thread.h>
 #include <kernel/memory.h>
 #include <os/guest_code_thread.h>
@@ -31,13 +33,25 @@ namespace apu
         bool g_audioReady = false;
         std::atomic<bool> g_surroundRequested{ false };
         bool g_surroundOpen = false; // driver thread after Init
+        std::atomic<bool> g_matrix{ false }; // matrix-encode the stereo frames
+        std::atomic<uint32_t> g_matrixRear{ 110 };
+        std::atomic<uint32_t> g_voiceVolume{ 100 };
+        // steady_clock time until which the speaker test plays
+        std::atomic<std::chrono::steady_clock::rep> g_testSignalUntil{ 0 };
+        std::atomic<float> g_testPosition{ -1.0f };
         std::atomic<uint32_t> g_outputChannels{ 0 };
 
         uint32_t FrameBytes() { return XAUDIO_NUM_SAMPLES * g_channels * sizeof(float); }
 
-        // Caller holds g_deviceMutex. 5.1 probes the device layout first:
-        // WASAPI reports its endpoint mix format here, while PulseAudio,
-        // PipeWire and Core Audio accept six channels and remix them.
+        // Caller holds g_deviceMutex. 5.1 needs a device that mixes six or
+        // more channels. PulseAudio, PipeWire and Core Audio accept six on
+        // any device and remix them, so their layout is checked before
+        // opening. Before opening, WASAPI reports the endpoint's hardware
+        // format as of startup: it stays stereo when an encoder (Dolby
+        // Digital Live, DTS Interactive over S/PDIF) takes a 5.1 mix, and
+        // misses a speaker layout changed while the game runs. The open
+        // device reports the live mix format, so WASAPI opens six and
+        // checks that.
         void OpenDevice(bool surround)
         {
             if (g_stream) SDL_DestroyAudioStream(g_stream);
@@ -47,30 +61,33 @@ namespace apu
             g_channels = 2;
             SDL_AudioSpec desired{SDL_AUDIO_F32, 2, XAUDIO_SAMPLES_HZ};
             SDL_AudioSpec preferred{};
-            const bool havePreferred = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &preferred, nullptr);
-            if (surround && havePreferred && preferred.channels >= 6)
-            {
+            const int listedChannels = SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &preferred, nullptr)
+                ? preferred.channels : 0;
+            int mixChannels = 0;
+            const char* driver = SDL_GetCurrentAudioDriver();
+            const bool wasapi = driver && SDL_strcmp(driver, "wasapi") == 0;
+            if (surround && (wasapi || listedChannels >= 6))
                 desired.channels = 6;
-            }
-            else if (surround)
-                LOG_WARNING("5.1 output unavailable (device channels {}); using the stereo downmix",
-                    havePreferred ? preferred.channels : 0);
             g_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired);
             if (g_device)
             {
                 SDL_AudioSpec obtained{};
-                if (!SDL_GetAudioDeviceFormat(g_device, &obtained, nullptr) ||
-                    (desired.channels == 6 && obtained.channels < 6))
+                if (!SDL_GetAudioDeviceFormat(g_device, &obtained, nullptr))
                 {
                     SDL_CloseAudioDevice(g_device);
                     g_device = 0;
                 }
+                else if ((mixChannels = obtained.channels) < 6)
+                    desired.channels = 2; // the open device takes the stereo downmix
             }
             if (!g_device && desired.channels == 6)
             {
                 desired.channels = 2;
                 g_device = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired);
             }
+            if (surround && desired.channels != 6)
+                LOG_WARNING("5.1 output unavailable (device channels listed {} mix {}); using the stereo downmix",
+                    listedChannels, mixChannels);
             if (g_device)
             {
                 SDL_AudioSpec obtained{};
@@ -91,7 +108,8 @@ namespace apu
                 else SDL_ResumeAudioDevice(g_device);
             }
             if (!g_device) LOG_WARNING("audio device unavailable: {}", SDL_GetError());
-            else LOG_INFO("audio output: 48000 Hz {} float, SDL driver {}", g_channels == 6 ? "5.1" : "stereo", SDL_GetCurrentAudioDriver());
+            else LOG_INFO("audio output: 48000 Hz {} float, device channels listed {} mix {}, SDL driver {}",
+                g_channels == 6 ? "5.1" : "stereo", listedChannels, mixChannels, driver ? driver : "none");
             g_outputChannels = g_device ? g_channels : 0;
         }
 
@@ -230,8 +248,10 @@ namespace apu
         }
     }
 
-    void Init(bool surround)
+    void Init(Output output)
     {
+        const bool surround = output == Output::Surround;
+        g_matrix = output == Output::Matrix;
         g_surroundRequested = g_surroundOpen = surround;
         // SDL3 picks 1024-frame device buffers at 48 kHz; keep SDL2's 512.
         SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "512");
@@ -252,10 +272,38 @@ namespace apu
         g_client.Register(callback, param);
     }
 
-    void SetSurround(bool surround)
+    void SetOutput(Output output)
     {
-        g_surroundRequested = surround;
-        g_outputChannels = 0; // unknown until the driver thread has applied it
+        g_matrix = output == Output::Matrix; // stereo frames, same device
+        const bool surround = output == Output::Surround;
+        if (g_surroundRequested.exchange(surround) != surround)
+            g_outputChannels = 0; // unknown until the driver thread has applied it
+    }
+
+    void SetMatrixRearAngle(uint32_t degrees)
+    {
+        g_matrixRear = std::clamp(degrees, 90u, 150u);
+    }
+
+    void SetVoiceVolume(uint32_t percent)
+    {
+        g_voiceVolume = std::min(percent, 100u);
+    }
+
+    uint32_t VoiceVolume()
+    {
+        return g_voiceVolume.load(std::memory_order_relaxed);
+    }
+
+    void SetTestSignal(bool on)
+    {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+        g_testSignalUntil = on ? until.time_since_epoch().count() : 0;
+    }
+
+    float TestSignalPosition()
+    {
+        return g_testPosition;
     }
 
     uint32_t OutputChannels()
@@ -278,6 +326,26 @@ namespace apu
         // Guest planes FL, FR, FC, LFE, BL, BR match SDL's 6-channel order
         // FL, FR, FC, LFE, SL/BL, SR/BR, so 5.1 interleaves them unchanged.
         std::array<float, XAUDIO_NUM_SAMPLES * XAUDIO_NUM_CHANNELS> surround;
+        // The encoder's filters carry state from frame to frame; this runs
+        // on the one thread that submits frames.
+        static MatrixSurround matrix;
+        static bool matrixOn = false;
+        static uint32_t matrixRear = 110;
+        if (const bool on = g_matrix; on != matrixOn)
+        {
+            matrix.Reset();
+            matrixOn = on;
+        }
+        if (const uint32_t rear = g_matrixRear; rear != matrixRear)
+        {
+            matrix.SetRearAngle(float(rear));
+            matrixRear = rear;
+        }
+        static SpeakerPan pan;
+        static bool testOn = false;
+        const bool test = std::chrono::steady_clock::now().time_since_epoch().count() < g_testSignalUntil;
+        if (test && !testOn) pan.Reset(); // each test starts at front left
+        testOn = test;
         float peak = 0;
         for (uint32_t i = 0; i < XAUDIO_NUM_SAMPLES; ++i)
         {
@@ -286,14 +354,25 @@ namespace apu
             {
                 const float value = std::bit_cast<float>(ByteSwap(words[c * XAUDIO_NUM_SAMPLES + i]));
                 channel[c] = std::isfinite(value) ? value : 0;
-                surround[i * 6 + c] = std::clamp(channel[c], -1.0f, 1.0f);
             }
-            // Guest order: FL, FR, FC, LFE, BL, BR. Include center dialogue
-            // and rear effects in the stereo fold-down, with headroom.
-            stereo[i * 2] = std::clamp((channel[0] + 0.7071f * (channel[2] + channel[4]) + 0.5f * channel[3]) * 0.5f, -1.0f, 1.0f);
-            stereo[i * 2 + 1] = std::clamp((channel[1] + 0.7071f * (channel[2] + channel[5]) + 0.5f * channel[3]) * 0.5f, -1.0f, 1.0f);
+            if (testOn) pan.Next(channel);
+            for (uint32_t c = 0; c < 6; ++c)
+                surround[i * 6 + c] = std::clamp(channel[c], -1.0f, 1.0f);
+            float left, right;
+            if (matrixOn)
+                matrix.Encode(channel, left, right);
+            else
+            {
+                // Guest order: FL, FR, FC, LFE, BL, BR. Include center dialogue
+                // and rear effects in the stereo fold-down, with headroom.
+                left = (channel[0] + 0.7071f * (channel[2] + channel[4]) + 0.5f * channel[3]) * 0.5f;
+                right = (channel[1] + 0.7071f * (channel[2] + channel[5]) + 0.5f * channel[3]) * 0.5f;
+            }
+            stereo[i * 2] = std::clamp(left, -1.0f, 1.0f);
+            stereo[i * 2 + 1] = std::clamp(right, -1.0f, 1.0f);
             peak = std::max({peak, std::abs(stereo[i * 2]), std::abs(stereo[i * 2 + 1])});
         }
+        g_testPosition = testOn ? pan.Position() : -1.0f;
         uint32_t n = ++g_framesSubmitted;
         CaptureRequested(stereo.data(), n);
         // Bounded diagnostic capture, before mute; raw f32le, 48 kHz stereo.

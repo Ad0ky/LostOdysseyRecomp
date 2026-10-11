@@ -20,12 +20,14 @@ PREAMBLE = r'''
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <apu/audio.h>
 #include <settings/graphics_menu.h>
 #include <settings/menu_render.h>
 #include <settings/menu_assets.h>
 #include <settings/translations.h>
 #include <settings/restart.h>
 #include <settings/language_selection.h>
+#include <settings/mods_page.h>
 #include <gpu/frame_plan.h>
 #include <gpu/frame_rate.h>
 #include <gpu/dlss_nr_state.h>
@@ -107,8 +109,17 @@ const wchar_t* Message(uint32_t){return L"Message";}
 int Consent(){return 0;} bool Enabled(){return false;}
 bool SetConsent(bool){++consents;return true;}
 }
-namespace apu { bool surround=false; void SetSurround(bool s){surround=s;} uint32_t OutputChannels(){return surround?6:2;} }
+namespace apu { bool surround=false; uint32_t matrixRear=110; void SetOutput(Output o){surround=o==Output::Surround;}
+void SetMatrixRearAngle(uint32_t d){matrixRear=d;} void SetVoiceVolume(uint32_t){} void SetTestSignal(bool){} float TestSignalPosition(){return -1.0f;} uint32_t OutputChannels(){return surround?6:2;} }
 namespace settings { bool SaveAudioOutput(uint32_t o){savedConfig.audioOutput=o;return true;} }
+// No mods folder: the Mods page shows its empty state.
+namespace modding {
+std::vector<ModInfo> ListMods(){return {};}
+std::filesystem::path Root(){return "mods";}
+bool Enabled(){return true;}
+ResolutionMode Mode(){return ResolutionMode::Combined;}
+bool SaveModList(const std::vector<std::pair<std::string,bool>>&,std::string*){Check(false,"empty Mods page must not save");return false;}
+}
 '''
 TEST = r'''
 extern "C" PPC_FUNC(__imp__sub_822F19B0) {}
@@ -149,6 +160,13 @@ int main(int argc, char** argv) {
             for(int i=0;i<8;++i)Check(words[i]==PPC_LOAD_U32(ConfigData+i*4),"A leaves guest settings unchanged");
         }
     }
+    // System -> Mods opens the Mods page; with no mods it says where they go, and B returns.
+    settings::tab=3;settings::row=settings::SystemModsRow;tick(0x1000);
+    Check(settings::modsOpen && settings::snapshot.pageTitle==L"Mods" && settings::snapshot.rows.front().name==L"No mods installed" &&
+          settings::snapshot.rows.size()==size_t(settings::mods_page::CanOpenFolder?2:1),"System Mods opens the empty Mods page");
+    tick(2);tick(0x2000);
+    Check(!settings::modsOpen && settings::active && settings::tab==3 && settings::row==settings::SystemModsRow,
+          "B leaves the Mods page for the System tab");
     settings::tab=0;settings::row=0;tick(8);
     Check(PPC_LOAD_U32(ConfigData)==1 && applies==1,"right still applies gameplay setting");
     settings::tab=1;settings::row=settings::AudioOutputRow;tick(8);
@@ -170,6 +188,8 @@ int main(int argc, char** argv) {
         Check(settings::snapshot.rows.back().name==L"Save graphics settings","Save is last");
         Check(settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden==(i%aaChoices<4),"quality visibility");
         Check(settings::snapshot.rows[int(GraphicsRow::FsrSharpness)].hidden==(i%aaChoices!=5),"FSR sharpness visibility");
+        Check(settings::snapshot.rows[int(GraphicsRow::DlssModel)].hidden==(settings::edit.upscaler!=Upscaler::Dlss),
+              "DLSS model shows only with DLSS");
     }
     tick(4);Check(settings::edit.upscaler==(aaChoices>6?Upscaler::Xess:Upscaler::Fsr),"left from Off selects the last provider");
     if(aaChoices>6){
@@ -179,6 +199,26 @@ int main(int argc, char** argv) {
     }
     Check(settings::edit.dlssQuality==gpu::upscaling::DlssQuality::Dlaa &&
           settings::edit.fsrQuality==gpu::upscaling::FsrQuality::Balanced,"provider-specific qualities preserved");
+#if !LO_PLATFORM_MACOS && !LO_PLATFORM_ANDROID
+    // With DLSS the model row follows quality: M by default, L, and back.
+    settings::edit.upscaler=Upscaler::Dlss;settings::row=int(GraphicsRow::DlssQuality);tick();
+    tick(2);Check(settings::row==int(GraphicsRow::DlssModel),"DLSS model directly follows quality");
+    Check(settings::snapshot.rows[int(GraphicsRow::DlssModel)].value==L"M","DLSS model defaults to M");
+    tick(8);Check(settings::edit.dlssModel==1 && settings::snapshot.rows[int(GraphicsRow::DlssModel)].value==L"L",
+                  "DLSS model selects L");
+    tick(8);Check(settings::edit.dlssModel==0,"DLSS model wraps to M");
+    settings::edit.upscaler=Upscaler::Fsr;
+#endif
+    // HDR paper white and peak brightness show only with HDR on.
+    settings::edit.hdr=false;settings::row=int(GraphicsRow::Hdr);tick();
+    Check(settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].hidden &&
+          settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden,"HDR off hides its levels");
+    tick(2);Check(settings::row==int(GraphicsRow::Brightness),"down from HDR off reaches Brightness");
+    settings::edit.hdr=true;settings::row=int(GraphicsRow::Hdr);tick();
+    Check(!settings::snapshot.rows[int(GraphicsRow::HdrPaperWhite)].hidden &&
+          !settings::snapshot.rows[int(GraphicsRow::HdrPeak)].hidden,"HDR on shows its levels");
+    tick(2);Check(settings::row==int(GraphicsRow::HdrPaperWhite),"down from HDR on reaches paper white");
+    settings::edit.hdr=false;
     // The scroll origin depends on the rows a platform shows; moving from
     // quality to sharpness must never scroll.
     settings::row=int(GraphicsRow::DlssQuality);tick();
@@ -223,7 +263,7 @@ int main(int argc, char** argv) {
     settings::savedConfig.frameGenerationMultiplier=4;
     settings::savedConfig.frameGenerationTargetFps=144;
     settings::edit=settings::savedConfig;
-    settings::row=int(GraphicsRow::VariableRefreshRate);settings::edit.variableRefreshRate=false;
+    settings::row=int(GraphicsRow::VariableRefreshRate);settings::edit.variableRefreshRate=false;settings::edit.vsync=true;
     const auto beforeVrr=settings::GetConfig();
     auto fgPreferenceRetained=[&]{const auto saved=settings::GetConfig();return
         saved.frameGenerationProvider==beforeVrr.frameGenerationProvider &&
@@ -232,7 +272,7 @@ int main(int argc, char** argv) {
         saved.frameGenerationTargetFps==beforeVrr.frameGenerationTargetFps;};
     tick(8);Check(settings::edit.variableRefreshRate,"VRR toggles on");
     Check(settings::GetConfig()==beforeVrr,"unsaved VRR does not change runtime settings");
-    Check(settings::snapshot.rows[int(GraphicsRow::VariableRefreshRate)].value==L"On","VRR preference published");
+    Check(settings::snapshot.rows[int(GraphicsRow::VariableRefreshRate)].value==L"FreeSync / G-SYNC Compatible","VRR preference published");
     Check(!settings::restart::Required(beforeVrr,settings::edit),"VRR does not require restart");
     settings::row=int(GraphicsRow::Save);tick(0x1000);
     Check(settings::GetConfig().variableRefreshRate,"Save applies VRR preference");
@@ -242,6 +282,16 @@ int main(int argc, char** argv) {
     settings::row=int(GraphicsRow::Save);tick(0x1000);
     Check(!settings::GetConfig().variableRefreshRate,"Save restores ordinary pacing");
     Check(fgPreferenceRetained(),"VRR-off Save preserves Dynamic MFG preference");
+    Check(settings::edit.vsync && settings::snapshot.rows[int(GraphicsRow::VariableRefreshRate)].value==L"On","VRR off returns to VSync On");
+    settings::row=int(GraphicsRow::VariableRefreshRate);tick(4);
+    Check(!settings::edit.vsync && !settings::edit.variableRefreshRate,"VSync turns off");
+    Check(settings::snapshot.rows[int(GraphicsRow::VariableRefreshRate)].value==L"Off","VSync Off published");
+    settings::row=int(GraphicsRow::Save);tick(0x1000);
+    Check(!settings::GetConfig().vsync,"Save applies VSync Off");
+    settings::row=int(GraphicsRow::VariableRefreshRate);tick(8);
+    Check(settings::edit.vsync && !settings::edit.variableRefreshRate,"VSync turns back on");
+    settings::row=int(GraphicsRow::Save);tick(0x1000);
+    Check(settings::GetConfig().vsync,"Save applies VSync On");
     // AF changes only after Save, does not require a restart, and survives all levels.
     settings::row=int(GraphicsRow::AnisotropicFiltering);settings::edit.anisotropicFiltering=0;
     const auto afSaved=settings::GetConfig();
