@@ -793,6 +793,17 @@ namespace gpu::renderer
             // unordered_map nodes keep their address across rehashes.
             PipelineKey lastPipelineKey{};
             PipelineSlot* lastPipelineSlot = nullptr;
+            // Recent hits by raw draw key, indexed by a hash of a few fields: a
+            // repeat skips normalization, the key hash and the map lookup.
+            struct PipelineLookup { PipelineKey raw{}, key{}; PipelineSlot* slot = nullptr; };
+            std::array<PipelineLookup, 256> pipelineLookups{};
+            static size_t PipelineLookupIndex(const PipelineKey& k)
+            {
+                uint64_t h = k.vs * 0x9E3779B97F4A7C15ull ^ k.ps * 0xC2B2AE3D27D4EB4Full ^
+                    ((uint64_t(k.blend) << 32 | k.depthControl) * 0x165667B19E3779F9ull) ^ (uint64_t(k.colorMask) << 32 | k.rtFormat);
+                h = (h ^ (h >> 31)) * 0x94D049BB133111EBull;
+                return size_t(h >> 56);
+            }
             std::unordered_map<PipelineKey, std::unique_ptr<RenderPipeline>, PipelineKeyHash> hdrPipelines;
             // Full state recipes are portable; driver blobs and object pointers
             // are never persisted. Render maps stay on the command thread.
@@ -942,6 +953,11 @@ namespace gpu::renderer
             } libraryPrecompile;
             std::unordered_map<RenderTargetKey, std::unique_ptr<HostTexture>, RenderTargetKeyHash> renderTargets;
             std::unordered_map<TextureKey, std::unique_ptr<HostTexture>, TextureKeyHash> textures;
+            // Changes on every insert into or erase from `textures`; an iterator
+            // remembered at an unchanged version is still valid.
+            uint64_t texturesVersion = 1;
+            struct TextureLookup { TextureKey key{}; decltype(textures)::iterator it{}; uint64_t version = 0; };
+            std::array<TextureLookup, 256> textureLookups{};
 
             // Resolve results kept on the GPU, keyed by guest physical address.
             // The game samples them through fetch constants pointing at the
@@ -1408,8 +1424,16 @@ namespace gpu::renderer
             uint64_t sceneAAConfigFrame=~0ull,sceneAAAppliedFrame=~0ull,sceneAAAllocation=0;
 
             // The entry at `base` whose destination format the fetch can read.
+            // Bases that may have resolve entries, by hash. Bits are set when an
+            // entry is created and cleared only with the map, so a clear bit is a
+            // certain miss and most texture fetches skip the map lookup.
+            std::bitset<4096> resolvedBases;
+            static size_t ResolvedBaseBit(uint32_t base) { return size_t((base * 0x9E3779B1u) >> 20); }
+
             ResolvedSurface* FindResolved(uint32_t base, uint32_t fetchFormat)
             {
+                if (!resolvedBases.test(ResolvedBaseBit(base)))
+                    return nullptr;
                 auto it = resolved.find(base);
                 if (it == resolved.end())
                     return nullptr;
@@ -1423,6 +1447,8 @@ namespace gpu::renderer
             // debug dumps want, since they ask for a surface, not a format.
             ResolvedSurface* NewestResolved(uint32_t base)
             {
+                if (!resolvedBases.test(ResolvedBaseBit(base)))
+                    return nullptr;
                 auto it = resolved.find(base);
                 if (it == resolved.end())
                     return nullptr;
@@ -1435,6 +1461,7 @@ namespace gpu::renderer
 
             ResolvedSurface& ResolvedSlot(uint32_t base, uint32_t destFormat)
             {
+                resolvedBases.set(ResolvedBaseBit(base));
                 std::vector<ResolvedSurface>& list = resolved[base];
                 for (ResolvedSurface& rs : list)
                     if (rs.destFormat == destFormat)
@@ -2227,7 +2254,6 @@ namespace gpu::renderer
             // MMIO stores by compare. drawConstants is the copy a draw may modify
             // (TAA jitter).
             ConstantBankSnapshot constantSnapshot[2];
-            uint64_t constantSnapshotGeneration[2]{UINT64_MAX, UINT64_MAX};
             uint64_t constantSnapshotVersion[2]{};
             uint64_t constantMmioEpoch[2]{}; // sync period of the last zero-register MMIO check
             uint32_t drawConstants[2][256 * 4]{};
@@ -2480,8 +2506,9 @@ namespace gpu::renderer
                     device->getCapabilities().occlusionQueryPrecise, kOcclusionQueriesPerSlot,
                     getenv("LO_ZPD_MODE") ? getenv("LO_ZPD_MODE") : "unset", countingState);
                 BindGpuSlot();
+                // Cached index conversions live in the arena too (INDEX).
                 const auto vertexFlags = RenderBufferFlag::STORAGE |
-                    (vulkan ? RenderBufferFlag::DEVICE_ADDRESSABLE : RenderBufferFlag::NONE);
+                    (vulkan ? RenderBufferFlag::DEVICE_ADDRESSABLE | RenderBufferFlag::INDEX : RenderBufferFlag::NONE);
                 vertexArena = device->createBuffer(RenderBufferDesc::UploadBuffer(gpu::render_arena::kVertexArenaSize, vertexFlags));
                 if (!vertexArena) return InitFailure("vertex_arena.create", gpu::render_arena::kVertexArenaSize);
                 if (vulkan && !vertexArena->getDeviceAddress())
@@ -4325,7 +4352,7 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
             // Writes guest query records. The guest's GetData treats a record as
             // ready once either ZPass half leaves its sentinel, so both halves are
             // stored together, after every other count.
-            void WriteOcclusionRecords(const std::vector<gpu::occlusion::Write>& writes)
+            void WriteOcclusionRecords(std::span<const gpu::occlusion::Write> writes)
             {
                 for (const auto& write : writes) {
                     if (!write.apply) continue;
@@ -4350,9 +4377,10 @@ void main(triangle V input[3], inout TriangleStream<V> stream)
                         const auto known = g_occlusionOwners.find(gpu::occlusion::SlotOf(address));
                         if (known != g_occlusionOwners.end()) owner = known->second;
                     }
-                    WriteOcclusionRecords({occlusion.Begin(address, owner)});
+                    const auto begin = occlusion.Begin(address, owner);
+                    WriteOcclusionRecords({&begin, 1});
                 }
-                else if (auto end = occlusion.End(address)) WriteOcclusionRecords({*end});
+                else if (const auto end = occlusion.End(address)) WriteOcclusionRecords({&*end, 1});
                 PublishOcclusionAwaited();
                 return true;
             }
@@ -7306,6 +7334,7 @@ void main()
                     lastFramebuffer = nullptr;
                     renderTargets.clear();
                     resolved.clear();
+                    resolvedBases.reset();
                     tileOwner.clear();
                     if (temporalHistory) temporalHistory->Reset();
                     temporalScene.Reset(frame);
@@ -8092,9 +8121,11 @@ void main()
                     Transition(*rs->tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                     return rs->tex.get();
                 }
-                auto it = textures.find(key);
+                auto& recentTexture = textureLookups[TextureKeyHash{}(key) & (textureLookups.size() - 1)];
+                auto it = recentTexture.version == texturesVersion && recentTexture.key == key ? recentTexture.it : textures.find(key);
                 if (it != textures.end())
                 {
+                    recentTexture = {key, it, texturesVersion};
                     HostTexture* cached = it->second.get();
                     // An original whose mod replacement was read since: re-create it.
                     const bool replacementArrived = cached->replacementPending && ReplacementArrived(*cached);
@@ -8129,6 +8160,7 @@ void main()
                     if (!replacementArrived) textureReuploads++;
                     Gpu().retiredTextures.push_back(std::move(it->second));
                     textures.erase(it);
+                    ++texturesVersion;
                 }
 
                 ScopedTimer timer{ tTexture, cpuTimingEnabled };
@@ -8333,6 +8365,7 @@ void main()
                         {
                             HostTexture* result = tex.get();
                             textures.emplace(key, std::move(tex));
+                            ++texturesVersion;
                             return SelectControllerAtlas(result, bindingInfo);
                         }
                         textureReplacementFailures.insert(fingerprint);
@@ -8406,6 +8439,7 @@ void main()
 
                 HostTexture* result = tex.get();
                 textures.emplace(key, std::move(tex));
+                ++texturesVersion;
                 return SelectControllerAtlas(result, bindingInfo);
             }
 
@@ -8421,6 +8455,7 @@ void main()
                         // hand it to the retired list (freed after the next fence wait).
                         Gpu().retiredTextures.push_back(std::move(it->second));
                         it = textures.erase(it);
+                        ++texturesVersion;
                     }
                     else ++it;
                 }
@@ -8482,18 +8517,26 @@ void main()
             // drawKey is the draw's raw state; pipelines and recipes use its normalized form.
             // mayDefer: with LO_PIPELINE_ASYNC=1 the draw may be skipped (nullptr and
             // pipelineDeferred) while a worker builds its pipeline.
+            RenderPipeline* PipelineHit(PipelineSlot& slot, const PipelineKey& key)
+            {
+                if (slot.sceneSerial != sceneSerial) {
+                    slot.sceneSerial = sceneSerial;
+                    NoteRecipeUse(key);
+                }
+                if (!unusedSiblings.empty() && unusedSiblings.erase(key)) ++workerStats.hits;
+                lastPipelineKey = key;
+                lastPipelineSlot = &slot;
+                return slot.pipeline.get();
+            }
+
             RenderPipeline* GetPipeline(const PipelineKey& drawKey, Shader* vs, Shader* ps, RenderFormat, RenderFormat, bool mayDefer = false)
             {
+                auto& recent = pipelineLookups[PipelineLookupIndex(drawKey)];
+                if (recent.slot && recent.raw == drawKey) return PipelineHit(*recent.slot, recent.key);
                 const PipelineKey key = gpu::pipeline_cache::Normalize(drawKey);
                 const auto hit = [&](PipelineSlot& slot) {
-                    if (slot.sceneSerial != sceneSerial) {
-                        slot.sceneSerial = sceneSerial;
-                        NoteRecipeUse(key);
-                    }
-                    if (!unusedSiblings.empty() && unusedSiblings.erase(key)) ++workerStats.hits;
-                    lastPipelineKey = key;
-                    lastPipelineSlot = &slot;
-                    return slot.pipeline.get();
+                    recent = {drawKey, key, &slot};
+                    return PipelineHit(slot, key);
                 };
                 // Consecutive draws often repeat the key; skip the map lookup.
                 if (lastPipelineSlot && key == lastPipelineKey) return hit(*lastPipelineSlot);
@@ -8708,11 +8751,28 @@ void main()
                 return ok;
             }
 
+            // Sources already found and validated in the current sync epoch, by
+            // key hash: a repeat skips the map lookup. Valid while the cache's
+            // version is unchanged (no entry added, removed or recaptured since).
+            struct VertexLookup { uint64_t key = 0, epoch = 0, version = 0; geometry_prepare::VertexEntry* entry = nullptr; };
+            std::array<VertexLookup, 256> vertexLookups{};
+
             // Returns the arena offset of the swapped copy of a guest vertex buffer.
             uint64_t GetVertexBuffer(uint32_t address, uint32_t sizeDwords, uint32_t endian)
             {
                 const size_t bytes = size_t(sizeDwords) * 4;
                 const uint64_t key = (uint64_t(address) << 32) | (uint64_t(sizeDwords) << 2) | endian;
+                static const bool verify = [] { const char* v = getenv("LO_REVALIDATE_VERIFY"); return v && strcmp(v, "0") != 0; }();
+                auto& lookup = vertexLookups[(key * 0x9E3779B97F4A7C15ull) >> 56];
+                const uint64_t epoch = g_commandProcessor.SyncEpoch();
+                if (!vertexTimingEnabled && !verify && lookup.entry && lookup.key == key && lookup.epoch == epoch &&
+                    lookup.version == vertexCache.Version())
+                {
+                    // What the map path does for a source validated this epoch.
+                    ++revalidationSkips;
+                    lookup.entry->lastFrame = frame;
+                    return lookup.entry->offset;
+                }
                 const uint8_t* guest = Phys(address);
                 if (vertexTimingEnabled && vertexTiming.find.calls == 0)
                 {
@@ -8735,6 +8795,8 @@ void main()
                     if (gpu::render_arena::VertexCacheReusable(matches))
                     {
                         it->second.lastFrame = frame;
+                        if (it->second.validatedEpoch == epoch)
+                            lookup = {key, epoch, vertexCache.Version(), &it->second};
                         return it->second.offset;
                     }
                     // Contents changed. Overwriting the arena copy in place would
@@ -8788,7 +8850,7 @@ void main()
                 entry.validatedEpoch = g_commandProcessor.SyncEpoch();
                 {
                     VertexStageTimer timer(vertexTiming.capture, vertexTimingEnabled, address, bytes);
-                    entry.content.Capture(guest, bytes);
+                    entry.content.Capture(guest, bytes, vertexCache.TakeSpare(bytes));
                 }
                 {
                     VertexStageTimer timer(vertexTiming.copy, vertexTimingEnabled, address, bytes);
@@ -9113,17 +9175,15 @@ void main()
                 // zero-register MMIO fallback.
                 static const bool verifyConstants = getenv("LO_CONSTANT_SNAPSHOT_VERIFY") != nullptr;
                 for (uint32_t bank = 0; bank < 2; ++bank) {
-                    const uint64_t generation = g_commandProcessor.ConstantGeneration(bank);
                     auto& snapshot = constantSnapshot[bank];
-                    const bool refresh = generation != constantSnapshotGeneration[bank];
                     // A direct guest MMIO store reaches draws only across a sync
                     // point, so the zero-register fallback is read once per period.
                     const uint64_t epoch = g_commandProcessor.SyncEpoch();
                     const bool checkMmio = constantMmioEpoch[bank] != epoch;
                     constantMmioEpoch[bank] = epoch;
                     uint64_t changedBlocks = g_commandProcessor.UpdateConstantSnapshot(bank, snapshot, checkMmio);
-                    constantSnapshotGeneration[bank] = generation;
-                    if (refresh || changedBlocks) ++constantSnapshotVersion[bank];
+                    // Every command write leaves a dirty block, so no change means no new version.
+                    if (changedBlocks) ++constantSnapshotVersion[bank];
                     if (verifyConstants) {
                         uint32_t check[256 * 4];
                         g_commandProcessor.ReadRegisters(REG_ALU_CONSTANTS + bank * 256 * 4, 256 * 4, check);
@@ -9510,8 +9570,12 @@ void main()
                     std::copy_n(vsConstants, 16, suspectWorld.begin());
                     std::copy_n(vsConstants + temporalSlot * 4, 16, suspectVP.begin());
                 }
-                const auto drawJitter = temporal::ApplyDrawJitter(key.vs, key.ps, frame,
-                    temporalActive && temporalJitter && !diagnosticMaterialBypass, temporalViewport, jitterAnchor,
+                // Without jitter the result is only the draw's slot, already in
+                // temporalSlot (same shader pair and screen-sample flag).
+                const bool jitterEnabled = temporalActive && temporalJitter && !diagnosticMaterialBypass;
+                const auto drawJitter = !jitterEnabled ? temporal::DrawJitter{temporalSlot} :
+                    temporal::ApplyDrawJitter(key.vs, key.ps, frame,
+                    jitterEnabled, temporalViewport, jitterAnchor,
                     depth ? depth->allocationSerial : 0,
                     {rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height},
                     vsConstants, psConstants, &temporalScene.DepthFor(jitterSampledDepth ? &*jitterSampledDepth : nullptr),
@@ -9641,10 +9705,13 @@ void main()
                 static const uint32_t vfTraceCount = getenv("LO_DRAW_TRACE_COUNT") ? strtoul(getenv("LO_DRAW_TRACE_COUNT"), nullptr, 10) : 1;
                 const bool vfTrace = vfTraceFrame && frame >= vfTraceFrame && frame < vfTraceFrame + vfTraceCount;
                 std::string vfTraceLine;
-                for (uint32_t slot = 0; slot < kVertexFetchSlots; slot++)
+                // Only the slots the shader reads, in ascending order.
+                for (uint32_t word = 0; word < 2; ++word)
+                for (uint64_t pending = vs->info.vertexFetchSlotMask[word]; pending; pending &= pending - 1)
                 {
-                    if (!((vs->info.vertexFetchSlotMask[slot >> 6] >> (slot & 63)) & 1))
-                        continue;
+                    const uint32_t slot = word * 64 + uint32_t(std::countr_zero(pending));
+                    if (slot >= kVertexFetchSlots)
+                        break;
                     uint32_t vfetch[2];
                     g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 2, 2, vfetch);
                     const uint32_t d0 = vfetch[0], d1 = vfetch[1];
@@ -9804,7 +9871,9 @@ void main()
                     RenderTexture* actualColor = nullptr;
                     const char* substitution = "none";
                 };
-                std::array<std::optional<AlphaPostInput>, 4> alphaPostInputs{};
+                // Default-initialized: four disengaged optionals without zeroing
+                // their payloads on every draw.
+                std::array<std::optional<AlphaPostInput>, 4> alphaPostInputs;
                 struct AlphaPostDepthInput {
                     RenderTexture* texture = nullptr;
                     RenderFormat format = RenderFormat::UNKNOWN;
@@ -9816,12 +9885,12 @@ void main()
                 auto bindTextures = [&](Shader* s)
                 {
                     if (!s) return;
-                    for (uint32_t slot = 0; slot < kTextureSlots; slot++)
+                    // Only the slots the shader samples, in ascending order.
+                    for (uint32_t pending = s->info.textureSlotMask; pending; pending &= pending - 1)
                     {
+                        const uint32_t slot = uint32_t(std::countr_zero(pending));
                         if (failedPlan)
                             return;
-                        if (!((s->info.textureSlotMask >> slot) & 1))
-                            continue;
                         uint32_t fetch[6];
                         g_commandProcessor.ReadRegisters(REG_FETCH_CONSTANTS + slot * 6, 6, fetch);
                         const uint32_t declared = s->info.textureDimension[slot];
@@ -10716,7 +10785,36 @@ void main()
                 // Upload indices first so no allocator pressure can Flush between the
                 // promoted fallback and the original guarded draw.
                 uint64_t preparedIndexOffset = UINT64_MAX;
-                if (useIndices) {
+                RenderBuffer* preparedIndexBuffer = uploadRing;
+                if (useIndices && cachedIndexEntry) {
+                    // A cache hit keeps its indices in the vertex arena, like a vertex
+                    // source, until that arena half is reset: later frames bind the
+                    // same bytes without copying them again.
+                    auto& entry = *cachedIndexEntry;
+                    const auto inArena = [&] {
+                        return entry.arenaOffset != UINT64_MAX && entry.arenaGeneration == motionArenaGeneration[entry.arenaSlot];
+                    };
+                    if (!inArena()) {
+                        const size_t bytes = indices.size() * 4;
+                        const size_t needed = (bytes + 15) & ~size_t(15);
+                        const uint32_t otherSlot = (gpuSlot + 1) % kGpuSlots;
+                        const uint32_t allocSlot = gpu::render_arena::VertexAllocSlot(
+                            gpuSlot, Gpu().arenaOffset, gpuSlots[otherSlot].arenaOffset, needed);
+                        if (allocSlot != gpu::render_arena::kGpuSlots) {
+                            uint64_t& local = gpuSlots[allocSlot].arenaOffset;
+                            entry.arenaOffset = gpu::render_arena::SlotBase(allocSlot) + local;
+                            entry.arenaSlot = uint8_t(allocSlot);
+                            entry.arenaGeneration = motionArenaGeneration[allocSlot];
+                            local += needed;
+                            std::memcpy(arenaMapped + entry.arenaOffset, indices.data(), bytes);
+                        }
+                    }
+                    if (inArena()) {
+                        preparedIndexBuffer = vertexArena.get();
+                        preparedIndexOffset = entry.arenaOffset;
+                    }
+                }
+                if (useIndices && preparedIndexOffset == UINT64_MAX) {
                     // A cache hit reuses its earlier upload while the ring has not
                     // been rewound since; the data then lives exactly as long as a
                     // fresh upload's would (until this slot is recycled).
@@ -10732,6 +10830,7 @@ void main()
                             cachedIndexEntry->ringGeneration = Gpu().uploadGeneration;
                         }
                     }
+                    preparedIndexBuffer = uploadRing; // the ring of the slot now holding the data
                 }
 
                 // Record.
@@ -10777,9 +10876,10 @@ void main()
                             viewport, guestScissor, replacesAlpha ? fullCopyBounds : nullptr);
                     }
                 }
+                int32_t scissorLeft, scissorTop, scissorRight, scissorBottom;
                 if (!scenePromotionActivated) {
-                    scissor.left = int32_t(rasterTarget->ScaleX(uint32_t(scissor.left))); scissor.right = int32_t(rasterTarget->ScaleX(uint32_t(scissor.right)));
-                    scissor.top = int32_t(rasterTarget->ScaleY(uint32_t(scissor.top))); scissor.bottom = int32_t(rasterTarget->ScaleY(uint32_t(scissor.bottom)));
+                    scissorLeft = int32_t(rasterTarget->ScaleX(uint32_t(scissor.left))); scissorRight = int32_t(rasterTarget->ScaleX(uint32_t(scissor.right)));
+                    scissorTop = int32_t(rasterTarget->ScaleY(uint32_t(scissor.top))); scissorBottom = int32_t(rasterTarget->ScaleY(uint32_t(scissor.bottom)));
                 } else {
                     // Activation can replace the map entry after the original
                     // render-target acquisition. Re-read the final attachments
@@ -10799,14 +10899,18 @@ void main()
                         drops.primMask |= 1u << (info.primitiveType & 31);
                         return;
                     }
+                    scissorLeft = scissor.left; scissorTop = scissor.top; scissorRight = scissor.right; scissorBottom = scissor.bottom;
                 }
                 // Height is a historical EDRAM allocation estimate. Attachments
                 // may have different padding while covering the same draw; keep
                 // that draw and constrain it to their common physical extent.
                 const int32_t attachmentWidth = int32_t(depthOnlyRaster ? depth->width : depth ? std::min(color->width, depth->width) : color->width);
                 const int32_t attachmentHeight = int32_t(depthOnlyRaster ? depth->height : depth ? std::min(color->height, depth->height) : color->height);
-                scissor.left = std::min(scissor.left, attachmentWidth); scissor.right = std::min(scissor.right, attachmentWidth);
-                scissor.top = std::min(scissor.top, attachmentHeight); scissor.bottom = std::min(scissor.bottom, attachmentHeight);
+                // Clamp in registers and store the rectangle once. Reloading four
+                // fields just stored one by one as one 16-byte vector cannot be
+                // store-forwarded and stalled every draw.
+                scissor = RenderRect(std::min(scissorLeft, attachmentWidth), std::min(scissorTop, attachmentHeight),
+                    std::min(scissorRight, attachmentWidth), std::min(scissorBottom, attachmentHeight));
                 if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
                 {
                     drops.scissor++;
@@ -11122,7 +11226,7 @@ void main()
                 recordProbe.Enter(record_timing::Phase::Draw);
                 if (useIndices)
                 {
-                    RenderIndexBufferView view(RenderBufferReference(uploadRing, preparedIndexOffset), uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
+                    RenderIndexBufferView view(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset), uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                     commandList->setIndexBuffer(&view);
                     commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
                 }
@@ -11340,7 +11444,7 @@ void main()
                                 commandList->setScissors(&scissor, 1);
                                 commandList->setPipeline(hdrPipeline.get());
                                 if (useIndices) {
-                                    RenderIndexBufferView view(RenderBufferReference(uploadRing, preparedIndexOffset),
+                                    RenderIndexBufferView view(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset),
                                         uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                                     commandList->setIndexBuffer(&view);
                                     commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
@@ -11425,7 +11529,7 @@ void main()
                                     commandList->setScissors(&scissor, 1);
                                     commandList->setPipeline(replay);
                                     if (useIndices) {
-                                        RenderIndexBufferView view(RenderBufferReference(uploadRing, preparedIndexOffset),
+                                        RenderIndexBufferView view(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset),
                                             uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                                         commandList->setIndexBuffer(&view);
                                         commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
@@ -12222,7 +12326,7 @@ void main()
                                     const RenderBufferReference cb[4] = {{uploadRing, vsOffset}, {uploadRing, sharedOffset},
                                         {uploadRing, psOffset}, {uploadRing, mvOffset}};
                                     RenderDescriptorSet* sets[] = {set0, set1, set2, set3, set4};
-                                    const RenderIndexBufferView replayIndices(RenderBufferReference(uploadRing, preparedIndexOffset),
+                                    const RenderIndexBufferView replayIndices(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset),
                                         uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                                     if (!motionReplay->Draw(commandList, prepared.pipeline, cb, sets, vulkan ? 5 : 4,
                                         rasterViewport, scissor, useIndices, indexCount, baseVertex, useIndices ? &replayIndices : nullptr)) {
@@ -12705,7 +12809,7 @@ void main()
                         commandList->setScissors(&fullRect, 1);
                         if (useIndices) {
                             // Expanded rect list: replay its encoded corners.
-                            RenderIndexBufferView view(RenderBufferReference(uploadRing, preparedIndexOffset),
+                            RenderIndexBufferView view(RenderBufferReference(preparedIndexBuffer, preparedIndexOffset),
                                 uint32_t(indices.size() * 4), RenderFormat::R32_UINT);
                             commandList->setIndexBuffer(&view);
                             commandList->drawIndexedInstanced(indexCount, 1, 0, baseVertex, 0);
@@ -14264,10 +14368,13 @@ void main()
                     c1.mmioBlockChecks = c1.mmioBlockDiffs = c1.mmioWordChanges = 0;
                 }
                 if (r.nativeVulkan) {
-                    // Graphics pipeline rebinds plume skipped inside a render pass (all lists).
+                    // Graphics pipeline rebinds plume skipped inside a render pass (renderer lists).
                     static uint64_t skippedBefore = 0;
-                    const uint64_t skipped = plume::VulkanCommandList::skippedPipelineBinds.load(std::memory_order_relaxed);
-                    LOG_INFO("render binds frame={} pipeline_binds_skipped={}", r.frame, skipped - skippedBefore);
+                    uint64_t skipped = 0;
+                    for (const auto& slot : r.gpuSlots)
+                        for (const auto* list : {slot.list.get(), slot.srIsolated.get(), slot.srContinuation.get()})
+                            if (list) skipped += static_cast<const plume::VulkanCommandList*>(list)->skippedPipelineBinds;
+                    LOG_INFO("render binds frame={} pipeline_binds_skipped={}", r.frame, skipped >= skippedBefore ? skipped - skippedBefore : skipped);
                     skippedBefore = skipped;
                 }
                 const render_timing::CpuSegments cpu{r.drawsThisFrame, r.nShader, r.nPipeline, r.nTexture, r.nResolve,
