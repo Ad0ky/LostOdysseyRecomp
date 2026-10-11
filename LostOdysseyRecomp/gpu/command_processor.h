@@ -75,9 +75,9 @@ namespace gpu
         // Same values as ordered ReadRegister calls, without a call per word.
         void ReadRegisters(uint32_t first, uint32_t count, uint32_t* destination);
         // Bring a renderer copy of a constant bank up to date: blocks command writes
-        // changed since the last update, then zero-register words whose direct
-        // MMIO store changed. Returns the 16-word blocks re-read or changed.
-        uint64_t UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot);
+        // changed since the last update, then, with checkMmio, zero-register words
+        // whose direct MMIO store changed. Returns the 16-word blocks re-read or changed.
+        uint64_t UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot, bool checkMmio);
         // ALU constant banks (0: vertex 0x4000-0x43FF, 1: pixel 0x4400-0x47FF). The
         // generation changes whenever command packets change a value in the bank.
         // Direct MMIO stores are checked separately at zero-register fallback words.
@@ -85,14 +85,15 @@ namespace gpu
         uint64_t ConstantGeneration(uint32_t bank) const { return m_constantGeneration[bank & 1].load(std::memory_order_acquire); }
         // Advances wherever the guest and the GPU synchronize or the GPU side
         // writes guest memory: read-pointer and scratch writeback, fences,
-        // interrupts, swaps, memory waits, occlusion records, resolve readback.
-        // A guest write to memory the GPU already read is only ordered against
-        // later draws across such a point.
+        // interrupts, swaps, memory waits, resolve readback. A guest write to
+        // memory the GPU already read is only ordered against later draws across
+        // such a point. Occlusion queries are not one: the guest polls their
+        // records but never makes the command stream wait for them.
         uint64_t SyncEpoch() const { return m_syncEpoch.load(std::memory_order_relaxed); }
         // What ended each sync period; counted only with LO_RENDER_TIMING.
         enum class SyncSource : uint32_t {
             Batch, Scratch, Interrupt, Swap, WaitRegMem, RegToMem, MemWrite, CondWrite,
-            EventShd, EventExt, EventZpd, Occlusion, Resolve, Count
+            EventShd, EventExt, Resolve, Count
         };
         void AdvanceSyncEpoch(SyncSource source)
         {
