@@ -14,6 +14,17 @@ import sys
 import time
 
 
+def keepalive(conn):
+    """Notice a console that vanished (Wi-Fi drop, reboot) within about 20 seconds."""
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "SIO_KEEPALIVE_VALS"):  # Windows
+        conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 10000, 3000))
+    elif hasattr(socket, "TCP_KEEPIDLE"):
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 10)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("host", help="the console's IP address")
@@ -27,6 +38,7 @@ def main():
             try:
                 with socket.create_connection((args.host, args.port), timeout=5) as conn:
                     conn.settimeout(None)
+                    keepalive(conn)
                     banner = f"--- connected {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n".encode()
                     out.write(banner)
                     out.flush()
