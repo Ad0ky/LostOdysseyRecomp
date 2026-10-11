@@ -30,6 +30,10 @@ struct Presentation::Impl
     std::unique_ptr<RenderPipeline> presentPipeline;
     std::unique_ptr<RenderShader> gainPs;
     std::unique_ptr<RenderPipeline> gainPipeline;
+    // pixelLinear and pixelCubic into the swap chain format, for the common
+    // final passes (see Draw); null when one failed to build.
+    std::unique_ptr<RenderShader> finalPs[2];
+    std::unique_ptr<RenderPipeline> finalPipelines[2];
     // The final pass as a compute pass into a storage swap chain image (see
     // PresentationOptions::storageTarget). Vulkan with an RGBA8 swap chain
     // only; null elsewhere or when creation failed.
@@ -175,6 +179,8 @@ bool Presentation::Init(RenderDevice *device, RenderFormat swapchainFormat, bool
     p.computePipeline.reset();
     p.computeCs.reset();
     p.computeLayout.reset();
+    for (auto &pipeline : p.finalPipelines) pipeline.reset();
+    for (auto &shader : p.finalPs) shader.reset();
     const auto binaryFormat = p.vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
     const auto renderFormat = p.vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
     const char *source = R"(
@@ -246,6 +252,15 @@ float4 vertex(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2,-2) + float2(-1,1),0,1);
 }
+// The source position of an output pixel center. precise keeps every shader
+// on the same arithmetic: without it some drivers (AMD Vulkan, NVIDIA D3D12)
+// reassociated it per shader, and the dedicated final passes below differed
+// from pixel() by one or two levels in up to 1% of the pixels.
+float2 sourcePixel(float2 position) {
+    precise float2 uv=(position-origin)/extent;
+    precise float2 p=uv*imageSize;
+    return p;
+}
 float3 sampleFrame(float2 pixel) {
     uint w,h; frame.GetDimensions(w,h);
     return frame.SampleLevel(linearClamp, clamp(pixel,0.5,imageSize-0.5)/float2(w,h),0).rgb;
@@ -257,11 +272,16 @@ float cubic(float x) {
     if(x<2) return ((-0.5*x+2.5)*x-4)*x+2;
     return 0;
 }
-float3 resample(float2 pixel) {
+// kind is a literal at every call: 0 decides at run time (pixel()), 1 is a
+// native-size copy or bilinear upscale, 2 a bicubic upscale. The dedicated
+// entry points below keep only their own branch and the same arithmetic.
+float3 resampleAs(float2 pixel, uint kind) {
+    // A native-size copy and a bilinear upscale are both one bilinear tap.
+    if(kind==1) return sampleFrame(pixel);
     float2 footprint=imageSize/extent;
     // Native pixel centers retain exact identity, including a padded source.
     if(all(abs(footprint-1)<0.00001)) return sampleFrame(pixel);
-    if(any(footprint>1.00001)) {
+    if(kind==0 && any(footprint>1.00001)) {
         // Exact box coverage per source texel, not a sparse sample approximation.
         // CPU stages large reductions so each axis spans at most five texels.
         float2 radius=max(footprint,1.0)*0.5;
@@ -275,7 +295,7 @@ float3 resample(float2 pixel) {
         }
         return sum/max(total,0.000001);
     }
-    if(!filter) return sampleFrame(pixel);
+    if(kind==0 && !filter) return sampleFrame(pixel);
     float2 base=floor(pixel-0.5)+0.5;
     float3 sum=0;
     [unroll] for(int y=-1;y<=2;++y) [unroll] for(int x=-1;x<=2;++x) {
@@ -287,6 +307,7 @@ float3 resample(float2 pixel) {
     float3 c=sampleFrame(base+float2(0,1)),d=sampleFrame(base+1);
     return clamp(sum,min(min(a,b),min(c,d)),max(max(a,b),max(c,d)));
 }
+float3 resample(float2 pixel) { return resampleAs(pixel,0); }
 // Edge decisions on the SDR range only: an extended-gamma scene keeps its
 // highlights, but above white the luma contrast is as saturated SDR would see.
 float luma(float3 c) { return dot(saturate(c),float3(0.299,0.587,0.114)); }
@@ -326,17 +347,21 @@ float4 outputSignal(float3 color, bool extended) {
     }
     return float4(encodeOutput(color),1);
 }
-float4 finishFrame(float3 color) {
+// sdr (a literal): the target is SDR, outputFlags 1, 2 and 8 are clear, so
+// the output conversion is the identity.
+float4 finishFrameAs(float3 color, bool sdr) {
     // Scanout order: the guest's ramp, then the optional RGB range expansion,
     // then the player's brightness/gamma, then the HDR output conversion.
     if ((outputFlags & 64) != 0) color=applyGammaRamp(color);
     if (expandRange != 0) {
         color=max((color-16.0/255.0)*(255.0/219.0),0);
-        if ((outputFlags & 2) == 0) color=min(color,1);
+        if (sdr || (outputFlags & 2) == 0) color=min(color,1);
     }
     if ((outputFlags & 256) != 0) color=applyUserCurve(color);
+    if (sdr) return float4(color,1);
     return outputSignal(color,(outputFlags & 2) != 0);
 }
+float4 finishFrame(float3 color) { return finishFrameAs(color,false); }
 // Fit the full frozen scene into one half of calibrationRect without
 // stretching or showing padded rows. Both halves sample exactly the same frame.
 float2 fitScene(float2 tile) {
@@ -397,7 +422,7 @@ float4 pixel(float4 position : SV_Position) : SV_Target {
         }
         return float4(encodeOutput((level*outputScale).xxx),1);
     }
-    float2 p = (position.xy-origin)/extent*imageSize;
+    float2 p = sourcePixel(position.xy);
     float3 center = sampleFrame(p);
     if (!aa) return finishFrame(resample(p));
     float nw=luma(sampleFrame(p+float2(-1,-1))), ne=luma(sampleFrame(p+float2(1,-1)));
@@ -411,6 +436,15 @@ float4 pixel(float4 position : SV_Position) : SV_Target {
     float3 b=a*0.5+0.25*(sampleFrame(p-direction*0.5)+sampleFrame(p+direction*0.5));
     float lb=luma(b);
     return finishFrame((lb<lo || lb>hi)?a:b);
+}
+// pixel() for the common final passes into an SDR target: no AA, no
+// calibration view, no reduction. Without the other branches the shader is a
+// fraction of pixel()'s size and register use (Presentation::Draw picks them).
+float4 pixelLinear(float4 position : SV_Position) : SV_Target {
+    return finishFrameAs(resampleAs(sourcePixel(position.xy),1),true);
+}
+float4 pixelCubic(float4 position : SV_Position) : SV_Target {
+    return finishFrameAs(resampleAs(sourcePixel(position.xy),2),true);
 }
 // Highlight gain: frame = final SDR output, calibrationScene = pre-upscale
 // extended-gamma scene (valid imageSize inside a calibrationRect.xy allocation).
@@ -486,6 +520,17 @@ float4 gainPixel(float4 position : SV_Position) : SV_Target {
     p.initialized = bool(p.pipeline) && bool(p.presentPipeline) && bool(p.hdrPipeline) && bool(p.gainPipeline) &&
         p.smaa[0].Init(device, p.vs.get(), p.sampler.get(), p.vulkan) &&
         p.smaa[1].Init(device, p.vs.get(), p.sampler.get(), p.vulkan);
+    // Optional: without them pixel() serves every final pass.
+    const char *finalEntries[] = {"pixelLinear", "pixelCubic"};
+    for (size_t i = 0; p.initialized && i < 2; ++i) {
+        auto shader = xenos::CompileCachedHlsl(source, finalEntries[i], "ps_6_0", binaryFormat);
+        if (shader.ok)
+            p.finalPs[i] = device->createShader(shader.bytecode.data(), shader.bytecode.size(), finalEntries[i], renderFormat);
+        else
+            LOG_WARNING("presentation {}: {}", finalEntries[i], shader.errors);
+        desc.pixelShader = p.finalPs[i].get();
+        if (p.finalPs[i]) p.finalPipelines[i] = device->createGraphicsPipeline(desc);
+    }
     // Optional: without it the fragment pass serves every target.
     if (p.initialized && storageSwapchain && device->getCapabilities().shaderFormat == RenderShaderFormat::SPIRV &&
         swapchainFormat == RenderFormat::R8G8B8A8_UNORM)
@@ -493,8 +538,8 @@ float4 gainPixel(float4 position : SV_Position) : SV_Target {
     return p.initialized;
 }
 // The final pass as a compute pass into a storage swap chain image: each
-// thread runs pixel()'s path for this case, finishFrame(resample(p)) (no AA,
-// no calibration view; Draw checks), for one output pixel, or writes black
+// thread runs pixelCubic()'s code (a bicubic upscale into an SDR target, no
+// AA, no calibration view; Draw checks) for one output pixel, or writes black
 // outside the viewport like the clear. The taps and the arithmetic are the
 // fragment pass's own, so the image is bit-identical, and the Adreno 750
 // (Turnip) spends less time on it than on the render pass. Reading each source
@@ -516,7 +561,7 @@ void presentCompute(uint3 id : SV_DispatchThreadID) {
     if(id.x>=width || id.y>=height) return;
     float2 position=float2(id.xy)+0.5;
     if(any(position<origin) || any(position>=origin+extent)) presentTarget[id.xy]=float4(0,0,0,1);
-    else presentTarget[id.xy]=finishFrame(resample((position-origin)/extent*imageSize));
+    else presentTarget[id.xy]=finishFrameAs(resampleAs(sourcePixel(position),2),true);
 })";
     const std::string groupDefines = "\n#define PRESENT_GROUP_X " + std::to_string(kComputeGroupX) +
         "\n#define PRESENT_GROUP_Y " + std::to_string(kComputeGroupY) + "\n";
@@ -997,7 +1042,7 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
     // outside it like the clear, so its bars must start on whole pixels.
     const bool covers=x<=0.0f && y<=0.0f && x+width>=float(ow) && y+height>=float(oh);
     const bool wholeBars=std::floor(x)==x && std::floor(y)==y && std::floor(x+width)==x+width && std::floor(y+height)==y+height;
-    if(p.computePipeline && toSwapchain && options.storageTarget && !hdrScene &&
+    if(p.computePipeline && toSwapchain && options.storageTarget && !hdrScene && !p.output.linear &&
        options.scalingFilter==ScalingFilter::Bicubic && scale>=1.001f &&
        !options.hdrCalibration && !options.brightnessPreview && (covers || wholeBars)) {
         auto &set=*p.computeDescriptors;
@@ -1017,9 +1062,16 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
         commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));
         return;
     }
+    // A native-size copy or an upscale into an SDR swap chain without a
+    // calibration view runs pixelLinear or pixelCubic: the final pass never
+    // runs AA, and scale >= 1 rules out pixel()'s reduction branch.
+    RenderPipeline *finalPipeline=toSwapchain ? p.presentPipeline.get() : intermediatePipeline;
+    if(toSwapchain && !p.output.linear && !options.hdrCalibration && !options.brightnessPreview && scale>=1.0f) {
+        auto *dedicated=p.finalPipelines[options.scalingFilter==ScalingFilter::Bicubic && scale!=1.0f ? 1 : 0].get();
+        if(dedicated) finalPipeline=dedicated;
+    }
     render(source,target,sw,sh,ow,oh,x,y,width,height,0,uint32_t(options.scalingFilter),
-           options.expandRgbRange ? 1u : 0u,true,
-           toSwapchain ? p.presentPipeline.get() : intermediatePipeline);
+           options.expandRgbRange ? 1u : 0u,true,finalPipeline);
     commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));
 }
 

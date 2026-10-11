@@ -1,3 +1,4 @@
+#include <gpu/display_gamma.h>
 #include <gpu/presentation.h>
 #include <plume_render_interface.h>
 #include <stdafx.h>
@@ -270,6 +271,137 @@ static int TestHdrCalibration(plume::RenderDevice* device)
     return pass?0:1;
 }
 
+// The final pass over a matrix of sizes, filters, display adjustments and AA,
+// once into the swap chain path (Draw with toSwapchain: the dedicated
+// pixelLinear / pixelCubic shaders, or with storage the compute upscale) and
+// once through pixel() (the same pass with toSwapchain=false into an RGBA8
+// target). Writes one FNV-1a hash per output and path to `output`, so builds
+// can be compared case by case, and fails when the two paths differ.
+static int TestPresentMatrix(plume::RenderDevice* device, bool storage, const char* output)
+{
+    using namespace plume;
+    constexpr uint32_t sw = 1280, sh = 720, sourcePitch = 1280;
+    auto queue = device->createCommandQueue(RenderCommandListType::DIRECT);
+    if (!queue) return 1;
+    auto commands = queue->createCommandList();
+    auto fence = device->createCommandFence();
+    gpu::Presentation presentation;
+    if (!commands || !fence || !presentation.Init(device, RenderFormat::R8G8B8A8_UNORM, storage)) return 1;
+    auto submit = [&] {
+        commands->end();
+        const RenderCommandList* lists[] = {commands.get()};
+        queue->executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+        queue->waitForCommandFence(fence.get());
+    };
+    // Noise, smooth gradients and hard one-pixel edges in three bands.
+    auto source = device->createTexture(RenderTextureDesc::Texture2D(sw, sh, 1, RenderFormat::R8G8B8A8_UNORM));
+    auto upload = device->createBuffer(RenderBufferDesc::UploadBuffer(uint64_t(sourcePitch) * sh * 4));
+    auto* pixels = upload ? static_cast<uint32_t*>(upload->map()) : nullptr;
+    if (!source || !pixels) return 1;
+    uint32_t state = 0x12345678u;
+    for (uint32_t y = 0; y < sh; ++y) for (uint32_t x = 0; x < sw; ++x) {
+        state ^= state << 13; state ^= state >> 17; state ^= state << 5;
+        uint32_t r, g, b;
+        if (y < 240) r = state & 255, g = (state >> 8) & 255, b = (state >> 16) & 255;
+        else if (y < 480) r = x * 255 / (sw - 1), g = (y - 240) * 255 / 239, b = (x ^ y) & 255;
+        else r = g = b = ((x / 3 + y / 5) % 2) ? 235 : 16;
+        pixels[y * sourcePitch + x] = 0xff000000u | (b << 16) | (g << 8) | r;
+    }
+    upload->unmap();
+    commands->begin();
+    commands->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(source.get(), RenderTextureLayout::COPY_DEST));
+    commands->copyTextureRegion(RenderTextureCopyLocation::Subresource(source.get()),
+        RenderTextureCopyLocation::PlacedFootprint(upload.get(), RenderFormat::R8G8B8A8_UNORM, sw, sh, 1, sourcePitch));
+    submit();
+    // A non-identity display gamma ramp like the game's (#179); a case enables
+    // it with displayGammaRamp.
+    namespace dg = gpu::display_gamma;
+    dg::OnRegisterWrite(dg::RegRwMode, 0);
+    dg::OnRegisterWrite(dg::RegWriteEnableMask, 7);
+    dg::OnRegisterWrite(dg::RegRwIndex, 0);
+    for (uint32_t i = 0; i < 256; ++i) {
+        const uint32_t v = uint32_t(std::lround(std::pow(i / 255.0, 1.12) * 1023.0));
+        dg::OnRegisterWrite(dg::Reg30Color, v | (v << 10) | (v << 20));
+    }
+    struct Size { uint32_t w, h; };
+    const Size sizes[] = {{1280, 720}, {1281, 721}, {1920, 1080}, {2048, 1152}, {2560, 1440}, {2560, 1600},
+                          {1712, 1070}, {3000, 1877}, {960, 540}};
+    const char* adjustNames[] = {"plain", "ramp", "all"};
+    std::ofstream file(output);
+    if (!file) return 1;
+    bool pass = true;
+    unsigned cases = 0;
+    auto draw = [&](const Size& size, const gpu::PresentationOptions& options, bool toSwapchain, std::vector<uint32_t>& result) {
+        const uint32_t pitch = (size.w + 63) & ~63u;
+        RenderTextureFlags flags = RenderTextureFlag::RENDER_TARGET;
+        if (toSwapchain && storage) flags |= RenderTextureFlag::STORAGE;
+        auto target = device->createTexture(RenderTextureDesc::Texture2D(size.w, size.h, 1, RenderFormat::R8G8B8A8_UNORM, flags));
+        auto readback = device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(pitch) * size.h * 4));
+        if (!target || !readback) return false;
+        commands->begin();
+        presentation.Draw(commands.get(), source.get(), target.get(), sw, sh, size.w, size.h, options, toSwapchain);
+        commands->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(target.get(), RenderTextureLayout::COPY_SOURCE));
+        commands->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(), RenderFormat::R8G8B8A8_UNORM,
+            size.w, size.h, 1, pitch), RenderTextureCopyLocation::Subresource(target.get()));
+        submit();
+        // The next target may reuse this one's address (see ForgetTargets).
+        presentation.ForgetTargets();
+        const auto* mapped = static_cast<const uint32_t*>(readback->map());
+        if (!mapped) return false;
+        result.resize(size_t(size.w) * size.h);
+        for (uint32_t y = 0; y < size.h; ++y) memcpy(result.data() + size_t(y) * size.w, mapped + size_t(y) * pitch, size.w * 4);
+        readback->unmap();
+        return true;
+    };
+    auto hash = [](const std::vector<uint32_t>& data) {
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t pixel : data) for (int shift = 0; shift < 32; shift += 8) { h ^= (pixel >> shift) & 255; h *= 0x100000001b3ull; }
+        return h;
+    };
+    auto run = [&](const Size& size, gpu::ScalingFilter filter, unsigned adjust, gpu::Antialiasing aa) {
+        gpu::PresentationOptions options{aa, filter, adjust == 2};
+        options.displayGammaRamp = adjust != 0;
+        options.displayAdjust = adjust != 0;
+        options.displayBrightness = adjust == 2 ? 10 : 0;
+        options.displayGamma = adjust == 2 ? 120 : 100;
+        options.storageTarget = storage;
+        std::vector<uint32_t> dedicated, general;
+        if (!draw(size, options, true, dedicated) || !draw(size, options, false, general)) { pass = false; return; }
+        unsigned differ = 0, maximum = 0;
+        for (size_t i = 0; i < dedicated.size(); ++i) {
+            if (dedicated[i] == general[i]) continue;
+            ++differ;
+            for (int shift = 0; shift < 32; shift += 8)
+                maximum = std::max(maximum, unsigned(std::abs(int((dedicated[i] >> shift) & 255) - int((general[i] >> shift) & 255))));
+        }
+        char line[256];
+        snprintf(line, sizeof line, "%ux%u %s %s aa%u swap=%016llx general=%016llx differ=%u max=%u",
+            size.w, size.h, filter == gpu::ScalingFilter::Bicubic ? "bicubic" : "bilinear", adjustNames[adjust], unsigned(aa),
+            (unsigned long long)hash(dedicated), (unsigned long long)hash(general), differ, maximum);
+        file << line << '\n';
+        printf("%s\n", line);
+        // LO_TEST_DUMP_DIR keeps the swap-path image of every case (raw RGBA8).
+        if (const char* dump = getenv("LO_TEST_DUMP_DIR")) {
+            char name[96];
+            snprintf(name, sizeof name, "/%ux%u-%u-%s-aa%u.rgba", size.w, size.h, unsigned(filter), adjustNames[adjust], unsigned(aa));
+            std::ofstream(std::string(dump) + name, std::ios::binary).write(reinterpret_cast<const char*>(dedicated.data()), dedicated.size() * 4);
+        }
+        // A compute store into an RGBA8 storage image may round differently
+        // from a render target on desktop GPUs (the Adreno 750 matched exactly).
+        pass &= storage ? maximum <= 1 : differ == 0;
+        ++cases;
+    };
+    for (const auto& size : sizes)
+        for (auto filter : {gpu::ScalingFilter::Bilinear, gpu::ScalingFilter::Bicubic})
+            for (unsigned adjust = 0; adjust < 3; ++adjust) run(size, filter, adjust, gpu::Antialiasing::Off);
+    for (auto aa : {gpu::Antialiasing::FXAA, gpu::Antialiasing::SMAA})
+        for (const Size size : {Size{1280, 720}, Size{1920, 1080}})
+            for (auto filter : {gpu::ScalingFilter::Bilinear, gpu::ScalingFilter::Bicubic}) run(size, filter, 1, aa);
+    printf("Present matrix (%s, %u cases): dedicated final passes match pixel(): %s\n",
+        storage ? "storage target" : "render target", cases, pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char** argv)
 {
     using namespace plume;
@@ -283,7 +415,10 @@ int main(int argc, char** argv)
     const char* backend = vulkan ? "Vulkan" : "D3D12";
 #endif
     if(!api)return 2;
-    auto device = api->createDevice();
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    // LO_TEST_DEVICE picks an adapter by name (e.g. one of two GPUs).
+    const char* deviceName = getenv("LO_TEST_DEVICE");
+    auto device = api->createDevice(deviceName ? deviceName : "");
     if(!device)return 2;
     printf("Backend: %s on %s\n",backend,device->getDescription().name.c_str());
 #ifdef _WIN32
@@ -294,6 +429,8 @@ int main(int argc, char** argv)
     if (argc == 2 && std::string(argv[1]) == "--hdr-calibration-only") return TestHdrCalibration(device.get());
     if (argc == 2 && std::string(argv[1]) == "--separated-ui-only")
         return TestSeparatedUi(device.get());
+    if (argc == 3 && std::string(argv[1]) == "--matrix") return TestPresentMatrix(device.get(), false, argv[2]);
+    if (argc == 3 && std::string(argv[1]) == "--matrix-storage") return TestPresentMatrix(device.get(), true, argv[2]);
     if (argc == 6 && std::string(argv[1]) == "--capture")
         return ReplayPresentationCapture(device.get(), argv[2], std::stoul(argv[3]), std::stoul(argv[4]), argv[5]);
     if (argc != 1) return 2;
