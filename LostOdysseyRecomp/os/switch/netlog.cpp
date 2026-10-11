@@ -95,6 +95,7 @@ void Serve(void*)
                 const ssize_t n = send(client, chunk.data() + offset, chunk.size() - offset, 0);
                 if (n <= 0)
                 {
+                    std::fprintf(stderr, "netlog: send failed (errno %d), dropping the connection\n", errno);
                     open = false;
                     break;
                 }
@@ -102,6 +103,10 @@ void Serve(void*)
                 sent += uint64_t(n);
             }
         }
+        // Drop what is still unsent right away: its buffers come from a pool
+        // sized for about one connection, and the next client needs them.
+        const linger abort{1, 0};
+        setsockopt(client, SOL_SOCKET, SO_LINGER, &abort, sizeof(abort));
         close(client);
     }
 }
@@ -125,7 +130,7 @@ void Start(const char* setting)
     config.tcp_rx_buf_size = 0x1000;
     config.tcp_rx_buf_max_size = 0;
     config.tcp_tx_buf_max_size = 0x20000;
-    config.sb_efficiency = 1;
+    config.sb_efficiency = 2; // room for a closing connection's buffers next to the new one
     config.num_bsd_sessions = 2;
     if (const Result rc = socketInitialize(&config); R_FAILED(rc))
     {
