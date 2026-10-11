@@ -116,6 +116,8 @@ def harvest_program():
         "int main() {",
         '    Emit(presentation, "vertex", "vs_6_0");',
         '    Emit(presentation, "pixel", "ps_6_0");',
+        '    Emit(presentation, "pixelLinear", "ps_6_0");',
+        '    Emit(presentation, "pixelCubic", "ps_6_0");',
         '    Emit(presentation, "gainPixel", "ps_6_0");',
         '    Emit(presentationUi, "vertexUi", "vs_6_0");',
         '    Emit(presentationUi, "pixelUi", "ps_6_0");',
