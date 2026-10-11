@@ -43,8 +43,8 @@ allocate:
 
 | Return address | Caller | Queries |
 |---|---|---|
-| `0x823CC2D0` | `sub_823CBF68` (primitive occlusion pass) | single primitives |
-| `0x823CD744` | `sub_823CD718` (batched boxes, 8 vertices each) | groups of primitives |
+| `0x823CC2D0` | `sub_823CBF68` (occlusion pass) | one box per projected shadow frustum |
+| `0x823CD744` | `sub_823CD718` (`FOcclusionQueryBatcher::BatchPrimitive`) | primitives: one per query, or up to 8 boxes per query for objects not seen recently |
 | `0x823D5688` | `sub_823D5430` (sun flare) | one per frame, after all others |
 
 The sun flare draws a 4-vertex quad around the sun inside its query and reads
@@ -114,16 +114,18 @@ never culls. A record without a reported owner keys on its slot as before.
 
 | Value | END record | Culling | Uhra cost (D3D12, 2560x1440, uncapped, ABBA) |
 |---|---|---|---|
-| unset / `host` (default) | Fast, Strict while most queried objects read zero (below) | Only in Strict stretches | as `fast` in Uhra (it stays Fast) |
+| unset / `host` (default) | `history` on Android, `adaptive` elsewhere | | |
+| `adaptive` | Fast, Strict while most queried objects read zero (below) | Only in Strict stretches | as `fast` in Uhra (it stays Fast) |
 | `fast` (the default before adaptive) | Written at the event with the last measured count of the same record; 1 when that was zero or unknown | Never: no query reads zero | 128.8 FPS vs 130.3 fake (about 1%) |
 | `strict` | Written once the host GPU has counted it; the guest waits | With exact counts | 111.2 FPS vs 131.7 fake (about 15%) |
+| `history` | The game reads each query at the start of the next frame; the guest hooks answer from the newest count of the same object (below) | With counts about three frames old | not measured on D3D12 |
 | `grow`, `xenia`, `begin0`, `none` | Old fake counts, no host queries | Never | baseline |
 
 Fast follows Xenia's default `fast` mode: counts used as magnitudes, such as
 flare visibility, follow the real ones a frame or two late, while culling is
 unchanged from the fake counts, so a stale zero can never hide an object.
 
-### Adaptive (default since 2026-10-08)
+### Adaptive (default on desktop since 2026-10-08)
 
 Fast never culls, so the game draws every object its occlusion pass tests, also
 those the console would skip. In most places that costs little (Uhra: 15% of
@@ -166,6 +168,97 @@ and queries (1.6 ms per frame in Uhra). Submitting the work before the first
 query earlier did not shorten that wait and lowered the rate further (about
 104 FPS), so it was removed. Any failure (device loss, failed submit or wait,
 shutdown) writes the waiting records as visible, so a guest never waits forever.
+
+### History (`LO_ZPD_MODE=history`, default on Android since 2026-10-11)
+
+Even Fast makes the guest wait in the middle of every frame: its same-frame
+read polls `GetData` until the command processor has reached the query. On
+psvita at 720p that wait was 8–13 ms a frame at 45 W and 22–31 ms at 12 W;
+Strict adds the GPU to it. History removes the read from the frame:
+
+- The game has a second, UE3-standard path behind the global `0x833180B4`
+  (only ever set to 0, at `827C94EC`). With it set, `sub_823CBF68` keeps the
+  queries in the view state's maps (`ViewState+136` -> `+40` keyed by the
+  primitive component, `+20` by the projected shadow's light, primitive and a
+  flag bit) instead of the per-frame `View+700`/`+712` arrays, and
+  `sub_823C0910` reads them through `sub_823CE960` at the start of the next
+  frame, before the depth prepass and before it issues the frame's own queries.
+  Its reads at `823CEC44` (primitives, `r31` = component) and `823CEACC`
+  (shadows) still loop in `sub_823CF390` until the count is there.
+- The host has not counted those queries by then (the command processor is
+  about a frame behind the guest, the GPU another one), so
+  `patches/occlusion_history.cpp` answers each of these reads itself
+  (`gpu/occlusion_history.h`): the exact count when `GetData` already has it,
+  otherwise the newest count measured for the same object, which on psvita is
+  the one issued three frames earlier. It answers visible for an object with no
+  count yet, a count older than three frames, a count from before a camera cut
+  (the view matrix turned about 15 degrees or moved 300 units in a frame), an
+  object not read in the previous frame, and reads in scene captures, which
+  share the game's query pool.
+- The game's own cut flag (`View+1620`) never fires in play: it is computed
+  only when a post-process effect asks for the previous view transforms
+  (`View+1616`), which none did in any test.
+- Each allocation gets its own owner (`HistoryOwner`), the command processor
+  takes owners per record slot in order (`NoteOcclusionQueryOwner`), and the
+  tracker hands every measured count back with its owner, also for a slot the
+  guest has reissued since. The counts reach the hooks when the command
+  processor reuses the batch's GPU slot (`RecycleSlot`), as Fast's do. Nothing
+  polls fences for them earlier: with Turnip on Android's KGSL kernel driver
+  `vkGetFenceStatus` waits for the fence (KGSL reads a zero timeout as no
+  timeout), so such a poll made the command processor wait for the GPU in every
+  frame (Uhra on the TB321FU: 22.7 FPS against 54.0 with Adaptive).
+- The sun flare still allocates and reads its query in the same frame and
+  keeps its Fast answer. A guest waiting in `GetData` now names the record it
+  waits for, and the command processor only waits for the GPU when that record
+  is unwritten.
+
+Objects that come out from behind an occluder are drawn up to three frames
+late. Against the counts the same queries measured (what Strict would draw), on
+psvita at 720p during camera turns, walking, teleports and the Guest Area
+conversation: about 1–3 of 300–800 tested primitives a frame at 45 W and 1–5 at
+12 W, each missing 1–3 frames (about 40% one frame, 40% three). Without the cut
+check a teleport left about 460 primitives undrawn for up to three frames; with
+it none. Hysteresis 4 (an object measured visible within its last four counts
+stays drawn) removes about 40% of the late objects for about 2% more draws and
+is on.
+
+psvita, native Vulkan, 1280x720, FSR native AA, capped at 12 W, average frame ms
+(draws) per 15 s view, two ABBA cycles back to back; the second cycle ran at
+52–55 °C, the first while the box was still cooling from 68 °C:
+
+| View | Adaptive | History | Second cycle |
+|---|---|---|---|
+| Uhra boot view | 31.7 (2142) | 30.2 (1944) | 28.2 → 27.8 ms (−1%) |
+| Queen's Room spawn | 21.7 (1206) | 20.8 (1007) | 20.3 → 19.5 ms (−4%) |
+| Guest Area conversation | 29.4 (1848–2459) | 27.4 (1505) | 28.4 → 25.8 ms (−9%) |
+
+TB321FU (Adreno 750, Turnip), 720p, frame rate 60, vsync off, FPS per 20 s view,
+one session after the fence poll was removed (two runs per arm in Uhra, one in
+the other views):
+
+| View | Adaptive | History |
+|---|---|---|
+| Uhra boot view | 49.5 / 50.5 (2172 draws) | 52.3 / 55.0 (1984) |
+| Queen's Room spawn | 27.0 / 26.9 (1298) | 60.0, at the frame rate limit (1093) |
+| Jansen dialogue | 16.5 / 16.8 (1873) | 53.2 (1510) |
+
+Adaptive is in Strict in the last two views and waits for the GPU once a frame
+(20 and 32–38 ms a frame); History does not wait.
+
+At 12 W this box's GPU stays at its lowest clock in both modes; the mid-frame
+wait that History removes costs the Adreno tablet far more (its CPU waits
+27–44 ms there and its GPU clock drops). At 45 W the box sits at its 95 °C limit
+and its GPU clock swings between 0.6 and 2 GHz from run to run (two Adaptive
+runs of the Queen's Room spawn in one session: 8.8 and 13.4 ms), so those
+numbers are not comparable.
+
+With the default policy the branch answers exactly as before: in one session,
+main and the branch tested the same queries (354 / 286 / 338 per frame in the
+three views, 52 / 97 / 122 zero), drew the same objects (2141 / 1206 / 1847) and
+switched Fast/Strict the same way, and the per-slot owner queue never handed out
+a different owner than the old map would have (0 of 1.75 million BEGIN events).
+In history mode the queue matters: the guest has usually allocated a slot again
+before the command processor reaches its BEGIN (1.5 of 2.15 million events).
 
 ## Validation so far
 
