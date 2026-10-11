@@ -4,9 +4,12 @@
 #include <switch.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <atomic>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,8 +33,15 @@ uint64_t g_end = 0;    // bytes ever written
 int g_port = kDefaultPort;
 Thread g_thread;
 
-// One client at a time; a new connection replaces nothing until the current
-// one is closed by the PC.
+// The PC closed the connection, or it failed.
+bool Closed(int client)
+{
+    char data[64];
+    const ssize_t n = recv(client, data, sizeof(data), MSG_DONTWAIT);
+    return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+}
+
+// One client at a time; the next one waits until the current one closes.
 void Serve(void*)
 {
     const int server = socket(AF_INET, SOCK_STREAM, 0);
@@ -54,6 +64,10 @@ void Serve(void*)
             svcSleepThread(1'000'000'000);
             continue;
         }
+        // A dead link (Wi-Fi drop, PC asleep) fails the send instead of
+        // blocking this thread, and every later client, for minutes.
+        const timeval sendTimeout{5, 0};
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout));
         uint64_t sent;
         {
             std::lock_guard lock(g_mutex);
@@ -70,7 +84,10 @@ void Serve(void*)
             }
             if (chunk.empty())
             {
-                svcSleepThread(50'000'000);
+                // Nothing to send, so only a read notices that the PC left.
+                pollfd event{client, POLLIN, 0};
+                if (poll(&event, 1, 50) > 0 && Closed(client))
+                    break;
                 continue;
             }
             for (size_t offset = 0; offset < chunk.size();)
@@ -78,6 +95,7 @@ void Serve(void*)
                 const ssize_t n = send(client, chunk.data() + offset, chunk.size() - offset, 0);
                 if (n <= 0)
                 {
+                    std::fprintf(stderr, "netlog: send failed (errno %d), dropping the connection\n", errno);
                     open = false;
                     break;
                 }
@@ -85,6 +103,10 @@ void Serve(void*)
                 sent += uint64_t(n);
             }
         }
+        // Drop what is still unsent right away: its buffers come from a pool
+        // sized for about one connection, and the next client needs them.
+        const linger abort{1, 0};
+        setsockopt(client, SOL_SOCKET, SO_LINGER, &abort, sizeof(abort));
         close(client);
     }
 }
@@ -108,7 +130,7 @@ void Start(const char* setting)
     config.tcp_rx_buf_size = 0x1000;
     config.tcp_rx_buf_max_size = 0;
     config.tcp_tx_buf_max_size = 0x20000;
-    config.sb_efficiency = 1;
+    config.sb_efficiency = 2; // room for a closing connection's buffers next to the new one
     config.num_bsd_sessions = 2;
     if (const Result rc = socketInitialize(&config); R_FAILED(rc))
     {

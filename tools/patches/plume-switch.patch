@@ -1,5 +1,5 @@
 diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
-index 937edec..274ce9e 100644
+index 6ebdd63..b2149f3 100644
 --- a/plume_render_interface_types.h
 +++ b/plume_render_interface_types.h
 @@ -15,7 +15,11 @@
@@ -28,7 +28,7 @@ index 937edec..274ce9e 100644
      typedef HWND RenderWindow;
  
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index a8cbdd4..a3db631 100644
+index cf5b792..093248d 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -20,6 +20,16 @@
@@ -70,7 +70,7 @@ index a8cbdd4..a3db631 100644
          VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
          // Vulkan spec requires this to be enabled if supported by the driver.
          VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
-@@ -2569,7 +2583,19 @@ namespace plume {
+@@ -2571,7 +2585,19 @@ namespace plume {
  
          VkResult res;
  
@@ -91,7 +91,7 @@ index a8cbdd4..a3db631 100644
          const WindowPixelContext pixels;
          if (!pixels.ready()) return;
          assert(desc.renderWindow != 0);
-@@ -3039,7 +3065,18 @@ namespace plume {
+@@ -3055,7 +3081,18 @@ namespace plume {
      }
  
      void VulkanSwapChain::getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const {
@@ -111,7 +111,22 @@ index a8cbdd4..a3db631 100644
          GetWindowClientPixels(desc.renderWindow, dstWidth, dstHeight);
  #   elif defined(PLUME_SDL_VULKAN_ENABLED)
          SDL_GetWindowSizeInPixels(desc.renderWindow, (int *)(&dstWidth), (int *)(&dstHeight));
-@@ -5576,7 +5613,21 @@ namespace plume {
+@@ -4884,6 +4921,14 @@ namespace plume {
+ 
+         // Store properties.
+         vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
++#   if defined(__SWITCH__)
++        // NVK reports a 1 ns timestamp period, as on desktop GPUs, but the Switch
++        // GPU timer runs at 614.4 MHz (625/384 ns per tick). Timings read as 1 ns
++        // ticks come out 1.63x too short.
++        if (physicalDeviceProperties.limits.timestampPeriod == 1.0f) {
++            physicalDeviceProperties.limits.timestampPeriod = 625.0f / 384.0f;
++        }
++#   endif
+ 
+         // Check for supported features.
+         void *featuresChain = nullptr;
+@@ -5781,7 +5826,21 @@ namespace plume {
          this->extensionHooks = extensionHooks;
          // A host may have initialised volk from a custom loader (Android
          // libadrenotools); keep that entry point instead of the system one.
@@ -134,10 +149,10 @@ index a8cbdd4..a3db631 100644
              PLUME_LOG_ERROR("Vulkan", "volkInitialize", LogErrorDomain::VkResult, res, "");
              return;
 diff --git a/plume_vulkan.h b/plume_vulkan.h
-index cfe428d..0f52f0c 100644
+index 4f53912..c4025b5 100644
 --- a/plume_vulkan.h
 +++ b/plume_vulkan.h
-@@ -15,7 +15,9 @@
+@@ -16,7 +16,9 @@
  #include <unordered_map>
  #include <unordered_set>
  

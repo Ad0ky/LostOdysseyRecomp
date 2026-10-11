@@ -119,7 +119,7 @@ each chain in this order on the pinned submodule commit:
 | Submodule | Chain | Switch patch contents |
 |---|---|---|
 | `tools/XenonRecomp` | `XenonRecomp-lostodyssey.patch`, `XenonRecomp-switch.patch` | GCC replacements for the Clang builtins in `ppc_context.h`, `cntpct_el0` timer on Horizon, GCC-compatible `XXOVERLAPPED`/`XDBFTitleID` |
-| `thirdparty/plume` | `plume-lostodyssey.patch`, `plume-sdl3.patch`, `plume-switch.patch` | `VK_NN_vi_surface` on the libnx `NWindow`, Vulkan entry points from the statically linked Mesa NVK ICD, libnx window size, no present-wait extensions |
+| `thirdparty/plume` | `plume-lostodyssey.patch`, `plume-sdl3.patch`, `plume-switch.patch` | `VK_NN_vi_surface` on the libnx `NWindow`, Vulkan entry points from the statically linked Mesa NVK ICD, libnx window size, no present-wait extensions, 625/384 ns GPU timestamp period (NVK reports 1 ns) |
 | `thirdparty/plume/contrib/volk` | `volk-switch.patch` | no `dlopen` on Horizon (from UnleashedRecomp-NX) |
 | `thirdparty/SDL-switch` | `sdl-switch-no-egl.patch` | devkitPro's SDL 3.4 Switch video driver without EGL (rendering is Vulkan) |
 
