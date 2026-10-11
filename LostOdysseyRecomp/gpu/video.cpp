@@ -49,6 +49,9 @@
 #include <kernel/memory.h>
 #include <os/main_thread.h>
 #include <os/platform.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #if LO_PLATFORM_MACOS
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -2852,6 +2855,9 @@ namespace gpu::video
         LOG_NOTICE("video: owner shutdown complete native_ngx_cleanup=complete streamline_cleanup=complete exit_code=0");
         os::shaderlog::CloseForExit();
         std::fflush(nullptr);
+#if LO_PLATFORM_SWITCH
+        os::switch_platform::AllowExit();
+#endif
         std::_Exit(EXIT_SUCCESS);
     }
 

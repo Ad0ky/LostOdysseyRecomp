@@ -39,5 +39,12 @@ namespace os::switch_platform
 
     // Raises the CPU clock while loading (applet CPU boost), off when false.
     void SetLoadingBoost(bool enabled);
+
+    // Closing the game from HOME asks it to quit (SDL_EVENT_QUIT, the normal
+    // shutdown that tears down the GPU) instead of killing it: a killed game
+    // left the console unable to start it again until a reboot. Initialize
+    // holds the exit; call this right before the process ends. Horizon kills
+    // the game anyway 15 s after the request.
+    void AllowExit();
 }
 #endif
