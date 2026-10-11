@@ -479,6 +479,9 @@ int main(int argc, char** argv)
             RenderTextureCopyLocation::PlacedFootprint(readback.get(), RenderFormat::R8G8B8A8_UNORM, w, h, 1, 64),
             RenderTextureCopyLocation::Subresource(target.get()));
         submit();
+        // The next target may reuse this one's address (see ForgetTargets).
+        presentation.ForgetTargets();
+        scenePresentation.ForgetTargets();
         auto *mapped = static_cast<uint32_t *>(readback->map());
         std::vector<uint32_t> result(w * h);
         for (unsigned y = 0; y < h; y++)
