@@ -8436,22 +8436,73 @@ void main()
                 return SelectControllerAtlas(result, bindingInfo);
             }
 
+            // A depth clear drawn through one pitch reaches the other pitches' views of
+            // its EDRAM tiles as physical rectangles: MapDepthClear, the coalescing
+            // sorts (Vulkan) and the scaling to the target's resolution. The result
+            // depends only on these inputs, and the title repeats the same clears
+            // every frame, so recent mappings are kept.
+            struct DepthClearMapKey {
+                uint32_t srcPitch, srcMsaa, dstPitch, dstHeight, dstMsaa, scaleWidth, scaleHeight;
+                bool coalesce;
+                DepthClearRect area;
+                bool operator==(const DepthClearMapKey& o) const {
+                    return srcPitch == o.srcPitch && srcMsaa == o.srcMsaa && dstPitch == o.dstPitch && dstHeight == o.dstHeight &&
+                        dstMsaa == o.dstMsaa && scaleWidth == o.scaleWidth && scaleHeight == o.scaleHeight && coalesce == o.coalesce &&
+                        area.left == o.area.left && area.top == o.area.top && area.right == o.area.right && area.bottom == o.area.bottom;
+                }
+            };
+            struct DepthClearMap { DepthClearMapKey key{}; std::vector<pending_clear::Rect> rects; bool valid = false; };
+            std::array<DepthClearMap, 16> depthClearMaps{};
+            size_t depthClearMapNext = 0;
+            std::vector<pending_clear::Rect> MappedDepthClear(const DepthClearMapKey& key, const HostTexture& target)
+            {
+                for (const auto& map : depthClearMaps)
+                    if (map.valid && map.key == key) return map.rects;
+                auto mapped = MapDepthClear(key.srcPitch, key.srcMsaa, key.area, key.dstPitch, key.dstHeight, key.dstMsaa);
+                if (key.coalesce) CoalesceDepthClearRects(mapped);
+                auto& map = depthClearMaps[depthClearMapNext];
+                depthClearMapNext = (depthClearMapNext + 1) % depthClearMaps.size();
+                map.key = key;
+                map.rects.clear();
+                map.rects.reserve(mapped.size());
+                for (const auto& r : mapped) map.rects.push_back({int32_t(target.ScaleX(uint32_t(r.left))), int32_t(target.ScaleY(uint32_t(r.top))),
+                    int32_t(target.ScaleX(uint32_t(r.right))), int32_t(target.ScaleY(uint32_t(r.bottom)))});
+                map.valid = true;
+                return map.rects;
+            }
+
+            // InvalidateRange's compact copy of every cached texture's key: a resolve
+            // scans this array instead of walking the map's nodes. Rebuilt when
+            // another path changed `textures`; its own erasures keep it in step.
+            std::vector<TextureKey> textureSpans;
+            uint64_t textureSpansVersion = 0;
+
             void InvalidateRange(uint32_t address, uint32_t size)
             {
-                for (auto it = textures.begin(); it != textures.end();)
+                if (textureSpansVersion != texturesVersion) {
+                    textureSpans.clear();
+                    for (const auto& entry : textures) textureSpans.push_back(entry.first);
+                    textureSpansVersion = texturesVersion;
+                }
+                for (size_t i = 0; i < textureSpans.size();)
                 {
-                    uint32_t texSize = it->first.width * it->first.height * 4; // conservative
-                    bool overlap = it->first.address < address + size && address < it->first.address + texSize;
-                    if (overlap)
+                    const TextureKey& key = textureSpans[i];
+                    uint32_t texSize = key.width * key.height * 4; // conservative
+                    bool overlap = key.address < address + size && address < key.address + texSize;
+                    const auto it = overlap ? textures.find(key) : textures.end();
+                    if (it != textures.end())
                     {
                         // The command list being recorded may still reference it, so
                         // hand it to the retired list (freed after the next fence wait).
                         Gpu().retiredTextures.push_back(std::move(it->second));
-                        it = textures.erase(it);
+                        textures.erase(it);
                         ++texturesVersion;
+                        textureSpans[i] = textureSpans.back();
+                        textureSpans.pop_back();
                     }
-                    else ++it;
+                    else ++i;
                 }
+                textureSpansVersion = texturesVersion;
             }
 
             // ---- pipeline state ---------------------------------------------------------
@@ -9447,7 +9498,17 @@ void main()
                 // so a reversed range (scale -1, offset 1) needs no reversed host viewport.
                 shared.ndcScale[2] = (vte & 0x10) ? zs : 1.0f;
                 shared.ndcOffset[2] = (vte & 0x20) ? zo : 0.0f;
-                const bool temporalViewport = temporal::IsJitterViewport(
+                // Per-draw temporal bookkeeping (jitter viewport, camera slot, shadow
+                // pair, motion fallback) is read by temporal AA and upscaling, spatial
+                // AA, AO, F1 captures and the opt-in temporal draw log. With all of
+                // them off (the factory default) nothing reads it, so it is not computed.
+                static const uint64_t jitterLogStart = getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME") ?
+                    strtoull(getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME"), nullptr, 10) : ~0ull;
+                static const bool jitterLogWithResolveTrace = getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE") &&
+                    strcmp(getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE"), "1") == 0;
+                const bool temporalBookkeeping = trackTemporalScene || jitterLogWithResolveTrace ||
+                    (frame >= jitterLogStart && frame - jitterLogStart < 32);
+                const bool temporalViewport = temporalBookkeeping && temporal::IsJitterViewport(
                     {viewport.x, viewport.y, viewport.width, viewport.height}, vte, shared.ndcScale, shared.ndcOffset);
                 // The absolute lighting bias changes Z only. Classify the guest
                 // camera first so those lighting layers retain the base pass's XY jitter.
@@ -9489,7 +9550,7 @@ void main()
                         key.colorMask, depthOnlyRaster, rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height, rasterScaleX, rasterScaleY);
                 }
                 render_batch::CpuTimer<> taaJitter(cpuTimingEnabled);
-                const bool constantScreenSample = key.vs == 0xe810cfacc107fd3cull &&
+                const bool constantScreenSample = temporalBookkeeping && key.vs == 0xe810cfacc107fd3cull &&
                     key.ps == 0xfe31f3d6588fde95ull && ps &&
                     (ps->info.textureSlotMask & 1) && ps->info.textureDimension[0] == 1 &&
                     !(vs->info.textureSlotMask & 1) &&
@@ -9497,8 +9558,8 @@ void main()
                         Reg(REG_FETCH_CONSTANTS + 2), Reg(REG_FETCH_CONSTANTS + 5),
                         FindResolved((Reg(REG_FETCH_CONSTANTS + 1) >> 12) << 12,
                             Reg(REG_FETCH_CONSTANTS + 1) & 0x3f) != nullptr);
-                const bool motionFallbackPair = temporal::RetainsMotionFallback(key.vs, key.ps);
-                const int temporalSlot=temporal::DrawPositionVPSlot(key.vs, key.ps, constantScreenSample);
+                const bool motionFallbackPair = temporalBookkeeping && temporal::RetainsMotionFallback(key.vs, key.ps);
+                const int temporalSlot = temporalBookkeeping ? temporal::DrawPositionVPSlot(key.vs, key.ps, constantScreenSample) : -1;
                 // bda also appears with a different camera. Reviewed sky pairs
                 // require a scene camera observed before the draw instead of
                 // self-anchoring it.
@@ -9514,7 +9575,7 @@ void main()
                     !temporalScene.Draws() ? nullptr : temporalSlot >= 0 && temporalSlot <= 252 ?
                     &temporalScene.AnchorFor(vsConstants + temporalSlot * 4) : &temporalScene.Anchor();
                 std::optional<temporal::SceneResolve> jitterSampledDepth;
-                const bool jitterShadowPair = temporal::IsShadowProjectionPair(key.vs, key.ps);
+                const bool jitterShadowPair = temporalBookkeeping && temporal::IsShadowProjectionPair(key.vs, key.ps);
                 if (temporalActive && temporalJitter && jitterShadowPair)
                 {
                     const uint32_t fetch0 = Reg(REG_FETCH_CONSTANTS), fetch1 = Reg(REG_FETCH_CONSTANTS + 1);
@@ -12438,8 +12499,6 @@ void main()
                 }
                 // Opt-in, bounded diagnostics of constants actually uploaded for
                 // a submitted draw. F1's guest register trace precedes these edits.
-                static const uint64_t jitterLogStart = getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME") ?
-                    strtoull(getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME"), nullptr, 10) : ~0ull;
                 static const uint64_t jitterLogVs = getenv("LO_TEMPORAL_DRAW_LOG_VS") ?
                     strtoull(getenv("LO_TEMPORAL_DRAW_LOG_VS"), nullptr, 16) : 0;
                 static const uint64_t jitterLogVs2 = getenv("LO_TEMPORAL_DRAW_LOG_VS2") ?
@@ -12448,8 +12507,6 @@ void main()
                 // pairs and one shadow/character sample per frame, reducing IO.
                 static const uint32_t jitterLogIndexCount = getenv("LO_TEMPORAL_DRAW_LOG_INDEX_COUNT") ?
                     strtoul(getenv("LO_TEMPORAL_DRAW_LOG_INDEX_COUNT"), nullptr, 10) : 0;
-                static const bool jitterLogWithResolveTrace = getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE") &&
-                    strcmp(getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE"), "1") == 0;
                 static uint64_t jitterLoggedShadowFrame = ~0ull, jitterLoggedCharacterFrame = ~0ull;
                 const bool jitterLogStaticMesh = key.vs == 0xb030ab4e17a20783ull || key.vs == 0xa27a7234977e0d4aull ||
                     key.vs == 0xff9da3984ce8d094ull || key.vs == 0xf7fd88506d704a3dull ||
@@ -12774,13 +12831,9 @@ void main()
                         {
                             const DepthClearRect sourceRect{int32_t(std::ceil(minX)), int32_t(std::ceil(minY)),
                                 int32_t(std::ceil(maxX)), int32_t(std::ceil(maxY))};
-                            auto mapped = MapDepthClear(pitch, (surfaceInfo >> 16) & 3, sourceRect,
-                                k.pitch, target->guestHeight, target->depthMsaa);
-                            if (vulkan) CoalesceDepthClearRects(mapped);
-                            std::vector<pending_clear::Rect> clearRects;
-                            clearRects.reserve(mapped.size());
-                            for (const auto& r : mapped) clearRects.push_back({int32_t(target->ScaleX(uint32_t(r.left))), int32_t(target->ScaleY(uint32_t(r.top))),
-                                int32_t(target->ScaleX(uint32_t(r.right))), int32_t(target->ScaleY(uint32_t(r.bottom)))});
+                            std::vector<pending_clear::Rect> clearRects = MappedDepthClear({pitch, (surfaceInfo >> 16) & 3,
+                                k.pitch, target->guestHeight, target->depthMsaa, target->resolutionSize.width,
+                                target->resolutionSize.height, vulkan, sourceRect}, *target);
                             const size_t regions = clearRects.size();
                             // An empty rectangle list would mean the whole texture,
                             // so an empty mapping is skipped.
