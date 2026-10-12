@@ -437,6 +437,24 @@ namespace gpu::renderer
             }
         }
 
+        // A texture-info word with the R/B swap of a resolved texture folded in:
+        // the decode swaps before applying the per-channel signs and the swizzle,
+        // so exchanging the signs of channels 0 and 2 and swizzle selectors 0 and 2
+        // gives the same result from the unswapped texel. Metal uses it (the SPIR-V
+        // decode no longer swaps; Vulkan binds an R/B-swapped view instead).
+        constexpr uint32_t FoldRedBlueSwap(uint32_t info)
+        {
+            const uint32_t sign = info & 0xFFu;
+            uint32_t out = (info & ~0xFFFFFu) | (sign & 0xCCu) | ((sign & 0x03u) << 4) | ((sign >> 4) & 0x03u);
+            for (uint32_t j = 0; j < 4; ++j) {
+                const uint32_t component = (info >> (8 + j * 3)) & 7u;
+                out |= (component == 0 ? 2u : component == 2 ? 0u : component) << (8 + j * 3);
+            }
+            return out;
+        }
+        static_assert(FoldRedBlueSwap(0x60a00u) == 0x68800u && FoldRedBlueSwap(0x68803u) == 0x60a30u &&
+            FoldRedBlueSwap(FoldRedBlueSwap(0xb683cu)) == 0xb683cu);
+
         struct HostTexture
         {
             uint64_t allocationSerial = 0; // Render-target identity, never a recycled host pointer.
@@ -791,9 +809,25 @@ namespace gpu::renderer
             // Keyed by the normalized pipeline key. sceneSerial: the scene in which
             // the pipeline was last drawn was recorded in its recipe.
             // origin/drawn: LO_RECORD_TIMING first-use attribution only.
+            // Vulkan texture-info specialization: pipelines of the same key whose
+            // texture-info specialization constants hold the words a draw binds (the
+            // driver folds the decode). The generic pipeline is always the one bound
+            // until a variant is built in the background; at most kMaxSpecVariants.
+            struct PrefetchJob;
+            struct SpecVariant {
+                gpu::pipeline_cache::TexInfo info;
+                std::unique_ptr<RenderPipeline> pipeline; // null while building or failed
+                // While queued: the job, and whether it still waits behind draw-time ones
+                // (recorded words); a draw that needs it moves it forward.
+                std::shared_ptr<PrefetchJob> job;
+                bool seeded = false;
+            };
+            static constexpr size_t kMaxSpecVariants = gpu::pipeline_cache::kMaxTexInfo;
             struct PipelineSlot {
                 std::unique_ptr<RenderPipeline> pipeline; uint32_t sceneSerial = 0;
                 record_timing::Origin origin = record_timing::Origin::Unknown; bool drawn = false;
+                bool specSeeded = false; // recipe words queued
+                std::vector<SpecVariant> variants;
             };
             std::unordered_map<PipelineKey, PipelineSlot, PipelineKeyHash> pipelines;
             // GetPipeline's last hit. Slots are never erased or replaced, and
@@ -820,7 +854,10 @@ namespace gpu::renderer
             // Known recipes: the player's learned file plus the shipped corpus, with
             // the scenes they were drawn in. Learned entries are saved. Written on the
             // render thread under pipelineRecipeMutex (the exit flush reads it).
-            struct RecipeEntry { gpu::pipeline_cache::Scenes scenes; bool learned = false; };
+            struct RecipeEntry {
+                gpu::pipeline_cache::Scenes scenes; bool learned = false;
+                std::vector<gpu::pipeline_cache::TexInfo> texinfo; // words it was drawn with (Vulkan)
+            };
             std::unordered_map<PipelineKey, RecipeEntry, PipelineKeyHash> knownRecipes;
             size_t learnedRecipes = 0, corpusRecipes = 0;
             std::unordered_set<PipelineKey, PipelineKeyHash> preparedPipelineKeys, usedPreparedPipelineKeys;
@@ -867,10 +904,11 @@ namespace gpu::renderer
                 enum State : int { Queued, Running, Done, Taken };
                 // Priority order. Draw: a skipped draw needs it. Scene: a scene that is
                 // loading. Sibling: shares a shader with a draw-time miss. Startup: the
-                // startup set, built in the background.
-                enum Kind : uint8_t { Draw, Scene, Sibling, Startup };
+                // startup set, built in the background. Specialise: a texture-info
+                // variant of a built pipeline (never in prefetchJobs).
+                enum Kind : uint8_t { Draw, Scene, Sibling, Startup, Specialise };
                 // The capped worker group a running job counts against.
-                enum Slot : uint8_t { NoSlot, DrawSlot, StartupSlot };
+                enum Slot : uint8_t { NoSlot, DrawSlot, StartupSlot, SpecialiseSlot };
                 std::atomic<int> state{Queued};
                 Kind kind = Scene; // changed under the pool mutex
                 Slot slot = NoSlot; // under the pool mutex
@@ -891,6 +929,11 @@ namespace gpu::renderer
                 Shader* vs = nullptr;
                 Shader* ps = nullptr;
                 std::shared_ptr<PrefetchJob> needVs, needPs;
+                // Specialise job: the words and the constants desc points at. seed: from
+                // recorded words, queued behind every draw-time variant (under the pool mutex).
+                gpu::pipeline_cache::TexInfo texInfo;
+                std::vector<RenderSpecConstant> specConstants;
+                bool seed = false;
             };
             static bool DrawTimeJob(PrefetchJob::Kind kind) { return kind == PrefetchJob::Draw || kind == PrefetchJob::Sibling; }
             // Worker-made modules whose hash got another module first; a build may
@@ -932,21 +975,32 @@ namespace gpu::renderer
             // parts instead of compiling the whole pipeline. A background thread builds
             // the parts for the shaders of known recipes (libraryPrecompile below).
             bool fastLinkPipelines = false;
+            // Texture-info specialization (Vulkan; LO_TEXINFO_SPEC=0 turns it off).
+            bool texInfoSpecialization = false;
+            struct SpecStats {
+                uint64_t textured = 0, specialised = 0; // draws since the last log
+                uint64_t queued = 0, built = 0, failed = 0, seeded = 0, promoted = 0; // variants since start
+                double logAt = 0;
+            } specStats;
+            std::atomic<uint64_t> specCompileNs{0};
             struct PrefetchPool {
                 std::mutex mutex;
                 std::condition_variable wake, finished;
                 // One queue per job kind; siblings newest miss first. Entries that were
                 // taken over, dropped or moved to another queue stay until a worker skips them.
-                std::deque<std::shared_ptr<PrefetchJob>> draw, scene, siblings, startup;
+                // Specialise jobs: draw-time words in specialise, recorded words (learned file,
+                // corpus) in seeded, taken only when no draw-time variant waits.
+                std::deque<std::shared_ptr<PrefetchJob>> draw, scene, siblings, startup, specialise, seeded;
                 size_t runningSmall = 0, smallCap = 1; // draw and sibling jobs
                 size_t runningStartup = 0, startupCap = 1;
+                size_t runningSpecialise = 0, specialiseCap = 1;
                 // Finished jobs for the render thread to harvest.
                 std::vector<std::shared_ptr<PrefetchJob>> finishedJobs;
                 std::vector<std::thread> workers;
                 bool stop = false;
                 ~PrefetchPool()
                 {
-                    { std::lock_guard lock(mutex); stop = true; draw.clear(); scene.clear(); siblings.clear(); startup.clear(); }
+                    { std::lock_guard lock(mutex); stop = true; draw.clear(); scene.clear(); siblings.clear(); startup.clear(); specialise.clear(); seeded.clear(); }
                     wake.notify_all();
                     for (auto& worker : workers) worker.join();
                 }
@@ -1049,11 +1103,13 @@ namespace gpu::renderer
                 out.otherPipelines = r.recordOtherPipelineCreates;
                 out.otherPipelineMs = r.recordOtherPipelineMs;
             }
-            // Origin and first use of the game-state pipeline bound by this draw.
-            void NoteRecordPipeline(record_timing::DrawSample& sample, const PipelineKey& drawKey, const RenderPipeline* bound)
+            // Origin and first use of the game-state pipeline of this draw (generic: the
+            // slot's pipeline, also when a texture-info variant of it is bound).
+            void NoteRecordPipeline(record_timing::DrawSample& sample, const PipelineKey& drawKey, const RenderPipeline* generic,
+                const RenderPipeline* bound)
             {
                 const auto it = pipelines.find(gpu::pipeline_cache::Normalize(drawKey));
-                if (it != pipelines.end() && it->second.pipeline.get() == bound) {
+                if (it != pipelines.end() && it->second.pipeline.get() == generic) {
                     sample.pipelineKnown = true;
                     sample.origin = it->second.origin;
                     sample.firstUse = !it->second.drawn;
@@ -2421,6 +2477,7 @@ namespace gpu::renderer
                 queue = video::GetQueue();
                 vulkan = video::UsesSpirv();
                 nativeVulkan = video::IsVulkan();
+                texInfoSpecialization = nativeVulkan && !(getenv("LO_TEXINFO_SPEC") && std::string_view(getenv("LO_TEXINFO_SPEC")) == "0");
 #if defined(LO_GPU_PLUME)
                 dlssController = video::GetDlssController();
 #if !defined(LO_RENDERER_P2_EMBEDDED_TEST)
@@ -5106,10 +5163,38 @@ void main()
                 return pool[used++].get();
             }
 
-            RenderDescriptorSet* AcquireTextureSet(int which, const TextureSetCache::Key& textures, uint32_t activeSlots)
+            // A texture pointer with bit 0 set in a set key stands for the texture's
+            // R/B-swapped view (Vulkan), so swapped and plain sets never alias.
+            static RenderTexture* TagRedBlueSwap(RenderTexture* texture)
+            {
+                return reinterpret_cast<RenderTexture*>(reinterpret_cast<uintptr_t>(texture) | 1u);
+            }
+            static void WriteTextureBinding(RenderDescriptorSet* set, uint32_t slot, RenderTexture* texture)
+            {
+                const auto bits = reinterpret_cast<uintptr_t>(texture);
+                if (!(bits & 1u)) {
+                    set->setTexture(slot, texture, RenderTextureLayout::SHADER_READ);
+                    return;
+                }
+                auto* plain = reinterpret_cast<RenderTexture*>(bits & ~uintptr_t(1));
+                const RenderTextureView* view = plain->getRedBlueSwapView();
+                if (!view) {
+                    static bool logged = false;
+                    if (!std::exchange(logged, true)) LOG_ERROR("renderer: R/B-swapped texture view unavailable; binding the plain view");
+                }
+                set->setTexture(slot, plain, RenderTextureLayout::SHADER_READ, view);
+            }
+
+            RenderDescriptorSet* AcquireTextureSet(int which, const TextureSetCache::Key& textures, uint32_t activeSlots, uint32_t swapSlots = 0)
             {
                 if (activeSlots == 0)
                     return staticDummySets[which - 1].get();
+                if (swapSlots &= activeSlots) {
+                    TextureSetCache::Key tagged = textures;
+                    for (; swapSlots; swapSlots &= swapSlots - 1)
+                        tagged[std::countr_zero(swapSlots)] = TagRedBlueSwap(tagged[std::countr_zero(swapSlots)]);
+                    return AcquireTextureSet(which, tagged, activeSlots);
+                }
                 // Complete immutable sets are reusable on both backends. The
                 // cache and pool belong to the same completed-fence interval.
                 const bool reuse = descriptorReuse;
@@ -5118,7 +5203,7 @@ void main()
                         auto* set = AcquireSet(which, false);
                         for (uint32_t slot = 0; slot < kTextureSlots; ++slot)
                             if ((activeSlots >> slot) & 1)
-                                set->setTexture(slot, textures[slot], RenderTextureLayout::SHADER_READ);
+                                WriteTextureBinding(set, slot, textures[slot]);
                         return set;
                     }
                     // A reused set must equal the key in every binding. Rewrite only
@@ -5135,7 +5220,7 @@ void main()
                     const HostTexture& dummy = which == 1 ? dummyTexture2D : which == 2 ? dummyTexture3D : dummyTextureCube;
                     bindings[used] = texture_descriptors::RewriteBindings(bindings[used], textures, dummy.texture.get(),
                         [&](uint32_t slot, RenderTexture* texture) {
-                            set->setTexture(slot, texture, RenderTextureLayout::SHADER_READ);
+                            WriteTextureBinding(set, slot, texture);
                         });
                     ++used;
                     return set;
@@ -5492,13 +5577,24 @@ void main()
                 const auto corpus = corpusPath.empty() ? gpu::pipeline_cache::LoadResult{} : LoadRecipes(corpusPath, true);
                 {
                     std::lock_guard lock(pipelineRecipeMutex);
+                    const auto mergeWords = [](RecipeEntry& entry, const gpu::pipeline_cache::Record& record) {
+                        for (const auto& info : record.texinfo)
+                            if (entry.texinfo.size() < gpu::pipeline_cache::kMaxTexInfo &&
+                                std::find(entry.texinfo.begin(), entry.texinfo.end(), info) == entry.texinfo.end())
+                                entry.texinfo.push_back(info);
+                    };
                     for (const auto& record : learned.records) {
                         auto& entry = knownRecipes[record.key];
                         entry.scenes.Merge(record.scenes);
                         entry.learned = true;
+                        mergeWords(entry, record);
                     }
                     learnedRecipes = learned.records.size();
-                    for (const auto& record : corpus.records) knownRecipes[record.key].scenes.Merge(record.scenes);
+                    for (const auto& record : corpus.records) {
+                        auto& entry = knownRecipes[record.key];
+                        entry.scenes.Merge(record.scenes);
+                        mergeWords(entry, record);
+                    }
                     corpusRecipes = corpus.records.size();
                 }
                 // An older file version is rewritten at the next save.
@@ -5793,7 +5889,7 @@ void main()
                 std::vector<gpu::pipeline_cache::Record> records;
                 records.reserve(learnedRecipes);
                 for (const auto& [key, entry] : knownRecipes)
-                    if (entry.learned) records.push_back({ key, entry.scenes });
+                    if (entry.learned) records.push_back({ key, entry.scenes, entry.texinfo });
                 return records;
             }
 
@@ -6016,6 +6112,7 @@ void main()
                         if (job->kind == PrefetchJob::Draw) prefetchPool.draw.push_back(job);
                         else if (job->kind == PrefetchJob::Scene) prefetchPool.scene.push_back(job);
                         else if (job->kind == PrefetchJob::Startup) prefetchPool.startup.push_back(job);
+                        else if (job->kind == PrefetchJob::Specialise) (job->seed ? prefetchPool.seeded : prefetchPool.specialise).push_back(job);
                     }
                     auto& siblings = prefetchPool.siblings;
                     while (siblings.size() > kMaxSiblings) {
@@ -6111,6 +6208,12 @@ void main()
                 prefetchPool.startupCap = video::IsMetal() ? prefetchPool.smallCap : std::max<size_t>(1, count - 1);
                 if (const char* value = getenv("LO_PIPELINE_STARTUP_WORKERS"))
                     prefetchPool.startupCap = std::clamp<size_t>(strtoul(value, nullptr, 10), 1, count);
+                // Texture-info variants share the startup budget, so one worker stays free
+                // for scene and draw-time jobs. Within it, variants draws asked for go before
+                // startup jobs; seeded ones run at most specialiseCap at a time.
+                if (const char* value = getenv("LO_TEXINFO_SPEC_WORKERS"))
+                    prefetchPool.specialiseCap = strtoul(value, nullptr, 10);
+                prefetchPool.specialiseCap = std::clamp<size_t>(prefetchPool.specialiseCap, 1, prefetchPool.startupCap);
                 for (size_t i = 0; i < count; ++i)
                     prefetchPool.workers.emplace_back([this] { PrefetchWorker(); });
                 LOG_INFO("renderer: pipeline workers: {}, {} for draw-time jobs, {} for startup preparation; siblings {}, skipped draws {}", count,
@@ -6124,22 +6227,29 @@ void main()
             std::shared_ptr<PrefetchJob> NextPrefetchJob()
             {
                 auto& pool = prefetchPool;
-                for (auto* queue : { &pool.draw, &pool.scene, &pool.siblings, &pool.startup }) {
+                // Startup jobs and texture-info variants share startupCap. Variants draws asked
+                // for come before startup jobs; seeded variants come last.
+                for (auto* queue : { &pool.draw, &pool.scene, &pool.siblings, &pool.specialise, &pool.startup, &pool.seeded }) {
                     while (!queue->empty()) {
                         const auto& front = queue->front();
                         const auto kind = front->kind;
-                        // A job moved to another queue (for a skipped draw, a loading scene)
-                        // runs from there.
+                        // A job moved to another queue (for a skipped draw, a loading scene, a
+                        // draw that needs a seeded variant) runs from there.
                         const auto* home = kind == PrefetchJob::Draw ? &pool.draw : kind == PrefetchJob::Scene ? &pool.scene :
-                            kind == PrefetchJob::Sibling ? &pool.siblings : &pool.startup;
+                            kind == PrefetchJob::Sibling ? &pool.siblings :
+                            kind == PrefetchJob::Specialise ? (front->seed ? &pool.seeded : &pool.specialise) : &pool.startup;
                         if (front->state != PrefetchJob::Queued || home != queue) {
                             queue->pop_front();
                             continue;
                         }
                         const auto slot = DrawTimeJob(kind) ? PrefetchJob::DrawSlot :
-                            kind == PrefetchJob::Startup ? PrefetchJob::StartupSlot : PrefetchJob::NoSlot;
+                            kind == PrefetchJob::Startup ? PrefetchJob::StartupSlot :
+                            kind == PrefetchJob::Specialise ? PrefetchJob::SpecialiseSlot : PrefetchJob::NoSlot;
                         if (slot == PrefetchJob::DrawSlot && pool.runningSmall >= pool.smallCap) break;
-                        if (slot == PrefetchJob::StartupSlot && pool.runningStartup >= pool.startupCap) break;
+                        const bool backgroundFull = pool.runningStartup + pool.runningSpecialise >= pool.startupCap;
+                        if (slot == PrefetchJob::StartupSlot && backgroundFull) break;
+                        if (slot == PrefetchJob::SpecialiseSlot && (backgroundFull ||
+                            (queue == &pool.seeded && pool.runningSpecialise >= pool.specialiseCap))) break;
                         auto job = std::move(queue->front());
                         queue->pop_front();
                         int expected = PrefetchJob::Queued;
@@ -6147,6 +6257,7 @@ void main()
                         job->slot = slot;
                         if (slot == PrefetchJob::DrawSlot) ++pool.runningSmall;
                         if (slot == PrefetchJob::StartupSlot) ++pool.runningStartup;
+                        if (slot == PrefetchJob::SpecialiseSlot) ++pool.runningSpecialise;
                         return job;
                     }
                 }
@@ -6171,8 +6282,11 @@ void main()
                     if (job->shader) {
                         LoadShaderJob(*job, pack);
                     } else if (!job->needVs && !job->needPs) {
+                        const auto started = std::chrono::steady_clock::now();
                         try { job->pipeline = device->createGraphicsPipeline(job->desc); }
                         catch (const std::exception& e) { LOG_WARNING("renderer: scene prefetch: {}", e.what()); }
+                        if (job->kind == PrefetchJob::Specialise)
+                            specCompileNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
                     } else if ((!job->needVs || NeedShaderJob(*job->needVs, pack)) && (!job->needPs || NeedShaderJob(*job->needPs, pack))) {
                         // MakeLoadingJob made no job for a rect-list recipe without its VS variant.
                         try {
@@ -6214,6 +6328,7 @@ void main()
                     prefetchPool.finishedJobs.push_back(job.shared_from_this());
                     if (job.slot == PrefetchJob::DrawSlot) --prefetchPool.runningSmall;
                     if (job.slot == PrefetchJob::StartupSlot) --prefetchPool.runningStartup;
+                    if (job.slot == PrefetchJob::SpecialiseSlot) --prefetchPool.runningSpecialise;
                     freed = std::exchange(job.slot, PrefetchJob::NoSlot) != PrefetchJob::NoSlot;
                 }
                 prefetchPool.finished.notify_all();
@@ -6292,20 +6407,25 @@ void main()
                         }
                         continue;
                     }
+                    if (job.kind == PrefetchJob::Specialise) {
+                        FinishSpecialisation(job);
+                        continue;
+                    }
                     const auto it = prefetchJobs.find(job.key);
                     if (it == prefetchJobs.end() || it->second != done) continue;
                     for (const auto* need : { &job.needVs, &job.needPs })
                         if (*need) PublishShaderJob(**need);
                     if (!job.pipeline) failedPrefetch.insert(job.key);
-                    else if (pipelines.try_emplace(job.key, PipelineSlot{ std::move(job.pipeline), 0,
+                    else if (const auto [slot, added] = pipelines.try_emplace(job.key, PipelineSlot{ std::move(job.pipeline), 0,
                                  job.kind == PrefetchJob::Scene ? record_timing::Origin::ScenePrefetch :
                                  job.kind == PrefetchJob::Sibling ? record_timing::Origin::Sibling :
-                                 job.kind == PrefetchJob::Startup ? record_timing::Origin::Prebuilt : record_timing::Origin::DrawJob }).second) {
+                                 job.kind == PrefetchJob::Startup ? record_timing::Origin::Prebuilt : record_timing::Origin::DrawJob }); added) {
                         if (job.kind == PrefetchJob::Sibling) {
                             ++workerStats.built;
                             if (pipelineMissVerbose) unusedSiblings.insert(job.key);
                         }
                         if (job.batch && job.batch->startup) preparedPipelineKeys.insert(job.key);
+                        SeedSpecialisations(slot->second, job.key, nullptr, nullptr);
                     }
                     prefetchJobs.erase(it);
                 }
@@ -6525,9 +6645,9 @@ void main()
                         auto recipes = LoadRecipes(RecipePath(), false).records;
                         if (const auto corpus = CorpusPath(); !corpus.empty())
                             for (const auto& record : LoadRecipes(corpus, true).records) recipes.push_back(record);
-                        for (const auto& [key, scenes] : recipes) {
-                            wantedModules[0].insert(key.vs);
-                            if (key.ps) wantedModules[1].insert(key.ps);
+                        for (const auto& record : recipes) {
+                            wantedModules[0].insert(record.key.vs);
+                            if (record.key.ps) wantedModules[1].insert(record.key.ps);
                         }
                     }
                     uint32_t deferredModules = 0;
@@ -8464,22 +8584,73 @@ void main()
                 return SelectControllerAtlas(result, bindingInfo);
             }
 
+            // A depth clear drawn through one pitch reaches the other pitches' views of
+            // its EDRAM tiles as physical rectangles: MapDepthClear, the coalescing
+            // sorts (Vulkan) and the scaling to the target's resolution. The result
+            // depends only on these inputs, and the title repeats the same clears
+            // every frame, so recent mappings are kept.
+            struct DepthClearMapKey {
+                uint32_t srcPitch, srcMsaa, dstPitch, dstHeight, dstMsaa, scaleWidth, scaleHeight;
+                bool coalesce;
+                DepthClearRect area;
+                bool operator==(const DepthClearMapKey& o) const {
+                    return srcPitch == o.srcPitch && srcMsaa == o.srcMsaa && dstPitch == o.dstPitch && dstHeight == o.dstHeight &&
+                        dstMsaa == o.dstMsaa && scaleWidth == o.scaleWidth && scaleHeight == o.scaleHeight && coalesce == o.coalesce &&
+                        area.left == o.area.left && area.top == o.area.top && area.right == o.area.right && area.bottom == o.area.bottom;
+                }
+            };
+            struct DepthClearMap { DepthClearMapKey key{}; std::vector<pending_clear::Rect> rects; bool valid = false; };
+            std::array<DepthClearMap, 16> depthClearMaps{};
+            size_t depthClearMapNext = 0;
+            std::vector<pending_clear::Rect> MappedDepthClear(const DepthClearMapKey& key, const HostTexture& target)
+            {
+                for (const auto& map : depthClearMaps)
+                    if (map.valid && map.key == key) return map.rects;
+                auto mapped = MapDepthClear(key.srcPitch, key.srcMsaa, key.area, key.dstPitch, key.dstHeight, key.dstMsaa);
+                if (key.coalesce) CoalesceDepthClearRects(mapped);
+                auto& map = depthClearMaps[depthClearMapNext];
+                depthClearMapNext = (depthClearMapNext + 1) % depthClearMaps.size();
+                map.key = key;
+                map.rects.clear();
+                map.rects.reserve(mapped.size());
+                for (const auto& r : mapped) map.rects.push_back({int32_t(target.ScaleX(uint32_t(r.left))), int32_t(target.ScaleY(uint32_t(r.top))),
+                    int32_t(target.ScaleX(uint32_t(r.right))), int32_t(target.ScaleY(uint32_t(r.bottom)))});
+                map.valid = true;
+                return map.rects;
+            }
+
+            // InvalidateRange's compact copy of every cached texture's key: a resolve
+            // scans this array instead of walking the map's nodes. Rebuilt when
+            // another path changed `textures`; its own erasures keep it in step.
+            std::vector<TextureKey> textureSpans;
+            uint64_t textureSpansVersion = 0;
+
             void InvalidateRange(uint32_t address, uint32_t size)
             {
-                for (auto it = textures.begin(); it != textures.end();)
+                if (textureSpansVersion != texturesVersion) {
+                    textureSpans.clear();
+                    for (const auto& entry : textures) textureSpans.push_back(entry.first);
+                    textureSpansVersion = texturesVersion;
+                }
+                for (size_t i = 0; i < textureSpans.size();)
                 {
-                    uint32_t texSize = it->first.width * it->first.height * 4; // conservative
-                    bool overlap = it->first.address < address + size && address < it->first.address + texSize;
-                    if (overlap)
+                    const TextureKey& key = textureSpans[i];
+                    uint32_t texSize = key.width * key.height * 4; // conservative
+                    bool overlap = key.address < address + size && address < key.address + texSize;
+                    const auto it = overlap ? textures.find(key) : textures.end();
+                    if (it != textures.end())
                     {
                         // The command list being recorded may still reference it, so
                         // hand it to the retired list (freed after the next fence wait).
                         Gpu().retiredTextures.push_back(std::move(it->second));
-                        it = textures.erase(it);
+                        textures.erase(it);
                         ++texturesVersion;
+                        textureSpans[i] = textureSpans.back();
+                        textureSpans.pop_back();
                     }
-                    else ++it;
+                    else ++i;
                 }
+                textureSpansVersion = texturesVersion;
             }
 
             // ---- pipeline state ---------------------------------------------------------
@@ -8548,6 +8719,151 @@ void main()
                 lastPipelineKey = key;
                 lastPipelineSlot = &slot;
                 return slot.pipeline.get();
+            }
+
+            // ---- texture-info specialization (Vulkan) --------------------------------
+            static uint32_t TextureSlotMask(const Shader* vs, const Shader* ps)
+            {
+                return (vs ? vs->info.textureSlotMask : 0u) | (ps ? ps->info.textureSlotMask : 0u);
+            }
+
+            // Render thread: a seeded variant a draw now needs runs before the other seeds.
+            void PromoteSpecialisation(SpecVariant& variant)
+            {
+                if (!std::exchange(variant.seeded, false) || !variant.job) return;
+                {
+                    std::lock_guard lock(prefetchPool.mutex);
+                    if (variant.job->state != PrefetchJob::Queued) return;
+                    variant.job->seed = false;
+                    prefetchPool.specialise.push_back(variant.job);
+                }
+                ++specStats.promoted;
+                prefetchPool.wake.notify_all();
+            }
+
+            // Render thread: builds the variant of slot (key) for info on a worker. Seeds
+            // (recorded words) wait until no draw-time variant is queued.
+            void QueueSpecialisation(PipelineSlot& slot, const PipelineKey& key, Shader* vs, Shader* ps,
+                const gpu::pipeline_cache::TexInfo& info, bool seed)
+            {
+                if (!info.Valid() || info.mask != TextureSlotMask(vs, ps)) return;
+                for (auto& variant : slot.variants)
+                    if (variant.info == info) {
+                        if (!seed) PromoteSpecialisation(variant);
+                        return;
+                    }
+                if (slot.variants.size() >= kMaxSpecVariants) return;
+                auto job = std::make_shared<PrefetchJob>();
+                slot.variants.push_back({ info, nullptr, job, seed });
+                job->key = key;
+                job->kind = PrefetchJob::Specialise;
+                job->seed = seed;
+                job->texInfo = info;
+                size_t word = 0;
+                for (uint32_t m = info.mask; m; m &= m - 1)
+                    job->specConstants.emplace_back(uint32_t(std::countr_zero(m)), info.words[word++]);
+                job->desc = DescribeForCreation(key, vs, ps, false, false);
+                job->desc.cacheKey = 0; // the D3D12 library and Metal archive name the generic pipeline
+                job->desc.specConstants = job->specConstants.data();
+                job->desc.specConstantsCount = uint32_t(job->specConstants.size());
+                ++specStats.queued;
+                if (seed) ++specStats.seeded;
+                QueuePrefetchJobs({ job });
+            }
+
+            // Render thread: the recorded words of a newly built pipeline's recipe go
+            // to the workers. Shaders are looked up when the caller has none.
+            void SeedSpecialisations(PipelineSlot& slot, const PipelineKey& key, Shader* vs, Shader* ps)
+            {
+                if (!texInfoSpecialization || std::exchange(slot.specSeeded, true)) return;
+                const auto recipe = knownRecipes.find(key);
+                if (recipe == knownRecipes.end() || recipe->second.texinfo.empty()) return;
+                if ((!vs || (key.ps && !ps)) && FindRecipeShaders(key, vs, ps, nullptr) != RecipeShaderState::Ready) return;
+                for (const auto& info : recipe->second.texinfo) QueueSpecialisation(slot, key, vs, ps, info, true);
+            }
+
+            // Render thread: a finished variant job into its slot.
+            void FinishSpecialisation(PrefetchJob& job)
+            {
+                const auto slot = pipelines.find(job.key);
+                if (slot == pipelines.end()) return;
+                for (auto& variant : slot->second.variants)
+                    if (variant.info == job.texInfo && !variant.pipeline) {
+                        variant.pipeline = std::move(job.pipeline);
+                        variant.job.reset();
+                        variant.seeded = false;
+                        ++(variant.pipeline ? specStats.built : specStats.failed);
+                        return;
+                    }
+            }
+
+            // Render thread: a draw's words for a recipe, saved with the learned file.
+            void NoteRecipeTexInfo(const PipelineKey& key, const gpu::pipeline_cache::TexInfo& info)
+            {
+                if (!pipelineCacheEnabled) return;
+                const auto it = knownRecipes.find(key);
+                if (it == knownRecipes.end() || !it->second.learned) return;
+                auto& list = it->second.texinfo;
+                if (list.size() >= gpu::pipeline_cache::kMaxTexInfo || std::find(list.begin(), list.end(), info) != list.end()) return;
+                std::lock_guard lock(pipelineRecipeMutex);
+                list.push_back(info);
+                pipelineRecipesDirty = true;
+            }
+
+            // Render thread, at the draw's bind: the specialised variant of the generic
+            // pipeline GetPipeline just returned, when one is built for the words the
+            // draw binds; otherwise the generic one, and an unseen tuple is queued.
+            RenderPipeline* SpecialisedPipeline(Shader* vs, Shader* ps, RenderPipeline* generic, const uint32_t* words)
+            {
+                const uint32_t mask = TextureSlotMask(vs, ps);
+                PipelineSlot* slot = lastPipelineSlot;
+                // A pipeline this draw made has no slot hit yet: its next draw seeds it.
+                // Pipelines fetching from more than kTexInfoWords slots stay generic.
+                if (!mask || !slot || slot->pipeline.get() != generic ||
+                    size_t(std::popcount(mask)) > gpu::pipeline_cache::kTexInfoWords) return generic;
+                ++specStats.textured;
+                for (auto& variant : slot->variants) {
+                    if (variant.info.mask != mask) continue;
+                    bool same = true;
+                    size_t word = 0;
+                    for (uint32_t m = mask; m && same; m &= m - 1)
+                        same = variant.info.words[word++] == words[std::countr_zero(m)];
+                    if (!same) continue;
+                    if (!variant.pipeline) { // building, or failed
+                        PromoteSpecialisation(variant);
+                        return generic;
+                    }
+                    ++specStats.specialised;
+                    return variant.pipeline.get();
+                }
+                SeedSpecialisations(*slot, lastPipelineKey, vs, ps);
+                if (slot->variants.size() >= kMaxSpecVariants) return generic;
+                gpu::pipeline_cache::TexInfo info;
+                info.mask = mask;
+                size_t word = 0;
+                for (uint32_t m = mask; m; m &= m - 1)
+                    info.words[word++] = words[std::countr_zero(m)];
+                QueueSpecialisation(*slot, lastPipelineKey, vs, ps, info, false);
+                NoteRecipeTexInfo(lastPipelineKey, info);
+                return generic;
+            }
+
+            // Once a frame: specialised share of the textured draws, and the variants
+            // built in the background, every 10 s while it changes.
+            void ReportSpecialisation()
+            {
+                if (!texInfoSpecialization) return;
+                const double now = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                if (now < specStats.logAt) return;
+                specStats.logAt = now + 10.0;
+                if (!specStats.textured && !specStats.queued) return;
+                LOG_INFO("renderer: texinfo spec frame={} {} textured_draws={} specialised={:.1f}% variants queued={} built={} failed={} building={} seeded={} promoted={} compile_ms={:.0f}",
+                    frame, SceneLabel(), specStats.textured,
+                    specStats.textured ? 100.0 * double(specStats.specialised) / double(specStats.textured) : 0.0,
+                    specStats.queued, specStats.built, specStats.failed,
+                    specStats.queued - specStats.built - specStats.failed, specStats.seeded, specStats.promoted,
+                    double(specCompileNs.load()) / 1e6);
+                specStats.textured = specStats.specialised = 0;
             }
 
             RenderPipeline* GetPipeline(const PipelineKey& drawKey, Shader* vs, Shader* ps, RenderFormat, RenderFormat, bool mayDefer = false)
@@ -9475,11 +9791,37 @@ void main()
                 // so a reversed range (scale -1, offset 1) needs no reversed host viewport.
                 shared.ndcScale[2] = (vte & 0x10) ? zs : 1.0f;
                 shared.ndcOffset[2] = (vte & 0x20) ? zo : 0.0f;
-                const bool temporalViewport = temporal::IsJitterViewport(
+                // Per-draw temporal bookkeeping (jitter viewport, camera slot, shadow
+                // pair, motion fallback) is read by temporal AA and upscaling, spatial
+                // AA, AO, F1 captures and the opt-in temporal draw log. With all of
+                // them off (the factory default) nothing reads it, so it is not computed.
+                static const uint64_t jitterLogStart = getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME") ?
+                    strtoull(getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME"), nullptr, 10) : ~0ull;
+                static const bool jitterLogWithResolveTrace = getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE") &&
+                    strcmp(getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE"), "1") == 0;
+                const bool temporalBookkeeping = trackTemporalScene || jitterLogWithResolveTrace ||
+                    (frame >= jitterLogStart && frame - jitterLogStart < 32);
+                const bool temporalViewport = temporalBookkeeping && temporal::IsJitterViewport(
                     {viewport.x, viewport.y, viewport.width, viewport.height}, vte, shared.ndcScale, shared.ndcOffset);
                 // The absolute lighting bias changes Z only. Classify the guest
                 // camera first so those lighting layers retain the base pass's XY jitter.
                 shared.ndcOffset[2] += layerDepthOffset;
+                // Depth pre-pass tolerance (#424). The title draws a mesh depth-only,
+                // then again with colour, testing GREATER_EQUAL against that depth.
+                // The two vertex shaders reach the same position through differently
+                // ordered float arithmetic, and the reversed depth (w - z) turns a
+                // last-bit difference into ~1e-4 of the depth: the sea's colour pass
+                // failed around single vertices and left black hexagons. Pull depth-only
+                // writers back by 2^-11 of their depth; the colour pass still writes its
+                // own depth, so only depth that nothing redraws keeps the offset.
+                if (key.colorMask == 0 && depth && (depthControl & 6) == 6 && (!ps || !ps->info.writesDepth) &&
+                    (((key.depthControl >> 4) & 7) == 4 || ((key.depthControl >> 4) & 7) == 6) &&
+                    (info.primitiveType == 4 || info.primitiveType == 5 || info.primitiveType == 6 || info.primitiveType == 13))
+                {
+                    constexpr float kPrepassDepthScale = 1.0f - 1.0f / 2048.0f;
+                    shared.ndcScale[2] *= kPrepassDepthScale;
+                    shared.ndcOffset[2] *= kPrepassDepthScale;
+                }
                 viewport.minDepth = 0.0f;
                 viewport.maxDepth = 1.0f;
                 shared.vtxFmt = (vte >> 8) & 7;
@@ -9501,7 +9843,7 @@ void main()
                         key.colorMask, depthOnlyRaster, rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height, rasterScaleX, rasterScaleY);
                 }
                 render_batch::CpuTimer<> taaJitter(cpuTimingEnabled);
-                const bool constantScreenSample = key.vs == 0xe810cfacc107fd3cull &&
+                const bool constantScreenSample = temporalBookkeeping && key.vs == 0xe810cfacc107fd3cull &&
                     key.ps == 0xfe31f3d6588fde95ull && ps &&
                     (ps->info.textureSlotMask & 1) && ps->info.textureDimension[0] == 1 &&
                     !(vs->info.textureSlotMask & 1) &&
@@ -9509,8 +9851,8 @@ void main()
                         Reg(REG_FETCH_CONSTANTS + 2), Reg(REG_FETCH_CONSTANTS + 5),
                         FindResolved((Reg(REG_FETCH_CONSTANTS + 1) >> 12) << 12,
                             Reg(REG_FETCH_CONSTANTS + 1) & 0x3f) != nullptr);
-                const bool motionFallbackPair = temporal::RetainsMotionFallback(key.vs, key.ps);
-                const int temporalSlot=temporal::DrawPositionVPSlot(key.vs, key.ps, constantScreenSample);
+                const bool motionFallbackPair = temporalBookkeeping && temporal::RetainsMotionFallback(key.vs, key.ps);
+                const int temporalSlot = temporalBookkeeping ? temporal::DrawPositionVPSlot(key.vs, key.ps, constantScreenSample) : -1;
                 // bda also appears with a different camera. Reviewed sky pairs
                 // require a scene camera observed before the draw instead of
                 // self-anchoring it.
@@ -9526,7 +9868,7 @@ void main()
                     !temporalScene.Draws() ? nullptr : temporalSlot >= 0 && temporalSlot <= 252 ?
                     &temporalScene.AnchorFor(vsConstants + temporalSlot * 4) : &temporalScene.Anchor();
                 std::optional<temporal::SceneResolve> jitterSampledDepth;
-                const bool jitterShadowPair = temporal::IsShadowProjectionPair(key.vs, key.ps);
+                const bool jitterShadowPair = temporalBookkeeping && temporal::IsShadowProjectionPair(key.vs, key.ps);
                 if (temporalActive && temporalJitter && jitterShadowPair)
                 {
                     const uint32_t fetch0 = Reg(REG_FETCH_CONSTANTS), fetch1 = Reg(REG_FETCH_CONSTANTS + 1);
@@ -9715,6 +10057,10 @@ void main()
                 RenderDescriptorSet* set0 = staticSet0.get();
                 TextureSetCache::Key textureBindings[3];
                 uint32_t activeTextureSlots[3] = {};
+                // Fetch slots whose texture is a resolve with RB_COPY_DEST_SWAP: Vulkan
+                // binds the texture's R/B-swapped view there (every bank, like the
+                // shared texture-info word the swap used to live in).
+                uint32_t textureSwapSlots = 0;
                 textureBindings[0].fill(dummyTexture2D.texture.get());
                 textureBindings[1].fill(dummyTexture3D.texture.get());
                 textureBindings[2].fill(dummyTextureCube.texture.get());
@@ -9937,6 +10283,7 @@ void main()
                             textureBindings[bank][slot] = dummy->texture.get();
                             shared.samplerIndex[slot] = 0;
                             shared.textureInfo[slot] = 0x68800u;
+                            textureSwapSlots &= ~(1u << slot);
                             if (selectedBinding) {
                                 *selectedBinding = {};
                                 DescribeBindingTexture(&*selectedBinding, *dummy, binding::TextureKind::Dummy);
@@ -10508,9 +10855,15 @@ void main()
                         shared.textureSize[slot] = tex->guestWidth | (tex->guestHeight << 16);
                         // GPU resolves retain canonical RGBA for presentation.
                         // Recreate COPY_DEST_SWAP at the guest texture-read boundary,
-                        // before applying that fetch's source signs and swizzle.
-                        if (ResolvedSurface* rs = FindResolved((fetch[1] >> 12) << 12, fetch[1] & 0x3F))
-                            if (rs->swapRedBlue) shared.textureInfo[slot] |= 1u << 20;
+                        // before applying that fetch's source signs and swizzle:
+                        // Vulkan through an R/B-swapped image view, Metal by folding
+                        // the swap into the word, D3D12 in the shader (bit 20).
+                        textureSwapSlots &= ~(1u << slot);
+                        if (ResolvedSurface* rs = FindResolved((fetch[1] >> 12) << 12, fetch[1] & 0x3F); rs && rs->swapRedBlue) {
+                            if (nativeVulkan) textureSwapSlots |= 1u << slot;
+                            else if (vulkan) shared.textureInfo[slot] = FoldRedBlueSwap(shared.textureInfo[slot]);
+                            else shared.textureInfo[slot] |= 1u << 20;
+                        }
                         uint64_t samplerKey = ((d3 >> 19) & 3) | (((d3 >> 21) & 3) << 2) | (((d3 >> 23) & 3) << 4)
                             | (((fetch[0] >> 10) & 7) << 6) | (((fetch[0] >> 13) & 7) << 9) | (((fetch[0] >> 16) & 7) << 12);
                         // The area-filtered guest grid still needs continuous
@@ -10673,9 +11026,9 @@ void main()
                 RenderDescriptorSet *set1, *set2, *set3;
                 {
                     ScopedTimer timer{ tSets, cpuTimingEnabled };
-                    set1 = AcquireTextureSet(1, textureBindings[0], activeTextureSlots[0]);
-                    set2 = AcquireTextureSet(2, textureBindings[1], activeTextureSlots[1]);
-                    set3 = AcquireTextureSet(3, textureBindings[2], activeTextureSlots[2]);
+                    set1 = AcquireTextureSet(1, textureBindings[0], activeTextureSlots[0], textureSwapSlots);
+                    set2 = AcquireTextureSet(2, textureBindings[1], activeTextureSlots[1], textureSwapSlots);
+                    set3 = AcquireTextureSet(3, textureBindings[2], activeTextureSlots[2], textureSwapSlots);
                 }
                 tBind0.AddTo(tBind);
                 render_batch::CpuTimer<> tIndex0(cpuTimingEnabled);
@@ -11047,9 +11400,11 @@ void main()
                 // A draw that an occlusion query will measure binds its counting
                 // variant here instead, so a run of query boxes keeps one binding;
                 // OcclusionQueryForDraw takes the counter at the draw.
+                RenderPipeline* const genericPipeline = pipeline;
+                if (texInfoSpecialization) pipeline = SpecialisedPipeline(vs, ps, pipeline, shared.textureInfo);
                 RenderPipeline* countingPipeline = OcclusionCountingPending() ? CountingPipeline(key, vs, ps) : nullptr;
                 commandList->setPipeline(countingPipeline ? countingPipeline : pipeline);
-                if (auto* sample = recordProbe.Sample()) NoteRecordPipeline(*sample, key, pipeline);
+                if (auto* sample = recordProbe.Sample()) NoteRecordPipeline(*sample, key, genericPipeline, pipeline);
                 // The command list keeps the constant for later rebinds of this
                 // pipeline, e.g. after the motion-vector replay.
                 if (UsesBlendConstant(key.blend))
@@ -11885,6 +12240,7 @@ void main()
                         if (maskPipeline) {
                             TextureSetCache::Key maskBindings[3] = {
                                 textureBindings[0], textureBindings[1], textureBindings[2]};
+                            uint32_t maskSlots = 0;
                             for (unsigned slot : {0u, 2u, 3u}) {
                                 if (slot != 0 && !tone) continue;
                                 if (slot == 2 && !needDof) continue;
@@ -11892,10 +12248,13 @@ void main()
                                 auto& input = *alphaPostInputs[slot];
                                 Gpu().fsrAlphaBridgeUses.push_back(input.fetch.mask);
                                 maskBindings[0][slot] = input.fetch.mask->texture.get();
+                                maskSlots |= 1u << slot;
                             }
-                            auto* maskSet1 = AcquireTextureSet(1, maskBindings[0], activeTextureSlots[0]);
-                            auto* maskSet2 = AcquireTextureSet(2, maskBindings[1], activeTextureSlots[1]);
-                            auto* maskSet3 = AcquireTextureSet(3, maskBindings[2], activeTextureSlots[2]);
+                            // XeFsrMaskTap reads a mask's .r raw: never through an R/B-swapped view.
+                            const uint32_t maskSwapSlots = textureSwapSlots & ~maskSlots;
+                            auto* maskSet1 = AcquireTextureSet(1, maskBindings[0], activeTextureSlots[0], maskSwapSlots);
+                            auto* maskSet2 = AcquireTextureSet(2, maskBindings[1], activeTextureSlots[1], maskSwapSlots);
+                            auto* maskSet3 = AcquireTextureSet(3, maskBindings[2], activeTextureSlots[2], maskSwapSlots);
                             const RenderBufferReference maskConstants[3] = {
                                 {uploadRing, vsOffset}, {uploadRing, sharedOffset}, {uploadRing, psOffset}};
                             RenderDescriptorSet* maskSets[] = {set0, maskSet1, maskSet2,
@@ -12450,8 +12809,6 @@ void main()
                 }
                 // Opt-in, bounded diagnostics of constants actually uploaded for
                 // a submitted draw. F1's guest register trace precedes these edits.
-                static const uint64_t jitterLogStart = getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME") ?
-                    strtoull(getenv("LO_TEMPORAL_DRAW_LOG_START_FRAME"), nullptr, 10) : ~0ull;
                 static const uint64_t jitterLogVs = getenv("LO_TEMPORAL_DRAW_LOG_VS") ?
                     strtoull(getenv("LO_TEMPORAL_DRAW_LOG_VS"), nullptr, 16) : 0;
                 static const uint64_t jitterLogVs2 = getenv("LO_TEMPORAL_DRAW_LOG_VS2") ?
@@ -12460,8 +12817,6 @@ void main()
                 // pairs and one shadow/character sample per frame, reducing IO.
                 static const uint32_t jitterLogIndexCount = getenv("LO_TEMPORAL_DRAW_LOG_INDEX_COUNT") ?
                     strtoul(getenv("LO_TEMPORAL_DRAW_LOG_INDEX_COUNT"), nullptr, 10) : 0;
-                static const bool jitterLogWithResolveTrace = getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE") &&
-                    strcmp(getenv("LO_TEMPORAL_DRAW_LOG_WITH_RESOLVE_TRACE"), "1") == 0;
                 static uint64_t jitterLoggedShadowFrame = ~0ull, jitterLoggedCharacterFrame = ~0ull;
                 const bool jitterLogStaticMesh = key.vs == 0xb030ab4e17a20783ull || key.vs == 0xa27a7234977e0d4aull ||
                     key.vs == 0xff9da3984ce8d094ull || key.vs == 0xf7fd88506d704a3dull ||
@@ -12786,13 +13141,9 @@ void main()
                         {
                             const DepthClearRect sourceRect{int32_t(std::ceil(minX)), int32_t(std::ceil(minY)),
                                 int32_t(std::ceil(maxX)), int32_t(std::ceil(maxY))};
-                            auto mapped = MapDepthClear(pitch, (surfaceInfo >> 16) & 3, sourceRect,
-                                k.pitch, target->guestHeight, target->depthMsaa);
-                            if (vulkan) CoalesceDepthClearRects(mapped);
-                            std::vector<pending_clear::Rect> clearRects;
-                            clearRects.reserve(mapped.size());
-                            for (const auto& r : mapped) clearRects.push_back({int32_t(target->ScaleX(uint32_t(r.left))), int32_t(target->ScaleY(uint32_t(r.top))),
-                                int32_t(target->ScaleX(uint32_t(r.right))), int32_t(target->ScaleY(uint32_t(r.bottom)))});
+                            std::vector<pending_clear::Rect> clearRects = MappedDepthClear({pitch, (surfaceInfo >> 16) & 3,
+                                k.pitch, target->guestHeight, target->depthMsaa, target->resolutionSize.width,
+                                target->resolutionSize.height, vulkan, sourceRect}, *target);
                             const size_t regions = clearRects.size();
                             // An empty rectangle list would mean the whole texture,
                             // so an empty mapping is skipped.
@@ -14546,6 +14897,7 @@ void main()
                 page.closed = true;
             }
             g_renderer->ReportPipelineMisses();
+            g_renderer->ReportSpecialisation();
             g_renderer->UpdateSceneTag();
             g_renderer->HarvestPrefetch();
             g_renderer->UpdateStartupPreparation();
