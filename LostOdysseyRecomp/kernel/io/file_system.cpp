@@ -21,6 +21,35 @@
 static std::mutex g_lastOpenedMutex;
 static std::string g_lastOpenedFile;
 
+// Host read timing for the periodic Switch log (FileSystem::TakeReadStatistics).
+namespace read_stats
+{
+std::atomic<uint64_t> calls{0}, bytes{0}, nanoseconds{0}, slowest{0}, small{0};
+std::mutex filesMutex;
+std::string files; // file names read in this interval, comma-separated, deduplicated
+
+struct Scope
+{
+    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    const std::FILE* file;
+    explicit Scope(const std::FILE* f) : file(f) {}
+    void Done(size_t read, const std::string& name)
+    {
+        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count());
+        calls.fetch_add(1, std::memory_order_relaxed);
+        bytes.fetch_add(read, std::memory_order_relaxed);
+        nanoseconds.fetch_add(ns, std::memory_order_relaxed);
+        if (read < 65536) small.fetch_add(1, std::memory_order_relaxed);
+        uint64_t previous = slowest.load(std::memory_order_relaxed);
+        while (ns > previous && !slowest.compare_exchange_weak(previous, ns, std::memory_order_relaxed)) {}
+        std::lock_guard lock(filesMutex);
+        if (files.size() < 400 && ("," + files + ",").find("," + name + ",") == std::string::npos)
+            files += files.empty() ? name : "," + name;
+    }
+};
+}
+
 #ifdef LO_STORAGE_TESTING
 static std::atomic<file_system_test::Hook> g_ioTestHook{nullptr};
 void file_system_test::SetHook(Hook hook) { g_ioTestHook.store(hook); }
@@ -654,6 +683,24 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
     return STATUS_SUCCESS;
 }
 
+std::string FileSystem::TakeReadStatistics()
+{
+    using namespace read_stats;
+    const uint64_t n = calls.exchange(0, std::memory_order_relaxed);
+    const uint64_t b = bytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t ns = nanoseconds.exchange(0, std::memory_order_relaxed);
+    const uint64_t worst = slowest.exchange(0, std::memory_order_relaxed);
+    const uint64_t smallReads = small.exchange(0, std::memory_order_relaxed);
+    std::string names;
+    {
+        std::lock_guard lock(filesMutex);
+        names.swap(files);
+    }
+    if (!n) return {};
+    return fmt::format("{} reads ({} under 64 KiB), {:.1f} MiB, {:.0f} ms reading ({:.1f} MiB/s while reading), slowest {:.1f} ms; {}",
+        n, smallReads, b / 1048576.0, ns / 1e6, ns ? (b / 1048576.0) / (ns / 1e9) : 0.0, worst / 1e6, names);
+}
+
 std::string FileSystem::LastOpenedFile()
 {
     std::lock_guard lock(g_lastOpenedMutex);
@@ -742,11 +789,13 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
         else if (Length)
         {
             clearerr(handle->file);
+            read_stats::Scope readScope(handle->file);
             if (_fseeki64(handle->file, int64_t(offset), SEEK_SET) != 0)
                 status = FileIoError(errno);
             else
             {
                 read = fread(Buffer, 1, Length, handle->file);
+                readScope.Done(read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
                 if (ferror(handle->file))
                     status = FileIoError(errno);
                 else if (read == 0 && feof(handle->file))

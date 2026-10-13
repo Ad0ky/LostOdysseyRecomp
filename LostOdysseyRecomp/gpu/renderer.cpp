@@ -7118,6 +7118,19 @@ void main()
                 }
                 if (it != cache.end() && !it->second.valid && !it->second.retry.Ready()) return nullptr;
                 if (it != cache.end() && it->second.valid) {
+                    // LO_SHADER_HLSL_DIR also covers shaders that came from the portable
+                    // pack (no HLSL was generated for them): translate once to write it.
+                    if (static const char* hlslDir = getenv("LO_SHADER_HLSL_DIR"); hlslDir && it->second.info.hlsl.empty()) {
+                        static std::unordered_set<uint64_t> written[2];
+                        static const bool directory = [] { std::error_code ec; std::filesystem::create_directories(getenv("LO_SHADER_HLSL_DIR"), ec); return true; }();
+                        (void)directory;
+                        if (written[pixel ? 1 : 0].insert(hash).second) {
+                            std::vector<uint32_t> swapped(count);
+                            for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
+                            std::ofstream(fmt::format("{}/{}_{:016x}.hlsl", hlslDir, pixel ? "ps" : "vs", hash))
+                                << xenos::TranslateShader(swapped.data(), count, pixel, uboConstants).hlsl;
+                        }
+                    }
                     if (!debugCaptureDir.empty() && it->second.valid && it->second.info.hlsl.empty()) {
                         std::vector<uint32_t> swapped(count);
                         for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);

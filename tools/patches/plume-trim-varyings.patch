@@ -1,0 +1,519 @@
+diff --git a/plume_spirv_trim.h b/plume_spirv_trim.h
+new file mode 100644
+index 0000000..1230e39
+--- /dev/null
++++ b/plume_spirv_trim.h
+@@ -0,0 +1,351 @@
++//
++// LostOdysseyRecomp: removes vertex shader outputs that the paired fragment
++// shader never reads.
++//
++// The Xenos translator declares all 16 interpolators in every vertex shader and
++// writes each of them (zero when the guest shader does not), because any vertex
++// shader can be paired with any pixel shader. Drivers that do not link varyings
++// across stages (NVK on the Switch) then store 64 floats per vertex, also for
++// depth-only draws that have no fragment shader at all. SpirvTrimOutputs turns
++// every Location output outside keepMask into a Private variable, so the driver
++// drops the stores and the code that only fed them.
++//
++// The transform is conservative: anything it does not fully understand (an
++// interface block, an array output, a Component decoration, a pointer copy)
++// makes it return false and the caller keeps the original module.
++//
++
++#pragma once
++
++#include <cstdint>
++#include <unordered_map>
++#include <unordered_set>
++#include <vector>
++
++namespace plume::spirv_trim {
++    namespace op {
++        constexpr uint32_t Name = 5, MemberName = 6, EntryPoint = 15, ExecutionMode = 16,
++            TypeVector = 23, TypeFloat = 22, TypeInt = 21, TypePointer = 32, Variable = 59, Load = 61,
++            Store = 62, AccessChain = 65, InBoundsAccessChain = 66, PtrAccessChain = 67, CopyObject = 83,
++            Decorate = 71, MemberDecorate = 72, DecorateId = 332, DecorateString = 5632, Function = 54,
++            ExecutionModeId = 331;
++    }
++    constexpr uint32_t kStorageInput = 1, kStorageOutput = 3, kStoragePrivate = 6;
++    constexpr uint32_t kDecorationBuiltIn = 11, kDecorationLocation = 30, kDecorationComponent = 31;
++
++    struct Instruction {
++        size_t offset;
++        uint32_t opcode;
++        uint32_t count;
++    };
++
++    inline bool Parse(const std::vector<uint32_t> &words, std::vector<Instruction> &out) {
++        if (words.size() < 5 || words[0] != 0x07230203u) {
++            return false;
++        }
++
++        for (size_t i = 5; i < words.size();) {
++            const uint32_t count = words[i] >> 16;
++            if ((count == 0) || ((i + count) > words.size())) {
++                return false;
++            }
++
++            out.push_back({ i, words[i] & 0xFFFFu, count });
++            i += count;
++        }
++
++        return true;
++    }
++
++    // True if the type is a scalar or a vector (one Location, no Component split).
++    inline bool SimpleType(const std::unordered_map<uint32_t, uint32_t> &typeOpcode, uint32_t type) {
++        auto it = typeOpcode.find(type);
++        return (it != typeOpcode.end()) && ((it->second == op::TypeVector) || (it->second == op::TypeFloat) || (it->second == op::TypeInt));
++    }
++
++    struct Interface {
++        // Location -> variable id, for simple Location variables of one storage class.
++        std::unordered_map<uint32_t, uint32_t> locationVariables;
++        bool understood = true;
++    };
++
++    // Collects the Location variables of a storage class and whether each is used.
++    struct Module {
++        std::vector<uint32_t> words;
++        std::vector<Instruction> instructions;
++        std::unordered_map<uint32_t, uint32_t> typeOpcode;               // type id -> opcode
++        std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> pointerTypes; // id -> (storage, pointee)
++        std::unordered_map<uint32_t, uint32_t> variableStorage;           // variable id -> storage class
++        std::unordered_map<uint32_t, uint32_t> variableType;              // variable id -> pointer type id
++        std::unordered_map<uint32_t, uint32_t> location;                  // id -> Location
++        std::unordered_set<uint32_t> builtIn, component, builtInStructs;
++
++        bool load(const uint32_t *data, size_t count) {
++            words.assign(data, data + count);
++            if (!Parse(words, instructions)) {
++                return false;
++            }
++
++            for (const Instruction &instruction : instructions) {
++                const uint32_t *w = &words[instruction.offset];
++                switch (instruction.opcode) {
++                case op::TypeVector:
++                case op::TypeFloat:
++                case op::TypeInt:
++                    if (instruction.count >= 2) typeOpcode[w[1]] = instruction.opcode;
++                    break;
++                case op::TypePointer:
++                    if (instruction.count >= 4) {
++                        typeOpcode[w[1]] = instruction.opcode;
++                        pointerTypes[w[1]] = { w[2], w[3] };
++                    }
++                    break;
++                case op::Variable:
++                    if (instruction.count >= 4) {
++                        variableType[w[2]] = w[1];
++                        variableStorage[w[2]] = w[3];
++                    }
++                    break;
++                case op::Decorate:
++                    if (instruction.count >= 3) {
++                        if ((w[2] == kDecorationLocation) && (instruction.count >= 4)) location[w[1]] = w[3];
++                        else if (w[2] == kDecorationBuiltIn) builtIn.insert(w[1]);
++                        else if (w[2] == kDecorationComponent) component.insert(w[1]);
++                    }
++                    break;
++                case op::MemberDecorate:
++                    if ((instruction.count >= 4) && (w[3] == kDecorationBuiltIn)) builtInStructs.insert(w[1]);
++                    break;
++                default:
++                    if ((instruction.opcode >= 19) && (instruction.opcode <= 39) && (instruction.count >= 2)) {
++                        typeOpcode[w[1]] = instruction.opcode; // other OpType*: struct, array, ...
++                    }
++                    break;
++                }
++            }
++
++            return true;
++        }
++
++        // The Location variables of storageClass. understood is false when one of
++        // them is not a plain scalar or vector or uses Component.
++        Interface interfaceOf(uint32_t storageClass) const {
++            Interface result;
++            for (const auto &[variable, storage] : variableStorage) {
++                if ((storage != storageClass) || builtIn.count(variable)) continue;
++                if (auto pointer = pointerTypes.find(variableType.at(variable));
++                    (pointer != pointerTypes.end()) && builtInStructs.count(pointer->second.second)) continue; // gl_PerVertex
++                auto loc = location.find(variable);
++                if (loc == location.end()) {
++                    result.understood = false; // an interface block or an undecorated variable
++                    continue;
++                }
++
++                auto pointer = pointerTypes.find(variableType.at(variable));
++                if ((pointer == pointerTypes.end()) || !SimpleType(typeOpcode, pointer->second.second) || component.count(variable) ||
++                    result.locationVariables.count(loc->second)) {
++                    result.understood = false;
++                    continue;
++                }
++
++                result.locationVariables[loc->second] = variable;
++            }
++
++            return result;
++        }
++
++        // Ids referenced by any instruction except names, decorations and entry points.
++        std::unordered_set<uint32_t> referencedIds() const {
++            std::unordered_set<uint32_t> ids;
++            for (const Instruction &instruction : instructions) {
++                switch (instruction.opcode) {
++                case op::Name: case op::MemberName: case op::EntryPoint: case op::Decorate: case op::MemberDecorate:
++                case op::DecorateId: case op::DecorateString: case op::ExecutionMode: case op::ExecutionModeId:
++                case op::Variable: // its own declaration (an initializer is never an interface variable)
++                    continue;
++                default:
++                    break;
++                }
++
++                // Every operand word is a candidate id; literals that collide with a
++                // variable id only make the result more conservative.
++                for (uint32_t i = 1; i < instruction.count; i++) {
++                    ids.insert(words[instruction.offset + i]);
++                }
++            }
++
++            return ids;
++        }
++    };
++
++    // Bit L set: the fragment shader reads Location L. Returns false when the
++    // shader's inputs are not understood (the caller must not trim then).
++    inline bool FragmentInputMask(const uint32_t *data, size_t count, uint32_t &mask) {
++        Module module;
++        if (!module.load(data, count)) {
++            return false;
++        }
++
++        const Interface inputs = module.interfaceOf(kStorageInput);
++        if (!inputs.understood) {
++            return false;
++        }
++
++        const std::unordered_set<uint32_t> used = module.referencedIds();
++        mask = 0;
++        for (const auto &[loc, variable] : inputs.locationVariables) {
++            if (loc >= 32) return false;
++            if (used.count(variable)) mask |= 1u << loc;
++        }
++
++        return true;
++    }
++
++    // Writes to out a copy of the vertex shader whose Location outputs outside
++    // keepMask are Private. Returns false (out untouched) when nothing changes or
++    // the module is not understood.
++    inline bool TrimOutputs(const uint32_t *data, size_t count, uint32_t keepMask, std::vector<uint32_t> &out, uint32_t *removedCount = nullptr) {
++        Module module;
++        if (!module.load(data, count)) {
++            return false;
++        }
++
++        const Interface outputs = module.interfaceOf(kStorageOutput);
++        if (!outputs.understood) {
++            return false;
++        }
++
++        std::unordered_set<uint32_t> demoted;
++        for (const auto &[loc, variable] : outputs.locationVariables) {
++            if ((loc >= 32) || !(keepMask & (1u << loc))) demoted.insert(variable);
++        }
++
++        if (demoted.empty()) {
++            return false;
++        }
++
++        std::vector<uint32_t> &words = module.words;
++        uint32_t bound = words[3];
++        const uint32_t version = words[1];
++
++        // Private pointer type for each pointee of an Output pointer type. Existing
++        // Private pointers are reused; new ones are inserted after the Output one.
++        std::unordered_map<uint32_t, uint32_t> privateForPointee;
++        for (const auto &[id, pointer] : module.pointerTypes) {
++            if (pointer.first == kStoragePrivate) privateForPointee.emplace(pointer.second, id);
++        }
++
++        std::unordered_map<uint32_t, uint32_t> outputToPrivate; // Output pointer type -> Private pointer type
++        std::unordered_map<size_t, std::vector<uint32_t>> insertAfter; // instruction offset -> new words
++        auto privatePointer = [&](uint32_t outputPointer, size_t declarationOffset) -> uint32_t {
++            if (auto it = outputToPrivate.find(outputPointer); it != outputToPrivate.end()) return it->second;
++            const uint32_t pointee = module.pointerTypes.at(outputPointer).second;
++            uint32_t id;
++            if (auto it = privateForPointee.find(pointee); it != privateForPointee.end()) {
++                id = it->second;
++            }
++            else {
++                id = bound++;
++                privateForPointee.emplace(pointee, id);
++                auto &extra = insertAfter[declarationOffset];
++                extra.insert(extra.end(), { (4u << 16) | op::TypePointer, id, kStoragePrivate, pointee });
++            }
++
++            outputToPrivate.emplace(outputPointer, id);
++            return id;
++        };
++
++        std::unordered_map<uint32_t, size_t> pointerDeclaration; // pointer type id -> offset
++        for (const Instruction &instruction : module.instructions) {
++            if (instruction.opcode == op::TypePointer) pointerDeclaration[words[instruction.offset + 1]] = instruction.offset;
++        }
++
++        // Pointers derived from demoted variables (access chains) are retyped too.
++        std::unordered_set<uint32_t> demotedPointers = demoted;
++        for (const Instruction &instruction : module.instructions) {
++            const uint32_t *w = &words[instruction.offset];
++            switch (instruction.opcode) {
++            case op::AccessChain:
++            case op::InBoundsAccessChain:
++            case op::PtrAccessChain:
++                if ((instruction.count >= 4) && demotedPointers.count(w[3])) demotedPointers.insert(w[2]);
++                break;
++            case op::CopyObject:
++                if ((instruction.count >= 4) && demotedPointers.count(w[3])) return false;
++                break;
++            default:
++                break;
++            }
++        }
++
++        // Resolve all needed pointer types before rewriting.
++        for (const Instruction &instruction : module.instructions) {
++            const uint32_t *w = &words[instruction.offset];
++            const bool variable = (instruction.opcode == op::Variable) && demoted.count(w[2]);
++            const bool chain = ((instruction.opcode == op::AccessChain) || (instruction.opcode == op::InBoundsAccessChain) ||
++                (instruction.opcode == op::PtrAccessChain)) && (instruction.count >= 4) && demotedPointers.count(w[2]);
++            if (!variable && !chain) continue;
++            auto pointer = module.pointerTypes.find(w[1]);
++            if ((pointer == module.pointerTypes.end()) || (pointer->second.first != kStorageOutput)) return false;
++            privatePointer(w[1], pointerDeclaration.at(w[1]));
++        }
++
++        std::vector<uint32_t> result(words.begin(), words.begin() + 5);
++        result.reserve(words.size() + 16);
++        for (const Instruction &instruction : module.instructions) {
++            const uint32_t *w = &words[instruction.offset];
++            std::vector<uint32_t> copy(w, w + instruction.count);
++            bool drop = false;
++            switch (instruction.opcode) {
++            case op::EntryPoint:
++                // SPIR-V before 1.4 lists only Input and Output variables in the interface.
++                if (version < 0x00010400u) {
++                    std::vector<uint32_t> kept;
++                    // Operands: execution model, id, name (literal string), interface ids.
++                    size_t nameWords = 0;
++                    for (size_t i = 3; i < copy.size(); i++) {
++                        nameWords++;
++                        if ((copy[i] & 0xFF000000u) == 0 || (copy[i] & 0x00FF0000u) == 0 || (copy[i] & 0x0000FF00u) == 0 || (copy[i] & 0xFFu) == 0) break;
++                    }
++
++                    kept.assign(copy.begin(), copy.begin() + 3 + nameWords);
++                    for (size_t i = 3 + nameWords; i < copy.size(); i++) {
++                        if (!demoted.count(copy[i])) kept.push_back(copy[i]);
++                    }
++
++                    kept[0] = (uint32_t(kept.size()) << 16) | op::EntryPoint;
++                    copy = std::move(kept);
++                }
++                break;
++            case op::Decorate:
++            case op::DecorateId:
++            case op::DecorateString:
++                drop = (copy.size() >= 2) && demoted.count(copy[1]);
++                break;
++            case op::Variable:
++                if (demoted.count(copy[2])) {
++                    copy[1] = outputToPrivate.at(copy[1]);
++                    copy[3] = kStoragePrivate;
++                }
++                break;
++            case op::AccessChain:
++            case op::InBoundsAccessChain:
++            case op::PtrAccessChain:
++                if ((copy.size() >= 4) && demotedPointers.count(copy[2])) copy[1] = outputToPrivate.at(copy[1]);
++                break;
++            default:
++                break;
++            }
++
++            if (!drop) result.insert(result.end(), copy.begin(), copy.end());
++            if (auto extra = insertAfter.find(instruction.offset); extra != insertAfter.end()) {
++                result.insert(result.end(), extra->second.begin(), extra->second.end());
++            }
++        }
++
++        result[3] = bound;
++        out = std::move(result);
++        if (removedCount != nullptr) *removedCount = uint32_t(demoted.size());
++        return true;
++    }
++};
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 9db5baa..3b06818 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -9,6 +9,11 @@
+ #define VOLK_IMPLEMENTATION 
+ 
+ #include "plume_vulkan.h"
++#include "plume_spirv_trim.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstdlib>
+ #include <cstring>
+ #include "plume_log.h"
+@@ -1384,6 +1389,74 @@ namespace plume {
+ 
+     // VulkanShader
+ 
++    // LostOdysseyRecomp: LO_TRIM_VARYINGS=1 gives each pipeline a vertex shader
++    // without the outputs its fragment shader does not read (all of them for a
++    // depth-only pipeline). See plume_spirv_trim.h.
++    static bool trimVaryingsEnabled() {
++        static const bool enabled = [] {
++            const char *value = std::getenv("LO_TRIM_VARYINGS");
++            return (value != nullptr) && (value[0] == '1') && (value[1] == '\0');
++        }();
++        return enabled;
++    }
++
++    static VkShaderModule vertexModuleFor(const RenderGraphicsPipelineDesc &desc) {
++        VulkanShader *vertexShader = const_cast<VulkanShader *>(static_cast<const VulkanShader *>(desc.vertexShader));
++        if (!trimVaryingsEnabled() || (desc.geometryShader != nullptr) || vertexShader->spirv.empty()) {
++            return vertexShader->vk;
++        }
++
++        uint32_t keepMask = 0;
++        if (desc.pixelShader != nullptr) {
++            VulkanShader *pixelShader = const_cast<VulkanShader *>(static_cast<const VulkanShader *>(desc.pixelShader));
++            std::lock_guard lock(pixelShader->variantMutex);
++            if (pixelShader->fragmentInputMask == -2) {
++                uint32_t mask = 0;
++                pixelShader->fragmentInputMask = (!pixelShader->spirv.empty() &&
++                    spirv_trim::FragmentInputMask(pixelShader->spirv.data(), pixelShader->spirv.size(), mask)) ? int64_t(mask) : -1;
++                std::vector<uint32_t>().swap(pixelShader->spirv); // only the mask is needed from a fragment shader
++            }
++
++            if (pixelShader->fragmentInputMask < 0) {
++                return vertexShader->vk;
++            }
++
++            keepMask = uint32_t(pixelShader->fragmentInputMask);
++        }
++
++        static std::atomic<uint32_t> variantCount{ 0 }, removedTotal{ 0 };
++        std::lock_guard lock(vertexShader->variantMutex);
++        auto it = vertexShader->outputVariants.find(keepMask);
++        if (it != vertexShader->outputVariants.end()) {
++            return (it->second != VK_NULL_HANDLE) ? it->second : vertexShader->vk;
++        }
++
++        VkShaderModule module = VK_NULL_HANDLE;
++        std::vector<uint32_t> trimmed;
++        uint32_t removed = 0;
++        if (spirv_trim::TrimOutputs(vertexShader->spirv.data(), vertexShader->spirv.size(), keepMask, trimmed, &removed)) {
++            VkShaderModuleCreateInfo shaderInfo = {};
++            shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
++            shaderInfo.pCode = trimmed.data();
++            shaderInfo.codeSize = trimmed.size() * sizeof(uint32_t);
++            if (vkCreateShaderModule(vertexShader->device->vk, &shaderInfo, nullptr, &module) != VK_SUCCESS) {
++                module = VK_NULL_HANDLE;
++            }
++        }
++
++        vertexShader->outputVariants.emplace(keepMask, module);
++        if (module != VK_NULL_HANDLE) {
++            const uint32_t count = ++variantCount;
++            const uint32_t total = (removedTotal += removed);
++            if ((count <= 3) || ((count % 100) == 0)) {
++                std::fprintf(stderr, "[trim] vertex shader variant %u: kept mask 0x%x, %u outputs removed (%u removed in all variants)\n",
++                    count, keepMask, removed, total);
++            }
++        }
++
++        return (module != VK_NULL_HANDLE) ? module : vertexShader->vk;
++    }
++
+     VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
+         assert(device != nullptr);
+         assert(data != nullptr);
+@@ -1404,14 +1477,25 @@ namespace plume {
+             PLUME_LOG_ERROR("Vulkan", "vkCreateShaderModule", LogErrorDomain::VkResult, res, "");
+             return;
+         }
++
++        if (trimVaryingsEnabled() && ((size % 4) == 0)) {
++            spirv.assign(reinterpret_cast<const uint32_t *>(data), reinterpret_cast<const uint32_t *>(data) + (size / 4));
++        }
+     }
+ 
+     VulkanShader::~VulkanShader() {
++        for (auto &variant : outputVariants) {
++            if (variant.second != VK_NULL_HANDLE) {
++                vkDestroyShaderModule(device->vk, variant.second, nullptr);
++            }
++        }
++
+         if (vk != VK_NULL_HANDLE) {
+             vkDestroyShaderModule(device->vk, vk, nullptr);
+         }
+     }
+ 
++
+     void VulkanShader::setName(const std::string &name) {
+         setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
+     }
+@@ -1537,7 +1621,7 @@ namespace plume {
+             VkPipelineShaderStageCreateInfo stageInfo = {};
+             stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+             stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+-            stageInfo.module = vertexShader->vk;
++            stageInfo.module = vertexModuleFor(desc);
+             stageInfo.pName = vertexShader->entryPointName.c_str();
+             stageInfo.pSpecializationInfo = pSpecInfo;
+             stages.emplace_back(stageInfo);
+@@ -2063,7 +2147,7 @@ namespace plume {
+         });
+ 
+         // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
+-        const VkShaderModule vertexModule = static_cast<const VulkanShader *>(desc.vertexShader)->vk;
++        const VkShaderModule vertexModule = vertexModuleFor(desc);
+         const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
+         const VkBool32 depthClamp = !desc.depthClipEnabled;
+         const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
+@@ -2080,6 +2164,7 @@ namespace plume {
+             VkPipelineShaderStageCreateInfo stages[2];
+             uint32_t stageCount = 0;
+             stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
++            stages[stageCount - 1].module = vertexModule;
+             if (desc.geometryShader != nullptr) {
+                 stages[stageCount++] = libraryStage(desc.geometryShader, VK_SHADER_STAGE_GEOMETRY_BIT);
+             }
+diff --git a/plume_vulkan.h b/plume_vulkan.h
+index 293ce15..e7bebc6 100644
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -183,6 +183,14 @@ namespace plume {
+         VulkanDevice *device = nullptr;
+         RenderShaderFormat format = RenderShaderFormat::UNKNOWN;
+ 
++        // LostOdysseyRecomp (LO_TRIM_VARYINGS): the SPIR-V is kept so pipelines can
++        // use a vertex shader variant without the outputs their fragment shader
++        // does not read (plume_spirv_trim.h). Variants are keyed by the kept mask.
++        std::vector<uint32_t> spirv;
++        std::mutex variantMutex;
++        std::unordered_map<uint32_t, VkShaderModule> outputVariants;
++        int64_t fragmentInputMask = -2; // -2: not computed, -1: not understood
++
+         VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format);
+         ~VulkanShader() override;
+         virtual void setName(const std::string &name) override;
