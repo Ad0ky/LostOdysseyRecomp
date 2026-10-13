@@ -1,4 +1,6 @@
 #include "config.h"
+#include <cstdlib>
+#include <cstring>
 #include <debug/fast_forward.h>
 #include <gpu/frame_rate.h>
 #include <filesystem>
@@ -35,7 +37,7 @@ Config Validate(Config value)
     value.gameLanguagePack = PackId(std::move(value.gameLanguagePack));
     if (value.displayName.empty() || value.displayIndex > 63) value.displayIndex = 0;
     if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative &&
-        value.internalResolution != 720 && value.internalResolution != 1080 &&
+        value.internalResolution != 540 && value.internalResolution != 720 && value.internalResolution != 1080 &&
         value.internalResolution != 1440 && value.internalResolution != 2160)
         value.internalResolution = 0;
 #if LO_PLATFORM_MACOS
@@ -128,7 +130,12 @@ Config Validate(Config value)
 #if LO_PLATFORM_SWITCH
     // The Xbox 360 image: the game's own 720p scene, retail shadow maps and none
     // of the host AA, AO, filtering, upscaling or HDR passes. The menu hides them.
-    value.internalResolution = 720;
+    // LO_SWITCH_RENDER_HEIGHT=540 (env.txt) renders the scene at 960x540 and
+    // scales it to the 720p output: a performance test, not a menu choice.
+    {
+        const char* height = std::getenv("LO_SWITCH_RENDER_HEIGHT");
+        value.internalResolution = height && std::strcmp(height, "540") == 0 ? 540 : 720;
+    }
     value.shadowResolution = 1;
     value.antialiasing = 0;
     value.fxaa = false;
