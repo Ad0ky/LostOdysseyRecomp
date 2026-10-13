@@ -390,7 +390,13 @@ int main(int argc, char* argv[])
     }
 #if LO_PLATFORM_SWITCH
     // One SD card line per guest file read and allocation: opt in (env.txt).
-    os::logger::g_kernelTrace = getenv("LO_KERNEL_TRACE") != nullptr;
+    // Quiet rather than just off, so the Debug log setting (SetDebugLog, also
+    // applied when settings load or save) keeps it off as well.
+    if (!getenv("LO_KERNEL_TRACE"))
+    {
+        os::logger::g_quietKernel = true;
+        os::logger::g_kernelTrace = false;
+    }
 #endif
 
     {
