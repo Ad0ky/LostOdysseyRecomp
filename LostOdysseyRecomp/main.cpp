@@ -188,6 +188,23 @@ static int RunGuest(uint32_t entry)
     }
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
+    // Docking changes the scene resolution (settings::Validate picks 540 in
+    // handheld mode, 720 docked): re-apply the settings when the mode changes.
+    os::DetachThread(std::thread([] {
+        os::SetCurrentThreadName("Dock Watch");
+        bool docked = os::switch_platform::IsDocked();
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const bool now = os::switch_platform::IsDocked();
+            if (now == docked)
+                continue;
+            docked = now;
+            settings::PreviewConfig(settings::GetConfig());
+            LOG_NOTICE("switch: {} mode, scene at {}p", docked ? "docked" : "handheld",
+                       settings::GetConfig().internalResolution);
+        }
+    }));
     // Memory over time: the console has no swap, and the GPU shares this RAM.
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("Memory Monitor");

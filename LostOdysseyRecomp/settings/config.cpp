@@ -1,6 +1,10 @@
 #include "config.h"
 #include <cstdlib>
 #include <cstring>
+#include <os/platform.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #include <debug/fast_forward.h>
 #include <gpu/frame_rate.h>
 #include <filesystem>
@@ -130,11 +134,16 @@ Config Validate(Config value)
 #if LO_PLATFORM_SWITCH
     // The Xbox 360 image: the game's own 720p scene, retail shadow maps and none
     // of the host AA, AO, filtering, upscaling or HDR passes. The menu hides them.
-    // LO_SWITCH_RENDER_HEIGHT=540 (env.txt) renders the scene at 960x540 and
-    // scales it to the 720p output: a performance test, not a menu choice.
+    // The scene renders at 960x540 in handheld mode (the GPU-bound console
+    // gains about a third in battle) and at the Xbox 360's 720p when docked,
+    // where the GPU clocks higher; the final pass scales to the 720p output.
+    // main.cpp re-applies this when the console is docked or undocked.
+    // LO_SWITCH_RENDER_HEIGHT=540 or 720 (env.txt) forces one of them.
     {
         const char* height = std::getenv("LO_SWITCH_RENDER_HEIGHT");
-        value.internalResolution = height && std::strcmp(height, "540") == 0 ? 540 : 720;
+        if (height && std::strcmp(height, "540") == 0) value.internalResolution = 540;
+        else if (height && std::strcmp(height, "720") == 0) value.internalResolution = 720;
+        else value.internalResolution = os::switch_platform::IsDocked() ? 720 : 540;
     }
     value.shadowResolution = 1;
     value.antialiasing = 0;
