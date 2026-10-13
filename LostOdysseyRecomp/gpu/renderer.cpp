@@ -8397,6 +8397,24 @@ void main()
                 for (uint32_t by = 0; by < levelBlocksY; by++)
                 {
                     uint8_t* dstRow = out + (size_t(f) * levelBlocksY + by) * outPitch;
+                    // Linear rows that need no format conversion are one copy plus an
+                    // in-place byte swap. The movie decoder rewrites its linear planes
+                    // every frame, so this is the per-frame cutscene upload path; the
+                    // block loop below cost ~35 ms per 720p frame on the Switch.
+                    if (!tiled && !fi.convertToRgba8)
+                    {
+                        const uint8_t* srcRow = levelSrc + size_t(f) * faceStride +
+                            (size_t(by + origin.y) * levelPitchBlocks + origin.x) * fi.bytesPerBlock;
+                        const size_t bytes = size_t(levelBlocksX) * fi.bytesPerBlock;
+                        memcpy(dstRow, srcRow, bytes);
+                        if (fi.bytesPerBlock >= 2 && (endian == 1 || (endian == 2 && fi.bytesPerBlock == 2)))
+                            for (size_t i = 0; i + 1 < bytes; i += 2) std::swap(dstRow[i], dstRow[i + 1]);
+                        else if (fi.bytesPerBlock >= 4 && endian == 2)
+                            for (size_t i = 0; i + 3 < bytes; i += 4) { std::swap(dstRow[i], dstRow[i + 3]); std::swap(dstRow[i + 1], dstRow[i + 2]); }
+                        else if (fi.bytesPerBlock >= 4 && endian == 3)
+                            for (size_t i = 0; i + 3 < bytes; i += 4) { std::swap(dstRow[i], dstRow[i + 2]); std::swap(dstRow[i + 1], dstRow[i + 3]); }
+                        continue;
+                    }
                     for (uint32_t bx = 0; bx < levelBlocksX; bx++)
                     {
                         const uint32_t sx = bx + origin.x, sy = by + origin.y;
