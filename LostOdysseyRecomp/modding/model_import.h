@@ -11,7 +11,7 @@
 // The package is rebuilt when the game opens the archive that holds it
 // (modding/text_overlay.h): the new mesh is serialized at the end of the
 // package and the export table points there, so nothing else in the package
-// moves. The skeleton and the material slots stay the original's; vertices,
+// moves; the old export's bytes are zeroed. The skeleton and the material slots stay the original's; vertices,
 // triangles, UVs and weights are the file's. A static mesh gets a new collision
 // tree, and the baked lighting of its placements follows its new vertices
 // (RemapLighting). See docs/wiki/Creating-Mods.md#replace-a-model.
@@ -50,6 +50,9 @@ struct Result
 };
 // package: the decoded package bytes (no CPX); stem: its file name without extension.
 Result RebuildPackage(std::span<const uint8_t> package, const std::string &stem, const std::vector<Replacement> &replacements);
+
+// Whether a package has StaticMeshComponents, which may place a replaced mesh.
+bool PlacesStaticMeshes(std::span<const uint8_t> package);
 
 // The StaticMeshComponents of a package that place a mesh in maps: their
 // per-vertex light maps and ShadowMap1D buffers rebuilt for the new vertices,
