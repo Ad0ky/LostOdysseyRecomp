@@ -7390,7 +7390,8 @@ void main()
             // All classes live in FP16 host textures: an 8-bit or 10-bit unorm value is
             // exact in half precision, and keeping one host format keeps resolves and
             // framebuffers simple. Only the interpretation differs between classes.
-            // LO_RT32=1: the two 32-bit 10-bit classes get 32-bit host formats, which
+            // LO_RT32 (on by default on the Switch, LO_RT32=0 turns it off; elsewhere
+            // LO_RT32=1 turns it on): the two 32-bit 10-bit classes get 32-bit host formats, which
             // halves their render target bandwidth (and blends at full rate on GPUs
             // whose FP16x4 blending is half rate, such as the Switch's Maxwell).
             // 2_10_10_10 stays exact in R10G10B10A2. 7e3 goes to R11G11B10_FLOAT:
@@ -7400,7 +7401,11 @@ void main()
             {
                 static const bool enabled = [] {
                     const char* value = getenv("LO_RT32");
+#if LO_PLATFORM_SWITCH
+                    return !value || value[0] != '0';
+#else
                     return value && value[0] == '1' && value[1] == '\0';
+#endif
                 }();
                 return enabled;
             }
