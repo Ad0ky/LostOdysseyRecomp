@@ -205,6 +205,17 @@ static int RunGuest(uint32_t entry)
                        settings::GetConfig().internalResolution);
         }
     }));
+    // Game file reads every 10 s (only intervals with reads), to tell slow SD
+    // reads from other waits during loading screens.
+    os::DetachThread(std::thread([] {
+        os::SetCurrentThreadName("IO Monitor");
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (const std::string reads = FileSystem::TakeReadStatistics(); !reads.empty())
+                LOG_INFO("switch io: {}", reads);
+        }
+    }));
     // Memory over time: the console has no swap, and the GPU shares this RAM.
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("Memory Monitor");
