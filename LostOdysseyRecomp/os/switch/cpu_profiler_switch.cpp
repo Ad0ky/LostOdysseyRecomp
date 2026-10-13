@@ -20,7 +20,8 @@ extern "C" char _start;
 
 namespace
 {
-    constexpr int MAX_THREADS = 64;
+    constexpr int MAX_THREADS = 256;   // the movie player starts threads all game long
+    constexpr uint32_t SLOT_SHIFT = 23;   // 256 slots; code offsets >> 4 below 1 << 23 (128 MiB)
     constexpr uint64_t SAMPLE_INTERVAL_NS = 2'000'000;   // 500 samples per second per thread
     constexpr uint64_t REPORT_INTERVAL_NS = 30'000'000'000ull;
     constexpr uint32_t TABLE_SIZE = 1u << 17;            // (thread, 16-byte code line) -> samples
@@ -49,7 +50,7 @@ namespace
 
     struct Bucket
     {
-        uint32_t key; // 0 = empty; otherwise ((slot << 26) | (offset >> 4)) + 1
+        uint32_t key; // 0 = empty; otherwise ((slot << SLOT_SHIFT) | (offset >> 4)) + 1
         uint32_t count;
     };
 
@@ -135,10 +136,10 @@ namespace
     void AddSample(uint32_t slot, uint64_t pc)
     {
         const uint64_t base = g_moduleBase;
-        if (pc < base || pc - base >= (uint64_t(1) << 30))
+        if (pc < base || pc - base >= (uint64_t(1) << (SLOT_SHIFT + 4)))
             return;
 
-        const uint32_t key = ((slot << 26) | uint32_t((pc - base) >> 4)) + 1;
+        const uint32_t key = ((slot << SLOT_SHIFT) | uint32_t((pc - base) >> 4)) + 1;
         uint32_t index = (key * 2654435761u) & (TABLE_SIZE - 1);
         for (uint32_t probe = 0; probe < 64; probe++)
         {
@@ -209,8 +210,8 @@ namespace
 
         std::sort(buckets.begin(), buckets.end(), [](const Bucket& a, const Bucket& b)
             {
-                const uint32_t slotA = (a.key - 1) >> 26;
-                const uint32_t slotB = (b.key - 1) >> 26;
+                const uint32_t slotA = (a.key - 1) >> SLOT_SHIFT;
+                const uint32_t slotB = (b.key - 1) >> SLOT_SHIFT;
                 return slotA != slotB ? slotA < slotB : a.count > b.count;
             });
 
@@ -230,11 +231,11 @@ namespace
                 uint32_t shown = 0;
                 for (const Bucket& bucket : buckets)
                 {
-                    if (((bucket.key - 1) >> 26) != thread.slot || shown++ == REPORT_LINES_PER_THREAD)
+                    if (((bucket.key - 1) >> SLOT_SHIFT) != thread.slot || shown++ == REPORT_LINES_PER_THREAD)
                         continue;
 
                     snprintf(line, sizeof(line), "    %5.1f%%  +0x%07x\n", 100.0 * bucket.count / thread.samples,
-                        ((bucket.key - 1) & ((1u << 26) - 1)) << 4);
+                        ((bucket.key - 1) & ((1u << SLOT_SHIFT) - 1)) << 4);
                     report += line;
                 }
             }
