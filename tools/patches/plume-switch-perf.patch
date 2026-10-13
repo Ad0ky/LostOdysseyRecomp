@@ -1,9 +1,50 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index 29cddfd..3972f17 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -100,6 +100,8 @@ namespace plume {
+             return DXGI_FORMAT_R16G16B16A16_TYPELESS;
+         case RenderFormat::R10G10B10A2_UNORM:
+             return DXGI_FORMAT_R10G10B10A2_UNORM;
++        case RenderFormat::R11G11B10_FLOAT:
++            return DXGI_FORMAT_R11G11B10_FLOAT;
+         case RenderFormat::R16G16B16A16_FLOAT:
+             return DXGI_FORMAT_R16G16B16A16_FLOAT;
+         case RenderFormat::R16G16B16A16_UNORM:
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index b2149f3..3b006ed 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -192,6 +192,7 @@ namespace plume {
+         BC7_UNORM_SRGB,
+         R10G10B10A2_UNORM,
+         B10G10R10A2_UNORM,
++        R11G11B10_FLOAT, // LostOdysseyRecomp: 32-bit packed float colour targets
+         MAX
+     };
+ 
+@@ -570,6 +571,7 @@ namespace plume {
+             return 8;
+         case RenderFormat::R10G10B10A2_UNORM:
+         case RenderFormat::B10G10R10A2_UNORM:
++        case RenderFormat::R11G11B10_FLOAT:
+         case RenderFormat::R8G8B8A8_TYPELESS:
+         case RenderFormat::R8G8B8A8_UNORM:
+         case RenderFormat::R8G8B8A8_UINT:
+@@ -637,6 +639,7 @@ namespace plume {
+         switch (format) {
+         case RenderFormat::R10G10B10A2_UNORM:
+         case RenderFormat::B10G10R10A2_UNORM:
++        case RenderFormat::R11G11B10_FLOAT:
+         case RenderFormat::R32G32B32A32_TYPELESS:
+         case RenderFormat::R32G32B32A32_FLOAT:
+         case RenderFormat::R32G32B32A32_UINT:
 diff --git a/plume_spirv_trim.h b/plume_spirv_trim.h
 new file mode 100644
-index 0000000..1230e39
+index 0000000..e9914b8
 --- /dev/null
 +++ b/plume_spirv_trim.h
-@@ -0,0 +1,351 @@
+@@ -0,0 +1,368 @@
 +//
 +// LostOdysseyRecomp: removes vertex shader outputs that the paired fragment
 +// shader never reads.
@@ -38,6 +79,7 @@ index 0000000..1230e39
 +    }
 +    constexpr uint32_t kStorageInput = 1, kStorageOutput = 3, kStoragePrivate = 6;
 +    constexpr uint32_t kDecorationBuiltIn = 11, kDecorationLocation = 30, kDecorationComponent = 31;
++    constexpr uint32_t kBuiltInPointSize = 1;
 +
 +    struct Instruction {
 +        size_t offset;
@@ -85,6 +127,7 @@ index 0000000..1230e39
 +        std::unordered_map<uint32_t, uint32_t> variableType;              // variable id -> pointer type id
 +        std::unordered_map<uint32_t, uint32_t> location;                  // id -> Location
 +        std::unordered_set<uint32_t> builtIn, component, builtInStructs;
++        std::unordered_map<uint32_t, uint32_t> builtInKind;                // variable id -> BuiltIn value
 +
 +        bool load(const uint32_t *data, size_t count) {
 +            words.assign(data, data + count);
@@ -115,7 +158,10 @@ index 0000000..1230e39
 +                case op::Decorate:
 +                    if (instruction.count >= 3) {
 +                        if ((w[2] == kDecorationLocation) && (instruction.count >= 4)) location[w[1]] = w[3];
-+                        else if (w[2] == kDecorationBuiltIn) builtIn.insert(w[1]);
++                        else if (w[2] == kDecorationBuiltIn) {
++                            builtIn.insert(w[1]);
++                            if (instruction.count >= 4) builtInKind[w[1]] = w[3];
++                        }
 +                        else if (w[2] == kDecorationComponent) component.insert(w[1]);
 +                    }
 +                    break;
@@ -210,7 +256,10 @@ index 0000000..1230e39
 +    // Writes to out a copy of the vertex shader whose Location outputs outside
 +    // keepMask are Private. Returns false (out untouched) when nothing changes or
 +    // the module is not understood.
-+    inline bool TrimOutputs(const uint32_t *data, size_t count, uint32_t keepMask, std::vector<uint32_t> &out, uint32_t *removedCount = nullptr) {
++    // removePointSize also turns a standalone PointSize output into a Private
++    // variable: only point-list pipelines read it.
++    inline bool TrimOutputs(const uint32_t *data, size_t count, uint32_t keepMask, std::vector<uint32_t> &out, uint32_t *removedCount = nullptr,
++        bool removePointSize = false) {
 +        Module module;
 +        if (!module.load(data, count)) {
 +            return false;
@@ -224,6 +273,15 @@ index 0000000..1230e39
 +        std::unordered_set<uint32_t> demoted;
 +        for (const auto &[loc, variable] : outputs.locationVariables) {
 +            if ((loc >= 32) || !(keepMask & (1u << loc))) demoted.insert(variable);
++        }
++
++        if (removePointSize) {
++            for (const auto &[variable, kind] : module.builtInKind) {
++                auto storage = module.variableStorage.find(variable);
++                if ((kind != kBuiltInPointSize) || (storage == module.variableStorage.end()) || (storage->second != kStorageOutput)) continue;
++                auto pointer = module.pointerTypes.find(module.variableType.at(variable));
++                if ((pointer != module.pointerTypes.end()) && SimpleType(module.typeOpcode, pointer->second.second)) demoted.insert(variable);
++            }
 +        }
 +
 +        if (demoted.empty()) {
@@ -356,7 +414,7 @@ index 0000000..1230e39
 +    }
 +};
 diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
-index 9db5baa..3b06818 100644
+index 9db5baa..ea99d72 100644
 --- a/plume_vulkan.cpp
 +++ b/plume_vulkan.cpp
 @@ -9,6 +9,11 @@
@@ -371,17 +429,27 @@ index 9db5baa..3b06818 100644
  #include <cstdlib>
  #include <cstring>
  #include "plume_log.h"
-@@ -1384,6 +1389,74 @@ namespace plume {
+@@ -182,6 +187,8 @@ namespace plume {
+             return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+         case RenderFormat::B10G10R10A2_UNORM:
+             return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
++        case RenderFormat::R11G11B10_FLOAT:
++            return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+         case RenderFormat::R16G16B16A16_FLOAT:
+             return VK_FORMAT_R16G16B16A16_SFLOAT;
+         case RenderFormat::R16G16B16A16_UNORM:
+@@ -1384,6 +1391,78 @@ namespace plume {
  
      // VulkanShader
  
-+    // LostOdysseyRecomp: LO_TRIM_VARYINGS=1 gives each pipeline a vertex shader
-+    // without the outputs its fragment shader does not read (all of them for a
-+    // depth-only pipeline). See plume_spirv_trim.h.
++    // LostOdysseyRecomp: each pipeline gets a vertex shader without the outputs
++    // its fragment shader does not read (all of them for a depth-only pipeline)
++    // and, unless it draws points, without the point size. See plume_spirv_trim.h.
 +    static bool trimVaryingsEnabled() {
++        // On by default; LO_TRIM_VARYINGS=0 turns it off.
 +        static const bool enabled = [] {
 +            const char *value = std::getenv("LO_TRIM_VARYINGS");
-+            return (value != nullptr) && (value[0] == '1') && (value[1] == '\0');
++            return (value == nullptr) || (value[0] != '0');
 +        }();
 +        return enabled;
 +    }
@@ -410,9 +478,12 @@ index 9db5baa..3b06818 100644
 +            keepMask = uint32_t(pixelShader->fragmentInputMask);
 +        }
 +
++        // Bit 31 of the variant key: the pipeline draws points and keeps PointSize.
++        const bool points = (desc.primitiveTopology == RenderPrimitiveTopology::POINT_LIST);
++        const uint32_t variantKey = keepMask | (points ? 0x80000000u : 0u);
 +        static std::atomic<uint32_t> variantCount{ 0 }, removedTotal{ 0 };
 +        std::lock_guard lock(vertexShader->variantMutex);
-+        auto it = vertexShader->outputVariants.find(keepMask);
++        auto it = vertexShader->outputVariants.find(variantKey);
 +        if (it != vertexShader->outputVariants.end()) {
 +            return (it->second != VK_NULL_HANDLE) ? it->second : vertexShader->vk;
 +        }
@@ -420,7 +491,7 @@ index 9db5baa..3b06818 100644
 +        VkShaderModule module = VK_NULL_HANDLE;
 +        std::vector<uint32_t> trimmed;
 +        uint32_t removed = 0;
-+        if (spirv_trim::TrimOutputs(vertexShader->spirv.data(), vertexShader->spirv.size(), keepMask, trimmed, &removed)) {
++        if (spirv_trim::TrimOutputs(vertexShader->spirv.data(), vertexShader->spirv.size(), keepMask, trimmed, &removed, !points)) {
 +            VkShaderModuleCreateInfo shaderInfo = {};
 +            shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
 +            shaderInfo.pCode = trimmed.data();
@@ -430,7 +501,7 @@ index 9db5baa..3b06818 100644
 +            }
 +        }
 +
-+        vertexShader->outputVariants.emplace(keepMask, module);
++        vertexShader->outputVariants.emplace(variantKey, module);
 +        if (module != VK_NULL_HANDLE) {
 +            const uint32_t count = ++variantCount;
 +            const uint32_t total = (removedTotal += removed);
@@ -446,7 +517,7 @@ index 9db5baa..3b06818 100644
      VulkanShader::VulkanShader(VulkanDevice *device, const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
          assert(device != nullptr);
          assert(data != nullptr);
-@@ -1404,14 +1477,25 @@ namespace plume {
+@@ -1404,14 +1483,25 @@ namespace plume {
              PLUME_LOG_ERROR("Vulkan", "vkCreateShaderModule", LogErrorDomain::VkResult, res, "");
              return;
          }
@@ -472,7 +543,7 @@ index 9db5baa..3b06818 100644
      void VulkanShader::setName(const std::string &name) {
          setObjectName(device->vk, VK_OBJECT_TYPE_SHADER_MODULE, uint64_t(vk), name);
      }
-@@ -1537,7 +1621,7 @@ namespace plume {
+@@ -1537,7 +1627,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stageInfo = {};
              stageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
              stageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
@@ -481,7 +552,7 @@ index 9db5baa..3b06818 100644
              stageInfo.pName = vertexShader->entryPointName.c_str();
              stageInfo.pSpecializationInfo = pSpecInfo;
              stages.emplace_back(stageInfo);
-@@ -2063,7 +2147,7 @@ namespace plume {
+@@ -2063,7 +2153,7 @@ namespace plume {
          });
  
          // Pre-rasterization: depth bias enable is static (it needs extended dynamic state 2).
@@ -490,7 +561,7 @@ index 9db5baa..3b06818 100644
          const VkShaderModule geometryModule = (desc.geometryShader != nullptr) ? static_cast<const VulkanShader *>(desc.geometryShader)->vk : VK_NULL_HANDLE;
          const VkBool32 depthClamp = !desc.depthClipEnabled;
          const VkBool32 depthBias = (desc.depthBias != 0) || (desc.depthBiasClamp != 0.0f) || (desc.slopeScaledDepthBias != 0.0f);
-@@ -2080,6 +2164,7 @@ namespace plume {
+@@ -2080,6 +2170,7 @@ namespace plume {
              VkPipelineShaderStageCreateInfo stages[2];
              uint32_t stageCount = 0;
              stages[stageCount++] = libraryStage(desc.vertexShader, VK_SHADER_STAGE_VERTEX_BIT);
