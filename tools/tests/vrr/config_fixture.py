@@ -32,6 +32,8 @@ std::filesystem::path ConfigDir() { return {}; }
 std::filesystem::path SettingsPath() { return "settings.ini"; }
 }
 #define LOG_INFO(...) ((void)0)
+#define LOG_NOTICE(...) ((void)0)
+namespace os::logger { void SetDebugLog(bool) {} }
 namespace settings { void LogSettingsSaved(const Config&) {} }
 '''
 test = r'''
@@ -53,6 +55,16 @@ int main() {
     }
     Write("variable_refresh_rate=1\n");
     Check(settings::Read().variableRefreshRate, "VRR key parsed");
+    Write(""); Check(settings::Read().vsync, "a fresh profile syncs");
+    Write("frame_rate=60\n"); Check(settings::Read().vsync, "an old 60 FPS profile keeps display sync");
+    Write("frame_rate=120\n"); Check(!settings::Read().vsync, "an old 120 FPS profile stays unsynced");
+    Write("frame_rate=120\nvsync=1\n"); Check(settings::Read().vsync, "VSync key wins over the migration");
+    Write("frame_rate=30\nvsync=0\n"); Check(!settings::Read().vsync, "VSync Off parsed");
+    Write("frame_rate=30\nvsync=2\n"); Check(settings::Read().vsync, "invalid VSync input falls back to the migration");
+    for (bool vsync : {false,true}) {
+        auto config = settings::GetConfig(); config.vsync = vsync;
+        Check(settings::SaveConfig(config) && settings::Read().vsync == vsync, "VSync round trip");
+    }
     for (auto rate : gpu::frame_rate::kNativeRates) for (bool enabled : {false,true}) {
         auto config = settings::GetConfig();
         config.frameRate = rate; config.variableRefreshRate = enabled;
@@ -88,6 +100,14 @@ int main() {
     Check(settings::Read().frameGenerationProvider==framegen::Provider::Xess,"XeSS has stable INI value 4");
     Write("frame_generation_provider=5\n");
     Check(settings::Read().frameGenerationProvider==framegen::Provider::Off,"unknown FG provider rejected");
+    Write("game_language_pack=PT-BR\n");
+    Check(settings::Read().gameLanguagePack=="pt-br","language pack id read in lower case");
+    Write("game_language_pack=../pt\n");
+    Check(settings::Read().gameLanguagePack.empty(),"invalid language pack id selects none");
+    {
+        auto config=settings::GetConfig(); config.gameLanguagePack="pt-br";
+        Check(settings::SaveConfig(config) && settings::Read().gameLanguagePack=="pt-br","language pack id saved");
+    }
     fs::current_path(previous);
     fs::remove_all(scratch);
     std::cout << "VRR production config parse/save/preview checks passed (isolated paths)\n";

@@ -48,6 +48,15 @@ struct PresentationOptions
     // calibrationSceneExtended marks an FP16 extended-gamma scene.
     bool brightnessPreview = false;
     bool calibrationSceneExtended = false;
+    // With brightnessPreview: calibrationScene holds two images side by side,
+    // the left one for the left tile and the right one for the right tile, and
+    // neither gets the curve (the DLSS 5 neural rendering page).
+    bool calibrationSplitScene = false;
+    // The target accepts storage writes (a swap chain image created with
+    // storage usage). A bicubic upscale into it then runs the same pixel
+    // shader as a compute pass (Vulkan, RGBA8 swap chains). The target
+    // finishes in GENERAL instead of COLOR_WRITE.
+    bool storageTarget = false;
 };
 // Owned by the presentation thread. Resources stay alive until the present fence.
 class Presentation
@@ -60,7 +69,10 @@ class Presentation
     Presentation();
     ~Presentation();
     bool Init(plume::RenderDevice *device);
-    bool Init(plume::RenderDevice *device, plume::RenderFormat swapchainFormat);
+    // storageSwapchain: the swap chain images accept storage writes
+    // (RenderSwapChain::hasStorageTextures), so the final bicubic upscale can
+    // run as a compute pass (PresentationOptions::storageTarget).
+    bool Init(plume::RenderDevice *device, plume::RenderFormat swapchainFormat, bool storageSwapchain = false);
     void SetOutputTransform(const hdr::OutputTransform& transform);
     // Draw and ProcessSceneColor keep one framebuffer per caller-owned target,
     // keyed by texture address and size. Call this, with no recorded draw of this
@@ -107,6 +119,17 @@ class Presentation
         plume::RenderCommandList *commands, plume::RenderTexture *hudless,
         plume::RenderTexture *uiColorAndAlpha, plume::RenderTexture *target,
         uint32_t width, uint32_t height, bool toSwapchain = true);
+    // Blend a straight-alpha RGBA8 image (SDR display signal) over the final
+    // image in target at x, y without scaling, times opacity, converted like
+    // the final pass's SDR output. Records after a Draw to the same swap chain
+    // image; target stays COLOR_WRITE and overlay ends SHADER_READ. Keep the
+    // overlay alive until the recorded work completes.
+    void DrawOverlay(plume::RenderCommandList *commands, plume::RenderTexture *overlay, plume::RenderTexture *target,
+                     uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                     uint32_t targetWidth, uint32_t targetHeight, float opacity);
+    // Builds DrawOverlay's shaders and pipeline now, so the first overlay does
+    // not compile on a visible frame. A failure is logged once until Init.
+    bool PrewarmOverlay();
     // Present the scene + subsequently composited UI without applying AA again.
     // Same ownership/layout contract as Draw (source ends COPY_SOURCE).
     void DrawComposited(plume::RenderCommandList *commands, plume::RenderTexture *source,

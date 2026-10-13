@@ -30,9 +30,27 @@ struct Presentation::Impl
     std::unique_ptr<RenderPipeline> presentPipeline;
     std::unique_ptr<RenderShader> gainPs;
     std::unique_ptr<RenderPipeline> gainPipeline;
+    // pixelLinear and pixelCubic into the swap chain format, for the common
+    // final passes (see Draw); null when one failed to build.
+    std::unique_ptr<RenderShader> finalPs[2];
+    std::unique_ptr<RenderPipeline> finalPipelines[2];
+    // The final pass as a compute pass into a storage swap chain image (see
+    // PresentationOptions::storageTarget). Vulkan with an RGBA8 swap chain
+    // only; null elsewhere or when creation failed.
+    static constexpr uint32_t kComputeGroupX = 16, kComputeGroupY = 16;
+    std::unique_ptr<RenderPipelineLayout> computeLayout;
+    std::unique_ptr<RenderShader> computeCs;
+    std::unique_ptr<RenderPipeline> computePipeline;
+    std::unique_ptr<RenderDescriptorSet> computeDescriptors;
     std::unique_ptr<RenderPipelineLayout> uiLayout;
     std::unique_ptr<RenderShader> uiVs, uiPs;
     std::unique_ptr<RenderPipeline> uiPipeline, uiPresentPipeline;
+    std::unique_ptr<RenderPipelineLayout> overlayLayout;
+    std::unique_ptr<RenderShader> overlayVs, overlayPs;
+    std::unique_ptr<RenderPipeline> overlayPipeline;
+    std::unique_ptr<RenderDescriptorSet> overlayDescriptors;
+    // A failed compile or pipeline creation is not retried until Init.
+    bool overlayFailed = false;
     std::unique_ptr<RenderSampler> sampler;
     struct Pass
     {
@@ -69,7 +87,9 @@ struct Presentation::Impl
     bool rampActive = false, curveActive = false;
     // Null keeps the current curve.
     RenderBuffer *UpdateGammaRamp(const PresentationOptions *curve);
+    bool InitCompute(const char *pixelSource);
     bool EnsureUiPipelines();
+    bool EnsureOverlayPipeline();
 };
 RenderBuffer *Presentation::Impl::UpdateGammaRamp(const PresentationOptions *curve)
 {
@@ -141,7 +161,7 @@ bool Presentation::Init(RenderDevice *device)
 {
     return Init(device, RenderFormat::R8G8B8A8_UNORM);
 }
-bool Presentation::Init(RenderDevice *device, RenderFormat swapchainFormat)
+bool Presentation::Init(RenderDevice *device, RenderFormat swapchainFormat, bool storageSwapchain)
 {
     auto &p = *impl;
     p.initialized = false;
@@ -153,6 +173,14 @@ bool Presentation::Init(RenderDevice *device, RenderFormat swapchainFormat)
     p.uiVs.reset();
     p.uiPs.reset();
     p.uiLayout.reset();
+    p.overlayPipeline.reset();
+    p.overlayFailed = false;
+    p.computeDescriptors.reset();
+    p.computePipeline.reset();
+    p.computeCs.reset();
+    p.computeLayout.reset();
+    for (auto &pipeline : p.finalPipelines) pipeline.reset();
+    for (auto &shader : p.finalPs) shader.reset();
     const auto binaryFormat = p.vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
     const auto renderFormat = p.vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
     const char *source = R"(
@@ -224,6 +252,15 @@ float4 vertex(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2,-2) + float2(-1,1),0,1);
 }
+// The source position of an output pixel center. precise keeps every shader
+// on the same arithmetic: without it some drivers (AMD Vulkan, NVIDIA D3D12)
+// reassociated it per shader, and the dedicated final passes below differed
+// from pixel() by one or two levels in up to 1% of the pixels.
+float2 sourcePixel(float2 position) {
+    precise float2 uv=(position-origin)/extent;
+    precise float2 p=uv*imageSize;
+    return p;
+}
 float3 sampleFrame(float2 pixel) {
     uint w,h; frame.GetDimensions(w,h);
     return frame.SampleLevel(linearClamp, clamp(pixel,0.5,imageSize-0.5)/float2(w,h),0).rgb;
@@ -235,11 +272,16 @@ float cubic(float x) {
     if(x<2) return ((-0.5*x+2.5)*x-4)*x+2;
     return 0;
 }
-float3 resample(float2 pixel) {
+// kind is a literal at every call: 0 decides at run time (pixel()), 1 is a
+// native-size copy or bilinear upscale, 2 a bicubic upscale. The dedicated
+// entry points below keep only their own branch and the same arithmetic.
+float3 resampleAs(float2 pixel, uint kind) {
+    // A native-size copy and a bilinear upscale are both one bilinear tap.
+    if(kind==1) return sampleFrame(pixel);
     float2 footprint=imageSize/extent;
     // Native pixel centers retain exact identity, including a padded source.
     if(all(abs(footprint-1)<0.00001)) return sampleFrame(pixel);
-    if(any(footprint>1.00001)) {
+    if(kind==0 && any(footprint>1.00001)) {
         // Exact box coverage per source texel, not a sparse sample approximation.
         // CPU stages large reductions so each axis spans at most five texels.
         float2 radius=max(footprint,1.0)*0.5;
@@ -253,7 +295,7 @@ float3 resample(float2 pixel) {
         }
         return sum/max(total,0.000001);
     }
-    if(!filter) return sampleFrame(pixel);
+    if(kind==0 && !filter) return sampleFrame(pixel);
     float2 base=floor(pixel-0.5)+0.5;
     float3 sum=0;
     [unroll] for(int y=-1;y<=2;++y) [unroll] for(int x=-1;x<=2;++x) {
@@ -265,6 +307,7 @@ float3 resample(float2 pixel) {
     float3 c=sampleFrame(base+float2(0,1)),d=sampleFrame(base+1);
     return clamp(sum,min(min(a,b),min(c,d)),max(max(a,b),max(c,d)));
 }
+float3 resample(float2 pixel) { return resampleAs(pixel,0); }
 // Edge decisions on the SDR range only: an extended-gamma scene keeps its
 // highlights, but above white the luma contrast is as saturated SDR would see.
 float luma(float3 c) { return dot(saturate(c),float3(0.299,0.587,0.114)); }
@@ -304,22 +347,27 @@ float4 outputSignal(float3 color, bool extended) {
     }
     return float4(encodeOutput(color),1);
 }
-float4 finishFrame(float3 color) {
+// sdr (a literal): the target is SDR, outputFlags 1, 2 and 8 are clear, so
+// the output conversion is the identity.
+float4 finishFrameAs(float3 color, bool sdr) {
     // Scanout order: the guest's ramp, then the optional RGB range expansion,
     // then the player's brightness/gamma, then the HDR output conversion.
     if ((outputFlags & 64) != 0) color=applyGammaRamp(color);
     if (expandRange != 0) {
         color=max((color-16.0/255.0)*(255.0/219.0),0);
-        if ((outputFlags & 2) == 0) color=min(color,1);
+        if (sdr || (outputFlags & 2) == 0) color=min(color,1);
     }
     if ((outputFlags & 256) != 0) color=applyUserCurve(color);
+    if (sdr) return float4(color,1);
     return outputSignal(color,(outputFlags & 2) != 0);
 }
+float4 finishFrame(float3 color) { return finishFrameAs(color,false); }
 // Fit the full frozen scene into one half of calibrationRect without
 // stretching or showing padded rows. Both halves sample exactly the same frame.
 float2 fitScene(float2 tile) {
     uint sceneWidth,sceneHeight;
     calibrationScene.GetDimensions(sceneWidth,sceneHeight);
+    if ((outputFlags & 8192) != 0) sceneWidth/=2;
     float sceneAspect=float(sceneWidth)/float(sceneHeight);
     float2 tileSize=(calibrationRect.zw-calibrationRect.xy)*imageSize*float2(0.5,1);
     float tileAspect=tileSize.x/tileSize.y;
@@ -337,6 +385,8 @@ float4 pixel(float4 position : SV_Position) : SV_Target {
         if ((outputFlags & 1024) != 0) {
             tile=fitScene(tile);
             if (any(tile<0) || any(tile>1)) return float4(0,0,0,1);
+            // Split scene: each tile samples its own half of the texture.
+            if ((outputFlags & 8192) != 0) tile.x=tile.x*0.5+(local.x>=0.5 ? 0.5 : 0.0);
             color=calibrationScene.SampleLevel(linearClamp,tile,0).rgb;
             if ((outputFlags & 128) != 0) color=applyGammaRamp(color);
             if ((outputFlags & 32) != 0) {
@@ -372,7 +422,7 @@ float4 pixel(float4 position : SV_Position) : SV_Target {
         }
         return float4(encodeOutput((level*outputScale).xxx),1);
     }
-    float2 p = (position.xy-origin)/extent*imageSize;
+    float2 p = sourcePixel(position.xy);
     float3 center = sampleFrame(p);
     if (!aa) return finishFrame(resample(p));
     float nw=luma(sampleFrame(p+float2(-1,-1))), ne=luma(sampleFrame(p+float2(1,-1)));
@@ -386,6 +436,15 @@ float4 pixel(float4 position : SV_Position) : SV_Target {
     float3 b=a*0.5+0.25*(sampleFrame(p-direction*0.5)+sampleFrame(p+direction*0.5));
     float lb=luma(b);
     return finishFrame((lb<lo || lb>hi)?a:b);
+}
+// pixel() for the common final passes into an SDR target: no AA, no
+// calibration view, no reduction. Without the other branches the shader is a
+// fraction of pixel()'s size and register use (Presentation::Draw picks them).
+float4 pixelLinear(float4 position : SV_Position) : SV_Target {
+    return finishFrameAs(resampleAs(sourcePixel(position.xy),1),true);
+}
+float4 pixelCubic(float4 position : SV_Position) : SV_Target {
+    return finishFrameAs(resampleAs(sourcePixel(position.xy),2),true);
 }
 // Highlight gain: frame = final SDR output, calibrationScene = pre-upscale
 // extended-gamma scene (valid imageSize inside a calibrationRect.xy allocation).
@@ -461,7 +520,82 @@ float4 gainPixel(float4 position : SV_Position) : SV_Target {
     p.initialized = bool(p.pipeline) && bool(p.presentPipeline) && bool(p.hdrPipeline) && bool(p.gainPipeline) &&
         p.smaa[0].Init(device, p.vs.get(), p.sampler.get(), p.vulkan) &&
         p.smaa[1].Init(device, p.vs.get(), p.sampler.get(), p.vulkan);
+    // Optional: without them pixel() serves every final pass.
+    const char *finalEntries[] = {"pixelLinear", "pixelCubic"};
+    for (size_t i = 0; p.initialized && i < 2; ++i) {
+        auto shader = xenos::CompileCachedHlsl(source, finalEntries[i], "ps_6_0", binaryFormat);
+        if (shader.ok)
+            p.finalPs[i] = device->createShader(shader.bytecode.data(), shader.bytecode.size(), finalEntries[i], renderFormat);
+        else
+            LOG_WARNING("presentation {}: {}", finalEntries[i], shader.errors);
+        desc.pixelShader = p.finalPs[i].get();
+        if (p.finalPs[i]) p.finalPipelines[i] = device->createGraphicsPipeline(desc);
+    }
+    // Optional: without it the fragment pass serves every target.
+    if (p.initialized && storageSwapchain && device->getCapabilities().shaderFormat == RenderShaderFormat::SPIRV &&
+        swapchainFormat == RenderFormat::R8G8B8A8_UNORM)
+        p.InitCompute(source);
     return p.initialized;
+}
+// The final pass as a compute pass into a storage swap chain image: each
+// thread runs pixelCubic()'s code (a bicubic upscale into an SDR target, no
+// AA, no calibration view; Draw checks) for one output pixel, or writes black
+// outside the viewport like the clear. The taps and the arithmetic are the
+// fragment pass's own, so the image is bit-identical, and the Adreno 750
+// (Turnip) spends less time on it than on the render pass. Reading each source
+// texel once through shared memory was tried there and took twice as long:
+// the sixteen texture taps cost little next to the output write, shared-memory
+// reads cost more than texture-cache hits, and their arithmetic differed in
+// the last bits.
+bool Presentation::Impl::InitCompute(const char *pixelSource)
+{
+    const char *computeSource = R"(
+#ifdef __spirv__
+[[vk::binding(4,0)]] [[vk::image_format("rgba8")]]
+#endif
+RWTexture2D<float4> presentTarget : register(u0);
+[numthreads(PRESENT_GROUP_X,PRESENT_GROUP_Y,1)]
+void presentCompute(uint3 id : SV_DispatchThreadID) {
+    uint width,height;
+    presentTarget.GetDimensions(width,height);
+    if(id.x>=width || id.y>=height) return;
+    float2 position=float2(id.xy)+0.5;
+    if(any(position<origin) || any(position>=origin+extent)) presentTarget[id.xy]=float4(0,0,0,1);
+    else presentTarget[id.xy]=finishFrameAs(resampleAs(sourcePixel(position),2),true);
+})";
+    const std::string groupDefines = "\n#define PRESENT_GROUP_X " + std::to_string(kComputeGroupX) +
+        "\n#define PRESENT_GROUP_Y " + std::to_string(kComputeGroupY) + "\n";
+    const auto failed = [](const char *step) {
+        LOG_WARNING("presentation: compute upscale unavailable ({}); using the fragment pass", step);
+        return false;
+    };
+    auto shader = xenos::CompileCachedHlsl(std::string(pixelSource) + groupDefines + computeSource, "presentCompute", "cs_6_0",
+        xenos::ShaderBinaryFormat::Spirv);
+    if (!shader.ok) {
+        LOG_WARNING("presentation compute shader: {}", shader.errors);
+        return failed("compile");
+    }
+    computeCs = device->createShader(shader.bytecode.data(), shader.bytecode.size(), "presentCompute", RenderShaderFormat::SPIRV);
+    RenderDescriptorSetBuilder set;
+    set.begin();
+    set.addTexture(0);
+    set.addSampler(1);
+    set.addTexture(2);
+    set.addConstantBuffer(3);
+    set.addReadWriteTexture(4);
+    set.end();
+    RenderPipelineLayoutBuilder layout;
+    layout.begin(false, false);
+    layout.addPushConstant(0, 0, 64, RenderShaderStageFlag::COMPUTE);
+    layout.addDescriptorSet(set);
+    layout.end();
+    computeLayout = layout.create(device);
+    computeDescriptors = set.create(device);
+    if (!computeCs || !computeLayout || !computeDescriptors) return failed("layout");
+    computeDescriptors->setSampler(1, sampler.get());
+    computePipeline = device->createComputePipeline(RenderComputePipelineDesc(computeLayout.get(), computeCs.get(), kComputeGroupX, kComputeGroupY, 1));
+    if (!computePipeline) return failed("pipeline");
+    return true;
 }
 bool Presentation::Impl::EnsureUiPipelines()
 {
@@ -534,6 +668,128 @@ float4 pixelUi(float4 position : SV_Position) : SV_Target {
     uiPipeline = std::move(texturePipeline);
     uiPresentPipeline = std::move(swapchainPipeline);
     return true;
+}
+bool Presentation::Impl::EnsureOverlayPipeline()
+{
+    if (overlayPipeline) return true;
+    if (overlayFailed) return false;
+    overlayFailed = true;
+    const char *overlaySource = R"(
+#ifdef __spirv__
+[[vk::binding(0,0)]]
+#endif
+Texture2D<float4> overlayImage : register(t0);
+#ifdef __spirv__
+struct OverlayParameters { float2 origin; uint outputFlags; float outputScale; float opacity; };
+[[vk::push_constant]] ConstantBuffer<OverlayParameters> overlayParameters;
+#define origin overlayParameters.origin
+#define outputFlags overlayParameters.outputFlags
+#define outputScale overlayParameters.outputScale
+#define opacity overlayParameters.opacity
+#else
+cbuffer OverlayParameters : register(b0) { float2 origin; uint outputFlags; float outputScale; float opacity; };
+#endif
+float4 vertexOverlay(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2,-2) + float2(-1,1),0,1);
+}
+// The final pass's SDR output conversion: linear swap chains get the sRGB
+// decode and paper white, PQ also Rec. 2020 primaries and the PQ curve.
+float4 pixelOverlay(float4 position : SV_Position) : SV_Target {
+    float4 image = overlayImage.Load(int3(int2(position.xy - origin), 0));
+    float3 color = image.rgb;
+    if ((outputFlags & 1) != 0) {
+        color=lerp(pow((color+0.055)/1.055,2.4),color/12.92,step(color,0.04045))*outputScale;
+        if ((outputFlags & 8) != 0) {
+            color = mul(float3x3(0.627404,0.329283,0.043313,
+                                0.069097,0.919540,0.011362,
+                                0.016391,0.088013,0.895595), color);
+            float3 p=pow(saturate(color/10000.0),2610.0/16384.0);
+            color=pow((3424.0/4096.0+(2413.0/128.0)*p)/(1+(2392.0/128.0)*p),2523.0/32.0);
+        }
+    }
+    return float4(color, saturate(image.a * opacity));
+})";
+    const auto binaryFormat = vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
+    const auto renderFormat = vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
+    auto vsResult = xenos::CompileCachedHlsl(overlaySource, "vertexOverlay", "vs_6_0", binaryFormat);
+    auto psResult = xenos::CompileCachedHlsl(overlaySource, "pixelOverlay", "ps_6_0", binaryFormat);
+    if (!vsResult.ok || !psResult.ok) {
+        LOG_WARNING("presentation overlay shaders: {} {}", vsResult.errors, psResult.errors);
+        return false;
+    }
+    auto vertexShader = device->createShader(vsResult.bytecode.data(), vsResult.bytecode.size(),
+                                              "vertexOverlay", renderFormat);
+    auto pixelShader = device->createShader(psResult.bytecode.data(), psResult.bytecode.size(),
+                                             "pixelOverlay", renderFormat);
+    if (!vertexShader || !pixelShader) {
+        LOG_WARNING("presentation overlay: shader creation failed");
+        return false;
+    }
+    RenderDescriptorSetBuilder set;
+    set.begin(); set.addTexture(0); set.end();
+    RenderPipelineLayoutBuilder builder;
+    builder.begin(false, false); builder.addPushConstant(0, 0, 20, RenderShaderStageFlag::PIXEL);
+    builder.addDescriptorSet(set); builder.end();
+    auto pipelineLayout = builder.create(device);
+    auto descriptors = set.create(device);
+    if (!pipelineLayout || !descriptors) {
+        LOG_WARNING("presentation overlay: layout creation failed");
+        return false;
+    }
+    RenderGraphicsPipelineDesc desc;
+    desc.pipelineLayout = pipelineLayout.get();
+    desc.vertexShader = vertexShader.get();
+    desc.pixelShader = pixelShader.get();
+    desc.renderTargetCount = 1;
+    desc.renderTargetFormat[0] = swapchainFormat;
+    desc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+    desc.cullMode = RenderCullMode::NONE;
+    auto pipeline = device->createGraphicsPipeline(desc);
+    if (!pipeline) {
+        LOG_WARNING("presentation overlay: pipeline creation failed");
+        return false;
+    }
+    overlayVs = std::move(vertexShader);
+    overlayPs = std::move(pixelShader);
+    overlayLayout = std::move(pipelineLayout);
+    overlayDescriptors = std::move(descriptors);
+    overlayPipeline = std::move(pipeline);
+    overlayFailed = false;
+    return true;
+}
+bool Presentation::PrewarmOverlay()
+{
+    return impl->initialized && impl->EnsureOverlayPipeline();
+}
+void Presentation::DrawOverlay(RenderCommandList *commands, RenderTexture *overlay, RenderTexture *target,
+                               uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+                               uint32_t targetWidth, uint32_t targetHeight, float opacity)
+{
+    auto &p = *impl;
+    if (!commands || !overlay || !target || overlay == target || !width || !height || !(opacity > 0.0f) ||
+        x >= targetWidth || y >= targetHeight || !p.initialized || !p.EnsureOverlayPipeline())
+        return;
+    width = std::min(width, targetWidth - x);
+    height = std::min(height, targetHeight - y);
+    // Each present records after the previous one completed, so one
+    // descriptor set serves every frame's overlay.
+    p.overlayDescriptors->setTexture(0, overlay, RenderTextureLayout::SHADER_READ);
+    commands->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(overlay, RenderTextureLayout::SHADER_READ));
+    commands->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(target, RenderTextureLayout::COLOR_WRITE));
+    commands->setFramebuffer(p.FramebufferFor(target, targetWidth, targetHeight));
+    const RenderViewport viewport{float(x), float(y), float(width), float(height)};
+    const RenderRect scissor{int32_t(x), int32_t(y), int32_t(x + width), int32_t(y + height)};
+    commands->setViewports(&viewport, 1);
+    commands->setScissors(&scissor, 1);
+    commands->setGraphicsPipelineLayout(p.overlayLayout.get());
+    commands->setPipeline(p.overlayPipeline.get());
+    struct { float x, y; uint32_t outputFlags; float outputScale, opacity; } constants{
+        float(x), float(y), (p.output.linear ? 1u : 0u) | (p.output.linear && p.output.pq ? 8u : 0u),
+        p.output.scale, std::min(opacity, 1.0f)};
+    commands->setGraphicsPushConstants(0, &constants);
+    commands->setGraphicsDescriptorSet(p.overlayDescriptors.get(), 0);
+    commands->drawInstanced(3, 1, 0, 0);
 }
 bool Presentation::ProcessSceneColor(RenderCommandList *commands, RenderTexture *source, RenderTexture *target,
                                      uint32_t width, uint32_t height, Antialiasing antialiasing, bool hdr)
@@ -679,6 +935,26 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
     auto &passes=p.passes[hdrScene ? 1 : 0];
     RenderBuffer *ramp=p.UpdateGammaRamp(options.displayAdjust || options.brightnessPreview || options.hdrCalibration
         ? &options : nullptr);
+    struct Parameters { float x,y,w,h,sw,sh;uint32_t aa,filter,expandRange,outputFlags;float outputScale,peakRatio;float calibrationRect[4]; };
+    auto parameters=[&](float ox,float oy,float ew,float eh,uint32_t iw,uint32_t ih,uint32_t aa,uint32_t filter,
+                        uint32_t expandRange,bool finalPass,bool linearOutput) {
+        return Parameters{ox,oy,ew,eh,float(iw),float(ih),aa,filter,expandRange,
+                (linearOutput ? 1u : 0u) | (linearOutput && hdrScene ? 2u : 0u) |
+                (linearOutput && p.output.active && options.hdrCalibration ? 4u : 0u) |
+                (linearOutput && p.output.pq ? 8u : 0u) |
+                (linearOutput && p.output.active && options.hdrCalibration && options.calibrationScene ? 16u : 0u) |
+                (options.calibrationExpandRgbRange ? 32u : 0u) |
+                (finalPass && options.displayGammaRamp && p.rampActive ? 64u : 0u) |
+                (options.calibrationDisplayGammaRamp && p.rampActive ? 128u : 0u) |
+                (finalPass && options.displayAdjust && p.curveActive ? 256u : 0u) |
+                (finalPass && options.brightnessPreview ? 512u : 0u) |
+                (finalPass && options.brightnessPreview && options.calibrationScene ? 1024u : 0u) |
+                (options.calibrationSceneExtended ? 2048u : 0u) |
+                (((options.brightnessPreview && !options.calibrationSplitScene) || options.hdrCalibration) && p.curveActive ? 4096u : 0u) |
+                (options.calibrationSplitScene ? 8192u : 0u),
+                p.output.scale,p.output.peakRatio,
+                {options.calibrationRect[0],options.calibrationRect[1],options.calibrationRect[2],options.calibrationRect[3]}};
+    };
     auto render=[&](RenderTexture *input,RenderTexture *output,uint32_t iw,uint32_t ih,
                     uint32_t tw,uint32_t th,float ox,float oy,float ew,float eh,uint32_t aa,uint32_t filter,
                     uint32_t expandRange,bool finalPass,
@@ -728,22 +1004,7 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
         RenderViewport viewport(ox,oy,ew,eh);RenderRect scissor(0,0,tw,th);
         commands->setViewports(&viewport,1);commands->setScissors(&scissor,1);
         const bool linearOutput = toSwapchain && output == target && p.output.linear;
-        struct { float x,y,w,h,sw,sh;uint32_t aa,filter,expandRange,outputFlags;float outputScale,peakRatio;float calibrationRect[4]; }
-            constants{ox,oy,ew,eh,float(iw),float(ih),aa,filter,expandRange,
-                (linearOutput ? 1u : 0u) | (linearOutput && hdrScene ? 2u : 0u) |
-                (linearOutput && p.output.active && options.hdrCalibration ? 4u : 0u) |
-                (linearOutput && p.output.pq ? 8u : 0u) |
-                (linearOutput && p.output.active && options.hdrCalibration && options.calibrationScene ? 16u : 0u) |
-                (options.calibrationExpandRgbRange ? 32u : 0u) |
-                (finalPass && options.displayGammaRamp && p.rampActive ? 64u : 0u) |
-                (options.calibrationDisplayGammaRamp && p.rampActive ? 128u : 0u) |
-                (finalPass && options.displayAdjust && p.curveActive ? 256u : 0u) |
-                (finalPass && options.brightnessPreview ? 512u : 0u) |
-                (finalPass && options.brightnessPreview && options.calibrationScene ? 1024u : 0u) |
-                (options.calibrationSceneExtended ? 2048u : 0u) |
-                ((options.brightnessPreview || options.hdrCalibration) && p.curveActive ? 4096u : 0u),
-                p.output.scale,p.output.peakRatio,
-                {options.calibrationRect[0],options.calibrationRect[1],options.calibrationRect[2],options.calibrationRect[3]}};
+        const auto constants=parameters(ox,oy,ew,eh,iw,ih,aa,filter,expandRange,finalPass,linearOutput);
         commands->setGraphicsPipelineLayout(p.layout.get());commands->setPipeline(pipe);
         commands->setGraphicsPushConstants(0,&constants);commands->setGraphicsDescriptorSet(pass.descriptors.get(),0);
         commands->drawInstanced(3,1,0,0);
@@ -777,9 +1038,40 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
         source=render(source,nullptr,sw,sh,nw,nh,0,0,float(nw),float(nh),0,0,0,false,intermediatePipeline);
         sw=nw;sh=nh;
     }
+    // The compute upscale writes the viewport like the triangle and black
+    // outside it like the clear, so its bars must start on whole pixels.
+    const bool covers=x<=0.0f && y<=0.0f && x+width>=float(ow) && y+height>=float(oh);
+    const bool wholeBars=std::floor(x)==x && std::floor(y)==y && std::floor(x+width)==x+width && std::floor(y+height)==y+height;
+    if(p.computePipeline && toSwapchain && options.storageTarget && !hdrScene && !p.output.linear &&
+       options.scalingFilter==ScalingFilter::Bicubic && scale>=1.001f &&
+       !options.hdrCalibration && !options.brightnessPreview && (covers || wholeBars)) {
+        auto &set=*p.computeDescriptors;
+        set.setBuffer(3,ramp,Impl::kRampBytes);
+        set.setTexture(0,source,RenderTextureLayout::SHADER_READ);
+        set.setTexture(2,source,RenderTextureLayout::SHADER_READ);
+        set.setTexture(4,target,RenderTextureLayout::GENERAL);
+        commands->barriers(RenderBarrierStage::COMPUTE,RenderTextureBarrier(source,RenderTextureLayout::SHADER_READ));
+        commands->barriers(RenderBarrierStage::COMPUTE,RenderTextureBarrier(target,RenderTextureLayout::GENERAL));
+        const auto constants=parameters(x,y,width,height,sw,sh,0,uint32_t(options.scalingFilter),
+            options.expandRgbRange ? 1u : 0u,true,p.output.linear);
+        commands->setComputePipelineLayout(p.computeLayout.get());
+        commands->setPipeline(p.computePipeline.get());
+        commands->setComputePushConstants(0,&constants);
+        commands->setComputeDescriptorSet(&set,0);
+        commands->dispatch((ow+Impl::kComputeGroupX-1)/Impl::kComputeGroupX,(oh+Impl::kComputeGroupY-1)/Impl::kComputeGroupY,1);
+        commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));
+        return;
+    }
+    // A native-size copy or an upscale into an SDR swap chain without a
+    // calibration view runs pixelLinear or pixelCubic: the final pass never
+    // runs AA, and scale >= 1 rules out pixel()'s reduction branch.
+    RenderPipeline *finalPipeline=toSwapchain ? p.presentPipeline.get() : intermediatePipeline;
+    if(toSwapchain && !p.output.linear && !options.hdrCalibration && !options.brightnessPreview && scale>=1.0f) {
+        auto *dedicated=p.finalPipelines[options.scalingFilter==ScalingFilter::Bicubic && scale!=1.0f ? 1 : 0].get();
+        if(dedicated) finalPipeline=dedicated;
+    }
     render(source,target,sw,sh,ow,oh,x,y,width,height,0,uint32_t(options.scalingFilter),
-           options.expandRgbRange ? 1u : 0u,true,
-           toSwapchain ? p.presentPipeline.get() : intermediatePipeline);
+           options.expandRgbRange ? 1u : 0u,true,finalPipeline);
     commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));
 }
 
@@ -798,7 +1090,7 @@ bool Presentation::Init(plume::RenderDevice *)
 {
     return false;
 }
-bool Presentation::Init(plume::RenderDevice *, plume::RenderFormat)
+bool Presentation::Init(plume::RenderDevice *, plume::RenderFormat, bool)
 {
     return false;
 }
@@ -812,6 +1104,14 @@ std::shared_ptr<Presentation::UiCompositionLease> Presentation::DrawSeparatedUi(
     plume::RenderTexture *, uint32_t, uint32_t, bool)
 {
     return {};
+}
+void Presentation::DrawOverlay(plume::RenderCommandList *, plume::RenderTexture *, plume::RenderTexture *,
+                               uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, float)
+{
+}
+bool Presentation::PrewarmOverlay()
+{
+    return false;
 }
 plume::RenderTexture* Presentation::ComposeHdrGain(plume::RenderCommandList *, plume::RenderTexture *, plume::RenderTexture *,
                                                    uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t)

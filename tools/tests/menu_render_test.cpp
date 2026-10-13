@@ -248,18 +248,22 @@ int main(int argc, char **argv)
         std::vector<uint32_t> panelPixels;
         Require(settings::RasterizeMenu(panels,1280,720,panelPixels), "panel backdrop rasterization failed");
         const struct { const char *name; const std::vector<uint32_t> *from, *to; std::chrono::milliseconds length; } cases[] = {
-            {"open", &panelPixels, &regularPixels, settings::kMenuOpenFade},
-            {"tab", &regularPixels, &audioPixels, settings::kMenuChangeFade},
-            {"dialog", &audioPixels, &pixels, settings::kMenuChangeFade}};
+            {"open", &panelPixels, &regularPixels, {}},
+            {"tab", &regularPixels, &audioPixels, settings::menu_motion::PageFade},
+            {"dialog", &audioPixels, &pixels, settings::menu_motion::DialogFade}};
         for (const auto &c : cases)
         {
             settings::MenuTransition motion;
             std::vector<uint32_t> shown = *c.from, target = *c.to;
             const auto start = settings::MenuTransition::Clock::time_point{} + std::chrono::seconds(10);
-            Require(motion.Start(shown, target, 1280, start, c.length), "menu transition did not start");
+            // The open cascades the list rows over the panels; the others fade linearly.
+            Require(c.length.count() ? motion.Start(shown, target, 1280, start, c.length)
+                                     : motion.StartCascade(shown, target, 1280, start, settings::MenuOpenCascade(1280, 720)),
+                    "menu transition did not start");
+            const auto length = motion.Duration();
             for (int step = 0; step <= 4; ++step)
             {
-                const bool easing = motion.Advance(shown, start + c.length * step / 4);
+                const bool easing = motion.Advance(shown, start + length * step / 4);
                 Require(easing == (step < 4), "menu transition does not settle at its duration");
                 if (step == 2)
                     Require(shown != *c.from && shown != *c.to, "halfway menu frame does not blend both images");
@@ -275,7 +279,33 @@ int main(int argc, char **argv)
             }
             Require(shown == *c.to, "menu transition did not land on its target");
         }
-        std::puts("menu motion: open, tab switch and dialog ease frames passed");
+        // The list arrow is a layer: the raster without it plus the arrow drawn
+        // at the reported spot is the raster with it, and Erase takes it off again.
+        settings::MenuSnapshot listOnly = snapshot;
+        listOnly.dialogChoices.clear();
+        std::vector<uint32_t> baked, layered;
+        settings::MenuArrow arrow;
+        Require(settings::RasterizeMenu(listOnly, 1280, 720, baked), "baked arrow raster failed");
+        Require(settings::RasterizeMenu(listOnly, 1280, 720, layered, &arrow) && arrow.visible, "list arrow not reported");
+        Require(baked != layered, "arrow layer still drawn into the raster");
+        const auto clean = layered;
+        settings::DrawMenuArrow(layered, 1280, 720, arrow.x, arrow.y);
+        Require(baked == layered, "arrow layer differs from the baked arrow");
+        settings::MenuTransition still;
+        std::vector<uint32_t> shown, target = clean;
+        still.Cut(shown, target, 1280);
+        settings::DrawMenuArrow(shown, 1280, 720, arrow.x + 3, arrow.y - 20);
+        still.Erase(shown, settings::MenuArrowBounds(1280, 720, arrow.x + 3, arrow.y - 20));
+        Require(shown == clean, "erasing the arrow leaves pixels behind");
+        // Under a prompt the arrow stays in the raster, dimmed with the page.
+        settings::MenuArrow underPrompt;
+        std::vector<uint32_t> prompt;
+        Require(settings::RasterizeMenu(snapshot, 1280, 720, prompt, &underPrompt) && !underPrompt.visible && prompt == pixels,
+                "prompt raster moved its arrow to the layer");
+        Require(settings::menu_motion::RowFade(0) == 0 && settings::menu_motion::RowFade(0.1) > 0.2 &&
+                    settings::menu_motion::RowFade(0.3) < settings::menu_motion::RowFade(0.6) && settings::menu_motion::RowFade(1.0) == 1,
+                "list row fade curve");
+        std::puts("menu motion: open, tab switch and dialog frames and the arrow layer passed");
     }
     if (argc>1) {
         std::filesystem::create_directories(argv[1]);
@@ -304,8 +334,60 @@ int main(int argc, char **argv)
     }
     std::puts("Language reference (with Korean 한국어) rendered at 1280x720");
 
-    // FG occupies a separated section inside the four-tab Graphics page.
-    // The hidden logical rows model scrolling to the section without changing
+    // Mods page: a list page with a title in place of the tabs, version/author
+    // details beside narrow switches, and move cells beside the focused mod.
+    {
+        settings::MenuSnapshot mods = snapshot;
+        mods.language = 0;
+        mods.row = 0;
+        mods.pageTitle = L"Mods";
+        mods.keyLegend = L"A: on / off     LB / RB: move     Start: save     B: back";
+        mods.reorder = true;
+        mods.rows = {
+            {L"4x HD Texture Pack", L"On", true, {L"On", L"Off"}, 0},
+            {L"My Menu", L"Off", true, {L"On", L"Off"}, 1},
+            {L"broken", L"Error", false, {L"Error"}, 0},
+            {L"Brasil", L"", true, {}, 0},
+            {L"Open mods folder", L"Open", true, {L"Open"}, 0},
+            {L"Save mod list", L"Save", true, {L"Save"}, 0}};
+        mods.rows[0].detail = L"1.0 - Someone";
+        mods.rows[1].detail = L"2.3";
+        mods.rows[2].detail = L"! —";
+        mods.rows[3].detail = L"Language pack: English";
+        mods.help = L"Upscaled textures for every map.";
+        mods.notice = L"Folder: hd-textures-4x     Overlay files: 15000";
+        std::vector<uint32_t> page, plain;
+        Require(settings::RasterizeMenu(mods, 1280, 720, page), "Mods page rasterization failed");
+        auto still = mods;
+        still.reorder = false;
+        still.pageTitle.clear();
+        still.keyLegend.clear();
+        for (auto &row : still.rows) row.detail.clear();
+        Require(settings::RasterizeMenu(still, 1280, 720, plain), "Mods page comparison rasterization failed");
+        const auto differs = [&](int x0, int y0, int x1, int y1) {
+            int count = 0;
+            for (int y = y0; y < y1; ++y)
+                for (int x = x0; x < x1; ++x)
+                    count += page[size_t(y) * 1280 + x] != plain[size_t(y) * 1280 + x];
+            return count > 20;
+        };
+        Require(differs(386, 110, 1026, 142), "Mods page title does not replace the tabs");
+        Require(differs(400, 50, 1260, 84), "Mods page key legend is missing");
+        Require(!differs(1262, 50, 1280, 84), "Mods page key legend runs past its box");
+        Require(differs(394, 150, 780, 191), "mod detail text is missing");
+        Require(differs(settings::ModsMoveLeft, 150, settings::ModsMoveLeft + 2 * settings::ModsMoveWidth + settings::ModsMoveGap, 191),
+                "move cells beside the focused mod are missing");
+        Require(!differs(settings::ModsMoveLeft, 193, 1270, 234), "move cells drawn beside an unfocused row");
+        if (argc > 1) {
+            std::ofstream f(std::filesystem::path(argv[1]) / "mods-page.ppm", std::ios::binary);
+            f << "P6\n1280 720\n255\n";
+            for (auto p : page) { const char rgb[] = {char(p), char(p >> 8), char(p >> 16)}; f.write(rgb, 3); }
+        }
+        std::puts("Mods page: title, legend, details, narrow switches and move cells rendered at 1280x720");
+    }
+
+    // Upscaling and FG share one divided group inside the four-tab Graphics page.
+    // The hidden logical rows model scrolling to the group without changing
     // row IDs; FSR hides the multiplier and compacts the visible list.
     snapshot.tab = 2;
     snapshot.language = 0;
@@ -313,6 +395,8 @@ int main(int argc, char **argv)
     snapshot.rows.assign(size_t(settings::GraphicsRow::Count), {});
     for (int i = 0; i < int(settings::GraphicsRow::FrameGeneration); ++i)
         snapshot.rows[size_t(i)].hidden = true;
+    snapshot.rows[size_t(settings::GraphicsRow::AntiAliasing)] =
+        {L"Anti-aliasing", L"DLSS", true, {L"TAA", L"DLSS"}, 1};
     snapshot.rows[size_t(settings::GraphicsRow::FrameGeneration)] =
         {L"Frame generation", L"DLSS", true, {L"Off", L"DLSS", L"FSR"}, 1};
     snapshot.rows[size_t(settings::GraphicsRow::FrameGenerationMultiplier)] =
@@ -334,7 +418,7 @@ int main(int argc, char **argv)
     int sectionPixels = 0;
     for (int x = 65; x < 1026; ++x)
         sectionPixels += fgPixels[size_t(147) * 1280 + x] != pixels[size_t(147) * 1280 + x];
-    Require(sectionPixels > 20, "FG section divider is not visible");
+    Require(sectionPixels > 20, "upscaling and FG group divider is not visible");
     snapshot.tab = 2;
     auto& providerRow = snapshot.rows[size_t(settings::GraphicsRow::FrameGeneration)];
     providerRow.value = L"FSR";
@@ -352,7 +436,7 @@ int main(int argc, char **argv)
         writeFg("fg-dlss-reference.ppm", fgPixels);
         writeFg("fg-fsr-reference.ppm", pixels);
     }
-    std::puts("four-tab Graphics FG section divider and DLSS/FSR row layouts rendered at 1280x720");
+    std::puts("four-tab Graphics upscaling and FG group divider and DLSS/FSR row layouts rendered at 1280x720");
 
     snapshot.calibration.open = true;
     snapshot.calibration.hdrActive = true;
@@ -406,6 +490,73 @@ int main(int argc, char **argv)
     Require((pixels[size_t(300) * 1280 + 640] >> 24) == 255,
             "inactive HDR comparison must explain why the pattern cannot render");
     snapshot.calibration.open = false;
+
+    // DLSS 5 neural rendering page: the preview rectangle stays transparent for
+    // presentation while a scene is held, and shows an opaque notice otherwise.
+    {
+        settings::MenuSnapshot page;
+        page.tab = 2;
+        page.neuralRendering.open = true;
+        page.neuralRendering.passes = 2;
+        page.neuralRendering.style = 1;
+        page.neuralRendering.preset = 2;
+        page.neuralRendering.intensity = 130;
+        page.neuralRendering.globalTone = 100;
+        page.neuralRendering.localTone = 60;
+        page.neuralRendering.structure = 100;
+        page.neuralRendering.skin = 20;
+        page.neuralRendering.focus = 3;
+        std::vector<uint32_t> nrPixels;
+        auto write = [&](const char *name) {
+            if (argc <= 1) return;
+            std::ofstream f(std::filesystem::path(argv[1]) / name, std::ios::binary);
+            f << "P6\n1280 720\n255\n";
+            for (auto p : nrPixels) {
+                if ((p >> 24) == 0) p = 0xff202020u; // Preview background; production paints the NGX preview here.
+                const char rgb[] = {char(p), char(p >> 8), char(p >> 16)};
+                f.write(rgb, 3);
+            }
+            Require(bool(f), "neural rendering page preview write failed");
+        };
+        for (const uint32_t language : {0u, 1u, 4u})
+        {
+            page.language = language;
+            page.neuralRendering.sceneAvailable = true;
+            Require(settings::RasterizeMenu(page, 1280, 720, nrPixels), "neural rendering page rasterization failed");
+            for (const auto [x, y] : {std::pair{settings::NrPreviewLeft, settings::NrPreviewTop},
+                                      std::pair{640, 200},
+                                      std::pair{settings::NrPreviewRight - 1, settings::NrPreviewBottom - 1}})
+                Require(nrPixels[size_t(y) * 1280 + x] == 0, "neural rendering preview rectangle must stay transparent");
+            Require((nrPixels[size_t(200) * 1280 + settings::NrPreviewLeft - 1] >> 24) == 255 &&
+                    (nrPixels[size_t(settings::NrPreviewBottom) * 1280 + 640] >> 24) == 255,
+                    "backdrop must surround the neural rendering preview");
+            Require((nrPixels[size_t(380) * 1280 + 240] >> 24) == 255 && (nrPixels[size_t(620) * 1280 + 300] >> 24) == 255 &&
+                    (nrPixels[size_t(680) * 1280 + 640] >> 24) == 255, "neural rendering controls must be opaque");
+            if (language == 0) write("nr-page-scene.ppm");
+            if (language == 4) write("nr-page-scene-zh-hans.ppm");
+            const auto withScene = nrPixels;
+            page.neuralRendering.sceneAvailable = false;
+            Require(settings::RasterizeMenu(page, 1280, 720, nrPixels), "neural rendering no-scene rasterization failed");
+            Require((nrPixels[size_t(200) * 1280 + 640] >> 24) == 255, "no-scene panel must cover the preview rectangle");
+            Require(!std::equal(nrPixels.begin() + 100 * 1280, nrPixels.begin() + 340 * 1280, withScene.begin() + 100 * 1280),
+                    "no-scene notice differs from the transparent preview");
+            Require(std::equal(nrPixels.begin() + 360 * 1280, nrPixels.end(), withScene.begin() + 360 * 1280),
+                    "scene availability leaves the controls unchanged");
+            if (language == 0) write("nr-page-no-scene.ppm");
+        }
+        // Each focus draws a different frame (help line and focused cell).
+        page.language = 0;
+        std::vector<std::vector<uint32_t>> frames;
+        for (int focus = 0; focus < settings::NrFocusCount; ++focus)
+        {
+            page.neuralRendering.focus = focus;
+            Require(settings::RasterizeMenu(page, 1280, 720, nrPixels), "neural rendering focus rasterization failed");
+            for (const auto &other : frames)
+                Require(other != nrPixels, "every neural rendering focus must render differently");
+            frames.push_back(nrPixels);
+        }
+        std::puts("DLSS 5 neural rendering page: transparent preview, no-scene panel, opaque controls in en/zh-Hant/zh-Hans");
+    }
 
     // Synthetic overflowing menu (>11 visible rows) to verify scroll clipping, hidden rows and overflow indicators.
     {

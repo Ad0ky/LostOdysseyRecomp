@@ -45,7 +45,9 @@ HARNESS = r'''
 #include <vector>
 #include "os/guest_code_thread.h"
 #define LOG_INFO(...) ((void)0)
+#define LOG_NOTICE(...) ((void)0)
 #define LOG_ERROR(...) ((void)0)
+#define LOG_NOTICE(...) ((void)0)
 template <typename T> using be = T;
 static const char* mode = nullptr;
 static std::thread::id gpuOwner;
@@ -61,8 +63,11 @@ namespace gpu {
 constexpr uint32_t REGISTER_COUNT = 0x3000, MMIO_BASE = 0x7FC80000;
 constexpr uint32_t REG_RB_EDRAM_TIMING = 0, REG_RB_BC_CONTROL = 1;
 constexpr uint32_t REG_D1MODE_V_COUNTER = 2, REG_INTERRUPT_STATUS = 3, REG_D1MODE_VIEWPORT_SIZE = 4;
+namespace render_timing { inline bool Enabled() { return false; } }
 class CommandProcessor {
     std::vector<uint32_t> m_registers;
+    const uint8_t* m_mmioWindow = nullptr;
+    bool m_countSyncSources = false;
     std::atomic<uint64_t> m_constantGeneration[2]{};
     std::atomic<bool> m_running{false};
     std::thread m_worker, m_vsync, m_interruptThread;

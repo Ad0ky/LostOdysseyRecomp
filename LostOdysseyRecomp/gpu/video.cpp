@@ -10,6 +10,7 @@
 #include "vulkan_command_recording.h"
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
 #include "dlss_ngx.h"
+#include "shader/dxc_compiler.h"
 #include "temporal_upscaler.h"
 #endif
 #endif
@@ -39,13 +40,18 @@
 #include "frame_pacer.h"
 #include "deadline_wait.h"
 #include "frame_plan.h"
+#include "pipeline_prepare_progress.h"
 #include <settings/config.h>
 #include "frame_generation_settings.h"
 #include <settings/menu.h>
 #include <settings/restart.h>
+#include <settings/title_entry.h>
 #include <kernel/memory.h>
 #include <os/main_thread.h>
 #include <os/platform.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #if LO_PLATFORM_MACOS
 #include <objc/message.h>
 #include <objc/runtime.h>
@@ -549,6 +555,20 @@ namespace gpu::video
         uint64_t g_fgPresentSerial = 0;
 #endif
         std::unique_ptr<plume::RenderTexture> g_cpuFrame;
+        // The title menu's Settings legend (settings/title_entry.cpp).
+        struct TitleHintResources {
+            std::unique_ptr<plume::RenderTexture> texture;
+            std::unique_ptr<plume::RenderBuffer> upload;
+            uint64_t revision = 0;
+        } g_titleHint;
+        // The background pipeline preparation bar (DrawPreparationBar).
+        struct PreparationBarResources {
+            std::unique_ptr<plume::RenderTexture> texture;
+            std::unique_ptr<plume::RenderBuffer> upload;
+            uint32_t width = 0, height = 0, filled = 0, total = 0;
+            std::chrono::steady_clock::time_point finished{};
+            bool hidden = false;
+        } g_preparationBar;
         std::unique_ptr<plume::RenderTexture> g_presentedSnapshot;
         uint32_t g_snapshotWidth=0,g_snapshotHeight=0;
         plume::RenderFormat g_snapshotFormat=plume::RenderFormat::UNKNOWN;
@@ -951,6 +971,12 @@ namespace gpu::video
 #else
             plume::RenderSwapChainDesc desc(PlumeWindow(), kSwapChainFormat, kSwapChainBuffers);
 #endif
+#ifdef __ANDROID__
+            // The final bicubic upscale may write the images from a compute
+            // pass (PresentationOptions::storageTarget), which costs the
+            // Adreno 750 less GPU time than the fragment pass.
+            desc.storageTextures = true;
+#endif
             if (g_hdrSwapchain) {
                 desc.format = plume::RenderFormat::R16G16B16A16_FLOAT;
                 desc.outputMode = plume::RenderOutputMode::HDR_LINEAR;
@@ -1050,7 +1076,8 @@ namespace gpu::video
                 GetDpiForWindow(g_nativeWindow), raw.right - raw.left, raw.bottom - raw.top,
                 physicalWidth, physicalHeight, g_swapChain->getWidth(), g_swapChain->getHeight(), g_displayMode.load());
 #else
-            LOG_INFO("video output: {} swapchain={}x{} mode={}", reason, g_swapChain->getWidth(), g_swapChain->getHeight(), g_displayMode.load());
+            LOG_INFO("video output: {} swapchain={}x{} storage={} mode={}", reason, g_swapChain->getWidth(), g_swapChain->getHeight(),
+                g_swapChain->hasStorageTextures(), g_displayMode.load());
 #endif
         }
 
@@ -1069,7 +1096,8 @@ namespace gpu::video
             // Vulkan gives the presentation engine ownership after vkQueuePresent.
             // The explicit presented-screenshot diagnostic retains an owned image
             // before that handoff; no extra copy is made during normal gameplay.
-            if(!g_vulkan || !getenv("LO_SCREENSHOT_PRESENTED")) return;
+            static const bool presentedScreenshot = getenv("LO_SCREENSHOT_PRESENTED") != nullptr;
+            if(!g_vulkan || !presentedScreenshot) return;
             const auto w=g_swapChain->getWidth(),h=g_swapChain->getHeight();
             const auto format=g_swapChain->getFormat();
             if(!g_presentedSnapshot || w!=g_snapshotWidth || h!=g_snapshotHeight || format!=g_snapshotFormat) {
@@ -1993,6 +2021,8 @@ namespace gpu::video
         if (g_captureCopy.buffer) g_captureCopy.buffer.reset();
         g_captureCopy = {};
         g_cpuFrame.reset(); g_cpuWidth = g_cpuHeight = 0;
+        g_titleHint = {};
+        g_preparationBar = {};
         g_presentedSnapshot.reset(); g_snapshotWidth = g_snapshotHeight = 0; g_snapshotFormat=plume::RenderFormat::UNKNOWN;
         g_hdrCalibrationCache = {};
         settings::SetHdrCalibrationSceneAvailable(false);
@@ -2264,6 +2294,15 @@ namespace gpu::video
             os::hang_watch::Watch startupWatch("DLSS controller creation", nullptr);
 #endif
 #ifdef _WIN32
+            dlss::SetLogSink([](const char* line) { LOG_INFO("{}", line); });
+#if !defined(LO_VIDEO_SUBMISSION_UNIT)
+            dlss::SetComputeShaderCompiler([](const char* source, std::vector<uint8_t>& dxil) {
+                auto compiled = xenos::CompileCachedHlsl(source, "main", "cs_6_0", xenos::ShaderBinaryFormat::Dxil);
+                if (!compiled.ok) LOG_WARNING("DLSS NR: bridge shader: {}", compiled.errors);
+                else dxil = std::move(compiled.bytecode);
+                return compiled.ok;
+            });
+#endif
             if (g_vulkan) {
                 g_dlssController = std::make_unique<dlss::Controller>(DlssApplicationDataPath(), DlssRuntimePath());
                 g_temporalUpscaler = std::make_unique<TemporalUpscaler>(*g_dlssController);
@@ -2313,6 +2352,7 @@ namespace gpu::video
             g_temporalUpscaler = std::make_unique<TemporalUpscaler>(static_cast<dlss::Controller*>(nullptr));
             g_interface = plume::CreateMetalInterface();
 #else
+            dlss::SetLogSink([](const char* line) { LOG_INFO("{}", line); });
             g_dlssController = std::make_unique<dlss::Controller>(DlssApplicationDataPath(), DlssRuntimePath());
             g_temporalUpscaler = std::make_unique<TemporalUpscaler>(*g_dlssController);
             LoadCustomVulkanDriver();
@@ -2366,7 +2406,7 @@ namespace gpu::video
                     const uint64_t nextEpoch = g_deviceEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
                     frame_plan::ResetSizing(nextEpoch);
                     const auto& description = g_device->getDescription();
-                    LOG_INFO("video device: backend={} name={} driver_raw={} vendor_enum={} type_enum={} reported_device_memory_bytes={}",
+                    LOG_NOTICE("video device: backend={} name={} driver_raw={} vendor_enum={} type_enum={} reported_device_memory_bytes={}",
                         backend::Name(candidate), description.name, description.driverVersion,
                         uint32_t(description.vendor), uint32_t(description.type), description.dedicatedVideoMemory);
                 }
@@ -2509,10 +2549,9 @@ namespace gpu::video
             startupWatch.Step("swap chain creation");
 #ifdef _WIN32
             // The swap chain takes the window's current size, so a resize the
-            // startup window-mode apply requested has nothing left to do. NVIDIA's
-            // Vulkan driver, presenting through DXGI, crashed right after that
-            // same-size rebuild at the first present (#323). Later window events
-            // still request one, and needsResize() still compares the sizes.
+            // startup window-mode apply requested has nothing left to do and would
+            // only rebuild it at the same size on the first present. Later window
+            // events still request one, and needsResize() still compares the sizes.
             g_windowResizeRequested = false;
 #endif
             g_swapChain = g_queue->createSwapChain(SwapChainDescription());
@@ -2581,7 +2620,9 @@ namespace gpu::video
             g_uploadBuffer = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(g_uploadCapacity));
             if (!g_uploadBuffer) return "presentation upload allocation failed";
             g_presentation = std::make_unique<Presentation>();
-            if (!g_presentation->Init(g_device.get(), g_swapChain->getFormat())) return "presentation shader/pipeline initialization failed";
+            if (!g_presentation->Init(g_device.get(), g_swapChain->getFormat(), g_swapChain->hasStorageTextures()))
+                return "presentation shader/pipeline initialization failed";
+            g_presentation->PrewarmOverlay();
             g_presentationFormat = g_swapChain->getFormat();
             startupWatch.Step("renderer initialization");
             if (!getenv("LO_NO_RENDERER") && !renderer::Init()) return "renderer initialization failed";
@@ -2618,7 +2659,7 @@ namespace gpu::video
             }
 #endif
             PublishOwnedDeviceCapability();
-            LOG_INFO("video: {} on {}", backend::Name(*selection.selected), g_device->getDescription().name);
+            LOG_NOTICE("video: {} on {}", backend::Name(*selection.selected), g_device->getDescription().name);
         } else {
             LOG_ERROR("video: no usable backend; guest startup aborted: {}", selection.Describe());
 #if defined(__ANDROID__) && !defined(LO_VIDEO_SUBMISSION_UNIT)
@@ -2811,9 +2852,12 @@ namespace gpu::video
         renderer::WaitDebugCaptureArchive();
         LOG_INFO("video: shutdown stage=capture-archive complete");
         Shutdown(); // Failed native/SDK drains terminate with EXIT_FAILURE.
-        LOG_INFO("video: owner shutdown complete native_ngx_cleanup=complete streamline_cleanup=complete exit_code=0");
+        LOG_NOTICE("video: owner shutdown complete native_ngx_cleanup=complete streamline_cleanup=complete exit_code=0");
         os::shaderlog::CloseForExit();
         std::fflush(nullptr);
+#if LO_PLATFORM_SWITCH
+        os::switch_platform::AllowExit();
+#endif
         std::_Exit(EXIT_SUCCESS);
     }
 
@@ -3854,8 +3898,9 @@ namespace gpu::video
             }
         }
 #else
-        const bool nativeVsync = vrr::HostVsyncEnabled(nativeTarget,
-            nativePolicy.nativeVsyncBaseline, forceImmediate, settings::GetConfig().variableRefreshRate);
+        const auto syncConfig = settings::GetConfig();
+        const bool nativeVsync = vrr::HostVsyncEnabled(nativeTarget, syncConfig.vsync,
+            nativePolicy.nativeVsyncBaseline, forceImmediate, syncConfig.variableRefreshRate);
 #endif
         if (nativeVsync != nativePolicy.nativeVsyncRequested) {
             // Plume marks Vulkan's swapchain for resize; the existing transaction
@@ -3940,13 +3985,14 @@ namespace gpu::video
             g_snapshotWidth = g_snapshotHeight = 0;
             if (g_presentationFormat != g_swapChain->getFormat()) {
                 auto replacement = std::make_unique<Presentation>();
-                if (!replacement->Init(g_device.get(), g_swapChain->getFormat())) {
+                if (!replacement->Init(g_device.get(), g_swapChain->getFormat(), g_swapChain->hasStorageTextures())) {
                     LOG_ERROR("HDR: presentation pipeline rebuild failed after swapchain format change");
                     g_displayFailed = true;
                     return false;
                 }
                 g_presentation = std::move(replacement);
                 g_presentationFormat = g_swapChain->getFormat();
+                g_presentation->PrewarmOverlay();
             }
             UpdateHdrOutput(true);
             LogOutputPixels("resized");
@@ -4009,6 +4055,24 @@ namespace gpu::video
         return cache.copies[0] && cache.copies[1] ? source : nullptr;
     }
 
+    // An upscaled HDR frame has its highlights only after the presentation gain
+    // pass; its resolve is SDR, so the HDR page's peak preview had nothing to map.
+    // It copies the gain pass's FP16 result instead, once that is recorded.
+    static bool PrepareGainSceneCopy(uint32_t width, uint32_t height)
+    {
+        auto& cache = g_hdrCalibrationCache;
+        if (!cache.copies[0] || cache.width != width || cache.height != height || !cache.extended) {
+            for (auto& copy : cache.copies)
+                copy = g_device->createTexture(plume::RenderTextureDesc::Texture2D(width, height, 1,
+                    plume::RenderFormat::R16G16B16A16_FLOAT));
+            cache.width = width;
+            cache.height = height;
+            cache.extended = true;
+            cache.filled[0] = cache.filled[1] = false;
+        }
+        return cache.copies[0] && cache.copies[1];
+    }
+
     static void RecordSceneCopy(plume::RenderTexture* source)
     {
         const auto& cache = g_hdrCalibrationCache;
@@ -4030,6 +4094,24 @@ namespace gpu::video
         cache.copied = now;
     }
 
+    // The DLSS 5 neural rendering page: whether a DLSS frame is held for its
+    // preview, and the preview's features released once the page closes.
+    // Callers have waited for the present GPU.
+    static void TrackNeuralRenderingPreview()
+    {
+#if defined(_WIN32) && defined(LO_GPU_PLUME) && !defined(LO_VIDEO_SUBMISSION_UNIT)
+        static bool available = false, open = false;
+        const bool nowAvailable = g_dlssController && g_dlssController->NeuralRenderingPreviewAvailable();
+        if (nowAvailable != available) {
+            available = nowAvailable;
+            settings::SetNeuralRenderingPreviewAvailable(available);
+        }
+        const bool nowOpen = settings::GetNeuralRenderingTuning().open;
+        if (open && !nowOpen && g_dlssController) g_dlssController->ReleaseNeuralRenderingPreview();
+        open = nowOpen;
+#endif
+    }
+
     // Copies stop refreshing and the previews may sample the older one.
     static void FreezeScene()
     {
@@ -4043,6 +4125,109 @@ namespace gpu::video
         static uint32_t logs = 0;
         if (logs++ < 8)
             LOG_INFO("calibration: frozen game scene {}x{} extended={}", cache.width, cache.height, cache.extended);
+    }
+
+    // The title menu's Settings legend over the presented frame, on the GPU
+    // path. It is rasterized and uploaded during its delay, before it fades in.
+    // The previous present has completed, so its texture and upload buffer can
+    // be replaced.
+    static void DrawTitleHint(plume::RenderTexture* backBuffer)
+    {
+#ifdef LO_GPU_PLUME
+        if (!settings::title_entry::HintShown() || !g_presentation) return;
+        const uint32_t outputWidth = g_swapChain->getWidth(), outputHeight = g_swapChain->getHeight();
+        const auto* hint = settings::title_entry::DrawHint(outputWidth, outputHeight);
+        if (!hint) return;
+        if (!g_titleHint.texture || g_titleHint.revision != hint->revision) {
+            const uint32_t rowPitch = (hint->width * 4 + 255) & ~255u;
+            g_titleHint.texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(hint->width, hint->height, 1,
+                plume::RenderFormat::R8G8B8A8_UNORM));
+            g_titleHint.upload = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * hint->height));
+            auto* mapped = g_titleHint.upload ? static_cast<uint8_t*>(g_titleHint.upload->map()) : nullptr;
+            if (!g_titleHint.texture || !mapped) { g_titleHint = {}; return; }
+            for (uint32_t y = 0; y < hint->height; ++y)
+                memcpy(mapped + size_t(y) * rowPitch, &hint->pixels[size_t(y) * hint->width], size_t(hint->width) * 4);
+            g_titleHint.upload->unmap();
+            g_commandList->barriers(plume::RenderBarrierStage::COPY,
+                plume::RenderTextureBarrier(g_titleHint.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+            g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(g_titleHint.texture.get()),
+                plume::RenderTextureCopyLocation::PlacedFootprint(g_titleHint.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                    hint->width, hint->height, 1, rowPitch / 4), 0, 0, 0, nullptr);
+            g_titleHint.revision = hint->revision;
+        }
+        if (const float opacity = settings::title_entry::HintOpacity(); opacity > 0.0f)
+            g_presentation->DrawOverlay(g_commandList.get(), g_titleHint.texture.get(), backBuffer, hint->x, hint->y,
+                hint->width, hint->height, outputWidth, outputHeight, opacity);
+#else
+        (void)backBuffer;
+#endif
+    }
+
+    // Startup pipeline preparation running in the background (renderer): a thin
+    // translucent bar along the bottom edge, filled done/total, fading out once
+    // done. Only game frames draw it, so the host menus and prompts hide it. The
+    // previous present has completed, so the upload buffer can be rewritten.
+    static void DrawPreparationBar(plume::RenderTexture* backBuffer)
+    {
+#ifdef LO_GPU_PLUME
+        auto& bar = g_preparationBar;
+        const uint64_t progress = gpu::pipeline_prepare::g_progress.load(std::memory_order_relaxed);
+        const uint32_t total = gpu::pipeline_prepare::Total(progress);
+        const uint32_t done = std::min(gpu::pipeline_prepare::Done(progress), total);
+        if (!total) { bar = {}; return; }
+        if (bar.total != total) { bar.total = total; bar.finished = {}; bar.hidden = false; }
+        if (bar.hidden || !g_presentation) return;
+        float opacity = 1.0f;
+        if (done == total) {
+            constexpr double kHoldSeconds = 0.3, kFadeSeconds = 0.7;
+            const auto now = std::chrono::steady_clock::now();
+            if (bar.finished == std::chrono::steady_clock::time_point{}) bar.finished = now;
+            const double since = std::chrono::duration<double>(now - bar.finished).count();
+            if (since >= kHoldSeconds + kFadeSeconds) {
+                bar.hidden = true;
+                bar.texture.reset();
+                bar.upload.reset();
+                return;
+            }
+            if (since > kHoldSeconds) opacity = float(1.0 - (since - kHoldSeconds) / kFadeSeconds);
+        }
+        const uint32_t outputWidth = g_swapChain->getWidth(), outputHeight = g_swapChain->getHeight();
+        const uint32_t height = std::max(2u, outputHeight / 360); // 3 px at 1080p
+        if (!outputWidth || height >= outputHeight) return;
+        const uint32_t rowPitch = (outputWidth * 4 + 255) & ~255u;
+        if (!bar.texture || bar.width != outputWidth || bar.height != height) {
+            bar.texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(outputWidth, height, 1,
+                plume::RenderFormat::R8G8B8A8_UNORM));
+            bar.upload = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * height));
+            if (!bar.texture || !bar.upload) { bar.texture.reset(); bar.upload.reset(); return; }
+            bar.width = outputWidth;
+            bar.height = height;
+            bar.filled = ~0u;
+        }
+        const uint32_t filled = uint32_t(uint64_t(outputWidth) * done / total);
+        if (filled != bar.filled) {
+            auto* mapped = static_cast<uint8_t*>(bar.upload->map());
+            if (!mapped) return;
+            // R8G8B8A8, straight alpha: light fill over a faint dark track.
+            constexpr uint32_t kFill = 235u | 240u << 8 | 245u << 16 | 150u << 24, kTrack = 0u | 0u << 8 | 0u << 16 | 64u << 24;
+            for (uint32_t y = 0; y < height; ++y) {
+                auto* row = reinterpret_cast<uint32_t*>(mapped + size_t(y) * rowPitch);
+                std::fill(row, row + filled, kFill);
+                std::fill(row + filled, row + outputWidth, kTrack);
+            }
+            bar.upload->unmap();
+            g_commandList->barriers(plume::RenderBarrierStage::COPY,
+                plume::RenderTextureBarrier(bar.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+            g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(bar.texture.get()),
+                plume::RenderTextureCopyLocation::PlacedFootprint(bar.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                    outputWidth, height, 1, rowPitch / 4), 0, 0, 0, nullptr);
+            bar.filled = filled;
+        }
+        g_presentation->DrawOverlay(g_commandList.get(), bar.texture.get(), backBuffer, 0, outputHeight - height,
+            outputWidth, height, outputWidth, outputHeight, opacity);
+#else
+        (void)backBuffer;
+#endif
     }
 
     static bool UploadAndPresentPixels(const std::vector<uint32_t>& pixels, uint32_t width, uint32_t height,
@@ -4088,6 +4273,7 @@ namespace gpu::video
             if (!WaitForPresentGpu()) return false;
             // A host menu opened straight over gameplay freezes the last copy.
             if (isMenu) FreezeScene();
+            TrackNeuralRenderingPreview();
             // Stage allocations before acquiring an image or opening a command
             // list. Failed resizing keeps the previous usable resources intact.
             std::unique_ptr<plume::RenderBuffer> upload;
@@ -4160,6 +4346,29 @@ namespace gpu::video
                     options.calibrationDisplayGammaRamp = true;
                 }
             }
+#if defined(_WIN32) && defined(LO_GPU_PLUME) && !defined(LO_VIDEO_SUBMISSION_UNIT)
+            // The DLSS 5 neural rendering page runs the model on the held DLSS
+            // frame with its unsaved values: DLSS on the left, DLSS + NR on the right.
+            const auto neuralRendering = settings::GetNeuralRenderingTuning();
+            if (isMenu && neuralRendering.open && g_dlssController) {
+                const dlss::NeuralRenderingTuning tuning{neuralRendering.style, neuralRendering.intensity / 100.0f,
+                    neuralRendering.globalTone / 100.0f, neuralRendering.localTone / 100.0f,
+                    neuralRendering.structure / 100.0f, neuralRendering.skin / 100.0f, neuralRendering.autoMask};
+                if (auto* preview = g_dlssController->RecordNeuralRenderingPreview(*g_commandList,
+                        neuralRendering.passes, neuralRendering.preset, tuning)) {
+                    const float scale = std::min(width/1280.0f,height/720.0f);
+                    const float x = (width-1280*scale)*0.5f, y = (height-720*scale)*0.5f;
+                    options.brightnessPreview = true;
+                    options.calibrationSplitScene = true;
+                    options.calibrationScene = preview;
+                    options.calibrationDisplayGammaRamp = true;
+                    options.calibrationRect[0] = (x+settings::NrPreviewLeft*scale)/width;
+                    options.calibrationRect[1] = (y+settings::NrPreviewTop*scale)/height;
+                    options.calibrationRect[2] = (x+settings::NrPreviewRight*scale)/width;
+                    options.calibrationRect[3] = (y+settings::NrPreviewBottom*scale)/height;
+                }
+            }
+#endif
             g_presentation->Draw(g_commandList.get(),g_cpuFrame.get(),backBuffer,width,height,
                 g_swapChain->getWidth(),g_swapChain->getHeight(),options);
         }
@@ -4355,10 +4564,12 @@ namespace gpu::video
                     return;
                 DisplayCompletion completion(g_displayChanges, displayTicket);
                 if (!WaitForPresentGpu()) return;
+                TrackNeuralRenderingPreview();
                 // Calibration previews: scene frames refresh the copy (no earlier
                 // frame still samples it after the wait); the first frame without
                 // the scene freezes it.
                 plume::RenderTexture* sceneCopySource = nullptr;
+                bool sceneCopyFromGain = false;
                 uint64_t sceneOrdinal = 0;
                 const auto now = std::chrono::steady_clock::now();
                 if (renderer::ResolvedScene(physicalAddress & 0x1FFFFFFF, sceneOrdinal)) {
@@ -4369,8 +4580,10 @@ namespace gpu::video
                         g_hdrCalibrationCache.filled[0] = g_hdrCalibrationCache.filled[1] = false;
                         settings::SetHdrCalibrationSceneAvailable(false);
                     }
-                    if (now - g_hdrCalibrationCache.copied >= std::chrono::milliseconds(250))
-                        sceneCopySource = PrepareSceneCopy(physicalAddress & 0x1FFFFFFF, sceneOrdinal, sourceWidth, sourceHeight);
+                    if (now - g_hdrCalibrationCache.copied >= std::chrono::milliseconds(250)) {
+                        if (hdrGainSource && g_presentation) sceneCopyFromGain = PrepareGainSceneCopy(sourceWidth, sourceHeight);
+                        else sceneCopySource = PrepareSceneCopy(physicalAddress & 0x1FFFFFFF, sceneOrdinal, sourceWidth, sourceHeight);
+                    }
                 }
                 else FreezeScene();
 #if (defined(_WIN32) && (defined(LO_ENABLE_STREAMLINE_FG) || defined(LO_ENABLE_D3D12_FG) || defined(LO_ENABLE_VULKAN_FSR_FG))) || (defined(__APPLE__) && defined(LO_ENABLE_METALFX_FG))
@@ -4474,6 +4687,10 @@ namespace gpu::video
                             sourceWidth, sourceHeight, hdrGainValidWidth, hdrGainValidHeight, hdrGainWidth, hdrGainHeight)) {
                         source = gained;
                         hdrScene = true;
+                        if (sceneCopyFromGain) {
+                            RecordSceneCopy(gained);
+                            sceneCopySource = gained;
+                        }
                         static uint32_t gainLogs = 0;
                         if (gainLogs++ < 8)
                             LOG_INFO("HDR: highlight gain applied address={:#x} scene={}x{} (valid {}x{}) output={}x{}",
@@ -4503,9 +4720,12 @@ namespace gpu::video
                     sourceOptions.displayAdjust = presentationOptions.displayAdjust;
                     sourceOptions.displayBrightness = presentationOptions.displayBrightness;
                     sourceOptions.displayGamma = presentationOptions.displayGamma;
+                    sourceOptions.storageTarget = g_swapChain->hasStorageTextures();
                     // With scene AA already applied this is DrawComposited's pass.
                     g_presentation->Draw(g_commandList.get(),source,backBuffer,sourceWidth,sourceHeight,
                         g_swapChain->getWidth(),g_swapChain->getHeight(),sourceOptions);
+                    DrawTitleHint(backBuffer);
+                    DrawPreparationBar(backBuffer);
                 }
                 else {
                     g_commandList->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(backBuffer, plume::RenderTextureLayout::COPY_DEST));
@@ -4651,7 +4871,8 @@ namespace gpu::video
         if (!PreparePresentation(displayTicket, menuWidth, menuHeight))
             return;
         renderer::SetOutputSize(menuWidth, menuHeight);
-        if (settings::GetConfig().variableRefreshRate) {
+        // Without display sync nothing else holds the paused menu to a frame rate.
+        if (const auto config = settings::GetConfig(); config.variableRefreshRate || !config.vsync) {
             static FramePacer overlayPacer;
             static DeadlineWait overlayWait;
             overlayWait.Until(overlayPacer.Schedule(std::chrono::steady_clock::now(), GetFramePacingTarget(60, true)));

@@ -6,7 +6,9 @@
 #include "fsr_projection.h"
 #include "xess_upscaler.h"
 #include <algorithm>
+#include <cctype>
 #include <cfloat>
+#include <cstdlib>
 
 #if LO_PLATFORM_MACOS
 #include <os/logger.h>
@@ -103,6 +105,17 @@ dlss::SrConfig DlssConfig(const SrRequest& request) {
     config.depthInverted = request.inputs.depthConvention == temporal::DepthConvention::Reversed;
     config.colorSpace = request.inputs.colorEncoding == temporal::ColorEncoding::Sdr ?
         dlss::SrColorSpace::DisplayEncoded : dlss::SrColorSpace::Linear;
+    config.neuralRenderingPasses = uint8_t(std::min(request.options.dlssNeuralRenderingPasses,
+        dlss::kMaxNeuralRenderingPasses));
+    config.neuralRenderingPreset = uint8_t(std::min(request.options.dlssNeuralRenderingPreset, 3u));
+    // LO_DLSS_PRESET=J|K|L|M replaces the menu's model for developer comparisons.
+    static const uint8_t presetOverride = [] {
+        const char* value = std::getenv("LO_DLSS_PRESET");
+        const int letter = value && value[0] && !value[1] ? std::toupper(static_cast<unsigned char>(value[0])) : 0;
+        return uint8_t(letter >= 'J' && letter <= 'M' ? letter - 'A' + 1 : 0);
+    }();
+    config.renderPreset = presetOverride ? presetOverride :
+        request.options.dlssModel == 1 ? dlss::kRenderPresetL : dlss::kRenderPresetM;
     return config;
 }
 }
@@ -166,6 +179,7 @@ SrResult TemporalUpscaler::RecordIsolated(plume::VulkanCommandList& commands,
         return result;
     }
     if (!dlss_) return result;
+    dlss_->SetNeuralRenderingTuning(request.options.dlssNeuralRenderingTuning);
     const auto attempt = dlss_->RecordIsolated(commands, DlssConfig(request), request.inputs, output, capture);
     result.actualProvider = upscaling::Upscaler::Dlss;
     result.status = Convert(attempt.status);
@@ -244,6 +258,7 @@ SrResult TemporalUpscaler::RecordIsolated(plume::D3D12CommandList& commands,
         return result;
     }
     if (!dlss_) return result;
+    dlss_->SetNeuralRenderingTuning(request.options.dlssNeuralRenderingTuning);
     const auto attempt = dlss_->RecordIsolated(commands, DlssConfig(request), request.inputs, output, capture);
     result.actualProvider = upscaling::Upscaler::Dlss;
     result.status = Convert(attempt.status);

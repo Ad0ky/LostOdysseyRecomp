@@ -1,12 +1,14 @@
-#include <gpu/taa_collection.h>
+#include <os/log_collection.h>
 #include "menu.h"
 #include "menu_render.h"
 #include "menu_assets.h"
 #include "config.h"
 #include "graphics_menu.h"
 #include <gpu/frame_rate.h>
+#include <gpu/dlss_nr_state.h>
 #include "restart.h"
 #include "translations.h"
+#include "mods_page.h"
 #include <gpu/video.h>
 #include <gpu/display_choice.h>
 #include <gpu/frame_plan.h>
@@ -34,6 +36,18 @@ std::atomic<uint16_t> cancelButton{0x2000};
 std::atomic<bool> swapConfirm{false};
 std::atomic<bool> waitForRelease{true};
 std::atomic<bool> releaseToParent{false};
+// Title menu entry: the title tick reports an idle menu, input polling records
+// a fresh Y there, and the opened task hides what a game would replace.
+std::atomic<bool> titleMenuIdle{false}, titleShortcut{false}, titleEntry{false};
+// With no game loaded, the retail options (Gameplay, and Voice language, Music and
+// Sound effects on Audio) and their Restore would be replaced by the next save or by
+// New Game's defaults (828710A0), and there is no game to quit.
+bool TitleModeHidden(int tab, int r)
+{
+    if (!titleEntry.load()) return false;
+    if (tab == 0) return r < GameRetailRowCount || r == GameRestoreRow || r == GameMainMenuRow;
+    return tab == 1 && (r == AudioVoiceRow || r == AudioMusicRow || r == AudioEffectsRow);
+}
 std::atomic<int> mouseTab{-1}, mouseRow{-1};
 std::atomic<int> mouseDialog{-1};
 std::atomic<uint16_t> mouseAction{0};
@@ -58,6 +72,15 @@ uint32_t gammaStart = 100;
 // The original calibration screen returns to the page with the unsaved edit.
 bool returnToBrightness = false;
 constexpr int kBrightnessSliderX = 380, kBrightnessSliderWidth = 620;
+// DLSS 5 neural rendering page. Focus: 0 passes, 1 model, 2 preset, 3-6 tones and
+// structure, 7 skin, 8 character mask, 9-11 Default / Done / Cancel.
+std::atomic<bool> nrOpen{false};
+std::atomic<bool> nrSceneAvailable{false};
+// Pending pointer action: valid bit, kind (1 focus, 2 step down, 3 step up,
+// 4 set value, 5 focus + confirm), focus in bits 4-7, value + 100 from bit 8.
+std::atomic<uint32_t> nrAction{0};
+int nrFocus = 0;
+Config nrStart; // NR fields (and passes) as the page opened
 std::mutex snapshotMutex;
 using Row = MenuRow;
 using Snapshot = MenuSnapshot;
@@ -91,6 +114,17 @@ bool mainMenuRequested = false;
 bool importPrompt = false;
 int importChoice = 1;
 bool importLaunchPending = false;
+// Mods page (System → Mods). The mods are listed when it opens; the order and
+// switches stay unsaved until Save. modsSaved is the order saved in this run,
+// applied at the next start; reopening the page shows it.
+std::atomic<bool> modsOpen{false};
+std::vector<mods_page::Entry> modsEntries;
+mods_page::Order modsStart, modsRunning, modsSaved;
+bool modsSavedThisRun = false;
+int modsFocus = 0;
+bool modsDiscardPrompt = false;
+int modsDiscardChoice = 1;
+bool restartForMods = false;
 Config restartAfter;
 int tab = 0, row = 0;
 bool bypass = false, sawModal = false;
@@ -134,6 +168,7 @@ BrightnessCalibration MakeBrightnessCalibration(const Config &config, bool open)
     result.sceneAvailable = calibrationSceneAvailable.load(std::memory_order_relaxed);
     result.scenePreview = calibrationScenePreview.load(std::memory_order_relaxed);
     if (open) result.focus = brightnessFocus;
+    result.originalPattern = !titleEntry.load();
     return result;
 }
 float BrightnessSliderFraction(float x)
@@ -143,6 +178,104 @@ float BrightnessSliderFraction(float x)
 std::wstring BrightnessValue(int brightness)
 {
     return brightness > 0 ? L"+" + std::to_wstring(brightness) : std::to_wstring(brightness);
+}
+constexpr uint32_t NrAction(int kind, int focus, int value = 0)
+{
+    return 0x80000000u | uint32_t(kind) | (uint32_t(focus) << 4) | (uint32_t(value + 100) << 8);
+}
+NeuralRenderingTuning MakeNeuralRenderingTuning(const Config &config, bool open)
+{
+    NeuralRenderingTuning result;
+    result.open = open;
+    result.sceneAvailable = nrSceneAvailable.load(std::memory_order_relaxed);
+    result.passes = std::min(config.dlssNeuralRendering, DlssNeuralRenderingMaxPasses);
+    result.preset = config.dlssNrPreset;
+    result.style = config.dlssNrStyle;
+    result.intensity = config.dlssNrIntensity;
+    result.globalTone = config.dlssNrGlobalTone;
+    result.localTone = config.dlssNrLocalTone;
+    result.structure = config.dlssNrStructure;
+    result.skin = config.dlssNrSkin;
+    result.autoMask = config.dlssNrAutoMask;
+    if (open) result.focus = nrFocus;
+    return result;
+}
+void ResetNeuralRenderingTuning(Config &config)
+{
+    const Config defaults;
+    config.dlssNrPreset = defaults.dlssNrPreset;
+    config.dlssNrStyle = defaults.dlssNrStyle;
+    config.dlssNrIntensity = defaults.dlssNrIntensity;
+    config.dlssNrGlobalTone = defaults.dlssNrGlobalTone;
+    config.dlssNrLocalTone = defaults.dlssNrLocalTone;
+    config.dlssNrStructure = defaults.dlssNrStructure;
+    config.dlssNrSkin = defaults.dlssNrSkin;
+    config.dlssNrAutoMask = defaults.dlssNrAutoMask;
+}
+void RestoreNeuralRenderingTuning(Config &config, const Config &start)
+{
+    config.dlssNeuralRendering = start.dlssNeuralRendering;
+    config.dlssNrPreset = start.dlssNrPreset;
+    config.dlssNrStyle = start.dlssNrStyle;
+    config.dlssNrIntensity = start.dlssNrIntensity;
+    config.dlssNrGlobalTone = start.dlssNrGlobalTone;
+    config.dlssNrLocalTone = start.dlssNrLocalTone;
+    config.dlssNrStructure = start.dlssNrStructure;
+    config.dlssNrSkin = start.dlssNrSkin;
+    config.dlssNrAutoMask = start.dlssNrAutoMask;
+}
+// Percent sliders (focus 3-6, 0-200) and skin (focus 7, -100..100) step by 5.
+bool NrIsSlider(int focus) { return focus >= 3 && focus <= 7; }
+uint32_t *NrPercentField(Config &config, int focus)
+{
+    switch (focus)
+    {
+    case 3: return &config.dlssNrIntensity;
+    case 4: return &config.dlssNrGlobalTone;
+    case 5: return &config.dlssNrLocalTone;
+    case 6: return &config.dlssNrStructure;
+    default: return nullptr;
+    }
+}
+void SetNrValue(Config &config, int focus, int value)
+{
+    if (uint32_t *percent = NrPercentField(config, focus))
+        *percent = uint32_t(std::clamp(value, 0, 200));
+    else if (focus == 7)
+        config.dlssNrSkin = std::clamp(value, -100, 100);
+}
+// Left/right on a control: combos cycle with wrap, sliders step by 5, the toggle flips.
+void StepNrControl(Config &config, int focus, int delta)
+{
+    auto wrap = [&](uint32_t value, uint32_t count) {
+        return uint32_t((int(value) + delta + int(count)) % int(count));
+    };
+    if (focus == 0)
+        config.dlssNeuralRendering = wrap(std::min(config.dlssNeuralRendering, DlssNeuralRenderingMaxPasses),
+                                          DlssNeuralRenderingMaxPasses + 1);
+    else if (focus == 1) config.dlssNrStyle = wrap(std::min(config.dlssNrStyle, 2u), 3);
+    else if (focus == 2) config.dlssNrPreset = wrap(std::min(config.dlssNrPreset, 3u), 4);
+    else if (const uint32_t *percent = NrPercentField(config, focus))
+        SetNrValue(config, focus, int(*percent) + delta * 5);
+    else if (focus == 7) SetNrValue(config, focus, config.dlssNrSkin + delta * 5);
+    else if (focus == 8) config.dlssNrAutoMask = !config.dlssNrAutoMask;
+}
+// Pointer position to the control row it lands on (focus 0-8). `value` is the
+// stepped slider value for x; `controlSide` is 0 over the label, else 2 / 3 for
+// the left / right half of a combo or toggle.
+bool NrControlAt(float x, float y, int &focus, bool &onTrack, int &value, int &controlSide)
+{
+    const int column = x >= NrColumnX[1] - 10 ? 1 : 0;
+    const int slot = int(std::floor((y - NrRowTop) / float(NrRowHeight)));
+    if (y < NrRowTop || slot < 0 || slot >= (column ? NrControlCount - 5 : 5)) return false;
+    if (x < NrColumnX[column] || x >= NrColumnX[column] + NrColumnWidth) return false;
+    focus = column ? 5 + slot : slot;
+    const float controlX = float(NrColumnX[column] + NrControlOffset);
+    onTrack = NrIsSlider(focus) && x >= controlX - 6 && x < controlX + NrSliderWidth + 6;
+    const float fraction = std::clamp((x - controlX) / float(NrSliderWidth), 0.0f, 1.0f);
+    value = int(std::lround(fraction * 40.0f)) * 5 - (focus == 7 ? 100 : 0);
+    controlSide = x < controlX ? 0 : x < controlX + (NrColumnWidth - NrControlOffset) * 0.5f ? 2 : 3;
+    return true;
 }
 std::wstring GammaValue(uint32_t gamma)
 {
@@ -237,6 +370,107 @@ std::wstring Widen(std::string_view text)
             result.push_back(wchar_t(code));
     }
     return result;
+}
+std::wstring PathText(const std::filesystem::path &path)
+{
+    const auto utf8 = path.u8string();
+    return Widen(std::string_view(reinterpret_cast<const char *>(utf8.data()), utf8.size()));
+}
+void OpenModsPage()
+{
+    modsEntries = mods_page::FromList(modding::ListMods());
+    modsRunning = mods_page::SaveOrder(modsEntries);
+    if (modsSavedThisRun) mods_page::ApplyOrder(modsEntries, modsSaved);
+    modsStart = mods_page::SaveOrder(modsEntries);
+    modsFocus = 0;
+    modsDiscardPrompt = false;
+    status.clear();
+    modsOpen = true;
+    LOG_INFO("settings: mods page opened ({} mods, {} entries)", modsStart.size(), modsEntries.size());
+}
+void CloseModsPage()
+{
+    modsOpen = false;
+    modsDiscardPrompt = false;
+    modsEntries.clear();
+    status.clear();
+}
+// A mod row: name, then version and author (or a mark for a mod.ini problem),
+// then on / off. Rejected mods and mods off in mod.ini have one inert cell.
+Row ModRow(const mods_page::Entry &entry)
+{
+    const auto &info = entry.info;
+    Row row{mods_page::Shorten(Widen(info.name.empty() ? info.id : info.name), 24), {}, true, {}, 0};
+    if (!mods_page::IsMod(entry))
+    {
+        row.detail = Tr(L"Language pack: ", L"語言包：") + mods_page::BaseLanguageName(info.base);
+        return row;
+    }
+    // Separators the menu font has (no "·"), so the line keeps that font.
+    std::wstring detail = Widen(info.version);
+    if (!info.author.empty()) detail += (detail.empty() ? L"" : L" - ") + Widen(info.author);
+    if (detail.empty()) detail = info.name.empty() ? L"—" : Widen(info.id);
+    if (info.apiVersion == 0 || !info.manifestEnabled || !info.problems.empty()) detail = L"! " + detail;
+    row.detail = mods_page::Shorten(detail, 34);
+    if (info.apiVersion == 0 || !info.manifestEnabled)
+    {
+        row.choices = {info.apiVersion == 0 ? Tr(L"Error", L"錯誤") : Tr(L"mod.ini: Off", L"mod.ini：關")};
+        row.enabled = false;
+    }
+    else
+    {
+        row.choices = {Tr(L"On", L"開"), Tr(L"Off", L"關")};
+        row.selectedChoice = entry.on ? 0 : 1;
+    }
+    row.value = row.choices[size_t(row.selectedChoice)];
+    return row;
+}
+// Help for the focused Mods page row: what it is (line 1) and where (line 2).
+std::pair<std::wstring, std::wstring> ModsHelp(const mods_page::Rows &rows)
+{
+    const std::wstring folder = PathText(modding::Root());
+    if (modsFocus == rows.empty)
+        return {modding::Enabled()
+                    ? Tr(L"Put each mod in its own folder inside the mods folder, then restart the game.",
+                         L"將每個 Mod 放在 mods 資料夾中各自的資料夾內，然後重新啟動遊戲。")
+                    : Tr(L"Mods are turned off for this run (LO_MODS=0 or an invalid --mods-mode).",
+                         L"本次執行已停用 Mod（LO_MODS=0 或 --mods-mode 無效）。"),
+                folder};
+    if (modsFocus == rows.open)
+        return {Tr(L"Opens the mods folder in File Explorer.", L"在檔案總管中開啟 mods 資料夾。"), folder};
+    if (modsFocus == rows.save)
+        return {Tr(L"Saves the order and the switches. They apply after the game restarts.",
+                   L"儲存順序與開關。重新啟動遊戲後生效。"),
+                Tr(L"When two mods change the same file, the one higher in the list wins.",
+                   L"兩個 Mod 修改同一個檔案時，清單中較上方的優先。")};
+    const int index = rows.EntryAt(modsFocus, modsEntries.size());
+    if (index < 0) return {};
+    const auto &info = modsEntries[size_t(index)].info;
+    const std::wstring problem = info.problems.empty() ? std::wstring{}
+                                                       : mods_page::Shorten(Widen(info.problems.front().message), 100);
+    std::wstring help;
+    if (!mods_page::IsMod(modsEntries[size_t(index)]))
+        help = !problem.empty() ? Tr(L"Problem: ", L"問題：") + problem
+                                : Tr(L"A language pack. Choose it in System → Game language.",
+                                     L"語言包。請在 系統 → 遊戲語言 中選擇。");
+    else if (modding::Mode() == modding::ResolutionMode::Overlay)
+        help = Tr(L"Mod folders are not used: the game was started with --mods-mode overlay.",
+                  L"遊戲以 --mods-mode overlay 啟動，不使用 Mod 資料夾。");
+    else if (info.apiVersion == 0)
+        help = Tr(L"Not loaded: ", L"未載入：") + problem;
+    else if (!info.manifestEnabled)
+        help = Tr(L"Its mod.ini turns it off (enabled=false).", L"它的 mod.ini 已將其關閉（enabled=false）。");
+    else if (!problem.empty())
+        help = Tr(L"Problem: ", L"問題：") + problem;
+    else
+        help = info.description.empty() ? std::wstring(Tr(L"No description.", L"沒有說明。"))
+                                        : mods_page::Shorten(Widen(info.description), 110);
+    std::wstring where = Tr(L"Folder: ", L"資料夾：") + PathText(info.folder.filename());
+    if (info.active && info.overlayFiles)
+        where += L"     " + (Tr(L"Overlay files: ", L"overlay 檔案：") + std::to_wstring(info.overlayFiles));
+    if (info.active && info.manifestEntries)
+        where += L"     " + (Tr(L"mod.ini entries: ", L"mod.ini 項目：") + std::to_wstring(info.manifestEntries));
+    return {help, where};
 }
 // Menu choice 0 is Automatic; choice i names[i - 1]. A saved name that is not
 // listed stays as the last choice, so the row shows the saved value.
@@ -587,13 +821,31 @@ std::wstring DlssNotice()
 }
 bool GraphicsRowHidden(int r)
 {
+#if LO_PLATFORM_SWITCH
+    // The console owns the display and output size, and settings::Validate pins
+    // the Xbox 360 image (720p scene, no host AA, AO, filtering, upscaling, HDR).
+    switch (GraphicsRow(r))
+    {
+    case GraphicsRow::Backend: case GraphicsRow::Gpu: case GraphicsRow::DisplayMode:
+    case GraphicsRow::Display: case GraphicsRow::AspectRatio: case GraphicsRow::OutputResolution:
+    case GraphicsRow::RenderResolution: case GraphicsRow::ShadowResolution: case GraphicsRow::AntiAliasing:
+    case GraphicsRow::DlssQuality: case GraphicsRow::FsrSharpness: case GraphicsRow::DlssNeuralRendering:
+    case GraphicsRow::FrameGeneration: case GraphicsRow::FrameGenerationMultiplier:
+    case GraphicsRow::AmbientOcclusion: case GraphicsRow::AnisotropicFiltering:
+    case GraphicsRow::VariableRefreshRate: case GraphicsRow::Hdr: case GraphicsRow::HdrPaperWhite:
+    case GraphicsRow::HdrPeak:
+        return true;
+    default:
+        return false;
+    }
+#endif
 #if LO_PLATFORM_ANDROID
     // Android owns the native surface; the renderer derives aspect from its drawable.
     // NGX and frame generation have no Android providers in this build.
     if (r == int(GraphicsRow::Backend) || r == int(GraphicsRow::Gpu) || r == int(GraphicsRow::DisplayMode) ||
         r == int(GraphicsRow::Display) || r == int(GraphicsRow::AspectRatio) || r == int(GraphicsRow::OutputResolution) ||
         r == int(GraphicsRow::VariableRefreshRate) || r == int(GraphicsRow::FrameGeneration) ||
-        r == int(GraphicsRow::FrameGenerationMultiplier))
+        r == int(GraphicsRow::FrameGenerationMultiplier) || r == int(GraphicsRow::DlssModel))
         return true;
     if (r == int(GraphicsRow::DlssQuality) || r == int(GraphicsRow::FsrSharpness))
         return !graphics_menu::AndroidFsrAvailable || edit.upscaler != gpu::upscaling::Upscaler::Fsr;
@@ -603,9 +855,24 @@ bool GraphicsRowHidden(int r)
         return gpu::video::GpuDeviceNames().size() <= 1;
     if (r == int(GraphicsRow::Display))
         return gpu::video::Displays().size() <= 1;
+#ifdef _WIN32
+    if (r == int(GraphicsRow::DlssNeuralRendering))
+        return edit.upscaler != gpu::upscaling::Upscaler::Dlss;
+#else
+    // nvngx_dlssnr.dll is Windows-only.
+    if (r == int(GraphicsRow::DlssNeuralRendering))
+        return true;
+#endif
+#if LO_PLATFORM_MACOS
+    // No NGX on macOS; a DLSS value from another platform's settings is not run here.
+    if (r == int(GraphicsRow::DlssModel))
+        return true;
+#endif
     return (r == int(GraphicsRow::DlssQuality) && edit.upscaler == gpu::upscaling::Upscaler::Off) ||
+           (r == int(GraphicsRow::DlssModel) && edit.upscaler != gpu::upscaling::Upscaler::Dlss) ||
            (r == int(GraphicsRow::FsrSharpness) && edit.upscaler != gpu::upscaling::Upscaler::Fsr) ||
-           (r == int(GraphicsRow::FrameGenerationMultiplier) && edit.frameGenerationProvider != framegen::Provider::Dlss);
+           (r == int(GraphicsRow::FrameGenerationMultiplier) && edit.frameGenerationProvider != framegen::Provider::Dlss) ||
+           ((r == int(GraphicsRow::HdrPaperWhite) || r == int(GraphicsRow::HdrPeak)) && !edit.hdr);
 }
 std::vector<framegen::Provider> FgProviders()
 {
@@ -649,20 +916,40 @@ std::wstring FgNotice()
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
 // Only Graphics scrolls; the other tabs fit the visible rows (menu.h layout rules).
 static_assert(GameRowCount <= kMenuVisibleRows && AudioRowCount <= kMenuVisibleRows && SystemRowCount <= kMenuVisibleRows);
+// Moves graphics focus off a hidden row to the next visible one.
+void SkipHiddenGraphicsRow()
+{
+    if (tab == 2)
+        for (int i = 0; i < int(GraphicsRow::Count) && GraphicsRowHidden(row); ++i)
+            row = (row + 1) % int(GraphicsRow::Count);
+}
 void Publish(uint8_t *base, uint32_t config)
 {
 #if LO_PLATFORM_ANDROID
     // The first graphics ids are hidden; enter the tab on a visible row.
-    if (tab == 2)
-        for (int i = 0; i < int(GraphicsRow::Count) && GraphicsRowHidden(row); ++i)
-            row = (row + 1) % int(GraphicsRow::Count);
+    SkipHiddenGraphicsRow();
 #endif
+    // Opened from the title menu, Gameplay and Audio start with hidden rows.
+    if (tab == 0 || tab == 1)
+    {
+        const int count = tab == 0 ? GameRowCount : AudioRowCount;
+        for (int i = 0; i < count && TitleModeHidden(tab, row); ++i)
+            row = (row + 1) % count;
+    }
+    // Speaker test noise while Rear angle is focused and adjustable; it
+    // stops by itself once the menu stops publishing. The speaker layout is
+    // drawn under the rows; DrawMenu moves the marker with the sound.
+    const bool speakerTest = tab == 1 && row == AudioRearAngleRow && edit.audioOutput == AudioOutputMatrix;
+    apu::SetTestSignal(speakerTest);
     Snapshot next;
     next.tab = tab;
-    next.row = row;
+    next.row = modsOpen ? modsFocus : row;
+    next.speakerLayout = speakerTest;
+    next.speakerRear = int(edit.audioMatrixRear);
     next.language = edit.uiLanguage;
     next.calibration = MakeHdrCalibration(edit, calibrationOpen.load());
     next.brightness = MakeBrightnessCalibration(edit, brightnessOpen.load());
+    next.neuralRendering = MakeNeuralRenderingTuning(edit, nrOpen.load());
     const uint32_t flags = PPC_LOAD_U32(config + 4);
     auto makeChoices = [&](const wchar_t *en, const wchar_t *zh, std::vector<std::wstring> choices,
                            uint32_t selected, bool enabled = true) {
@@ -684,7 +971,36 @@ void Publish(uint8_t *base, uint32_t config)
     auto onOff = [&]() {
         return std::vector<std::wstring>{Tr(L"On", L"開"), Tr(L"Off", L"關")};
     };
-    if (tab == 0)
+    const auto modsRows = mods_page::Layout(modsEntries, mods_page::CanOpenFolder);
+    if (modsOpen)
+    {
+        next.pageTitle = Tr(L"Mods", L"Mod");
+        next.keyLegend = (flags & 0x02000000)
+            ? Tr(L"B: on / off     LB / RB: move     Start: save     A: back",
+                 L"B：開 / 關     LB / RB：移動     Start：儲存     A：返回")
+            : Tr(L"A: on / off     LB / RB: move     Start: save     B: back",
+                 L"A：開 / 關     LB / RB：移動     Start：儲存     B：返回");
+        next.rows.resize(size_t(modsRows.count));
+        if (modsRows.empty >= 0)
+        {
+            std::wstring folder = PathText(modding::Root());
+            if (folder.size() > 52) folder = L"..." + folder.substr(folder.size() - 49);
+            next.rows[size_t(modsRows.empty)] = {modding::Enabled() ? Tr(L"No mods installed", L"未安裝 Mod")
+                                                                    : Tr(L"Mods are off", L"Mod 已停用"),
+                                                 {}, true, {}, 0};
+            next.rows[size_t(modsRows.empty)].detail = folder.empty() ? L"—" : folder;
+        }
+        for (size_t i = 0; i < modsEntries.size(); ++i)
+            next.rows[size_t(modsRows.first) + i] = ModRow(modsEntries[i]);
+        if (modsRows.open >= 0)
+            next.rows[size_t(modsRows.open)] = makeChoices(L"Open mods folder", L"開啟 mods 資料夾", {Tr(L"Open", L"開啟")}, 0);
+        if (modsRows.save >= 0)
+            next.rows[size_t(modsRows.save)] = makeChoices(L"Save mod list", L"儲存 Mod 清單", {Tr(L"Save", L"儲存")}, 0);
+        const int focused = modsRows.EntryAt(modsFocus, modsEntries.size());
+        next.reorder = focused >= 0 && mods_page::IsMod(modsEntries[size_t(focused)]) &&
+                       modsEntries[size_t(focused)].info.apiVersion != 0 && mods_page::ModCount(modsEntries) > 1;
+    }
+    else if (tab == 0)
     {
         addChoices(L"Text speed", L"文字速度", {Tr(L"Fast", L"快"), Tr(L"Normal", L"正常"),
                                                     Tr(L"Slow", L"慢")},
@@ -706,6 +1022,8 @@ void Publish(uint8_t *base, uint32_t config)
         addSlider(L"Vibration", L"震動", edit.vibrationPercent);
         addAction(L"Restore game defaults", L"恢復遊戲預設設定", Tr(L"Restore", L"恢復"));
         addAction(L"Quit to Main Menu", L"退出到主選單", Tr(L"Return", L"返回"));
+        for (int i = 0; i < GameRowCount; ++i)
+            next.rows[i].hidden = TitleModeHidden(0, i);
     }
     else if (tab == 1)
     {
@@ -723,8 +1041,17 @@ void Publish(uint8_t *base, uint32_t config)
         }
         addSlider(L"Music", L"音樂音量", PPC_LOAD_U32(config + 8));
         addSlider(L"Sound effects", L"音效音量", PPC_LOAD_U32(config + 12));
-        addChoices(L"Audio output", L"音訊輸出", {Tr(L"Stereo", L"立體聲"), Tr(L"5.1 surround", L"5.1 環繞聲")},
+        addSlider(L"Voice volume", L"語音音量", edit.voiceVolume);
+        addChoices(L"Audio output", L"音訊輸出",
+                   {Tr(L"Stereo", L"立體聲"), Tr(L"5.1 surround", L"5.1 環繞聲"), Tr(L"Matrix surround", L"矩陣環繞聲")},
                    edit.audioOutput);
+        std::vector<std::wstring> angles;
+        for (uint32_t degrees = 90; degrees <= 150; degrees += 10)
+            angles.push_back(std::to_wstring(degrees) + L"°");
+        addChoices(L"Rear angle", L"後方角度", std::move(angles), (edit.audioMatrixRear - 90) / 10,
+                   edit.audioOutput == AudioOutputMatrix);
+        for (int i = 0; i < AudioRowCount; ++i)
+            if (TitleModeHidden(1, i)) next.rows[i].hidden = true;
     }
     else if (tab == 2)
     {
@@ -803,6 +1130,8 @@ void Publish(uint8_t *base, uint32_t config)
         // Hidden instead of removed so this logical id stays stable for input, drawing and hit-testing.
         dlssQuality.hidden = GraphicsRowHidden(int(GraphicsRow::DlssQuality));
         placeGraphics(GraphicsRow::DlssQuality, std::move(dlssQuality));
+        placeGraphics(GraphicsRow::DlssModel, makeChoices(L"DLSS model", L"DLSS 模型", {L"M", L"L"},
+                   std::min(edit.dlssModel, 1u)));
         // Reuse the existing many-choice control: it shows the selected percentage
         // between arrows without adding another renderer layout or shifting row IDs.
         std::vector<std::wstring> sharpnessChoices;
@@ -814,6 +1143,11 @@ void Publish(uint8_t *base, uint32_t config)
                                         std::min(edit.fsrSharpnessPercent, 100u));
         fsrSharpness.hidden = GraphicsRowHidden(int(GraphicsRow::FsrSharpness));
         placeGraphics(GraphicsRow::FsrSharpness, std::move(fsrSharpness));
+        auto neuralRendering = makeChoices(L"DLSS 5 neural rendering", L"DLSS 5 神經渲染",
+                   {Tr(L"Off", L"關"), L"1×", L"2×", L"3×", L"4×"},
+                   std::min(edit.dlssNeuralRendering, DlssNeuralRenderingMaxPasses));
+        neuralRendering.hidden = GraphicsRowHidden(int(GraphicsRow::DlssNeuralRendering));
+        placeGraphics(GraphicsRow::DlssNeuralRendering, std::move(neuralRendering));
         const uint32_t afChoice = edit.anisotropicFiltering == 16 ? 4 : edit.anisotropicFiltering == 8 ? 3 :
                                   edit.anisotropicFiltering == 4 ? 2 : edit.anisotropicFiltering == 2 ? 1 : 0;
         placeGraphics(GraphicsRow::AnisotropicFiltering, makeChoices(L"Anisotropic filtering", L"各向異性過濾",
@@ -825,6 +1159,11 @@ void Publish(uint8_t *base, uint32_t config)
                    (std::min(edit.depthOfFieldPercent, 100u) + 5) / 10));
         placeGraphics(GraphicsRow::Bloom, makeChoices(L"Bloom", L"光暈", onOff(), edit.bloom ? 0 : 1));
         placeGraphics(GraphicsRow::MotionBlur, makeChoices(L"Motion blur", L"動態模糊", onOff(), edit.motionBlur ? 0 : 1));
+        std::vector<std::wstring> cullingChoices;
+        for (uint32_t percent = 0; percent <= 200; percent += 10)
+            cullingChoices.push_back(std::to_wstring(percent) + L"%");
+        placeGraphics(GraphicsRow::Culling, makeChoices(L"Culling", L"剔除", std::move(cullingChoices),
+                   (std::min(edit.cullingPercent, 200u) + 5) / 10));
 #if LO_PLATFORM_MACOS
         placeGraphics(GraphicsRow::ScalingQuality, makeChoices(L"Scaling filter", L"縮放濾鏡",
                    {Tr(L"Standard", L"標準"), Tr(L"High", L"高"), L"MetalFX"},
@@ -845,8 +1184,12 @@ void Publish(uint8_t *base, uint32_t config)
         placeGraphics(GraphicsRow::VariableRefreshRate, makeChoices(L"Adaptive sync (ProMotion)",
             L"自適應同步（ProMotion）", onOff(), edit.variableRefreshRate ? 0 : 1));
 #else
-        placeGraphics(GraphicsRow::VariableRefreshRate, makeChoices(L"FreeSync / G-SYNC Compatible",
-            L"FreeSync / G-SYNC Compatible", onOff(), edit.variableRefreshRate ? 0 : 1));
+        // The long FreeSync name needs the full value column.
+        auto vsync = makeChoices(L"VSync", L"垂直同步",
+            {Tr(L"Off", L"關"), Tr(L"On", L"開"), L"FreeSync / G-SYNC Compatible"},
+            edit.variableRefreshRate ? 2 : edit.vsync ? 1 : 0);
+        vsync.singleValue = true;
+        placeGraphics(GraphicsRow::VariableRefreshRate, std::move(vsync));
 #endif
         std::vector<std::wstring> providers;
         uint32_t selected = 0;
@@ -888,11 +1231,19 @@ void Publish(uint8_t *base, uint32_t config)
     {
         std::vector<std::wstring> uiLanguages(std::begin(UiLanguageNames), std::end(UiLanguageNames));
         addChoices(L"Settings language", L"設定界面語言", std::move(uiLanguages), edit.uiLanguage);
+        const auto gameLanguageChoices = GameLanguageChoices();
         std::vector<std::wstring> gameLanguages;
-        for (const auto name : GameLanguageNames) gameLanguages.emplace_back(name);
-        addChoices(L"Game language", L"遊戲語言", std::move(gameLanguages), GameLanguageIndex(edit.gameLanguage));
+        for (size_t i = 0; i < gameLanguageChoices.size(); ++i)
+            gameLanguages.push_back(i < GameLanguageNames.size() ? std::wstring(GameLanguageNames[i]) : Widen(gameLanguageChoices[i].name));
+        addChoices(L"Game language", L"遊戲語言", std::move(gameLanguages),
+                   GameLanguageChoiceIndex(gameLanguageChoices, edit.gameLanguage, edit.gameLanguagePack));
         addChoices(L"Automatic updates", L"自動更新", onOff(), edit.automaticUpdates ? 0 : 1);
-        next.rows.push_back({gpu::taa_collection::Label(edit.uiLanguage), gpu::taa_collection::Enabled() ? Tr(L"On", L"開") : Tr(L"Off", L"關"), true, {}, 0});
+        addChoices(L"Debug log", L"除錯日誌", onOff(), edit.debugLog ? 0 : 1);
+        const bool logUpload = os::log_collection::Supported();
+        next.rows.push_back({os::log_collection::Label(edit.uiLanguage),
+            !logUpload ? Tr(L"Windows only", L"僅限 Windows") : os::log_collection::Enabled() ? Tr(L"On", L"開") : Tr(L"Off", L"關"),
+            logUpload, {}, 0});
+        addAction(L"Mods", L"Mod", Tr(L"Open", L"開啟"));
         addAction(L"Import discs & DLC", L"匯入光碟與 DLC", Tr(L"Open", L"開啟"));
         addAction(L"Save settings", L"儲存設定", Tr(L"Save", L"儲存"));
     }
@@ -900,15 +1251,15 @@ void Publish(uint8_t *base, uint32_t config)
     // so returning to a long list restores its position.
     if (tab >= 0 && tab < MenuTabCount)
     {
-        static int scrollByTab[MenuTabCount] = {};
+        static int scrollByTab[MenuTabCount] = {}, modsScroll = 0;
         int visibleCount = 0, visibleFocus = 0;
         for (size_t i = 0; i < next.rows.size(); ++i)
         {
             if (next.rows[i].hidden) continue;
-            if (int(i) <= row) visibleFocus = visibleCount;
+            if (int(i) <= next.row) visibleFocus = visibleCount;
             ++visibleCount;
         }
-        int &scroll = scrollByTab[tab];
+        int &scroll = modsOpen ? modsScroll : scrollByTab[tab];
         scroll = std::clamp(scroll, 0, std::max(0, visibleCount - kMenuVisibleRows));
         if (visibleFocus < scroll) scroll = visibleFocus;
         if (visibleFocus >= scroll + kMenuVisibleRows) scroll = visibleFocus - kMenuVisibleRows + 1;
@@ -924,16 +1275,31 @@ void Publish(uint8_t *base, uint32_t config)
         next.help = Tr(L"Controller vibration strength. Min turns it off. Applies immediately.",
                        L"控制器震動強度。調到最小即關閉。立即套用。");
     if (tab == 3 && row == SystemGameLanguageRow)
-        next.help = Tr(L"Game language takes effect after restarting. Requires matching language assets.",
-                       L"遊戲語言重新啟動後生效，需要對應語言資源。中文遊戲文本需要亞洲版資源。");
+        next.help = !edit.gameLanguagePack.empty()
+            ? Tr(L"A language pack from the mods folder. Voices and the rest stay in the language it is based on. Takes effect after restarting.",
+                 L"來自 mods 資料夾的語言包。語音等其餘內容沿用它所基於的語言。重新啟動後生效。")
+            : Tr(L"Game language takes effect after restarting. Requires matching language assets.",
+                 L"遊戲語言重新啟動後生效，需要對應語言資源。中文遊戲文本需要亞洲版資源。");
     if (tab == 0 && row == GamePromptRow)
         next.help = Tr(L"Which button icons the game shows. Auto follows the controller you use.",
                        L"遊戲顯示的按鍵圖示。自動會跟隨你使用的控制器。");
+    if (tab == 3 && row == SystemDebugLogRow)
+        next.help = Tr(L"Writes every message to the log in logs/. Turn it on when you report a problem. Applies when saved.",
+                       L"把所有訊息寫入 logs/ 中的日誌。回報問題時請開啟。儲存後生效。");
+    if (tab == 3 && row == SystemModsRow)
+        next.help = Tr(L"Turn installed mods on or off and change their order. Changes apply after a restart.",
+                       L"開關已安裝的 Mod 並調整順序。重新啟動後生效。");
     if (tab == 3 && row == SystemImportRow)
         next.help = Tr(L"Close the game to import selected discs or DLC again. Other content and saves stay intact.",
                        L"關閉遊戲並重新匯入所選光碟或 DLC；其他內容與存檔保留。");
+    if (tab == 1 && row == AudioVoiceVolumeRow && status.empty())
+        next.help = Tr(L"Spoken dialogue in cutscenes, set apart from Sound effects. Voices in battle follow Sound effects. Applies from the next scene.",
+                       L"過場動畫中的對白音量，與音效音量分開。戰鬥中的語音仍跟隨音效音量。從下一個場景起套用。");
     if (tab == 1 && row == AudioOutputRow && status.empty())
-        next.help = edit.audioOutput == AudioOutputSurround && apu::OutputChannels() == 2
+        next.help = edit.audioOutput == AudioOutputMatrix
+            ? Tr(L"Encodes 5.1 into stereo for an AV receiver's Pro Logic II, Dolby Surround or Neural:X mode; plays as stereo elsewhere. Applies immediately.",
+                 L"把 5.1 編入立體聲，供 AV 擴大機的 Pro Logic II、Dolby Surround 或 Neural:X 模式還原；其他裝置照常播放立體聲。立即套用。")
+            : edit.audioOutput == AudioOutputSurround && apu::OutputChannels() == 2
 #ifdef _WIN32
             // The speaker layout is only in the classic Sound control panel.
             ? Tr(L"Windows reports a stereo device. Open Control Panel → Sound → Playback, select the device, click Configure and choose 5.1 or 7.1 Surround, then select 5.1 again.",
@@ -944,6 +1310,12 @@ void Publish(uint8_t *base, uint32_t config)
 #endif
             : Tr(L"5.1 sends the game's surround mix to a 5.1 or 7.1 speaker setup. Applies immediately.",
                  L"5.1 會將遊戲的環繞聲混音輸出到 5.1 或 7.1 喇叭，立即套用。");
+    if (tab == 1 && row == AudioRearAngleRow && status.empty())
+        next.help = edit.audioOutput == AudioOutputMatrix
+            ? Tr(L"A test sound circles the speakers. Sets where the rear channels sound; 110° is the Pro Logic II standard.",
+                 L"測試聲音會繞著喇叭轉圈。設定後方聲道的位置；110° 為 Pro Logic II 標準。")
+            : Tr(L"Select Matrix surround in Audio output to adjust this.",
+                 L"在音訊輸出選擇矩陣環繞聲後才能調整。");
     if (tab == 2)
     {
         switch (GraphicsRow(row))
@@ -1032,10 +1404,29 @@ void Publish(uint8_t *base, uint32_t config)
                 Tr(L"Performance, Balanced, Quality, or Native AA. Native AA keeps the output resolution.", L"效能、平衡、品質或 Native AA。Native AA 維持輸出解析度。") : Tr(L"Performance, Balanced, Quality, or DLAA. The status line shows the submitted mode.",
                            L"效能、平衡、品質或 DLAA。狀態列顯示已提交的模式。");
             break;
+        case GraphicsRow::DlssModel:
+            next.help = Tr(L"M: steadier and sharper than older DLSS models at a moderate cost. L: the steadiest image with the least ghosting, but slower, especially on RTX 20 and 30 series.",
+                           L"M：比舊版 DLSS 模型更穩定、更清晰，開銷適中。L：畫面最穩定、拖影最少，但較慢，在 RTX 20/30 系列顯示卡上尤其明顯。");
+            break;
         case GraphicsRow::FsrSharpness:
             next.help = Tr(L"FSR sharpening: Off disables RCAS; 1-100% sets sharpening strength.",
                            L"FSR 銳化：關閉會停用 RCAS；1-100% 調整銳化強度。");
             break;
+        case GraphicsRow::DlssNeuralRendering:
+        {
+            next.help = Tr(L"NVIDIA's DLSS 5 neural rendering on the DLSS image. 1×-4× runs it that many times: stronger, but each pass costs frame rate. Needs an RTX GPU and nvngx_dlssnr.dll next to the game (not included). Applies after saving.",
+                           L"在 DLSS 畫面上執行 NVIDIA 的 DLSS 5 神經渲染。1×-4× 為執行次數：次數越多效果越強，但每次都會降低影格率。需要 RTX 顯示卡，並將 nvngx_dlssnr.dll 放在遊戲旁（不隨附）。儲存後套用。");
+            next.help = next.help + L" " + Tr(L"Confirm opens the tuning page.", L"按確認開啟調整頁面。");
+            using gpu::dlss::NeuralRenderingState;
+            const auto state = gpu::dlss::g_neuralRenderingState.load(std::memory_order_relaxed);
+            const wchar_t *status =
+                state == NeuralRenderingState::Active ? Tr(L"Running.", L"執行中。") :
+                state == NeuralRenderingState::MissingRuntime ? Tr(L"nvngx_dlssnr.dll is missing or unusable.", L"找不到 nvngx_dlssnr.dll 或無法使用。") :
+                state == NeuralRenderingState::Unsupported ? Tr(L"This GPU or driver cannot run it.", L"此顯示卡或驅動程式無法執行。") :
+                state == NeuralRenderingState::Failed ? Tr(L"It stopped after an error; see the log.", L"發生錯誤後已停止，請查看記錄檔。") : nullptr;
+            if (status) next.help = next.help + L" " + status;
+            break;
+        }
         case GraphicsRow::AnisotropicFiltering:
             next.help = Tr(L"Improves texture clarity at oblique viewing angles. Changes apply immediately after saving.",
                            L"提升斜角觀看時的紋理清晰度。儲存後立即套用。");
@@ -1051,6 +1442,10 @@ void Publish(uint8_t *base, uint32_t config)
         case GraphicsRow::MotionBlur:
             next.help = Tr(L"The game's blur during fast camera and character movement. Off keeps moving scenes sharp. Applies immediately after saving.",
                            L"遊戲在鏡頭與角色快速移動時的模糊。關閉後移動畫面保持清晰。儲存後立即套用。");
+            break;
+        case GraphicsRow::Culling:
+            next.help = Tr(L"How soon the game stops drawing characters and objects at the screen edges. 100% is the original; lower keeps them until they are fully off screen but costs frame rate, higher hides them sooner. Applies immediately after saving.",
+                           L"遊戲在畫面邊緣停止繪製角色與物件的時機。100% 為原版；數值越低越晚隱藏，直到完全離開畫面，但會降低影格率；數值越高越早隱藏。儲存後立即套用。");
             break;
         case GraphicsRow::ScalingQuality:
 #if LO_PLATFORM_MACOS
@@ -1077,8 +1472,8 @@ void Publish(uint8_t *base, uint32_t config)
             next.help = Tr(L"Shows each frame for one game frame so ProMotion and adaptive-sync displays follow the game's frame rate. Display sync stays on.",
                            L"每個影格至少顯示一個遊戲影格的時間，讓 ProMotion 與自適應同步螢幕跟隨遊戲影格率；顯示同步保持開啟。");
 #else
-            next.help = Tr(L"VRR-friendly pacing. Enable adaptive sync in your display/driver. Actual VRR is not detected.",
-                           L"VRR 友善限幀；請在螢幕與驅動程式啟用自適應同步。無法偵測實際 VRR 狀態。");
+            next.help = Tr(L"Off: each frame shows as soon as it is ready, with the lowest latency, but the picture can tear. On: frames wait for the display to refresh, without tearing. FreeSync / G-SYNC Compatible: for adaptive-sync displays; turn it on in the display and driver too. Applies immediately after saving.",
+                           L"關：畫面完成即顯示，延遲最低，但可能出現畫面撕裂。開：等待螢幕刷新再顯示，不會撕裂。FreeSync / G-SYNC Compatible：適用於自適應同步螢幕，需同時在螢幕與驅動程式中啟用。儲存後立即套用。");
 #endif
             break;
         case GraphicsRow::FrameGeneration:
@@ -1151,6 +1546,12 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         }
     }
+    std::pair<std::wstring, std::wstring> modsHelp;
+    if (modsOpen)
+    {
+        modsHelp = ModsHelp(modsRows);
+        next.help = modsHelp.first;
+    }
     if (!status.empty()) next.help = status;
     if (restartPrompt)
     {
@@ -1159,6 +1560,7 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogMessage = restartSaveFailed
             ? Tr(L"Settings could not be saved. Check settings.ini permissions, then retry or cancel.",
                  L"無法儲存設定。請檢查 settings.ini 權限後重試或取消。")
+            : restartForMods ? Tr(L"Mod list saved. Restart now?", L"Mod 清單已儲存。立即重新啟動嗎？")
             : savedRestartPrompt && restartForFgProvider
                 ? edit.graphicsBackend == GraphicsBackend::Vulkan
                     ? Tr(L"Enabling or changing Vulkan frame generation requires a restart. Settings saved. Restart now?",
@@ -1173,6 +1575,7 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogMessage = restartSaveFailed
             ? Tr(L"Settings could not be saved. Check settings.ini permissions, then retry or cancel.",
                  L"無法儲存設定。請檢查 settings.ini 權限後重試或取消。")
+            : restartForMods ? Tr(L"Mod list saved. Restart the game to apply the changes.", L"Mod 清單已儲存。請重新啟動遊戲以套用變更。")
             : savedRestartPrompt ? Tr(L"Settings saved. Restart manually to apply changes.", L"設定已儲存。請手動重新啟動以套用變更。")
             : Tr(L"Save these settings? Restart manually to apply changes.", L"儲存這些設定嗎？請手動重新啟動以套用變更。");
         next.dialogChoices = savedRestartPrompt
@@ -1182,8 +1585,8 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogSelection = restartChoice;
     }
     if (collectionPrompt) {
-        next.dialogTitle = gpu::taa_collection::Label(edit.uiLanguage);
-        next.dialogMessage = gpu::taa_collection::Message(edit.uiLanguage);
+        next.dialogTitle = os::log_collection::Label(edit.uiLanguage);
+        next.dialogMessage = os::log_collection::Message(edit.uiLanguage);
         next.dialogChoices = {Tr(L"Yes", L"是"), Tr(L"No", L"否")};
         next.dialogSelection = collectionChoice;
     }
@@ -1202,6 +1605,13 @@ void Publish(uint8_t *base, uint32_t config)
                                 L"關閉遊戲並開啟匯入器嗎？尚未儲存的進度將會遺失。");
         next.dialogChoices = {Tr(L"Open importer", L"開啟匯入器"), Tr(L"Cancel", L"取消")};
         next.dialogSelection = importChoice;
+    }
+    if (modsDiscardPrompt)
+    {
+        next.dialogTitle = Tr(L"Unsaved changes", L"尚未儲存的變更");
+        next.dialogMessage = Tr(L"Leave without saving the mod list?", L"不儲存 Mod 清單就離開嗎？");
+        next.dialogChoices = {Tr(L"Discard changes", L"捨棄變更"), Tr(L"Cancel", L"取消")};
+        next.dialogSelection = modsDiscardChoice;
     }
     if (displayConfirm)
     {
@@ -1233,15 +1643,20 @@ void Publish(uint8_t *base, uint32_t config)
         : tab == 2 ? (row == int(GraphicsRow::FrameGeneration) ||
         row == int(GraphicsRow::FrameGenerationMultiplier) ? FgNotice() : DlssNotice()) : std::wstring{};
 #endif
+    if (modsOpen) next.notice = std::move(modsHelp.second);
     std::lock_guard lock(snapshotMutex);
     // Presentation may have published availability while this snapshot was built.
     next.calibration.sceneAvailable = calibrationSceneAvailable.load(std::memory_order_relaxed);
     next.brightness.sceneAvailable = next.calibration.sceneAvailable;
+    next.neuralRendering.sceneAvailable = nrSceneAvailable.load(std::memory_order_relaxed);
     if (next.tab == snapshot.tab && next.row == snapshot.row && next.scroll == snapshot.scroll && next.language == snapshot.language &&
         next.calibration == snapshot.calibration && next.brightness == snapshot.brightness &&
+        next.neuralRendering == snapshot.neuralRendering &&
         next.rows == snapshot.rows && next.help == snapshot.help && next.notice == snapshot.notice && next.dialogTitle == snapshot.dialogTitle &&
         next.dialogMessage == snapshot.dialogMessage && next.dialogChoices == snapshot.dialogChoices &&
-        next.dialogSelection == snapshot.dialogSelection)
+        next.dialogSelection == snapshot.dialogSelection && next.speakerLayout == snapshot.speakerLayout &&
+        next.speakerRear == snapshot.speakerRear && next.pageTitle == snapshot.pageTitle &&
+        next.keyLegend == snapshot.keyLegend && next.reorder == snapshot.reorder)
         return;
     next.revision = snapshot.revision + 1;
     snapshot = std::move(next);
@@ -1263,6 +1678,29 @@ void SetHdrCalibrationSceneAvailable(bool available)
         snapshot.calibration.sceneAvailable = snapshot.brightness.sceneAvailable = available;
         ++snapshot.revision;
     }
+}
+void SetNeuralRenderingPreviewAvailable(bool available)
+{
+    nrSceneAvailable.store(available, std::memory_order_relaxed);
+    std::lock_guard lock(snapshotMutex);
+    if (snapshot.neuralRendering.sceneAvailable != available)
+    {
+        snapshot.neuralRendering.sceneAvailable = available;
+        ++snapshot.revision;
+    }
+}
+NeuralRenderingTuning GetNeuralRenderingTuning()
+{
+    NeuralRenderingTuning result;
+    {
+        std::lock_guard lock(snapshotMutex);
+        result = snapshot.neuralRendering;
+    }
+    // The open menu previews its unsaved values; gameplay uses the saved ones.
+    if (!active.load())
+        return MakeNeuralRenderingTuning(GetConfig(), false);
+    result.sceneAvailable = nrSceneAvailable.load(std::memory_order_relaxed);
+    return result;
 }
 BrightnessCalibration GetBrightnessCalibration()
 {
@@ -1305,7 +1743,9 @@ bool CalibrationKey(uint32_t key)
         displayConfirmEscape = true;
         return true;
     }
-    const bool brightnessKey = brightnessOpen.load() && (key == 13 || key == 27);
+    // Escape also leaves the Mods page; Enter stays Start there (jump to Save).
+    const bool brightnessKey = ((brightnessOpen.load() || nrOpen.load()) && (key == 13 || key == 27)) ||
+                               (modsOpen.load() && key == 27);
     if (!brightnessKey && (!calibrationOpen.load() || !(key == 8 || key == 13 || key == 27 || (key >= '0' && key <= '9'))))
         return false;
     std::lock_guard lock(calibrationKeyMutex);
@@ -1314,6 +1754,14 @@ bool CalibrationKey(uint32_t key)
 }
 void PointerDrag(float x, float y, bool held)
 {
+    if (held && nrOpen.load())
+    {
+        int focus = 0, value = 0, side = 0;
+        bool track = false;
+        if (NrControlAt(x, y, focus, track, value, side) && NrIsSlider(focus))
+            nrAction = NrAction(4, focus, value);
+        return;
+    }
     if (held && brightnessOpen.load())
     {
         if (y >= 516 && y < 552)
@@ -1345,6 +1793,19 @@ bool FilterInput(uint16_t &buttons, int16_t x, int16_t y)
     {
         buttons = cancelButton.load();
         return false;
+    }
+    {
+        // Y pressed on the idle title menu. A button already held when the
+        // menu became idle is not a press.
+        static uint16_t titlePrevious = 0xFFFF;
+        if (titleMenuIdle.load())
+        {
+            if ((buttons & TitleSettingsButton) && !(titlePrevious & TitleSettingsButton))
+                titleShortcut = true;
+            titlePrevious = buttons;
+        }
+        else
+            titlePrevious = 0xFFFF;
     }
     if (!active.load())
         return false;
@@ -1387,6 +1848,24 @@ void PointerClick(float x, float y, bool reverse)
     if (!active.load())
         return;
     std::lock_guard lock(snapshotMutex);
+    if (snapshot.neuralRendering.open)
+    {
+        int focus = 0, value = 0, side = 0;
+        bool track = false;
+        if (y >= NrButtonTop && y < NrButtonTop + NrButtonHeight)
+        {
+            for (int i = 0; i < 3; ++i)
+            {
+                const int left = NrColumnX[0] + i * (NrButtonWidth + NrButtonGap);
+                if (x >= left && x < left + NrButtonWidth) nrAction = NrAction(5, 9 + i);
+            }
+        }
+        else if (NrControlAt(x, y, focus, track, value, side))
+            nrAction = track ? NrAction(4, focus, value)
+                     : (side == 0 || NrIsSlider(focus)) ? NrAction(1, focus)
+                     : NrAction(side, focus);
+        return;
+    }
     if (snapshot.brightness.open)
     {
         // Same top toggle and button row as the HDR page; sliders take the pointer x.
@@ -1422,15 +1901,18 @@ void PointerClick(float x, float y, bool reverse)
         }
         return;
     }
+    // A list page (Mods) has no tabs; its focused row may have move cells.
+    const bool listPage = !snapshot.pageTitle.empty();
     if (x >= 386 && x < 1026 && y >= 110 && y < 142)
     {
-        mouseTab = int(x - 386) / MenuTabWidth;
+        if (!listPage) mouseTab = int(x - 386) / MenuTabWidth;
         return;
     }
     constexpr int height = 43;
     constexpr int top = 150;
     const int slot = int(y - top) / height;
-    if (x < 38 || x >= 1026 || y < top || slot < 0 || slot >= kMenuVisibleRows || (top + (slot + 1) * height) > 640)
+    const int right = snapshot.reorder ? ModsMoveLeft + 2 * ModsMoveWidth + ModsMoveGap : 1026;
+    if (x < 38 || x >= right || y < top || slot < 0 || slot >= kMenuVisibleRows || (top + (slot + 1) * height) > 640)
         return;
     // Translate the clicked slot through hidden rows and the scroll window
     // back to a logical row index.
@@ -1449,8 +1931,19 @@ void PointerClick(float x, float y, bool reverse)
     }
     if (hit >= snapshot.rows.size())
         return;
+    if (x >= 1026)
+    {
+        // Move up / move down cells beside the focused row: LB / RB.
+        if (int(hit) == snapshot.row && x >= ModsMoveLeft)
+            mouseAction = x < ModsMoveLeft + ModsMoveWidth ? 0x100
+                        : x >= ModsMoveLeft + ModsMoveWidth + ModsMoveGap ? 0x200 : 0;
+        return;
+    }
     mouseRow = int(hit);
-    if (x >= 386 && snapshot.rows[hit].enabled) {
+    if (listPage) {
+        // A switches a mod or runs an action; a right click switches too.
+        if (x >= 386 && snapshot.rows[hit].enabled) mouseAction = reverse ? 4 : 0x1000;
+    } else if (x >= 386 && snapshot.rows[hit].enabled) {
         const bool hdrLevel = snapshot.tab == 2 &&
             (hit == size_t(GraphicsRow::HdrPaperWhite) || hit == size_t(GraphicsRow::HdrPeak));
         // Pointer adjustment is explicit left/right, not a synthetic A press.
@@ -1506,6 +1999,9 @@ PPC_FUNC(sub_822F19B0)
     const uint32_t menu = ctx.r3.u32;
     const uint32_t state = PPC_LOAD_U32(menu + 4);
     const uint32_t modal = PPC_LOAD_U32(menu + 0x1804);
+    // The task is idle again (1): a later open comes from a loaded game.
+    if (state <= 1)
+        titleEntry = false;
     if (menu != lastMenu)
     {
         lastMenu = menu;
@@ -1578,12 +2074,16 @@ PPC_FUNC(sub_822F19B0)
         brightnessClick = -1;
         brightnessDragBrightness = INT_MIN;
         brightnessDragGamma = -1;
+        nrOpen = false;
+        nrAction = 0;
         calibrationOpen = false;
         calibrationNumberEditing = false;
         calibrationNumber.clear();
         calibrationClick = -1;
         calibrationDragNits = -1;
-        collectionPrompt = gpu::taa_collection::Consent() < 0;
+        // Log collection is asked at the first launch and from its System
+        // row; opening Settings does not ask.
+        collectionPrompt = false;
         collectionChoice = 1;
         pending = 0;
         waitForRelease = true;
@@ -1594,6 +2094,10 @@ PPC_FUNC(sub_822F19B0)
         mainMenuPrompt = false;
         importPrompt = false;
         importLaunchPending = false;
+        modsOpen = false;
+        modsDiscardPrompt = false;
+        restartForMods = false;
+        modsEntries.clear();
         displayConfirm = displayReverting = false;
         displayConfirmOpen = false;
         {
@@ -1602,6 +2106,8 @@ PPC_FUNC(sub_822F19B0)
             syncedDisplayIndex = saved.displayIndex;
         }
         status.clear();
+        // The menu reopens on the last row; unsaved choices that showed it are gone.
+        SkipHiddenGraphicsRow();
         Publish(base, config);
         LOG_INFO("settings: replacement opened at guest menu {:#x}", menu);
         language::TraceConfig(base, config, "menu-open");
@@ -1632,7 +2138,8 @@ PPC_FUNC(sub_822F19B0)
     }
     if (int selected = mouseRow.exchange(-1); selected >= 0)
     {
-        row = selected;
+        if (modsOpen) modsFocus = selected;
+        else row = selected;
         input |= 0x400;
     }
     input |= mouseAction.exchange(0);
@@ -1649,6 +2156,8 @@ PPC_FUNC(sub_822F19B0)
         active = false;
         calibrationOpen = false;
         brightnessOpen = false;
+        nrOpen = false;
+        modsOpen = false;
         cancelPolls = 0;
         pending = 0;
         PPCContext apply = ctx;
@@ -1700,7 +2209,7 @@ PPC_FUNC(sub_822F19B0)
         if (input & 3) collectionChoice = 1 - collectionChoice;
         if (input & 0x2000) collectionChoice = 1;
         if (input & 0x3000) {
-            if (gpu::taa_collection::SetConsent(collectionChoice == 0)) { collectionPrompt = false; status.clear(); }
+            if (os::log_collection::SetConsent(collectionChoice == 0)) { collectionPrompt = false; status.clear(); }
             else status = Tr(L"Settings could not be saved.", L"無法儲存設定。");
         }
         Publish(base, config);
@@ -1746,6 +2255,7 @@ PPC_FUNC(sub_822F19B0)
                 savedRestartPrompt = false;
                 restartSaveFailed = false;
                 restartForFgProvider = false;
+                restartForMods = false;
 #ifdef _WIN32
                 status = restartChoice == 0
                     ? Tr(L"Saved. Preparing a safe restart…", L"已儲存，正在準備安全重新啟動……")
@@ -1954,6 +2464,53 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+    if (nrOpen.load())
+    {
+        std::vector<uint32_t> keys;
+        {
+            std::lock_guard lock(calibrationKeyMutex);
+            keys.swap(calibrationKeys);
+        }
+        bool cancel = (input & 0x2000) != 0, close = false;
+        for (const uint32_t key : keys)
+        {
+            if (key == 13) input |= 0x1000;
+            else if (key == 27) cancel = true;
+        }
+        if (const uint32_t action = nrAction.exchange(0); action & 0x80000000u)
+        {
+            const int kind = int(action & 15), focus = int((action >> 4) & 15), value = int((action >> 8) & 0xFFFFF) - 100;
+            if (focus < NrFocusCount)
+            {
+                nrFocus = focus;
+                if (kind == 2 || kind == 3) StepNrControl(edit, focus, kind == 3 ? 1 : -1);
+                else if (kind == 4) SetNrValue(edit, focus, value);
+                else if (kind == 5) input |= 0x1000;
+            }
+        }
+        if (input & 1) nrFocus = (nrFocus + NrFocusCount - 1) % NrFocusCount;
+        if (input & 2) nrFocus = (nrFocus + 1) % NrFocusCount;
+        if (const int delta = (input & 4) ? -1 : (input & 8) ? 1 : 0)
+        {
+            if (nrFocus < NrControlCount) StepNrControl(edit, nrFocus, delta);
+            else nrFocus = 9 + (nrFocus - 9 + 3 + delta) % 3;
+        }
+        if (input & 0x1000)
+        {
+            if (nrFocus == 9) ResetNeuralRenderingTuning(edit);
+            else if (nrFocus == 10) close = true;
+            else if (nrFocus == 11) cancel = true;
+        }
+        if (cancel)
+            RestoreNeuralRenderingTuning(edit, nrStart);
+        if (cancel || close)
+        {
+            nrOpen = false;
+            nrAction = 0;
+        }
+        Publish(base, config);
+        return;
+    }
     if (brightnessOpen.load())
     {
         if (const int dragged = brightnessDragBrightness.exchange(INT_MIN); dragged != INT_MIN)
@@ -1981,18 +2538,25 @@ PPC_FUNC(sub_822F19B0)
         {
             if (clicked >= 7)
                 calibrationScenePreview = clicked == 7;
-            else
+            else if (clicked != 3 || !titleEntry.load())
             {
                 brightnessFocus = clicked;
                 input |= 0x1000;
             }
         }
         bool close = (input & 0x2000) != 0;
+        // The original pattern hands input to the retail list, which writes the
+        // save's own brightness: not from the title menu, where a click on it
+        // does nothing (above) and focus steps over it.
+        const bool noOriginal = titleEntry.load();
+        if (noOriginal && brightnessFocus == 3) brightnessFocus = 2;
         // LB / RB pick scene or pattern, like the tab bar.
         if (input & 0x100) calibrationScenePreview = true;
         if (input & 0x200) calibrationScenePreview = false;
-        if (input & 1) brightnessFocus = (brightnessFocus + 5) % 6;
-        if (input & 2) brightnessFocus = (brightnessFocus + 1) % 6;
+        if (input & 1)
+            do brightnessFocus = (brightnessFocus + 5) % 6; while (noOriginal && brightnessFocus == 3);
+        if (input & 2)
+            do brightnessFocus = (brightnessFocus + 1) % 6; while (noOriginal && brightnessFocus == 3);
         if (const int delta = (input & 4) ? -1 : (input & 8) ? 1 : 0)
         {
             if (brightnessFocus == 0)
@@ -2000,7 +2564,7 @@ PPC_FUNC(sub_822F19B0)
             else if (brightnessFocus == 1)
                 edit.displayGamma = uint32_t(std::clamp(int(edit.displayGamma) + delta * 5, 50, 150));
             else
-                brightnessFocus = 2 + (brightnessFocus - 2 + 4 + delta) % 4;
+                do brightnessFocus = 2 + (brightnessFocus - 2 + 4 + delta) % 4; while (noOriginal && brightnessFocus == 3);
         }
         bool original = false;
         if (input & 0x1000)
@@ -2010,7 +2574,7 @@ PPC_FUNC(sub_822F19B0)
                 edit.displayBrightness = 0;
                 edit.displayGamma = 100;
             }
-            else if (brightnessFocus == 3) original = true;
+            else if (brightnessFocus == 3) original = !noOriginal;
             else if (brightnessFocus == 4) close = true;
             else if (brightnessFocus == 5) cancel = true;
         }
@@ -2111,6 +2675,93 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+    if (modsOpen.load())
+    {
+        std::vector<uint32_t> keys;
+        {
+            std::lock_guard lock(calibrationKeyMutex);
+            keys.swap(calibrationKeys);
+        }
+        // B, Back (keyboard Backspace) and Escape leave the page.
+        bool back = (input & 0x2020) != 0 || std::find(keys.begin(), keys.end(), 27u) != keys.end();
+        if (modsDiscardPrompt)
+        {
+            if (int selected = mouseDialog.exchange(-1); selected >= 0) modsDiscardChoice = std::min(selected, 1);
+            if (input & 3) modsDiscardChoice = 1 - modsDiscardChoice;
+            if (back) modsDiscardPrompt = false;
+            else if (input & 0x1000)
+            {
+                modsDiscardPrompt = false;
+                if (modsDiscardChoice == 0) CloseModsPage();
+            }
+            Publish(base, config);
+            return;
+        }
+        const auto rows = mods_page::Layout(modsEntries, mods_page::CanOpenFolder);
+        if (input & 0x331f) status.clear();
+        if (input & 1) modsFocus = (modsFocus + rows.count - 1) % rows.count;
+        if (input & 2) modsFocus = (modsFocus + 1) % rows.count;
+        // Start / Enter goes to Save, and saves when pressed there.
+        if ((input & 0x10) && rows.save >= 0)
+        {
+            if (modsFocus == rows.save) input |= 0x1000;
+            else
+            {
+                modsFocus = rows.save;
+                input &= ~0x1000;
+            }
+        }
+        const int entry = rows.EntryAt(modsFocus, modsEntries.size());
+        if (back) {}
+        else if (entry >= 0 && (input & 0x300))
+        {
+            // LB / RB move a mod among the mods; a rejected mod.ini keeps its place.
+            if (mods_page::IsMod(modsEntries[size_t(entry)]) && modsEntries[size_t(entry)].info.apiVersion != 0)
+                modsFocus = rows.first + int(mods_page::Move(modsEntries, size_t(entry), (input & 0x100) ? -1 : 1));
+        }
+        else if (entry >= 0 && (input & 0x100c) && mods_page::Switchable(modsEntries[size_t(entry)]))
+            modsEntries[size_t(entry)].on = !modsEntries[size_t(entry)].on;
+        else if ((input & 0x1000) && modsFocus == rows.open)
+        {
+            if (!mods_page::OpenFolder(modding::Root()))
+                status = Tr(L"Could not open the mods folder.", L"無法開啟 mods 資料夾。");
+        }
+        else if ((input & 0x1000) && modsFocus == rows.save)
+        {
+            const auto order = mods_page::SaveOrder(modsEntries);
+            std::string error;
+            if (!modding::SaveModList(order, &error))
+            {
+                status = std::wstring(Tr(L"Could not save the mod list.", L"無法儲存 Mod 清單。")) + L" " + Widen(error);
+                LOG_INFO("settings: mod list not saved: {}", error);
+            }
+            else
+            {
+                modsSaved = modsStart = order;
+                modsSavedThisRun = true;
+                LOG_INFO("settings: mod list saved ({} mods)", order.size());
+                // Saving the order this run started with needs no restart.
+                if (order == modsRunning) status = Tr(L"Mod list saved.", L"Mod 清單已儲存。");
+                else
+                {
+                    restartPrompt = savedRestartPrompt = restartForMods = true;
+                    restartSaveFailed = restartForFgProvider = false;
+                    restartChoice = 0;
+                }
+            }
+        }
+        if (back)
+        {
+            if (mods_page::SaveOrder(modsEntries) != modsStart)
+            {
+                modsDiscardPrompt = true;
+                modsDiscardChoice = 1; // Cancel unless Discard is chosen
+            }
+            else CloseModsPage();
+        }
+        Publish(base, config);
+        return;
+    }
     bool changed = false;
     if (input & 0x300)
     {
@@ -2123,7 +2774,7 @@ PPC_FUNC(sub_822F19B0)
     // when unavailable. Keyboard Enter reaches the menu as GAMEPAD_START
     // (hid.cpp), so one branch covers gamepad Start and Enter.
     auto rowHidden = [&](int r) {
-        return tab == 2 && GraphicsRowHidden(r);
+        return (tab == 2 && GraphicsRowHidden(r)) || TitleModeHidden(tab, r);
     };
     if (input & 1)
         do { row = (row + count - 1) % count; } while (rowHidden(row));
@@ -2143,9 +2794,9 @@ PPC_FUNC(sub_822F19B0)
             input &= ~0x1000;
         }
     }
-    if (tab == 3 && row == SystemCollectionRow && (input & 0x000c)) {
-        if (gpu::taa_collection::Enabled()) {
-            if (!gpu::taa_collection::SetConsent(false)) status = Tr(L"Settings could not be saved.", L"無法儲存設定。");
+    if (tab == 3 && row == SystemCollectionRow && (input & 0x000c) && os::log_collection::Supported()) {
+        if (os::log_collection::Enabled()) {
+            if (!os::log_collection::SetConsent(false)) status = Tr(L"Settings could not be saved.", L"無法儲存設定。");
         } else { collectionPrompt = true; collectionChoice = 1; }
         Publish(base, config); return;
     }
@@ -2181,7 +2832,7 @@ PPC_FUNC(sub_822F19B0)
                 hid::PreviewVibration();
             }
         }
-        else if (tab == 0 && row < GameRetailRowCount)
+        else if (tab == 0 && row < GameRetailRowCount && !TitleModeHidden(0, row))
         {
             if (row == 0)
                 PPC_STORE_U32(config, cycle(PPC_LOAD_U32(config), 3));
@@ -2196,12 +2847,44 @@ PPC_FUNC(sub_822F19B0)
         else if (tab == 1 && row == AudioOutputRow)
         {
             // Host setting beside the retail rows: applied and saved at once.
-            edit.audioOutput = cycle(edit.audioOutput, 2);
-            apu::SetSurround(edit.audioOutput == AudioOutputSurround);
+            static_assert(uint32_t(apu::Output::Surround) == AudioOutputSurround &&
+                          uint32_t(apu::Output::Matrix) == AudioOutputMatrix);
+            edit.audioOutput = cycle(edit.audioOutput, 3);
+            apu::SetOutput(apu::Output(edit.audioOutput));
             if (!SaveAudioOutput(edit.audioOutput))
                 status = Tr(L"Could not save settings.", L"無法儲存設定。");
         }
-        else if (tab == 1)
+        else if (tab == 1 && row == AudioVoiceVolumeRow)
+        {
+            // Like Vibration: applied and saved at once, in the retail volume
+            // rows' steps, and handed to the game like a retail volume change.
+            // Streams started afterwards use it.
+            const auto volume = uint32_t(std::clamp(int(edit.voiceVolume) + delta * 4, 0, 100));
+            if (volume != edit.voiceVolume)
+            {
+                edit.voiceVolume = volume;
+                Config saved = GetConfig();
+                saved.voiceVolume = volume;
+                if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+                apu::SetVoiceVolume(volume);
+                changed = true;
+            }
+        }
+        else if (tab == 1 && row == AudioRearAngleRow)
+        {
+            // Like Vibration: applied and saved at once, without unsaved
+            // Graphics edits; only adjustable with Matrix surround.
+            const auto rear = uint32_t(std::clamp(int(edit.audioMatrixRear) + delta * 10, 90, 150));
+            if (edit.audioOutput == AudioOutputMatrix && rear != edit.audioMatrixRear)
+            {
+                edit.audioMatrixRear = rear;
+                Config saved = GetConfig();
+                saved.audioMatrixRear = rear;
+                if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+                apu::SetMatrixRearAngle(rear);
+            }
+        }
+        else if (tab == 1 && !TitleModeHidden(1, row))
         {
             if (row == AudioVoiceRow)
             {
@@ -2309,8 +2992,15 @@ PPC_FUNC(sub_822F19B0)
                 else edit.dlssQuality = gpu::upscaling::DlssQuality(
                     qualityMenuIds[cycle(QualityMenuIndex(uint32_t(edit.dlssQuality)), std::size(qualityMenuIds))]);
                 break;
+            case GraphicsRow::DlssModel:
+                edit.dlssModel = cycle(std::min(edit.dlssModel, 1u), 2);
+                break;
             case GraphicsRow::FsrSharpness:
                 edit.fsrSharpnessPercent = uint32_t(std::clamp(int(edit.fsrSharpnessPercent) + delta, 0, 100));
+                break;
+            case GraphicsRow::DlssNeuralRendering:
+                edit.dlssNeuralRendering = cycle(std::min(edit.dlssNeuralRendering, DlssNeuralRenderingMaxPasses),
+                                                 DlssNeuralRenderingMaxPasses + 1);
                 break;
             case GraphicsRow::AnisotropicFiltering:
             {
@@ -2329,6 +3019,9 @@ PPC_FUNC(sub_822F19B0)
             case GraphicsRow::MotionBlur:
                 edit.motionBlur = !edit.motionBlur;
                 break;
+            case GraphicsRow::Culling:
+                edit.cullingPercent = uint32_t(std::clamp(int(std::min(edit.cullingPercent, 200u) + 5) / 10 * 10 + delta * 10, 0, 200));
+                break;
             case GraphicsRow::ScalingQuality:
 #if LO_PLATFORM_MACOS
                 edit.scalingQuality = cycle(edit.scalingQuality, ScalingMetalFx + 1);
@@ -2346,7 +3039,16 @@ PPC_FUNC(sub_822F19B0)
                 break;
             }
             case GraphicsRow::VariableRefreshRate:
+#if LO_PLATFORM_MACOS
                 edit.variableRefreshRate = !edit.variableRefreshRate;
+#else
+            {
+                // Off, On, FreeSync / G-SYNC Compatible.
+                const auto sync = cycle(edit.variableRefreshRate ? 2 : edit.vsync ? 1 : 0, 3);
+                edit.variableRefreshRate = sync == 2;
+                if (sync < 2) edit.vsync = sync == 1;
+            }
+#endif
                 break;
             case GraphicsRow::FrameGeneration:
             {
@@ -2394,9 +3096,17 @@ PPC_FUNC(sub_822F19B0)
             if (row == SystemUiLanguageRow)
                 edit.uiLanguage = cycle(edit.uiLanguage, 5);
             if (row == SystemGameLanguageRow)
-                edit.gameLanguage = GameLanguageIds[cycle(GameLanguageIndex(edit.gameLanguage), uint32_t(GameLanguageIds.size()))];
+            {
+                const auto choices = GameLanguageChoices();
+                const auto &choice = choices[cycle(GameLanguageChoiceIndex(choices, edit.gameLanguage, edit.gameLanguagePack),
+                                                   uint32_t(choices.size()))];
+                edit.gameLanguage = choice.id;
+                edit.gameLanguagePack = choice.pack;
+            }
             if (row == SystemUpdatesRow)
                 edit.automaticUpdates = !edit.automaticUpdates;
+            if (row == SystemDebugLogRow)
+                edit.debugLog = !edit.debugLog;
         }
     }
     if (changed)
@@ -2407,7 +3117,7 @@ PPC_FUNC(sub_822F19B0)
         __imp__sub_82870E38(call, base);
         language::TraceConfig(base, config, "menu-after-apply");
     }
-    if ((input & 0x1000) && tab == 0 && row == GameRestoreRow)
+    if ((input & 0x1000) && tab == 0 && row == GameRestoreRow && !TitleModeHidden(0, row))
     {
         PPCContext call = ctx;
         call.r3.u32 = config;
@@ -2419,7 +3129,7 @@ PPC_FUNC(sub_822F19B0)
         language::TraceConfig(base, config, "menu-after-defaults");
         status = Tr(L"Game defaults restored.", L"遊戲預設設定已恢復。");
     }
-    if ((input & 0x1000) && tab == 0 && row == GameMainMenuRow)
+    if ((input & 0x1000) && tab == 0 && row == GameMainMenuRow && !TitleModeHidden(0, row))
     {
         mainMenuPrompt = true;
         mainMenuChoice = 1; // Require an explicit selection of Return; Back always cancels.
@@ -2451,7 +3161,9 @@ PPC_FUNC(sub_822F19B0)
         Config graphics = edit;
         graphics.uiLanguage = previousDisplay.uiLanguage;
         graphics.gameLanguage = previousDisplay.gameLanguage;
+        graphics.gameLanguagePack = previousDisplay.gameLanguagePack;
         graphics.automaticUpdates = previousDisplay.automaticUpdates;
+        graphics.debugLog = previousDisplay.debugLog;
         if (graphics.frameGenerationProvider == framegen::Provider::Fsr || graphics.frameGenerationProvider == framegen::Provider::MetalFx)
             graphics.frameGenerationMultiplier = 2;
         if (!SaveConfig(graphics))
@@ -2461,7 +3173,9 @@ PPC_FUNC(sub_822F19B0)
             graphics = GetConfig();
             graphics.uiLanguage = edit.uiLanguage;
             graphics.gameLanguage = edit.gameLanguage;
+            graphics.gameLanguagePack = edit.gameLanguagePack;
             graphics.automaticUpdates = edit.automaticUpdates;
+            graphics.debugLog = edit.debugLog;
             edit = graphics;
             if (edit.width != previousDisplay.width || edit.height != previousDisplay.height ||
                 edit.windowMode != previousDisplay.windowMode || edit.displayName != previousDisplay.displayName ||
@@ -2481,7 +3195,9 @@ PPC_FUNC(sub_822F19B0)
         Config languages = GetConfig();
         languages.uiLanguage = edit.uiLanguage;
         languages.gameLanguage = edit.gameLanguage;
+        languages.gameLanguagePack = edit.gameLanguagePack;
         languages.automaticUpdates = edit.automaticUpdates;
+        languages.debugLog = edit.debugLog;
         const Config before = GetConfig();
         if (restart::Required(before, languages))
         {
@@ -2507,6 +3223,21 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 3 && row == SystemModsRow)
+    {
+        OpenModsPage();
+        Publish(base, config);
+        return;
+    }
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 2 && row == int(GraphicsRow::DlssNeuralRendering) &&
+        !GraphicsRowHidden(row))
+    {
+        nrStart = edit;
+        nrFocus = 0;
+        nrOpen = true;
+        Publish(base, config);
+        return;
+    }
     if (input & 0x2000)
     {
         closeSettings();
@@ -2524,49 +3255,143 @@ bool settings::IsOpen()
     return active.load();
 }
 
+bool settings::ConsumeTitleShortcut(bool idle)
+{
+    titleMenuIdle = idle;
+    if (!idle)
+    {
+        titleShortcut = false;
+        return false;
+    }
+    return titleShortcut.exchange(false);
+}
+
+void settings::MarkTitleEntry()
+{
+    titleEntry = true;
+}
+
 bool settings::DrawMenu(std::vector<uint32_t> &pixels, uint64_t &revision, uint32_t width, uint32_t height)
 {
     // This cache belongs to the sole presentation thread. Dimensions must be
     // checked independently: portrait and landscape buffers can have equal area.
     static uint32_t cachedWidth = 0, cachedHeight = 0;
-    static bool cachedPlayStation = false, cachedPreviewPage = false, shown = false;
+    static bool cachedPlayStation = false, cachedPreviewPage = false, cachedDialog = false, shown = false, closing = false;
+    static int cachedTab = -1;
+    static std::wstring cachedPage;
+    static std::shared_ptr<const menu_assets::Assets> cachedAssets;
     // Motion is presentation only: input and menu state change at once, and the
-    // shown image eases toward the newest raster (#151).
+    // shown image moves toward the newest raster (#151), timed like the retail menus.
     static MenuTransition motion;
     static std::vector<uint32_t> raster;
+    // The list arrow is a layer over the raster: it slides between rows and sways.
+    static MenuArrow arrow;
+    static MenuRect arrowDrawn;
+    // The speaker test marker is another layer: it follows the sound every frame.
+    static MenuRect markerDrawn;
+    static double arrowY = 0;
+    static bool arrowPlaced = false;
+    static MenuTransition::Clock::time_point openTime{}, arrowTime{};
+    const auto seconds = [](MenuTransition::Clock::duration value) { return std::chrono::duration<double>(value).count(); };
+    // Removes the arrow from pixels; Advance must already have run this frame.
+    const auto eraseArrow = [&] {
+        if (arrowDrawn.x1 > arrowDrawn.x0)
+            motion.Erase(pixels, arrowDrawn);
+        arrowDrawn = {};
+    };
+    const auto drawArrow = [&](MenuTransition::Clock::time_point now) {
+        if (!arrow.visible || closing)
+            return;
+        // It waits above the first row while an open starts, then follows its row.
+        if (now < openTime + menu_motion::ArrowOpenDelay)
+        {
+            arrowTime = now;
+            return;
+        }
+        const double dt = std::clamp(seconds(now - arrowTime), 0.0, 1.0);
+        arrowTime = now;
+        arrowY += (arrow.y - arrowY) * std::clamp(dt * menu_motion::ArrowSpeed, 0.0, 1.0);
+        if (std::abs(arrow.y - arrowY) < 0.5)
+            arrowY = arrow.y;
+        const double phase = seconds(now - openTime) / seconds(menu_motion::ArrowSwayPeriod);
+        const int x = arrow.x + int(std::lround(menu_motion::ArrowSway * (0.5 - 0.5 * std::cos(6.283185307179586 * phase))));
+        const int y = int(std::lround(arrowY));
+        DrawMenuArrow(pixels, width, height, x, y);
+        arrowDrawn = MenuArrowBounds(width, height, x, y);
+    };
     if (!active.load())
     {
+        // Closing: the content fades off the panels before the game's own exit
+        // animation shows. The arrow fades with it.
+        if (shown && !closing && !cachedPreviewPage && cachedWidth == width && cachedHeight == height && !pixels.empty())
+        {
+            MenuSnapshot panels;
+            panels.assets = cachedAssets;
+            panels.backdropOnly = true;
+            motion.Advance(pixels, MenuNow());
+            arrowDrawn = markerDrawn = {};
+            closing = RasterizeMenu(panels, width, height, raster) &&
+                      motion.Start(pixels, raster, width, MenuNow(), menu_motion::CloseFade) && motion.Running();
+        }
+        if (closing && motion.Advance(pixels, MenuNow()))
+            return true;
         if (shown)
         {
-            shown = false;
+            shown = closing = arrowPlaced = false;
+            arrowDrawn = markerDrawn = {};
+            cachedAssets.reset();
             motion.Reset();
             std::vector<uint32_t>().swap(raster);
         }
         return false;
+    }
+    if (closing)
+    {
+        // Reopened while the close was fading: start over.
+        shown = closing = arrowPlaced = false;
+        motion.Reset();
     }
     MenuSnapshot current;
     {
         std::lock_guard lock(snapshotMutex);
         current = snapshot;
     }
+    const auto eraseMarker = [&] {
+        if (markerDrawn.x1 > markerDrawn.x0)
+            motion.Erase(pixels, markerDrawn);
+        markerDrawn = {};
+    };
+    const auto drawMarker = [&] {
+        const float position = current.speakerLayout && current.dialogChoices.empty() ? apu::TestSignalPosition() : -1.0f;
+        if (position >= 0)
+            markerDrawn = DrawSpeakerMarker(pixels, width, height, position, float(current.speakerRear));
+    };
     // Input style can change without a guest menu tick (hot-plug or keyboard).
     current.playStationPrompts = hid::UsesPlayStationPrompts();
     const bool opened = !shown;
     if (!opened && revision == current.revision && cachedWidth == width && cachedHeight == height &&
         cachedPlayStation == current.playStationPrompts && !pixels.empty())
     {
-        motion.Advance(pixels, MenuNow());
+        const auto now = MenuNow();
+        motion.Advance(pixels, now);
+        eraseArrow();
+        eraseMarker();
+        drawMarker();
+        drawArrow(now);
         return true;
     }
     current.assets = menu_assets::Cached(FileSystem::GetGameRoot(), current.language);
-    if (!RasterizeMenu(current, width, height, raster))
+    MenuArrow nextArrow;
+    if (!RasterizeMenu(current, width, height, raster, &nextArrow))
         return false;
     // Ease what the player did: opening (content over the panels) and a new
     // revision at the same size and prompt style. A resize, a controller style
     // change and the calibration pages, whose preview presentation paints
     // into the frame, switch at once. The clock starts after rasterizing (tens
     // of milliseconds at 4K, more on the first open) so no part of it is lost.
-    const bool previewPage = current.calibration.open || current.brightness.open;
+    const auto now = MenuNow();
+    const bool previewPage = current.calibration.open || current.brightness.open || current.neuralRendering.open;
+    const bool dialog = !current.dialogChoices.empty();
     bool eased = false;
     if (opened && !previewPage)
     {
@@ -2574,23 +3399,50 @@ bool settings::DrawMenu(std::vector<uint32_t> &pixels, uint64_t &revision, uint3
         panels.assets = current.assets;
         panels.backdropOnly = true;
         eased = RasterizeMenu(panels, width, height, pixels) &&
-                motion.Start(pixels, raster, width, MenuNow(), kMenuOpenFade);
+                motion.StartCascade(pixels, raster, width, now, MenuOpenCascade(width, height));
     }
-    else if (!opened && revision != current.revision && cachedWidth == width && cachedHeight == height &&
+    else if (!opened && cachedWidth == width && cachedHeight == height &&
              cachedPlayStation == current.playStationPrompts && !previewPage && !cachedPreviewPage)
-        eased = motion.Start(pixels, raster, width, MenuNow(), kMenuChangeFade);
-    if (eased)
-        motion.Advance(pixels, MenuNow());
-    else
     {
-        motion.Stop();
-        pixels.swap(raster);
+        // Settle this frame's image first. The arrow goes into the outgoing
+        // image only when the new raster draws it itself (under a prompt).
+        motion.Advance(pixels, now);
+        if (nextArrow.visible)
+            eraseArrow();
+        arrowDrawn = {};
+        eraseMarker();
+        const auto fade = current.tab != cachedTab || current.pageTitle != cachedPage ? menu_motion::PageFade
+                        : dialog != cachedDialog   ? menu_motion::DialogFade
+                                                   : menu_motion::ChangeFade;
+        eased = motion.Start(pixels, raster, width, now, fade);
     }
+    if (eased)
+        motion.Advance(pixels, now);
+    else
+        motion.Cut(pixels, raster, width);
+    arrowDrawn = markerDrawn = {};
+    if (opened)
+    {
+        openTime = arrowTime = now;
+        arrowPlaced = false;
+    }
+    arrow = nextArrow;
+    if (arrow.visible && !arrowPlaced)
+    {
+        arrowY = arrow.y - (opened ? menu_motion::ArrowOpenDrop : 0);
+        arrowPlaced = true;
+    }
+    drawMarker();
+    drawArrow(now);
     shown = true;
     cachedWidth = width;
     cachedHeight = height;
     cachedPlayStation = current.playStationPrompts;
     cachedPreviewPage = previewPage;
+    cachedDialog = dialog;
+    cachedTab = current.tab;
+    cachedPage = current.pageTitle;
+    cachedAssets = current.assets;
     revision = current.revision;
     return true;
 }

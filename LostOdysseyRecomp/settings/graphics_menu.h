@@ -93,16 +93,19 @@ inline bool IsAction(int tab, int row)
 {
     return (tab == 0 && (row == GameRestoreRow || row == GameMainMenuRow)) ||
            (tab == 2 && (row == int(GraphicsRow::Brightness) || row == int(GraphicsRow::Save))) ||
-           (tab == 3 && (row == SystemImportRow || row == SystemSaveRow));
+           (tab == 3 && (row == SystemModsRow || row == SystemImportRow || row == SystemSaveRow));
 }
-static_assert(int(GraphicsRow::DlssQuality) + 1 == int(GraphicsRow::FsrSharpness));
+static_assert(int(GraphicsRow::DlssQuality) + 1 == int(GraphicsRow::DlssModel));
+static_assert(int(GraphicsRow::DlssModel) + 1 == int(GraphicsRow::FsrSharpness));
 static_assert(int(GraphicsRow::RenderResolution) + 1 == int(GraphicsRow::ShadowResolution));
 static_assert(int(GraphicsRow::ShadowResolution) + 1 == int(GraphicsRow::DynamicShadows));
-static_assert(int(GraphicsRow::AntiAliasing) + 1 == int(GraphicsRow::AmbientOcclusion));
-static_assert(int(GraphicsRow::AmbientOcclusion) + 1 == int(GraphicsRow::DlssQuality));
-static_assert(int(GraphicsRow::FsrSharpness) + 1 == int(GraphicsRow::AnisotropicFiltering));
-static_assert(int(GraphicsRow::FrameRate) + 1 == int(GraphicsRow::FrameGeneration));
+// Upscaling, neural rendering and frame generation stay one group.
+static_assert(int(GraphicsRow::AntiAliasing) + 1 == int(GraphicsRow::DlssQuality));
+static_assert(int(GraphicsRow::FsrSharpness) + 1 == int(GraphicsRow::DlssNeuralRendering));
+static_assert(int(GraphicsRow::DlssNeuralRendering) + 1 == int(GraphicsRow::FrameGeneration));
 static_assert(int(GraphicsRow::FrameGeneration) + 1 == int(GraphicsRow::FrameGenerationMultiplier));
-static_assert(int(GraphicsRow::FrameGenerationMultiplier) + 1 == int(GraphicsRow::VariableRefreshRate));
+static_assert(int(GraphicsRow::FrameGenerationMultiplier) + 1 == int(GraphicsRow::AmbientOcclusion));
+static_assert(int(GraphicsRow::AmbientOcclusion) + 1 == int(GraphicsRow::AnisotropicFiltering));
+static_assert(int(GraphicsRow::FrameRate) + 1 == int(GraphicsRow::VariableRefreshRate));
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
 }

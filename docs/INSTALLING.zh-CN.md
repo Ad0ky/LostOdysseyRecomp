@@ -29,7 +29,7 @@
 
 需要 Windows x64 和支持 AVX 的 CPU。默认使用 Direct3D 12，也可以在设置中改用 Vulkan。
 
-1. 从[最新发布页](https://github.com/freefrank/LostOdysseyRecomp/releases/latest)下载 `LostOdysseyRecomp-windows-x64-v0.9.0.zip`。
+1. 从[最新发布页](https://github.com/freefrank/LostOdysseyRecomp/releases/latest)下载 `LostOdysseyRecomp-windows-x64-v0.9.22.zip`。
 2. 把整个 ZIP 解压到可写目录，不要放在 `Program Files` 下。
 3. 运行 `LostOdysseyRecomp.exe`。找不到游戏时会打开导入器。
 4. 选择语言和图形选项。游戏可能会先询问是否下载预编译着色器，见[着色器准备](#shader-preparation)。
@@ -73,17 +73,17 @@ Linux 使用 Vulkan。Steam Deck 和其他 Linux 硬件的测试还不多。从�
 
 ### AppImage
 
-下载 `LostOdysseyRecomp-linux-x64-v0.9.0.AppImage` 后运行：
+下载 `LostOdysseyRecomp-linux-x64-v0.9.22.AppImage` 后运行：
 
 ```bash
-chmod +x LostOdysseyRecomp-linux-x64-v0.9.0.AppImage
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage
+chmod +x LostOdysseyRecomp-linux-x64-v0.9.22.AppImage
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage
 ```
 
 可以在导入器里导入游戏，也可以直接指定游戏文件夹启动：
 
 ```bash
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage --game /path/to/game
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage --game /path/to/game
 ```
 
 AppImage 把存档和设置放在当前用户的目录，见[文件位置](#file-locations)。
@@ -100,7 +100,7 @@ flatpak install --user flathub org.freedesktop.Platform//26.08
 再安装并运行下载的 bundle：
 
 ```bash
-flatpak --user install --bundle LostOdysseyRecomp-linux-x64-v0.9.0.flatpak
+flatpak --user install --bundle LostOdysseyRecomp-linux-x64-v0.9.22.flatpak
 flatpak run io.github.freefrank.LostOdysseyRecomp
 ```
 
@@ -112,7 +112,7 @@ flatpak run io.github.freefrank.LostOdysseyRecomp
 
 需要 macOS 15 或更高版本的 Apple Silicon Mac。应用未经公证，macOS 会拦截首次启动。
 
-1. 下载 `LostOdysseyRecomp-macos-arm64-v0.9.0.dmg` 并打开。
+1. 下载 `LostOdysseyRecomp-macos-arm64-v0.9.22.dmg` 并打开。
 2. 把 `LostOdysseyRecomp.app` 拖到 Applications 链接上，然后推出磁盘映像。
 3. 从“应用程序”打开 `LostOdysseyRecomp`。macOS 第一次会拦截它。打开 **系统设置 → 隐私与安全性**，滚动到“安全性”，点击应用旁的 **仍要打开**（这个按钮只在启动被拦截后出现）。macOS 再次询问时点击 **打开**，可能需要输入密码。之后的启动不再需要批准。
 4. 找不到游戏时会打开导入器，见[导入游戏数据](#automatic-content-import)。
@@ -149,9 +149,9 @@ flatpak run io.github.freefrank.LostOdysseyRecomp
 
 ## 首次设置和普通设置
 
-Windows 上，首次设置页面用来选择界面语言、游戏语言和图形选项；运行 `LostOdysseyRecomp.exe --setup` 可以重新打开。Linux 和 macOS 以默认设置启动，之后在游戏内设置页面修改。需要重启的改动，设置页面会提示。
+游戏以默认设置启动，之后在游戏内设置页面修改：在标题菜单按 Y（键盘 S），或在游戏中从营地菜单打开 系统 → 设置。存在存档里的选项（文字速度、字幕、语音和音乐音量等）只在游戏中显示。Windows 上运行 `LostOdysseyRecomp.exe --setup`，会在游戏启动前打开设置页面，选择界面语言、游戏语言和图形选项。需要重启的改动，设置页面会提示。
 
-在图像设置中，**显示模式**可选窗口或全屏。电脑有多台显示器或多张显卡时，**显示器**选择用哪台显示器，**GPU** 选择用哪张显卡（GPU 的改动重启后生效）。切换显示器后，游戏会询问是否保留，5 秒内没有回应就回到原来的显示器。在 Windows 上，Win+Shift+左／右方向键也可以把游戏移到相邻的显示器。**画面比例**可选自动（画面填满窗口），或 16:9、21:9、4:3（画面保持该比例，屏幕比例不同时加上黑边）。在游戏设置中，**震动**调整震动强度。在声音设置中，**音频输出**选择立体声或 5.1 环绕声；使用 5.1 前，请先在系统声音设置中把扬声器设为 5.1 或 7.1，否则游戏仍使用立体声。Windows 上这个选项只在 控制面板 → 声音 → 播放 中：选中设备，点“配置”，选 5.1 或 7.1 环绕。
+在图像设置中，**显示模式**可选窗口或全屏。电脑有多台显示器或多张显卡时，**显示器**选择用哪台显示器，**GPU** 选择用哪张显卡（GPU 的改动重启后生效）。切换显示器后，游戏会询问是否保留，5 秒内没有回应就回到原来的显示器。在 Windows 上，Win+Shift+左／右方向键也可以把游戏移到相邻的显示器。**画面比例**可选自动（画面填满窗口），或 16:9、21:9、4:3（画面保持该比例，屏幕比例不同时加上黑边）。在游戏设置中，**震动**调整震动强度。在声音设置中，**语音音量**单独调整过场对白的音量；原版里它跟随音效音量，战斗中的语音现在仍是如此。**音频输出**选择立体声或 5.1 环绕声；使用 5.1 前，请先在系统声音设置中把扬声器设为 5.1 或 7.1，否则游戏仍使用立体声。Windows 上这个选项只在 控制面板 → 声音 → 播放 中：选中设备，点“配置”，选 5.1 或 7.1 环绕。**矩阵环绕声**不需要设置扬声器：它把 5.1 混音编入立体声，交给 AV 功放的 Pro Logic II、Dolby Surround 或 Neural:X 模式还原；**后方角度**设置后方声道听起来所在的位置（90°–150°，默认 110°），选中这一行时，测试声音会在 5.1 布局图上绕着扬声器转圈。
 
 界面语言和游戏语言是两套选项。USA/Europe 光盘有英、日、德、法、西、意语言；亚洲版有英、日、韩、繁中、简中。光盘里没有的游戏语言会回退到英语。
 
@@ -180,7 +180,7 @@ Windows 上，首次设置页面用来选择界面语言、游戏语言和图形
 | macOS | 存档、个人配置、缓存、游戏和设置：`~/Library/Application Support/LostOdysseyRecomp/`。日志：`~/Library/Logs/LostOdysseyRecomp/logs/`。 |
 | Android | 游戏：`Android/data/io.github.freefrank.lostodyssey/files/game/`（或在 **Game folder** 页面选择的文件夹）。日志：`Android/data/io.github.freefrank.lostodyssey/files/logs/`。存档和设置保存在应用内部；用 **CTRL → Saves** 导出和导入存档。 |
 
-渲染捕获保存在 `captures/`，Mod 放在 `mods/`：Windows ZIP 都在程序旁边；其他安装包的捕获在设置目录，Mod 在数据目录。下载的着色器放在 `shaders/`，位置和 Mod 相同。
+渲染捕获保存在 `captures/`，Mod 放在 `mods/`：Windows ZIP 都在程序旁边；其他安装包的捕获在设置目录，Mod 在数据目录。下载的着色器放在 `shaders/`，位置和 Mod 相同。用 Mod Organizer 2 管理 Mod 见 [Mod Organizer 2](wiki/Mod-Organizer-2.md)。
 
 Linux 上可以用 `XDG_CONFIG_HOME`、`XDG_DATA_HOME` 和 `XDG_STATE_HOME` 改变 AppImage 的目录。放在可写目录里的 Linux 构建会像 Windows ZIP 一样把所有文件放在程序旁边。用 `--game` 启动 Windows ZIP 时，存档和设置跟随启动时所在的目录，请始终从同一个目录启动。
 
@@ -221,7 +221,7 @@ Xenia 的存档格式相同，不需要转换。
 | :--- | :--- |
 | `--game <路径>` | 使用指定的游戏：包含 `default.xex` 或 `disc1/` 的文件夹，或 `default.xex` 文件。跳过导入器；找不到 `default.xex` 时报错退出。 |
 | `--install` | 即使已经设置好游戏也打开导入器，完成后退出。 |
-| `--setup` | 重新运行首次启动设置，然后进入游戏（Windows；其他平台只会保存当前设置）。 |
+| `--setup` | 打开设置页面，然后进入游戏（Windows；其他平台只会保存当前设置）。 |
 | `--setup-only` | 同 `--setup`，完成后退出。 |
 | `--prepare-shaders-only` | 预先准备全部着色器，然后不启动游戏直接退出。 |
 | `--quiet-kernel` | 日志中不记录内核跟踪行。 |
@@ -230,7 +230,7 @@ Xenia 的存档格式相同，不需要转换。
 
 ```bash
 LostOdysseyRecomp.exe --game "D:\Games\Lost Odyssey"
-./LostOdysseyRecomp-linux-x64-v0.9.0.AppImage --game ~/Games/LostOdyssey
+./LostOdysseyRecomp-linux-x64-v0.9.22.AppImage --game ~/Games/LostOdyssey
 flatpak run io.github.freefrank.LostOdysseyRecomp --game ~/Games/LostOdyssey
 LostOdysseyRecomp.app/Contents/MacOS/LostOdysseyRecomp --game ~/Games/LostOdyssey
 ```

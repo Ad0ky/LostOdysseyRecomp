@@ -36,13 +36,15 @@ struct ConstantBankSnapshot
     uint64_t zero[kWords / 64]{};
     uint64_t zeroBlocks = 0;
     bool valid = false;
+    // Zero-register fallback work since the caller last reset them (diagnostics).
+    uint64_t mmioBlockChecks = 0, mmioBlockDiffs = 0, mmioWordChanges = 0;
 };
 
-// Re-reads the dirty blocks (all of them for a new snapshot), then the
-// zero-register words whose MMIO word changed. Returns the blocks re-read or
-// changed. `registers` and guest-endian `mmio` cover the bank.
+// Re-reads the dirty blocks (all of them for a new snapshot), then, with
+// checkMmio, the zero-register words whose MMIO word changed. Returns the
+// blocks re-read or changed. `registers` and guest-endian `mmio` cover the bank.
 inline uint64_t UpdateConstantBankSnapshot(ConstantBankSnapshot& s, const uint32_t* registers,
-    const uint32_t* mmio, uint64_t dirty)
+    const uint32_t* mmio, uint64_t dirty, bool checkMmio = true)
 {
     constexpr size_t kBlock = ConstantBankSnapshot::kBlockWords;
     if (!s.valid) { dirty = ~0ull; s.valid = true; }
@@ -60,11 +62,14 @@ inline uint64_t UpdateConstantBankSnapshot(ConstantBankSnapshot& s, const uint32
         bits = (bits & ~(uint64_t(0xFFFF) << (first % 64))) | (zero << (first % 64));
         s.zeroBlocks = zero ? s.zeroBlocks | (1ull << block) : s.zeroBlocks & ~(1ull << block);
     }
+    if (!checkMmio) return changed;
+    s.mmioBlockChecks += uint64_t(std::popcount(s.zeroBlocks & ~changed));
     for (uint64_t blocks = s.zeroBlocks & ~changed; blocks; blocks &= blocks - 1) {
         const size_t block = size_t(std::countr_zero(blocks)), first = block * kBlock;
         uint32_t diff = 0;
         for (size_t i = first; i < first + kBlock; ++i) diff |= s.mmio[i] ^ mmio[i];
         if (!diff) continue;
+        ++s.mmioBlockDiffs;
         for (size_t i = first; i < first + kBlock; ++i) {
             if (s.mmio[i] == mmio[i]) continue;
             s.mmio[i] = mmio[i];
@@ -72,6 +77,7 @@ inline uint64_t UpdateConstantBankSnapshot(ConstantBankSnapshot& s, const uint32
             if (((s.zero[i / 64] >> (i % 64)) & 1) && s.values[i] != value) {
                 s.values[i] = value;
                 changed |= 1ull << block;
+                ++s.mmioWordChanges;
             }
         }
     }

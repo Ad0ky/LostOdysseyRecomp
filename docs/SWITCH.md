@@ -9,10 +9,14 @@ Switch layer follows the Sonic Unleashed Switch ports
 ([NaGaa95/UnleashedRecomp-NX](https://github.com/NaGaa95/UnleashedRecomp-NX),
 [ChanseyIsTheBest/UnleashedRecomp-NX](https://github.com/ChanseyIsTheBest/UnleashedRecomp-NX)).
 
-> **Status: bring-up.** The port compiles as Switch code; it has not yet been
-> run on a console. Expect crashes and missing features until it has been
-> tested. Performance on the Tegra X1 is unknown: Lost Odyssey is a heavy
-> Unreal Engine 3 game, so a lower internal resolution will likely be needed.
+> **Status: early.** The game runs on a console, but slowly: the GPU is the
+> limit, and battles stay well below 30 fps. Expect crashes and missing
+> features.
+
+The Switch build keeps the Xbox 360 image: the game's 720p scene and its own
+effects (bloom, depth of field, motion blur, shadows). The PC additions are off
+and hidden in the Graphics menu: anti-aliasing, ambient occlusion, anisotropic
+filtering, render and shadow resolution, upscalers, frame generation and HDR.
 
 ## What you need
 
@@ -22,7 +26,8 @@ Switch layer follows the Sonic Unleashed Switch ports
   writes them (`disc1` … `disc4`, each with `default.xex`, `LO.fpi` and the
   `*.fpd` archives). The supported editions are the PC version's: Asian
   multilingual or USA/Europe, not mixed.
-- The Vulkan shader pack (`portable_vk.lospv`), see [Shaders](#shaders).
+- The Switch shader pack (`portable_vk.lospv`, built on a PC), see
+  [Shaders](#shaders).
 - To build: a PC with Docker. Windows: Docker Desktop with the WSL 2 backend,
   plus Git.
 
@@ -70,15 +75,26 @@ caches match.
 - **Rect lists** are drawn with the precompiled geometry shader rather than
   the PC default (a vertex-shader variant compiled per game shader), which
   would need DXC. `LO_RECT_LIST_GS=0` switches back.
-- **Game shaders** come from the shader pack, `shaders/portable_vk.lospv`:
-  - from a PC installation that has run with Vulkan: its
-    `shaders/portable_vk.lospv`, or
-  - the `vulkan` pack listed in `index.json` of the
-    [`shader-packs` release](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/shader-packs),
-    renamed to `portable_vk.lospv`.
-- Optional: a PC's Vulkan shader cache (`cache/shaders/`, after a Vulkan run)
-  copied to `sdmc:/switch/LostOdysseyRecomp/cache/shaders` adds game shaders
-  the PC compiled that the pack lacks.
+- **Game shaders** come from the shader pack, `shaders/portable_vk.lospv`.
+  The Switch reads shader constants from uniform buffers, which the hardware
+  keeps in its constant banks, so it needs its own pack: the PC `vulkan` pack
+  from the [`shader-packs` release](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/shader-packs)
+  does not match and is rejected. Build it on a Windows or Linux PC from the
+  same source as the NRO:
+  1. Build the PC runtime and the `LoShaderPackTool` target
+     ([BUILDING.md](BUILDING.md)).
+  2. Run
+     ```
+     python tools/shader_pack/build_packs.py --renderer switch --game <your disc1 folder>
+     ```
+     It prepares every game shader with the PC runtime in the background
+     (about 6 minutes) and checks the result.
+  3. Copy `out/shader-pack-build/switch/portable_vk.lospv` to
+     `sdmc:/switch/LostOdysseyRecomp/shaders/portable_vk.lospv`.
+- Optional: a PC's Vulkan shader cache (`cache/shaders/`) from a run with
+  `LO_VK_UBO_CONSTANTS=1`, copied to `sdmc:/switch/LostOdysseyRecomp/cache/shaders`,
+  adds game shaders the PC compiled that the pack lacks. A cache from an
+  ordinary PC run does not match.
 
 The pack and any PC cache must come from the same game edition. A shader missing from all of them cannot be
 compiled on the console: the renderer logs it (`shader pack: …`, shader
@@ -94,7 +110,7 @@ mesa-switch (NVK). Nothing else is installed on the PC.
 2. Copy your Disc 1 `default.xex` to `LostOdysseyRecompLib/private/disc1/`.
 3. Pull the image once (a few GB):
    ```
-   docker pull ghcr.io/autorunhq/switch-dev:2026.09.28
+   docker pull ghcr.io/autorunhq/switch-dev:2026.10.05
    ```
 4. Build:
    - Windows (PowerShell):
@@ -103,7 +119,7 @@ mesa-switch (NVK). Nothing else is installed on the PC.
      ```
    - Linux/macOS:
      ```
-     docker run --rm -v "$PWD:/work" -w /work ghcr.io/autorunhq/switch-dev:2026.09.28 \
+     docker run --rm -v "$PWD:/work" -w /work ghcr.io/autorunhq/switch-dev:2026.10.05 \
          bash tools/switch/build-switch.sh
      ```
 
@@ -161,6 +177,17 @@ reads; off by default on the console).
 The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
 written at least once a second; warnings and errors are written at once.
 
+### Live log over the network
+
+The log files cannot be read over FTP while the game has them open. With
+`LO_NETLOG=1` in env.txt the console also streams the runtime log and stderr
+over TCP (port 28780, or `LO_NETLOG=<port>`), starting with the newest
+megabyte. On a PC in the same network:
+
+    python tools/switch/netlog.py <console IP> --out netlog.txt
+
+It reconnects by itself, so it can be started before the game.
+
 ### CPU profile
 
 Put `LO_CPU_PROFILE=1` in env.txt (or create an empty file named
@@ -182,18 +209,20 @@ Delete the file to turn sampling off. Per-thread CPU shares are logged every
 | Guest memory | 4 GiB `virtmem` reservation; pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
 | Threads | Guest code threads get 4 MiB stacks (libnx defaults to 128 KiB) |
 | Graphics | plume Vulkan on statically linked Mesa NVK, `VK_NN_vi_surface` on the libnx window (`tools/patches/plume-switch.patch`, `volk-switch.patch`) |
-| Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`) |
+| Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
 | Window, input, audio | devkitPro's SDL 3.4 fork (`thirdparty/SDL-switch`), built without EGL (`tools/patches/sdl-switch-no-egl.patch`) |
 | XMA audio | Xenia's FFmpeg fork with `thirdparty/ffmpeg-config/switch-aarch64` |
+| Graphics settings | `settings::Validate()` pins a 720p scene, 1x shadow maps and no AA, AO, anisotropic filtering, upscaling, frame generation or HDR; `GraphicsRowHidden()` hides those rows |
 | Not on Switch | Updater, network downloads, importer, D3D12, DLSS/FSR/XeSS, frame generation, HDR |
 
 ## Known gaps
 
-- Not yet run on hardware; the first runs will find problems the compile
-  checks cannot.
+- Slow: about 4 FPS in the opening battle in handheld mode, with 150 ms of GPU
+  time per frame. Candidates are vertex fetch through buffer device
+  addresses (the depth-only passes now cost the most), the occlusion queries,
+  and render pass breaks.
 - No on-console importer: discs are copied from a PC.
 - Shaders missing from both the pack and the PC cache cannot be compiled on the
   console.
-- The performance work of the Unleashed Switch ports (shader constants in
-  uniform buffers, direct calls between recompiled functions, PGO, the
-  patched NVK) is not ported yet.
+- The other performance work of the Unleashed Switch ports (direct calls
+  between recompiled functions, PGO, the patched NVK) is not ported yet.

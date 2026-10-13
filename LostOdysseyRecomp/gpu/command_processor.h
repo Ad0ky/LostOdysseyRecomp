@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -57,24 +59,51 @@ namespace gpu
         // MMIO
         void WriteRegister(uint32_t index, uint32_t value);
         uint32_t ReadRegister(uint32_t index);
+        // ReadRegister inlined for the renderer's per-draw reads (same values):
+        // the register, or the big-endian MMIO word where the register is zero.
+        uint32_t ReadRegisterInline(uint32_t index)
+        {
+            if (index >= REGISTER_COUNT || !m_mmioWindow) [[unlikely]]
+                return ReadRegister(index);
+            if (const uint32_t value = m_registers[index]) [[likely]]
+                return value;
+            uint32_t word;
+            std::memcpy(&word, m_mmioWindow + size_t(index) * 4, sizeof(word));
+            // Big-endian MMIO word (std::byteswap needs C++23; fixtures build C++20).
+            return (word >> 24) | ((word >> 8) & 0xFF00u) | ((word << 8) & 0xFF0000u) | (word << 24);
+        }
         // Same values as ordered ReadRegister calls, without a call per word.
         void ReadRegisters(uint32_t first, uint32_t count, uint32_t* destination);
         // Bring a renderer copy of a constant bank up to date: blocks command writes
-        // changed since the last update, then zero-register words whose direct
-        // MMIO store changed. Returns the 16-word blocks re-read or changed.
-        uint64_t UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot);
-        // ALU constant banks (0: vertex 0x4000-0x43FF, 1: pixel 0x4400-0x47FF). The
-        // generation changes whenever command packets change a value in the bank.
-        // Direct MMIO stores are checked separately at zero-register fallback words.
+        // changed since the last update, then, with checkMmio, zero-register words
+        // whose direct MMIO store changed. Returns the 16-word blocks re-read or changed.
+        uint64_t UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot, bool checkMmio);
+        // ALU constant banks (0: vertex 0x4000-0x43FF, 1: pixel 0x4400-0x47FF).
+        // Register writes mark the changed 16-word blocks dirty; direct MMIO stores
+        // are checked separately at zero-register fallback words.
         static constexpr uint32_t kAluConstantBase = 0x4000, kAluConstantBankSize = 0x400;
-        uint64_t ConstantGeneration(uint32_t bank) const { return m_constantGeneration[bank & 1].load(std::memory_order_acquire); }
         // Advances wherever the guest and the GPU synchronize or the GPU side
         // writes guest memory: read-pointer and scratch writeback, fences,
-        // interrupts, swaps, memory waits, occlusion records, resolve readback.
-        // A guest write to memory the GPU already read is only ordered against
-        // later draws across such a point.
+        // interrupts, swaps, memory waits, resolve readback. A guest write to
+        // memory the GPU already read is only ordered against later draws across
+        // such a point. Occlusion queries are not one: the guest polls their
+        // records but never makes the command stream wait for them.
         uint64_t SyncEpoch() const { return m_syncEpoch.load(std::memory_order_relaxed); }
-        void AdvanceSyncEpoch() { m_syncEpoch.fetch_add(1, std::memory_order_relaxed); }
+        // What ended each sync period; counted only with LO_RENDER_TIMING.
+        enum class SyncSource : uint32_t {
+            Batch, Scratch, Interrupt, Swap, WaitRegMem, RegToMem, MemWrite, CondWrite,
+            EventShd, EventExt, Resolve, Count
+        };
+        void AdvanceSyncEpoch(SyncSource source)
+        {
+            m_syncEpoch.fetch_add(1, std::memory_order_relaxed);
+            if (m_countSyncSources) [[unlikely]]
+                m_syncSources[uint32_t(source)].fetch_add(1, std::memory_order_relaxed);
+        }
+        uint64_t SyncSourceCount(SyncSource source) const
+        {
+            return m_syncSources[uint32_t(source)].load(std::memory_order_relaxed);
+        }
         // Microcode of the last IM_LOAD for the vertex (false) / pixel (true) stage.
         const uint32_t* GetActiveShader(bool pixel, uint32_t& dwordCount, uint64_t& commandHash) const;
         // Byte identity of the owned IM_LOAD snapshot; resolved once per change.
@@ -113,7 +142,11 @@ namespace gpu
 
         // Same effects as WriteRegister; skips its special cases for plain banks.
         void WriteRegisterFast(uint32_t index, uint32_t value);
+        // Any thread (guest MMIO stores reach WriteRegister on guest threads).
         void MarkConstantsChanged(uint32_t bank, uint64_t blocks);
+        // Command thread only: packet writes, read back by UpdateConstantSnapshot
+        // on the same thread without a locked instruction.
+        void MarkCommandConstantsChanged(uint32_t bank, uint64_t blocks) { m_commandConstantDirty[bank] |= blocks; }
         bool WritePlainRun(uint32_t first, const uint32_t* guestWords, uint32_t count);
 
         void WorkerMain();
@@ -137,6 +170,8 @@ namespace gpu
         uint8_t* TranslatePhysical(uint32_t physicalAddress);
 
         std::vector<uint32_t> m_registers;
+        // Host view of the guest MMIO register window (MMIO_BASE), set by Init.
+        const uint8_t* m_mmioWindow = nullptr;
         struct MovieClearStage
         {
             bool active = false;
@@ -154,10 +189,18 @@ namespace gpu
         std::condition_variable m_writePtrChanged;
         std::atomic<bool> m_wake{ false }; // Wake(): end the current idle or WAIT_REG_MEM wait early
         std::atomic<uint32_t> m_counter{ 0 };
-        std::atomic<uint64_t> m_constantGeneration[2]{};
-        std::atomic<uint64_t> m_constantDirty[2]{}; // 16-word blocks changed since the last snapshot update
+        // The command thread updates these on every constant run and sync point.
+        // They get a cache line of their own, apart from the write pointer, its
+        // mutex and condition variable, m_wake and the vsync counter, which guest
+        // threads write.
+        // 16-word blocks changed since the last snapshot update: by command packets
+        // (command thread, plain) and by WriteRegister from any thread (atomic).
+        alignas(64) uint64_t m_commandConstantDirty[2]{};
+        std::atomic<uint64_t> m_constantDirty[2]{};
         std::atomic<uint64_t> m_syncEpoch{1};
-        std::atomic<bool> m_running{ false };
+        alignas(64) std::atomic<bool> m_running{ false };
+        bool m_countSyncSources = false;
+        std::atomic<uint64_t> m_syncSources[uint32_t(SyncSource::Count)]{};
 
         IndirectBufferGuard m_indirectGuard;
         InterruptRegistration m_interruptRegistration;

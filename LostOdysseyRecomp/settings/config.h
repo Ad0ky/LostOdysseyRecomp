@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <span>
 #include <string>
+#include <vector>
 #include "gpu/aspect_ratio.h"
 #include "gpu/backend_selection.h"
 #include "gpu/upscaling_plan.h"
@@ -34,26 +35,64 @@ inline uint32_t GameLanguageIndex(uint32_t id)
             return i;
     return 0;
 }
+// Installed language packs (mods/<folder>/language.ini), registered at startup:
+// id (lower case), name (UTF-8) and the language ID the game runs as.
+struct LanguagePack
+{
+    std::string id, name;
+    uint32_t base = 1;
+};
+inline std::vector<LanguagePack> LanguagePacks;
+// The Game language list: this edition's languages, then each pack whose base
+// language this edition has. pack is empty for an edition language.
+struct GameLanguageChoice
+{
+    uint32_t id = 1;
+    std::string pack, name;
+};
+inline std::vector<GameLanguageChoice> GameLanguageChoices()
+{
+    std::vector<GameLanguageChoice> result;
+    for (const auto id : GameLanguageIds) result.push_back({id, {}, {}});
+    for (const auto &pack : LanguagePacks)
+        if (GameLanguageIds[GameLanguageIndex(pack.base)] == pack.base) result.push_back({pack.base, pack.id, pack.name});
+    return result;
+}
+inline uint32_t GameLanguageChoiceIndex(const std::vector<GameLanguageChoice> &choices, uint32_t id, const std::string &pack)
+{
+    for (uint32_t i = 0; i < choices.size(); ++i)
+        if (choices[i].id == id && choices[i].pack == pack)
+            return i;
+    return GameLanguageIndex(id);
+}
 // Native pixels: the drawable's backing size. On macOS "follow output" uses the
 // window's logical size instead (Retina renders 4x the pixels); elsewhere both match.
 // Scaling filter: MetalFX spatial upscaling before presentation (macOS only).
 inline constexpr uint32_t ScalingMetalFx = 2;
 inline constexpr int InternalResolutionNative = 1;
-// Audio output: the stereo downmix, or the game's 5.1 channels passed through.
+// Audio output: the stereo downmix, the game's 5.1 channels passed through,
+// or 5.1 matrix-encoded into stereo for a receiver to decode.
 inline constexpr uint32_t AudioOutputStereo = 0;
 inline constexpr uint32_t AudioOutputSurround = 1;
+inline constexpr uint32_t AudioOutputMatrix = 2;
+// DLSS 5 Neural Rendering runs at most this many passes after DLSS.
+inline constexpr uint32_t DlssNeuralRenderingMaxPasses = 4;
 
 struct Config
 {
     uint32_t uiLanguage = 0;
     uint32_t debugLanguage = 0; // Independent tool UI: 0 English, 1 Simplified Chinese.
     uint32_t gameLanguage = 1;
+    // Language pack id shown in place of gameLanguage's text (the game still
+    // runs as gameLanguage, the pack's base); empty for none. Applied on the next start.
+    std::string gameLanguagePack;
     uint32_t width = 1280, height = 720;
     // Shape of the game image; a fixed one is centred in the window with black
     // bars. Applied live. Android always uses Auto.
     gpu::aspect_ratio::Mode aspectRatio = gpu::aspect_ratio::Mode::Auto;
-    int internalResolution = 0; // 0 follows output (up to 4K); 720/1080/1440/2160 select scene height;
-                                // InternalResolutionNative renders at the drawable's pixel size.
+    int internalResolution = 720; // Factory default is the Xbox 360's native 720p. 0 follows output (up to 4K);
+                                  // 720/1080/1440/2160 select scene height;
+                                  // InternalResolutionNative renders at the drawable's pixel size.
     WindowMode windowMode = WindowMode::Windowed;
 #ifdef _WIN32
     GraphicsBackend graphicsBackend = GraphicsBackend::D3D12; // Applied on the next process start.
@@ -73,6 +112,9 @@ struct Config
     uint32_t shadowResolution = 1; // Shadow map width and height multiplier: 1/2/4.
     uint32_t ambientOcclusion = 0; // 0 Off, 1 SSAO, 2 GTAO.
     uint32_t frameRate = 30;
+    // Settings -> Graphics -> VSync: Off, On, or FreeSync / G-SYNC Compatible
+    // (variableRefreshRate, which wins over vsync). Applied live.
+    bool vsync = true;
     bool variableRefreshRate = false; // Opt-in VRR-friendly presentation; does not enable monitor/driver VRR.
     bool hdr = false; // HDR output preference; applied on the next process start.
     uint32_t hdrPaperWhiteNits = 203; // Content reference white; Metal maps this to the system SDR white.
@@ -90,10 +132,27 @@ struct Config
     bool bloom = true; // Tone-map bloom. Applied live by the renderer.
     bool motionBlur = true; // The game's motion blur pass. Applied live.
     bool dynamicShadows = true; // The game's shadow-map rendering. Applied live.
+    // View-frustum culling, 0..200 in steps of 10: 100 retail, lower draws
+    // objects at the screen edges longer, higher hides them sooner. Applied live.
+    uint32_t cullingPercent = 100;
     gpu::upscaling::Upscaler upscaler = gpu::upscaling::Upscaler::Off;
     gpu::upscaling::DlssQuality dlssQuality = gpu::upscaling::DlssQuality::Quality;
+    uint32_t dlssModel = 0; // DLSS SR model (render preset): 0 M, 1 L. Applied after saving.
     gpu::upscaling::FsrQuality fsrQuality = gpu::upscaling::FsrQuality::Quality;
     uint32_t fsrSharpnessPercent = 0; // 0 disables FSR RCAS; 1-100 sets its strength.
+    // DLSS 5 Neural Rendering passes on the DLSS output: 0 Off, 1-4. Needs the
+    // player's nvngx_dlssnr.dll; Windows only. Applied after saving.
+    uint32_t dlssNeuralRendering = 0;
+    // Its model tuning, laid out like the RenoDX ReShade add-on. Percents are the
+    // model's 0..2 strengths (100 = 1.0). Applied after saving.
+    uint32_t dlssNrPreset = 0; // 0 Default, 1-3 Preset #1-#3
+    uint32_t dlssNrStyle = 0; // 0 Default, 1 Natural, 2 Cinematic
+    uint32_t dlssNrIntensity = 100; // 0-200
+    uint32_t dlssNrGlobalTone = 100; // 0-200
+    uint32_t dlssNrLocalTone = 100; // 0-200
+    uint32_t dlssNrStructure = 100; // 0-200
+    int dlssNrSkin = -100; // -100..100; below 0 follows Structure
+    bool dlssNrAutoMask = true; // Character mask
     framegen::Provider frameGenerationProvider = framegen::Provider::Off; // Reconciled at presentation; Vulkan hooks need startup opt-in.
     framegen::Mode frameGenerationMode = framegen::Mode::Fixed;
     uint32_t frameGenerationMultiplier = 2; // Requested total output frames per rendered frame.
@@ -102,7 +161,10 @@ struct Config
     uint32_t buttonPrompts = 0; // Button icons: 0 Auto (last active controller), 1 Xbox, 2 PlayStation. Applied live.
     bool fxaa = false; // Legacy serialized mirror; antialiasing is authoritative.
     bool automaticUpdates = true;
+    bool debugLog = false; // Writes info and kernel lines to the runtime log. Applied live.
     uint32_t audioOutput = AudioOutputStereo; // Applied live; saved by SaveAudioOutput.
+    uint32_t audioMatrixRear = 110; // Matrix surround rear angle, 90-150 degrees in 10 degree steps. Applied live.
+    uint32_t voiceVolume = 100; // Cutscene dialogue, 0-100, in place of the Sound effects volume. Applied live.
     bool skipShaderPrebuild = false;
     bool saveAnywhere = false; // Debug-only preference; defaults off for existing profiles.
     bool noRandomEncounters = false; // Debug-only preference, persisted like saveAnywhere.
@@ -126,4 +188,7 @@ bool SaveAudioOutput(uint32_t output);
 // saves only the display choice, merged with the persisted settings.
 bool SaveDisplayChoice(const std::string &name, uint32_t index);
 uint32_t GameLanguage();
+// The selected language pack's id, if it is installed and its base is
+// GameLanguage(); empty otherwise. Fixed at the first call, after LanguagePacks.
+std::string GameLanguagePack();
 } // namespace settings

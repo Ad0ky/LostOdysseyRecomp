@@ -63,6 +63,10 @@
 
 [详细步骤](docs/INSTALLING.zh-CN.md#android)。
 
+### Nintendo Switch（实验性）
+
+自制程序版本，需要运行 Atmosphère 的主机，画面与 Xbox 360 版相同（720p，不带 PC 版新增的图像选项）。目前还很早期，运行较慢。构建方法、SD 卡目录和所需的着色器文件见 [Switch 说明](docs/SWITCH.md)（英文）。
+
 ### HDR
 
 在图像设置中开启 **HDR** 并保存。**HDR 最高亮度**会打开校准页，按 **LB / RB** 在游戏画面和测试图案之间切换。支持 Windows、Linux 和 macOS。
@@ -76,12 +80,12 @@
 | 显示 | 窗口或全屏，可选显示器和 GPU，16:9 和 21:9 分辨率（16:10 等更高的屏幕会被画面铺满），[HDR](#hdr) 和**亮度 / Gamma**。 |
 | 抗锯齿与超分 | FXAA、SMAA、TAA、DLSS、FSR 3.1、XeSS（Windows Direct3D 12）和 MetalFX（macOS）。 |
 | 图像选项 | 阴影分辨率 1×／2×／4×、SSAO／GTAO、各向异性过滤、景深和泛光。 |
-| 帧率 | 30／60／90／120 FPS，以及 FreeSync／G-SYNC Compatible VRR。 |
+| 帧率 | 30／60／90／120 FPS；垂直同步可选关、开或 FreeSync／G-SYNC Compatible VRR。 |
 | 插帧 | Windows Direct3D 12 上可用 DLSS、FSR 或 XeSS；Windows Vulkan 上可用 DLSS。 |
 | 着色器 | 首次启动下载预编译着色器，或在本机编译一次并缓存。 |
-| 声音 | 立体声或 5.1 环绕声。 |
+| 声音 | 立体声、5.1 环绕声，或交给 AV 功放还原的矩阵环绕声。过场对白有单独的音量。 |
 | 输入 | 手柄、键盘和震动；Android 上有触摸按键。 |
-| Mod | 纹理、菜单和字体替换，以及 PlayStation 按键提示。见 [Mod 指南](docs/wiki/Modding.md)。 |
+| Mod | 仅 Windows：纹理、菜单和字体替换、文本翻译和语言包，以及 PlayStation 按键提示，可手动安装或用 Mod Organizer 2 管理。其他平台也可能加载 Mod，但不提供支持。见 [Mod 指南](docs/wiki/Modding.md)。 |
 | 调试菜单 | 渲染捕获、随时存档、遇敌开关、传送、快进和修改。见[调试菜单](#调试菜单)。 |
 
 ## 操作按键
@@ -174,7 +178,7 @@ Windows ZIP 是**便携式**的，所有文件都留在解压目录里。AppImag
 | :--- | :--- |
 | `--game <路径>` | 使用指定的游戏文件夹（含 `default.xex` 或 `disc1/`）或 `default.xex` 文件，跳过导入器。 |
 | `--install` | 即使已经设置好游戏也打开导入器。 |
-| `--setup` | Windows：重新运行首次启动设置，然后进入游戏。 |
+| `--setup` | Windows：打开设置页面，然后进入游戏。 |
 | `--prepare-shaders-only` | 预先准备全部着色器，然后不启动游戏直接退出。 |
 
 ```bash
@@ -195,7 +199,7 @@ flatpak run io.github.freefrank.LostOdysseyRecomp --game ~/Games/LostOdyssey
 
 ## 反馈问题
 
-[提交 issue](https://github.com/freefrank/LostOdysseyRecomp/issues) 时请写明版本、操作系统、图形后端、GPU 和驱动、游戏版本和光盘，以及出现问题的步骤或场景，并附上最新的 `logs/runtime-<timestamp>.log`。
+[提交 issue](https://github.com/freefrank/LostOdysseyRecomp/issues) 时请写明版本、操作系统、图形后端、GPU 和驱动、游戏版本和光盘，以及出现问题的步骤或场景，并附上最新的 `logs/runtime-<timestamp>.log`。需要完整日志时，先在**设置 → 系统**打开“调试日志”并保存，再重现一次问题后附上。
 
 画面问题请在问题出现时做一次[渲染捕获](#overview捕获与游戏操作)。不要附上游戏文件、存档或个人数据。
 

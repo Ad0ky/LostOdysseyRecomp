@@ -9,7 +9,7 @@ if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS LO_MINIMUM_MACOS)
     message(STATUS "Raising CMAKE_OSX_DEPLOYMENT_TARGET from ${CMAKE_OSX_DEPLOYMENT_TARGET} to ${LO_MINIMUM_MACOS}")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "${LO_MINIMUM_MACOS}" CACHE STRING "Minimum macOS deployment target" FORCE)
 endif()
-project(LostOdysseyRecomp VERSION 0.9.0 LANGUAGES C CXX)
+project(LostOdysseyRecomp VERSION 0.9.22 LANGUAGES C CXX)
 include(GNUInstallDirs)
 # Source version, not a release/commit or clean-checkout assertion.
 # Capture before nested projects can replace PROJECT_VERSION in their scope.
@@ -97,6 +97,13 @@ if(LO_BUILD_RECOMP_LIB)
     add_subdirectory(LostOdysseyRecompLib)
 endif()
 
+# miniz (XenosRecomp submodule) writes the asset exporter's PNG files.
+set(LO_MINIZ_DIR "${CMAKE_SOURCE_DIR}/tools/XenosRecomp/thirdparty/smol-v/testing/external/miniz" CACHE PATH
+    "miniz sources used by the asset exporter")
+# xxHash for the exporter's texture fingerprints (the runtime links xxHash::xxhash).
+set(LO_XXHASH_DIR "${CMAKE_SOURCE_DIR}/tools/XenosRecomp/thirdparty/xxHash" CACHE PATH
+    "xxHash sources used by the focused LoAssetExport target")
+
 if(LO_BUILD_RUNTIME)
     if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
         message(FATAL_ERROR "The runtime requires a 64-bit target")
@@ -147,6 +154,26 @@ if(LO_BUILD_MOD_TESTS)
         target_compile_options(LoModApiTest PRIVATE -UNDEBUG)
     endif()
     add_test(NAME LoModApiTest COMMAND LoModApiTest)
+    # The runtime's --export-assets mode without game code, GPU or SDL.
+    if(EXISTS "${LO_MINIZ_DIR}/miniz.c")
+        add_executable(LoAssetExport
+            tools/tests/asset_export_cli.cpp
+            LostOdysseyRecomp/modding/asset_export.cpp
+            LostOdysseyRecomp/modding/mod_api.cpp
+            LostOdysseyRecomp/modding/text_format.cpp
+            LostOdysseyRecomp/modding/text_menu.cpp
+            thirdparty/lzokay/lzokay.cpp
+            ${LO_MINIZ_DIR}/miniz.c
+            ${LO_XXHASH_DIR}/xxhash.c)
+        target_include_directories(LoAssetExport PRIVATE LostOdysseyRecomp thirdparty/lzokay ${LO_MINIZ_DIR} ${LO_XXHASH_DIR})
+        target_compile_features(LoAssetExport PRIVATE cxx_std_20)
+        target_compile_definitions(LoAssetExport PRIVATE NOMINMAX)
+        target_link_libraries(LoAssetExport PRIVATE Threads::Threads)
+        if(WIN32 AND MSVC)
+            # The runtime's subsystem, so redirected stdout is exercised as shipped.
+            target_link_options(LoAssetExport PRIVATE /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup)
+        endif()
+    endif()
 endif()
 
 if(UNIX AND NOT ANDROID AND LO_BUILD_RUNTIME AND NOT LO_TARGET_PLATFORM STREQUAL "switch")

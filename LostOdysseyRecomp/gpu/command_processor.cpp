@@ -8,6 +8,7 @@
 #include "frame_pacer.h"
 #include "deadline_wait.h"
 #include "register_snapshot.h"
+#include "render_timing.h"
 #include "shader_identity.h"
 #include <debug/frame_timing.h>
 #include <cpu/guest_thread.h>
@@ -20,6 +21,7 @@
 #include <kernel/io/file_system.h>
 #include <notified_wait.h>
 #include <set>
+#include <utility>
 #include <mutex>
 #include <host_ui/host_ui.h>
 #include <fstream>
@@ -259,6 +261,8 @@ namespace gpu
     bool CommandProcessor::Init()
     {
         m_registers.assign(REGISTER_COUNT, 0);
+        m_mmioWindow = static_cast<const uint8_t*>(g_memory.Translate(MMIO_BASE));
+        m_countSyncSources = render_timing::Enabled();
         for (uint32_t bank = 0; bank < 2; ++bank) MarkConstantsChanged(bank, ~0ull);
 
         // Registers the guest reads back through plain loads: keep the MMIO
@@ -394,12 +398,10 @@ namespace gpu
         m_writePtrChanged.notify_one();
     }
 
-    // Dirty blocks before the generation: a reader that sees the new generation
-    // also takes its blocks. Guest MMIO stores reach WriteRegister on other threads.
+    // Guest MMIO stores reach WriteRegister on other threads.
     inline void CommandProcessor::MarkConstantsChanged(uint32_t bank, uint64_t blocks)
     {
         m_constantDirty[bank].fetch_or(blocks, std::memory_order_release);
-        m_constantGeneration[bank].fetch_add(1, std::memory_order_release);
     }
 
     static uint64_t ConstantBlockBit(uint32_t index)
@@ -496,7 +498,7 @@ namespace gpu
             if ((1u << scratchReg) & umsk)
             {
                 *reinterpret_cast<be<uint32_t>*>(TranslatePhysical(scratchAddr + scratchReg * 4)) = value;
-                AdvanceSyncEpoch();
+                AdvanceSyncEpoch(SyncSource::Scratch);
                 static uint32_t logged = 0;
                 if (logged++ < 4 || (g_swapCount >= 110 && scratchReg <= 1))
                     LOG_VERBOSE("scratch writeback reg{} = {:#x} -> physical {:#x} (umsk {:#x}) swap #{}", scratchReg, value, scratchAddr + scratchReg * 4, umsk, g_swapCount.load());
@@ -529,7 +531,7 @@ namespace gpu
             m_registers[index] = value;
             reinterpret_cast<be<uint32_t>*>(g_memory.Translate(MMIO_BASE))[index] = value;
             if (constantChanged)
-                MarkConstantsChanged((index - kAluConstantBase) / kAluConstantBankSize, ConstantBlockBit(index));
+                MarkCommandConstantsChanged((index - kAluConstantBase) / kAluConstantBankSize, ConstantBlockBit(index));
             return;
         }
         WriteRegister(index, value);
@@ -574,7 +576,7 @@ namespace gpu
         }
         copy(constantEnd, end);
         for (uint32_t bank = 0; bank < 2; ++bank)
-            if (changed[bank]) MarkConstantsChanged(bank, changed[bank]);
+            if (changed[bank]) MarkCommandConstantsChanged(bank, changed[bank]);
         return true;
     }
 
@@ -595,14 +597,15 @@ namespace gpu
             std::span<uint32_t>(destination, count), mmio);
     }
 
-    uint64_t CommandProcessor::UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot)
+    uint64_t CommandProcessor::UpdateConstantSnapshot(uint32_t bank, ConstantBankSnapshot& snapshot, bool checkMmio)
     {
         bank &= 1;
         const uint32_t first = kAluConstantBase + bank * kAluConstantBankSize;
-        const uint64_t dirty = m_constantDirty[bank].load(std::memory_order_relaxed)
-            ? m_constantDirty[bank].exchange(0, std::memory_order_acquire) : 0;
+        const uint64_t dirty = std::exchange(m_commandConstantDirty[bank], 0) |
+            (m_constantDirty[bank].load(std::memory_order_relaxed)
+                ? m_constantDirty[bank].exchange(0, std::memory_order_acquire) : 0);
         return UpdateConstantBankSnapshot(snapshot, m_registers.data() + first,
-            static_cast<const uint32_t*>(g_memory.Translate(MMIO_BASE + first * 4)), dirty);
+            static_cast<const uint32_t*>(g_memory.Translate(MMIO_BASE + first * 4)), dirty, checkMmio);
     }
 
     void CommandProcessor::MmioWrite32(uint32_t address, uint32_t value)
@@ -706,7 +709,7 @@ namespace gpu
 
             if (m_readPtrWritebackPhysical)
                 *reinterpret_cast<be<uint32_t>*>(TranslatePhysical(m_readPtrWritebackPhysical)) = m_readPtrIndex;
-            AdvanceSyncEpoch();
+            AdvanceSyncEpoch(SyncSource::Batch);
         }
     }
 
@@ -980,10 +983,14 @@ namespace gpu
 
         switch (opcode)
         {
-        case PM4_INTERRUPT: case PM4_XE_SWAP: case PM4_WAIT_REG_MEM: case PM4_REG_TO_MEM: case PM4_MEM_WRITE:
-        case PM4_COND_WRITE: case PM4_EVENT_WRITE_SHD: case PM4_EVENT_WRITE_EXT: case PM4_EVENT_WRITE_ZPD:
-            AdvanceSyncEpoch();
-            break;
+        case PM4_INTERRUPT: AdvanceSyncEpoch(SyncSource::Interrupt); break;
+        case PM4_XE_SWAP: AdvanceSyncEpoch(SyncSource::Swap); break;
+        case PM4_WAIT_REG_MEM: AdvanceSyncEpoch(SyncSource::WaitRegMem); break;
+        case PM4_REG_TO_MEM: AdvanceSyncEpoch(SyncSource::RegToMem); break;
+        case PM4_MEM_WRITE: AdvanceSyncEpoch(SyncSource::MemWrite); break;
+        case PM4_COND_WRITE: AdvanceSyncEpoch(SyncSource::CondWrite); break;
+        case PM4_EVENT_WRITE_SHD: AdvanceSyncEpoch(SyncSource::EventShd); break;
+        case PM4_EVENT_WRITE_EXT: AdvanceSyncEpoch(SyncSource::EventExt); break;
         default:
             break;
         }
@@ -1292,7 +1299,7 @@ namespace gpu
                     std::this_thread::yield();
             }
             // Guest writes made before the waited-for value are visible from here.
-            AdvanceSyncEpoch();
+            AdvanceSyncEpoch(SyncSource::WaitRegMem);
             return true;
         }
 

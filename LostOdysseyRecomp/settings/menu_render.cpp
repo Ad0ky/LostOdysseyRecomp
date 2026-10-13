@@ -4,6 +4,7 @@
 #include "translations.h"
 #include "../host_ui/rasterizer.h"
 #include "../hid/controller_glyphs.h"
+#include "../apu/test_signal.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -27,22 +28,266 @@ namespace
         int b = std::clamp(int((col >> 16) & 0xFF) + amount, 0, 255);
         return host_ui::PackRgba(uint8_t(r), uint8_t(g), uint8_t(b), uint8_t(a));
     }
+
+    // The 1280x720 layout scaled and centred onto an output buffer.
+    struct Canvas
+    {
+        uint32_t *dib;
+        uint32_t width, height;
+        double scale, offsetX, offsetY;
+        Canvas(uint32_t *pixels, uint32_t w, uint32_t h)
+            : dib(pixels), width(w), height(h), scale(std::min(w / 1280.0, h / 720.0)),
+              offsetX((w - 1280 * scale) * 0.5), offsetY((h - 720 * scale) * 0.5) {}
+        // A part of a larger output: its scale, shifted so layout coordinates apply.
+        Canvas(uint32_t *pixels, uint32_t w, uint32_t h, const Canvas &output, int left, int top)
+            : dib(pixels), width(w), height(h), scale(output.scale),
+              offsetX(output.offsetX - left), offsetY(output.offsetY - top) {}
+    };
+
+    // The title menu's Settings legend: key, then label, in this layout box
+    // with a margin for the outline.
+    constexpr int kHintX = 1036, kHintY = 646, kHintKey = 22, kHintWidth = 180, kHintHeight = 28;
+    constexpr int kHintLeft = kHintX - 8, kHintTop = kHintY - 4, kHintRight = kHintX + kHintWidth + 8,
+                  kHintBottom = kHintY + kHintHeight + 4;
+
+    void Line(const Canvas &c, int x1, int y1, int x2, int y2, uint32_t color, int thickness = 1)
+    {
+        const auto width = c.width, height = c.height;
+        int sx1 = int(std::lround(c.offsetX + x1 * c.scale));
+        int sy1 = int(std::lround(c.offsetY + y1 * c.scale));
+        int sx2 = int(std::lround(c.offsetX + x2 * c.scale));
+        int sy2 = int(std::lround(c.offsetY + y2 * c.scale));
+        int th = std::max(1, int(std::lround(thickness * c.scale)));
+
+        if (sy1 == sy2) // Horizontal line
+        {
+            int left = std::clamp(std::min(sx1, sx2), 0, int(width));
+            int right = std::clamp(std::max(sx1, sx2), 0, int(width));
+            int top = std::clamp(sy1 - th / 2, 0, int(height));
+            int bottom = std::clamp(sy1 + (th + 1) / 2, 0, int(height));
+            for (int py = top; py < bottom; ++py)
+            {
+                uint32_t *row = &c.dib[size_t(py) * width + left];
+                std::fill_n(row, right - left, color);
+            }
+            return;
+        }
+        if (sx1 == sx2) // Vertical line
+        {
+            int left = std::clamp(sx1 - th / 2, 0, int(width));
+            int right = std::clamp(sx1 + (th + 1) / 2, 0, int(width));
+            int top = std::clamp(std::min(sy1, sy2), 0, int(height));
+            int bottom = std::clamp(std::max(sy1, sy2), 0, int(height));
+            for (int py = top; py < bottom; ++py)
+            {
+                uint32_t *row = &c.dib[size_t(py) * width + left];
+                std::fill_n(row, right - left, color);
+            }
+            return;
+        }
+
+        // Generic Bresenham line
+        int dx = std::abs(sx2 - sx1), sx = sx1 < sx2 ? 1 : -1;
+        int dy = -std::abs(sy2 - sy1), sy = sy1 < sy2 ? 1 : -1;
+        int err = dx + dy, e2;
+        int cx = sx1, cy = sy1;
+        while (true)
+        {
+            if (cx >= 0 && cx < int(width) && cy >= 0 && cy < int(height))
+                c.dib[size_t(cy) * width + cx] = color;
+            if (cx == sx2 && cy == sy2) break;
+            e2 = 2 * err;
+            if (e2 >= dy) { err += dy; cx += sx; }
+            if (e2 <= dx) { err += dx; cy += sy; }
+        }
+    }
+
+    // The list cursor: a pointer with a drop shadow, 36x22 layout pixels.
+    void Arrow(const Canvas &c, int x, int y)
+    {
+        auto draw = [&](int dx, int dy, uint32_t fillColor, uint32_t edgeColor) {
+            for (int row = 0; row <= 10; ++row)
+            {
+                Line(c, x + dx, y + dy + row, x + 22 + dx + row, y + dy + row, fillColor);
+                Line(c, x + dx, y + dy + 20 - row, x + 22 + dx + row, y + dy + 20 - row, fillColor);
+            }
+            Line(c, x + dx, y + dy, x + 22 + dx, y + dy, edgeColor);
+            Line(c, x + 22 + dx, y + dy, x + 34 + dx, y + 10 + dy, edgeColor);
+            Line(c, x + 34 + dx, y + 10 + dy, x + 22 + dx, y + 20 + dy, edgeColor);
+            Line(c, x + 22 + dx, y + 20 + dy, x + dx, y + 20 + dy, edgeColor);
+            Line(c, x + dx, y + 20 + dy, x + dx, y + dy, edgeColor);
+        };
+        draw(2, 2, MakeColor(255, 46, 47, 47), MakeColor(255, 46, 47, 47));
+        draw(0, 0, MakeColor(255, 239, 240, 236), MakeColor(255, 49, 50, 50));
+        Line(c, x + 2, y + 2, x + 21, y + 2, MakeColor(255, 255, 255, 251));
+    }
+
+    // Visible list slots, as drawn below.
+    constexpr int ListTop = 150, ListRowHeight = 43, ListArrowX = 38, ListArrowOffset = 10, ListColumnRight = 366;
+
+    // Speaker test layout in the free space under the Audio rows: a ring
+    // around the listener with an anchor and a label box per speaker, at the
+    // test sound's angles (degrees clockwise from the front).
+    constexpr int SpeakerDivider = ListTop + settings::AudioRowCount * ListRowHeight + 13;
+    constexpr double RingX = 706, RingY = SpeakerDivider + 129, RingRadiusX = 160, RingRadiusY = 80;
+    constexpr double LabelRadiusX = 196, LabelRadiusY = 104, LabelWidth = 52, LabelHeight = 28;
+    constexpr const wchar_t *SpeakerLabels[5] = {L"L", L"C", L"R", L"SR", L"SL"}; // apu::SpeakerPan order
+
+    std::array<double, 2> RingPoint(double degrees, double rx, double ry)
+    {
+        const double radians = degrees * 0.017453292519943295;
+        return {RingX + rx * std::sin(radians), RingY - ry * std::cos(radians)};
+    }
+
+    // Coverage-blended ellipse in layout coordinates: a band `thickness` wide
+    // along the outline, or filled when thickness is 0.
+    void Ellipse(const Canvas &c, double cx, double cy, double rx, double ry, double thickness, uint32_t color)
+    {
+        const double reach = thickness / 2 + 1;
+        const auto span = [&](double from, double to, double offset, uint32_t limit) {
+            return std::array<int, 2>{std::clamp(int(std::floor(offset + from * c.scale)), 0, int(limit)),
+                                      std::clamp(int(std::ceil(offset + to * c.scale)), 0, int(limit))};
+        };
+        const auto [x0, x1] = span(cx - rx - reach, cx + rx + reach, c.offsetX, c.width);
+        const auto [y0, y1] = span(cy - ry - reach, cy + ry + reach, c.offsetY, c.height);
+        const uint32_t alpha = color >> 24, rgb = color & 0xFFFFFFu;
+        for (int py = y0; py < y1; ++py)
+            for (int px = x0; px < x1; ++px)
+            {
+                const double x = (px + 0.5 - c.offsetX) / c.scale - cx, y = (py + 0.5 - c.offsetY) / c.scale - cy;
+                const double k = std::sqrt(x * x / (rx * rx) + y * y / (ry * ry));
+                const double g = std::sqrt(x * x / (rx * rx * rx * rx) + y * y / (ry * ry * ry * ry));
+                // First-order distance to the outline, negative inside.
+                double d = g > 0 ? (k - 1) * k / g : -std::min(rx, ry);
+                if (thickness > 0)
+                    d = std::abs(d) - thickness / 2;
+                const double coverage = std::clamp(0.5 - d * c.scale, 0.0, 1.0);
+                if (coverage <= 0)
+                    continue;
+                uint32_t &p = c.dib[size_t(py) * c.width + px];
+                p = ColorBlend(p, rgb | (uint32_t(alpha * coverage + 0.5) << 24));
+            }
+    }
+}
+
+void settings::DrawMenuArrow(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, int x, int y)
+{
+    if (!width || !height || pixels.size() != size_t(width) * height)
+        return;
+    Arrow(Canvas(pixels.data(), width, height), x, y);
+}
+
+settings::MenuRect settings::TitleHintBounds(uint32_t width, uint32_t height)
+{
+    // Rounded like RasterizeMenu's own rectangles.
+    const Canvas c(nullptr, width, height);
+    const auto edge = [](double value, uint32_t limit) {
+        return size_t(std::clamp(int(std::lround(value)), 0, int(limit)));
+    };
+    return {edge(c.offsetX + kHintLeft * c.scale, width), edge(c.offsetY + kHintTop * c.scale, height),
+            edge(c.offsetX + kHintRight * c.scale, width), edge(c.offsetY + kHintBottom * c.scale, height)};
+}
+
+settings::MenuRect settings::MenuArrowBounds(uint32_t width, uint32_t height, int x, int y)
+{
+    const Canvas c(nullptr, width, height);
+    // The shape spans 36x22 with its shadow; one more layout pixel covers rounding.
+    const auto edge = [](double value, uint32_t limit) {
+        return size_t(std::clamp(value, 0.0, double(limit)));
+    };
+    return {edge(std::floor(c.offsetX + (x - 1) * c.scale), width), edge(std::floor(c.offsetY + (y - 1) * c.scale), height),
+            edge(std::ceil(c.offsetX + (x + 38) * c.scale), width), edge(std::ceil(c.offsetY + (y + 24) * c.scale), height)};
+}
+
+settings::MenuRect settings::DrawSpeakerMarker(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, float position,
+                                               float rearAngle)
+{
+    if (!width || !height || pixels.size() != size_t(width) * height)
+        return {};
+    const Canvas c(pixels.data(), width, height);
+    const uint32_t ink = MakeColor(255, 242, 242, 237);
+    double left = 1e9, top = 1e9, right = -1e9, bottom = -1e9;
+    const auto cover = [&](double x0, double y0, double x1, double y1) {
+        left = std::min(left, x0); top = std::min(top, y0);
+        right = std::max(right, x1); bottom = std::max(bottom, y1);
+    };
+    // Resting on a speaker: frame its label.
+    if (const float rest = std::round(position); std::abs(position - rest) < 1e-4f)
+    {
+        const auto [x, y] = RingPoint(apu::SpeakerPan::SpeakerAngle(int(rest) % 5, rearAngle), LabelRadiusX, LabelRadiusY);
+        const int x0 = int(std::lround(x - LabelWidth / 2)) - 4, y0 = int(std::lround(y - LabelHeight / 2)) - 4;
+        const int x1 = x0 + int(LabelWidth) + 8, y1 = y0 + int(LabelHeight) + 8;
+        Line(c, x0, y0, x1, y0, ink, 2);
+        Line(c, x0, y1, x1, y1, ink, 2);
+        Line(c, x0, y0, x0, y1, ink, 2);
+        Line(c, x1, y0, x1, y1 + 1, ink, 2);
+        cover(x0 - 2, y0 - 2, x1 + 3, y1 + 3);
+    }
+    // A bright dot with a soft halo where the decoder puts the sound: on the
+    // ring when focused, nearer the listener when spread out.
+    const auto decoded = apu::SpeakerPan::Decoded(position, rearAngle);
+    const auto [x, y] = RingPoint(decoded.degrees, RingRadiusX * decoded.focus, RingRadiusY * decoded.focus);
+    Ellipse(c, x, y, 15, 15, 0, (ink & 0xFFFFFFu) | (70u << 24));
+    Ellipse(c, x, y, 6.5, 6.5, 0, ink);
+    cover(x - 17, y - 17, x + 17, y + 17);
+    const auto edge = [](double value, uint32_t limit) { return size_t(std::clamp(value, 0.0, double(limit))); };
+    return {edge(std::floor(c.offsetX + left * c.scale), width), edge(std::floor(c.offsetY + top * c.scale), height),
+            edge(std::ceil(c.offsetX + right * c.scale), width), edge(std::ceil(c.offsetY + bottom * c.scale), height)};
+}
+
+double settings::menu_motion::RowFade(double t)
+{
+    // Measured per row on the retail screen: opacity climbs at a constant
+    // 2.5/s until the remainder decays faster, then closes at 5.1/s.
+    constexpr double rise = 2.5, settle = 5.1, knee = 1 - rise / settle, kneeTime = knee / rise;
+    if (t <= 0) return 0;
+    if (t <= kneeTime) return rise * t;
+    const double value = 1 - (1 - knee) * std::exp(-settle * (t - kneeTime));
+    return value >= 0.99 ? 1 : value;
+}
+
+settings::MenuCascade settings::MenuOpenCascade(uint32_t width, uint32_t height)
+{
+    MenuCascade cascade;
+    if (!width || !height)
+        return cascade;
+    const Canvas c(nullptr, width, height);
+    const auto row = [&](int y) { return size_t(std::clamp(std::lround(c.offsetY + y * c.scale), 0l, long(height))); };
+    cascade.split = size_t(std::clamp(std::lround(c.offsetX + ListColumnRight * c.scale), 0l, long(width)));
+    // The "Menu" heading above the first row comes in with it.
+    for (int slot = 0; slot < kMenuVisibleRows; ++slot)
+        cascade.bands.emplace_back(row(slot ? ListTop + slot * ListRowHeight : 104), row(ListTop + (slot + 1) * ListRowHeight));
+    return cascade;
 }
 
 bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32_t height,
-                             std::vector<uint32_t> &pixels)
+                             std::vector<uint32_t> &pixels, MenuArrow *arrowLayer)
 {
+    if (arrowLayer)
+        *arrowLayer = {};
     if (!width || !height || width > 16384 || height > 16384 || uint64_t(width) * height > 7680ull * 4320)
         return false;
 
     // Cross-platform software rasterizer: logical design canvas is 1280x720.
     // If output dimensions differ, scale and center onto the output buffer.
+    // The title hint rasterizes only its own rectangle of the output.
+    const Canvas output(nullptr, width, height);
+    const MenuRect hint = current.titleHint ? TitleHintBounds(width, height) : MenuRect{};
+    if (current.titleHint)
+    {
+        width = uint32_t(hint.x1 - hint.x0);
+        height = uint32_t(hint.y1 - hint.y0);
+        if (!width || !height)
+            return false;
+    }
     pixels.assign(size_t(width) * height, 0xFF000000u);
     uint32_t *dib = pixels.data();
 
-    const double scale = std::min(width / 1280.0, height / 720.0);
-    const double offsetX = (width - 1280 * scale) * 0.5;
-    const double offsetY = (height - 720 * scale) * 0.5;
+    const Canvas canvas = current.titleHint ? Canvas(dib, width, height, output, int(hint.x0), int(hint.y0))
+                                            : Canvas(dib, width, height);
+    const double scale = canvas.scale;
+    const double offsetX = canvas.offsetX;
+    const double offsetY = canvas.offsetY;
 
     auto rect = [&](int x, int y, int w, int h) {
         int x0 = std::clamp(int(std::lround(offsetX + x * scale)), 0, int(width));
@@ -78,53 +323,7 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
     };
 
     auto line = [&](int x1, int y1, int x2, int y2, uint32_t color, int thickness = 1) {
-        int sx1 = int(std::lround(offsetX + x1 * scale));
-        int sy1 = int(std::lround(offsetY + y1 * scale));
-        int sx2 = int(std::lround(offsetX + x2 * scale));
-        int sy2 = int(std::lround(offsetY + y2 * scale));
-        int th = std::max(1, int(std::lround(thickness * scale)));
-
-        if (sy1 == sy2) // Horizontal line
-        {
-            int left = std::clamp(std::min(sx1, sx2), 0, int(width));
-            int right = std::clamp(std::max(sx1, sx2), 0, int(width));
-            int top = std::clamp(sy1 - th / 2, 0, int(height));
-            int bottom = std::clamp(sy1 + (th + 1) / 2, 0, int(height));
-            for (int py = top; py < bottom; ++py)
-            {
-                uint32_t *row = &dib[size_t(py) * width + left];
-                std::fill_n(row, right - left, color);
-            }
-            return;
-        }
-        if (sx1 == sx2) // Vertical line
-        {
-            int left = std::clamp(sx1 - th / 2, 0, int(width));
-            int right = std::clamp(sx1 + (th + 1) / 2, 0, int(width));
-            int top = std::clamp(std::min(sy1, sy2), 0, int(height));
-            int bottom = std::clamp(std::max(sy1, sy2), 0, int(height));
-            for (int py = top; py < bottom; ++py)
-            {
-                uint32_t *row = &dib[size_t(py) * width + left];
-                std::fill_n(row, right - left, color);
-            }
-            return;
-        }
-
-        // Generic Bresenham line
-        int dx = std::abs(sx2 - sx1), sx = sx1 < sx2 ? 1 : -1;
-        int dy = -std::abs(sy2 - sy1), sy = sy1 < sy2 ? 1 : -1;
-        int err = dx + dy, e2;
-        int cx = sx1, cy = sy1;
-        while (true)
-        {
-            if (cx >= 0 && cx < int(width) && cy >= 0 && cy < int(height))
-                dib[size_t(cy) * width + cx] = color;
-            if (cx == sx2 && cy == sy2) break;
-            e2 = 2 * err;
-            if (e2 >= dy) { err += dy; cx += sx; }
-            if (e2 <= dx) { err += dx; cy += sy; }
-        }
+        Line(canvas, x1, y1, x2, y2, color, thickness);
     };
 
     auto sprite = [&](const menu_assets::Image &image, int sx, int sy, int sw, int sh,
@@ -281,8 +480,11 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 #ifdef LO_MENU_RENDER_TRACE
                 LoMenuRenderTrace(value, true);
 #endif
+                // Measure spaces the way they are drawn below, or right-aligned
+                // and centered text with spaces runs past its box.
                 double advance = 0;
-                for (const auto c : value) advance += int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
+                for (const auto c : value)
+                    advance += c == L' ' ? font.height * 0.3 : int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
                 const double desired = size >= 32 ? size * 1.25 : size * 1.30;
                 const double ratio = std::min({desired / font.height, double(h) / font.height, std::max(1.0, double(w - 8)) / std::max(1.0, advance)});
                 double left = x;
@@ -389,23 +591,7 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         line(x + w - 1, y, x + w - 1, y + h, selected ? MakeColor(255, 70, 71, 71) : MakeColor(255, 76, 78, 78));
     };
 
-    auto arrow = [&](int x, int y) {
-        auto draw = [&](int dx, int dy, uint32_t fillColor, uint32_t edgeColor) {
-            for (int row = 0; row <= 10; ++row)
-            {
-                line(x + dx, y + dy + row, x + 22 + dx + row, y + dy + row, fillColor);
-                line(x + dx, y + dy + 20 - row, x + 22 + dx + row, y + dy + 20 - row, fillColor);
-            }
-            line(x + dx, y + dy, x + 22 + dx, y + dy, edgeColor);
-            line(x + 22 + dx, y + dy, x + 34 + dx, y + 10 + dy, edgeColor);
-            line(x + 34 + dx, y + 10 + dy, x + 22 + dx, y + 20 + dy, edgeColor);
-            line(x + 22 + dx, y + 20 + dy, x + dx, y + 20 + dy, edgeColor);
-            line(x + dx, y + 20 + dy, x + dx, y + dy, edgeColor);
-        };
-        draw(2, 2, MakeColor(255, 46, 47, 47), MakeColor(255, 46, 47, 47));
-        draw(0, 0, MakeColor(255, 239, 240, 236), MakeColor(255, 49, 50, 50));
-        line(x + 2, y + 2, x + 21, y + 2, MakeColor(255, 255, 255, 251));
-    };
+    auto arrow = [&](int x, int y) { Arrow(canvas, x, y); };
 
     auto controllerButton = [&](int x, int y, wchar_t letter, bool green, bool bright) {
         const uint32_t base = green ? (bright ? MakeColor(255, 116, 177, 43) : MakeColor(255, 91, 116, 72))
@@ -427,6 +613,150 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         else text(x, y, 24, 24, std::wstring(1, letter), 15, ink, true, 1, outline, 12);
     };
 
+    if (current.titleHint)
+    {
+        // The key on its own, so a PlayStation face does not move the label off
+        // the menu font. Drawn over black and over white: the difference is
+        // the coverage, so the legend keeps the font's outline in straight alpha.
+        const uint32_t face = MakeColor(255, 196, 197, 194);
+        const auto legend = [&] {
+            text(kHintX, kHintY, kHintKey, kHintHeight, current.help.substr(0, 1), 18, face, false, 1, outline, 12);
+            text(kHintX + kHintKey, kHintY, kHintWidth - kHintKey, kHintHeight, current.help.substr(1), 18, face,
+                 false, 0, outline, 12);
+        };
+        legend();
+        const std::vector<uint32_t> overBlack = pixels;
+        std::fill(pixels.begin(), pixels.end(), 0xFFFFFFFFu);
+        legend();
+        for (size_t i = 0; i < pixels.size(); ++i)
+        {
+            auto &p = pixels[i];
+            const uint32_t b = overBlack[i];
+            int spread = 0;
+            for (int c = 0; c < 3; ++c) spread += int((p >> (8 * c)) & 255) - int((b >> (8 * c)) & 255);
+            const int alpha = std::clamp(255 - spread / 3, 0, 255);
+            const auto channel = [&](int c) {
+                return uint8_t(alpha ? std::min(255, int((b >> (8 * c)) & 255) * 255 / alpha) : 0);
+            };
+            p = host_ui::PackRgba(channel(0), channel(1), channel(2), uint8_t(alpha));
+        }
+        return true;
+    }
+
+    if (current.neuralRendering.open)
+    {
+        // Presentation paints the DLSS / DLSS + NR comparison in the transparent
+        // preview rectangle; everything around it is opaque UI.
+        pixels.assign(size_t(width) * height, 0u);
+        const auto &page = current.neuralRendering;
+        const auto tr = [&](const wchar_t *en, const wchar_t *zh) { return std::wstring(Translate(current.language, en, zh)); };
+        const uint32_t backdrop = MakeColor(255, 27, 31, 35);
+        fill(0, 0, 1280, NrPreviewTop, backdrop);
+        fill(0, NrPreviewBottom, 1280, 720 - NrPreviewBottom, backdrop);
+        fill(0, NrPreviewTop, NrPreviewLeft, NrPreviewBottom - NrPreviewTop, backdrop);
+        fill(NrPreviewRight, NrPreviewTop, 1280 - NrPreviewRight, NrPreviewBottom - NrPreviewTop, backdrop);
+        text(160, 10, 960, 42, tr(L"DLSS 5 neural rendering", L"DLSS 5 神經渲染"), 29, ink, false, 1, outline, 19);
+        const int mid = (NrPreviewLeft + NrPreviewRight) / 2;
+        text(NrPreviewLeft, 52, mid - NrPreviewLeft, 26, L"DLSS", 18, ink, false, 1, outline, 13);
+        text(mid, 52, NrPreviewRight - mid, 26, tr(L"DLSS + NR", L"DLSS + NR"), 18, ink, false, 1, outline, 13);
+        if (!page.sceneAvailable)
+        {
+            fill(NrPreviewLeft, NrPreviewTop, NrPreviewRight - NrPreviewLeft, NrPreviewBottom - NrPreviewTop,
+                 MakeColor(255, 40, 45, 50));
+            text(NrPreviewLeft + 20, NrPreviewTop + 100, NrPreviewRight - NrPreviewLeft - 40, 70,
+                 tr(L"Play a scene with DLSS on to see a preview.", L"請在開啟 DLSS 的情況下進入遊戲場景以預覽。"),
+                 20, muted, false, 1, outline, 14);
+        }
+        const auto percent = [](uint32_t value) { return std::to_wstring(value) + L"%"; };
+        const std::wstring skin = page.skin > 0 ? L"+" + std::to_wstring(page.skin) : std::to_wstring(page.skin);
+        const struct { const wchar_t *en, *zh; } labels[NrControlCount] = {
+            {L"Passes", L"次數"}, {L"Model", L"模型"}, {L"Preset", L"預設組"},
+            {L"Intensity", L"強度"}, {L"Global tone", L"整體色調"}, {L"Local tone", L"局部色調"},
+            {L"Structure", L"結構"}, {L"Skin structure", L"皮膚結構"}, {L"Character mask", L"角色遮罩"},
+        };
+        const std::wstring combos[3] = {
+            page.passes == 0 ? tr(L"Off", L"關") : std::to_wstring(page.passes) + L"×",
+            page.style == 1 ? tr(L"Natural", L"自然") : page.style == 2 ? tr(L"Cinematic", L"電影感") : tr(L"Default", L"預設"),
+            page.preset == 0 ? tr(L"Default", L"預設") : tr(L"Preset", L"預設組") + L" " + std::to_wstring(page.preset),
+        };
+        // Slider fraction and value text for focus 3-7.
+        const float fractions[5] = {page.intensity / 200.0f, page.globalTone / 200.0f, page.localTone / 200.0f,
+                                    page.structure / 200.0f, (page.skin + 100) / 200.0f};
+        const std::wstring values[5] = {percent(page.intensity), percent(page.globalTone), percent(page.localTone),
+                                        percent(page.structure), skin};
+        for (int focus = 0; focus < NrControlCount; ++focus)
+        {
+            const int column = focus >= 5 ? 1 : 0;
+            const int x = NrColumnX[column], y = NrRowTop + (focus - column * 5) * NrRowHeight;
+            const int controlX = x + NrControlOffset;
+            const bool focused = page.focus == focus;
+            text(x, y, NrControlOffset - 6, 36, tr(labels[focus].en, labels[focus].zh), 18, ink, false, 0, outline, 12);
+            if (focus >= 3 && focus <= 7)
+            {
+                const int sliderY = y + 8;
+                cell(controlX, sliderY, NrSliderWidth, 20, focused);
+                const float fraction = std::clamp(fractions[focus - 3], 0.0f, 1.0f);
+                const int marker = int(std::lround(controlX + 4 + (NrSliderWidth - 8) * fraction));
+                // Default tick: 100% for the tones, 0 for the skin range.
+                const int tick = int(std::lround(controlX + 4 + (NrSliderWidth - 8) * 0.5));
+                fill(tick, sliderY + 3, 2, 14, MakeColor(255, 120, 124, 126));
+                fill(controlX + 4, sliderY + 6, std::max(0, marker - controlX - 4), 8, MakeColor(255, 167, 200, 214));
+                fill(marker - 4, sliderY - 5, 8, 30, MakeColor(255, 234, 238, 234));
+                text(controlX + NrSliderWidth + 10, y, NrColumnWidth - NrControlOffset - NrSliderWidth - 10, 36,
+                     values[focus - 3], 18, ink, false, 2, outline, 13);
+            }
+            else
+            {
+                const std::wstring value = focus == 8 ? (page.autoMask ? tr(L"On", L"開") : tr(L"Off", L"關"))
+                                                      : combos[focus];
+                const int w = NrColumnWidth - NrControlOffset;
+                cell(controlX, y, w, 36, focused);
+                text(controlX + 6, y, 28, 36, L"<", 18, ink, false, 1, outline, 13);
+                text(controlX + w - 34, y, 28, 36, L">", 18, ink, false, 1, outline, 13);
+                text(controlX + 36, y, w - 72, 36, value, 18, ink, false, 1, outline, 13);
+            }
+        }
+        const wchar_t *buttonEn[3] = {L"Default", L"Done", L"Cancel"};
+        const wchar_t *buttonZh[3] = {L"預設值", L"完成", L"取消"};
+        for (int i = 0; i < 3; ++i)
+        {
+            const int x = NrColumnX[0] + i * (NrButtonWidth + NrButtonGap);
+            cell(x, NrButtonTop, NrButtonWidth, NrButtonHeight, page.focus == 9 + i);
+            text(x + 8, NrButtonTop, NrButtonWidth - 16, NrButtonHeight, tr(buttonEn[i], buttonZh[i]),
+                 19, ink, false, 1, outline, 14);
+        }
+        const wchar_t *helpEn[NrFocusCount] = {
+            L"How many times the model runs on each frame. More passes look stronger and cost more frame time.",
+            L"The look the model renders. Default lets the model choose; Cinematic is experimental.",
+            L"Model preset hint. Its effect is unverified; keep Default unless you are experimenting.",
+            L"Overall strength of the effect. 100% is the model's default.",
+            L"Strength of whole-image tone changes. Some nvngx_dlssnr.dll versions ignore it.",
+            L"Strength of local light and shadow changes. With more than one pass it applies to the first pass only.",
+            L"Strength of the surface detail the model adds.",
+            L"Detail on faces and skin. Below 0 it follows Structure.",
+            L"Lets the model find characters and treat them separately.",
+            L"Restores the model settings to their defaults.",
+            L"Keeps these values. Save them on the Graphics tab.",
+            L"Discards the changes made on this page.",
+        };
+        const wchar_t *helpZh[NrFocusCount] = {
+            L"模型在每個影格上執行的次數。次數越多效果越強，影格耗時也越高。",
+            L"模型呈現的風格。預設由模型自行決定；電影感為實驗性質。",
+            L"模型預設組提示。實際效果未經驗證，除非要實驗，否則請維持預設。",
+            L"整體效果強度。100% 為模型預設值。",
+            L"整張畫面的色調變化強度。部分版本的 nvngx_dlssnr.dll 會忽略此項。",
+            L"局部光影變化的強度。執行多次時，只作用於第一次。",
+            L"模型所加入表面細節的強度。",
+            L"臉部與皮膚的細節。低於 0 時跟隨「結構」。",
+            L"讓模型辨識角色並單獨處理。",
+            L"將模型設定還原為預設值。",
+            L"保留這些數值。請在「圖像」分頁儲存。",
+            L"捨棄在此頁所做的變更。",
+        };
+        const int helpFocus = std::clamp(page.focus, 0, NrFocusCount - 1);
+        text(160, 666, 960, 32, tr(helpEn[helpFocus], helpZh[helpFocus]), 16, ink, false, 1, outline, 12);
+        return true;
+    }
     if (current.brightness.open)
     {
         // Same frame as the HDR page: presentation paints the comparison in
@@ -480,7 +810,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         for (int i = 0; i < 4; ++i)
         {
             cell(buttons[i].x, 610, buttons[i].w, 40, page.focus == i + 2);
-            text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, buttons[i].label, 19, ink, false, 1, outline, 14);
+            text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, buttons[i].label, 19,
+                 i == 1 && !page.originalPattern ? muted : ink, false, 1, outline, 14);
         }
         text(160, 666, 960, 32,
              Translate(current.language, L"D-pad: select / adjust · A: choose · B: back · LB / RB: scene / pattern",
@@ -633,7 +964,15 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 
     const wchar_t *enTabs[] = {L"Gameplay", L"Audio", L"Graphics", L"System"};
     const wchar_t *zhTabs[] = {L"遊戲", L"聲音", L"圖像", L"系統"};
-    for (int i = 0; i < MenuTabCount; ++i)
+    if (!current.pageTitle.empty())
+    {
+        // A page opened from a row: one selected cell in place of the tabs.
+        cell(386, 110, 640, 32, true);
+        text(394, 110, 624, 32, current.pageTitle, 17, selectedInk, true, 1, MakeColor(255, 222, 223, 219), 12);
+        if (!current.keyLegend.empty())
+            text(380, 52, 880, 32, current.keyLegend, 18, ink, false, 2, outline, 13);
+    }
+    for (int i = 0; i < MenuTabCount && current.pageTitle.empty(); ++i)
     {
         constexpr int tabWidth = MenuTabWidth;
         const int x = 386 + i * tabWidth;
@@ -644,8 +983,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
              selected ? MakeColor(255, 222, 223, 219) : outline, 12);
     }
 
-    constexpr int rowTop = 150;
-    constexpr int rowHeight = 43;
+    constexpr int rowTop = ListTop;
+    constexpr int rowHeight = ListRowHeight;
     constexpr int labelLeft = 65;
     constexpr int labelWidth = 299;
     constexpr int choiceLeft = 386;
@@ -662,7 +1001,9 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         const int y = rowTop + slot * rowHeight;
         if (y + rowHeight > 640) break;
         const bool focused = int(index) == current.row;
-        if (current.tab == 2 && (index == size_t(GraphicsRow::FrameGeneration) ||
+        if (current.tab == 2 && (index == size_t(GraphicsRow::AntiAliasing) ||
+                                 index == size_t(GraphicsRow::AmbientOcclusion) ||
+                                 index == size_t(GraphicsRow::FrameRate) ||
                                  index == size_t(GraphicsRow::Hdr) ||
                                  index == size_t(GraphicsRow::Brightness)))
             line(labelLeft, y - 3, choiceLeft + choiceWidth, y - 3, MakeColor(255, 173, 176, 177));
@@ -670,7 +1011,10 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         if (focused)
         {
             brushedCell(labelLeft, y, labelWidth, rowHeight - 2, selectedSurface);
-            arrow(38, y + 10);
+            if (arrowLayer && current.dialogChoices.empty())
+                *arrowLayer = {true, ListArrowX, y + ListArrowOffset};
+            else
+                arrow(ListArrowX, y + ListArrowOffset);
         }
         line(labelLeft, y, labelLeft + labelWidth, y, focused ? MakeColor(255, 244, 244, 239) : MakeColor(255, 145, 147, 146));
         line(labelLeft, y + rowHeight - 2, labelLeft + labelWidth, y + rowHeight - 2,
@@ -694,6 +1038,22 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             continue;
         }
 
+        if (focused && current.reorder)
+        {
+            // Move up / move down for the pointer, beside the value column. The
+            // triangles are drawn: the menu fonts have no ▲ / ▼.
+            for (int i = 0; i < 2; ++i)
+            {
+                const int x = ModsMoveLeft + i * (ModsMoveWidth + ModsMoveGap);
+                cell(x, y, ModsMoveWidth, rowHeight - 2, false);
+                const int cx = x + ModsMoveWidth / 2, top = y + 13;
+                for (int step = 0; step < 14; ++step)
+                {
+                    const int half = (i ? 13 - step : step) * 3 / 4;
+                    line(cx - half, top + step, cx + half + 1, top + step, ink);
+                }
+            }
+        }
         std::vector<std::wstring> fallback;
         const std::vector<std::wstring> *choices = &row.choices;
         if (choices->empty())
@@ -702,6 +1062,26 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             choices = &fallback;
         }
         const int selected = std::clamp(row.selectedChoice, 0, int(choices->size()) - 1);
+        if (!row.detail.empty())
+        {
+            // Detail text first, then the choices in the last ModsCellsWidth.
+            const bool cells = !(row.choices.empty() && row.value.empty());
+            const int cellsLeft = choiceLeft + choiceWidth - (cells ? ModsCellsWidth : 0);
+            text(choiceLeft + 8, y, cellsLeft - choiceLeft - 16, rowHeight - 2, row.detail, 20,
+                 row.enabled ? muted : disabled, false, 0, outline, 13);
+            const int count = cells ? int(choices->size()) : 0;
+            for (int option = 0; option < count; ++option)
+            {
+                const int left = cellsLeft + ModsCellsWidth * option / count;
+                const int right = cellsLeft + ModsCellsWidth * (option + 1) / count;
+                const bool currentChoice = option == selected;
+                cell(left, y, right - left, rowHeight - 2, focused && currentChoice);
+                text(left + 7, y, right - left - 14, rowHeight - 2, (*choices)[option], 22,
+                     !row.enabled ? disabled : currentChoice ? (focused ? selectedInk : ink) : muted,
+                     false, 1, focused && currentChoice ? MakeColor(255, 222, 223, 219) : outline, 13);
+            }
+            continue;
+        }
         if (row.controllerButtons && choices->size() >= 2)
         {
             for (int option = 0; option < 2; ++option)
@@ -751,6 +1131,44 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         }
     }
 
+    // Speaker test under the Audio rows: a ring around the listener with the
+    // five speakers; DrawSpeakerMarker adds the dot that follows the sound.
+    if (current.speakerLayout)
+    {
+        line(choiceLeft, SpeakerDivider, choiceLeft + choiceWidth, SpeakerDivider, MakeColor(255, 173, 176, 177));
+        Ellipse(canvas, RingX, RingY, RingRadiusX, RingRadiusY, 2, MakeColor(255, 128, 131, 130));
+        // The path a matrix decoder gives the test sound at this phase, as
+        // evenly spaced dots; where it jumps the dots leave a gap.
+        double travelled = 0, lastX = 0, lastY = 0;
+        for (int i = 0; i <= 2000; ++i)
+        {
+            const auto decoded = apu::SpeakerPan::Decoded(i / 400.0f, float(current.speakerRear));
+            const auto [x, y] = RingPoint(decoded.degrees, RingRadiusX * decoded.focus, RingRadiusY * decoded.focus);
+            const double step = i ? std::hypot(x - lastX, y - lastY) : 7;
+            travelled = step > 30 ? 7 : travelled + step;
+            lastX = x;
+            lastY = y;
+            if (travelled < 7)
+                continue;
+            travelled = 0;
+            Ellipse(canvas, x, y, 1.5, 1.5, 0, MakeColor(170, 214, 220, 224));
+        }
+        // The listener from above, facing the center speaker.
+        Ellipse(canvas, RingX, RingY + 4, 15, 7, 0, muted);
+        Ellipse(canvas, RingX, RingY - 3, 6.5, 6.5, 0, ink);
+        for (int i = 0; i < 5; ++i)
+        {
+            const double angle = apu::SpeakerPan::SpeakerAngle(i, float(current.speakerRear));
+            const auto [ax, ay] = RingPoint(angle, RingRadiusX, RingRadiusY);
+            Ellipse(canvas, ax, ay, 4, 4, 0, muted);
+            const auto [lx, ly] = RingPoint(angle, LabelRadiusX, LabelRadiusY);
+            const int x = int(std::lround(lx - LabelWidth / 2)), y = int(std::lround(ly - LabelHeight / 2));
+            fill(x, y, int(LabelWidth), int(LabelHeight), MakeColor(255, 66, 69, 69));
+            cell(x, y, int(LabelWidth), int(LabelHeight), false);
+            text(x, y, int(LabelWidth), int(LabelHeight), SpeakerLabels[i], 18, ink, false, 1, outline, 12);
+        }
+    }
+
     // Understated overflow indicators when rows exceed the visible viewport.
     if (current.scroll > 0)
         text( choiceLeft + choiceWidth - 40, rowTop - 24, 40, 20, L"▲", 13, muted, false, 1);
@@ -773,6 +1191,13 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 
     if (!current.dialogChoices.empty())
     {
+        // The retail prompts darken the whole page behind them.
+        for (auto &pixel : pixels)
+        {
+            const uint32_t rb = ((pixel & 0x00ff00ffu) * menu_motion::DialogDim >> 8) & 0x00ff00ffu;
+            const uint32_t g = ((pixel & 0x0000ff00u) * menu_motion::DialogDim >> 8) & 0x0000ff00u;
+            pixel = (pixel & 0xff000000u) | rb | g;
+        }
         brushedCell(280, 208, 720, 306, MakeColor(255, 73, 76, 76));
         line(280, 208, 1000, 208, MakeColor(255, 231, 232, 228), 2);
         line(280, 208, 280, 514, MakeColor(255, 194, 196, 193), 2);
@@ -810,13 +1235,41 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
     return true;
 }
 
+namespace
+{
+    // out = a + (b - a) * w / 256, fixed point.
+    void Blend(const uint32_t *a, const uint32_t *b, uint32_t *out, size_t count, uint32_t w)
+    {
+        if (w >= 256 || w == 0)
+        {
+            const uint32_t *source = w ? b : a;
+            std::copy(source, source + count, out);
+            return;
+        }
+        const uint32_t keep = 256 - w;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const uint32_t rb = (((a[i] & 0x00ff00ffu) * keep + (b[i] & 0x00ff00ffu) * w) >> 8) & 0x00ff00ffu;
+            const uint32_t ga = (((a[i] >> 8) & 0x00ff00ffu) * keep + ((b[i] >> 8) & 0x00ff00ffu) * w) & 0xff00ff00u;
+            out[i] = rb | ga;
+        }
+    }
+
+    double Seconds(std::chrono::steady_clock::duration value)
+    {
+        return std::chrono::duration<double>(value).count();
+    }
+}
+
 bool settings::MenuTransition::Start(const std::vector<uint32_t> &shown, std::vector<uint32_t> &target,
-                                     uint32_t width, Clock::time_point now, Clock::duration length)
+                                     uint32_t outputWidth, Clock::time_point now, Clock::duration length)
 {
     running = false;
     spans.clear();
-    if (!width || shown.empty() || shown.size() != target.size() || shown.size() % width)
+    cascade = {};
+    if (!outputWidth || shown.empty() || shown.size() != target.size() || shown.size() % outputWidth)
         return false;
+    width = outputWidth;
     from.assign(shown.begin(), shown.end());
     to.swap(target);
     // Rows equal in both images stay untouched for the whole transition: a
@@ -836,6 +1289,45 @@ bool settings::MenuTransition::Start(const std::vector<uint32_t> &shown, std::ve
     return true;
 }
 
+bool settings::MenuTransition::StartCascade(const std::vector<uint32_t> &shown, std::vector<uint32_t> &target,
+                                            uint32_t outputWidth, Clock::time_point now, MenuCascade order)
+{
+    using namespace menu_motion;
+    if (!Start(shown, target, outputWidth, now, OpenPanelFade))
+        return false;
+    // A row is done once RowFade reaches 1 (0.99 snaps): the knee, then the decay to 1%.
+    constexpr double rise = 2.5, settle = 5.1, knee = 1 - rise / settle;
+    const double rowSeconds = knee / rise + std::log((1 - knee) / 0.01) / settle;
+    const double lastRow = order.bands.empty() ? 0 : Seconds(OpenRowStagger) * double(order.bands.size() - 1);
+    duration = std::max<Clock::duration>(OpenPanelFade, std::chrono::duration_cast<Clock::duration>(
+                                                            std::chrono::duration<double>(lastRow + rowSeconds)));
+    order.split = std::min<size_t>(order.split, width);
+    cascade = std::move(order);
+    return true;
+}
+
+void settings::MenuTransition::Cut(std::vector<uint32_t> &pixels, std::vector<uint32_t> &target, uint32_t outputWidth)
+{
+    running = false;
+    spans.clear();
+    cascade = {};
+    width = outputWidth;
+    to.swap(target);
+    pixels.assign(to.begin(), to.end());
+}
+
+double settings::MenuTransition::Weight(size_t row, bool list, double seconds) const
+{
+    using namespace menu_motion;
+    if (cascade.bands.empty())
+        return std::clamp(seconds / Seconds(duration), 0.0, 1.0);
+    if (list)
+        for (size_t slot = 0; slot < cascade.bands.size(); ++slot)
+            if (row >= cascade.bands[slot].first && row < cascade.bands[slot].second)
+                return RowFade(seconds - Seconds(OpenRowStagger) * double(slot));
+    return std::clamp(seconds / Seconds(OpenPanelFade), 0.0, 1.0);
+}
+
 bool settings::MenuTransition::Advance(std::vector<uint32_t> &pixels, Clock::time_point now)
 {
     if (!running)
@@ -846,31 +1338,48 @@ bool settings::MenuTransition::Advance(std::vector<uint32_t> &pixels, Clock::tim
         return false;
     }
     const auto elapsed = now - start;
-    const double t = elapsed.count() < 0 ? 1.0 : std::min(1.0, double(elapsed.count()) / double(duration.count()));
-    if (t >= 1.0)
+    if (elapsed.count() < 0 || elapsed >= duration)
     {
         for (const auto [first, last] : spans)
             std::copy(to.begin() + first, to.begin() + last, pixels.begin() + first);
         running = false;
         return false;
     }
-    // Ease out: most of the change lands in the first frames after the input.
-    const double eased = 1.0 - (1.0 - t) * (1.0 - t) * (1.0 - t);
-    const uint32_t w = uint32_t(std::lround(eased * 256.0)), keep = 256 - w;
+    const double seconds = Seconds(elapsed);
+    const size_t split = cascade.bands.empty() ? width : cascade.split;
+    const auto fixed = [](double weight) { return uint32_t(std::lround(weight * 256.0)); };
     for (const auto [first, last] : spans)
-        for (size_t i = first; i < last; ++i)
+        for (size_t row = first; row < last; row += width)
         {
-            const uint32_t a = from[i], b = to[i];
-            const uint32_t rb = (((a & 0x00ff00ffu) * keep + (b & 0x00ff00ffu) * w) >> 8) & 0x00ff00ffu;
-            const uint32_t ga = (((a >> 8) & 0x00ff00ffu) * keep + ((b >> 8) & 0x00ff00ffu) * w) & 0xff00ff00u;
-            pixels[i] = rb | ga;
+            const size_t y = row / width;
+            Blend(&from[row], &to[row], &pixels[row], split, fixed(Weight(y, true, seconds)));
+            if (split < width)
+                Blend(&from[row + split], &to[row + split], &pixels[row + split], width - split,
+                      fixed(Weight(y, false, seconds)));
         }
     return true;
+}
+
+void settings::MenuTransition::Erase(std::vector<uint32_t> &pixels, const MenuRect &rect) const
+{
+    if (!width || pixels.size() != to.size() || rect.x1 > width || rect.x0 >= rect.x1)
+        return;
+    for (size_t y = rect.y0; y < rect.y1 && (y + 1) * width <= to.size(); ++y)
+    {
+        const size_t row = y * width;
+        // Advance has just rewritten the rows it blends.
+        if (running && std::any_of(spans.begin(), spans.end(), [&](const auto &span) {
+                return row >= span.first && row < span.second;
+            }))
+            continue;
+        std::copy(to.begin() + row + rect.x0, to.begin() + row + rect.x1, pixels.begin() + row + rect.x0);
+    }
 }
 
 void settings::MenuTransition::Reset()
 {
     running = false;
+    cascade = {};
     std::vector<uint32_t>().swap(from);
     std::vector<uint32_t>().swap(to);
     std::vector<std::pair<size_t, size_t>>().swap(spans);

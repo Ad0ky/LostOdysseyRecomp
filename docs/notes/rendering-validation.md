@@ -30,6 +30,8 @@
 | LoShaderAluTest | 真实 GPU ALU 旧值读取、后续结果、gamma、swizzle 和 resolve R/B 往返 | Windows D3D12 |
 | LoStencilTest | 左半写 stencil=3，EQUAL/NOT_EQUAL 的 GPU 像素读回；D24 端点静态断言 | Windows D3D12，LO_BUILD_GPU=ON |
 
+> 2026-10 测试精简：`LoStencilTest` 已从仓库移除，上文中它的命令和结果仅为历史记录。
+
 另以 LoShaderTool 编译开场现场捕获的 162 个 shader，结果 0 失败；捕获数据只在本地，不作为仓库测试资产。
 
 ## 实机复现
@@ -54,7 +56,7 @@ logger输出在stderr，并默认将每次运行写入工作目录`logs/runtime-
 
 本轮基线：`out/render-final/`（几何与纹理修复后）。
 光影最终结果：`out/render-light-depthpack/`；中间实验 `render-light-stencil-ref/` 的红色偏光不是最终结果。
-Xenia 对照条件见 [对照记录](xenia-render-comparison.md)。
+Xenia 对照条件见 [对照记录](../archive/notes/xenia-render-comparison.md)。
 
 ## 已知范围
 
@@ -65,7 +67,7 @@ Xenia 对照条件见 [对照记录](xenia-render-comparison.md)。
 
 ## 隐藏窗口的后台测试
 
-设置 `LO_BACKGROUND=1` 后，SDL 从创建时使用隐藏窗口，D3D12 渲染和游戏截图仍然执行，不显示窗口或占用焦点。它不同于停用视频初始化的 `LO_HEADLESS`。通过 `LO_TEST_INPUT_FILE` 提交进程内输入，不注入系统键鼠；运行记录见 [攻略测试](walkthrough-testing.md)。后台运行仍消耗 CPU/GPU，测试结束应停止独立进程。
+设置 `LO_BACKGROUND=1` 后，SDL 从创建时使用隐藏窗口，D3D12 渲染和游戏截图仍然执行，不显示窗口或占用焦点。它不同于停用视频初始化的 `LO_HEADLESS`。通过 `LO_TEST_INPUT_FILE` 提交进程内输入，不注入系统键鼠；运行记录见 [攻略测试](../archive/notes/walkthrough-testing.md)。后台运行仍消耗 CPU/GPU，测试结束应停止独立进程。
 
 资源解析致命错误会记录原始资源名与调用者，随后保留游戏原本的报错和退出行为；日志不再只显示笼统的 dirty disc 提示。
 

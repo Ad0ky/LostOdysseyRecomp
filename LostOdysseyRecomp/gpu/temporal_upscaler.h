@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dlss_nr_state.h"
 #include "frame_plan.h"
 #include "temporal_frame_inputs.h"
 
@@ -59,6 +60,10 @@ struct SrResult {
 struct SrDispatchOptions {
     bool fsrSharpening = false;
     float fsrSharpness = 0.0f;
+    uint32_t dlssNeuralRenderingPasses = 0;
+    uint32_t dlssNeuralRenderingPreset = 0;
+    dlss::NeuralRenderingTuning dlssNeuralRenderingTuning{};
+    uint32_t dlssModel = 0; // Settings dlss_model: 0 M, 1 L.
 };
 
 struct SrRequest {
