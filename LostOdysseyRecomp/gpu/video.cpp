@@ -3,6 +3,7 @@
 #include <stdafx.h>
 #endif
 #include "video.h"
+#include "lsfg_frame_gen.h"
 #include "frame_plan.h"
 #if defined(LO_GPU_PLUME) || defined(LO_VIDEO_SUBMISSION_UNIT)
 #include "backend_device.h"
@@ -2042,7 +2043,7 @@ namespace gpu::video
         // Renderer and presentation work have already been drained.
         if (g_d3dFg) g_d3dFg->ReleaseFeatureAfterGpuDrain();
 #endif
-        g_swapChain.reset(); g_presentSemaphores.clear();
+        gpu::lsfg::Reset(); g_swapChain.reset(); g_presentSemaphores.clear();
         if (g_temporalUpscaler) {
             g_temporalUpscaler->ShutdownAfterGpuDrain();
             if (!g_temporalUpscaler->ShutdownComplete()) {
@@ -2917,14 +2918,14 @@ namespace gpu::video
         if (surfaceSerial == g_androidAppliedSurfaceChangeSerial && g_swapChain) return true;
         if (!g_queue || !g_window || !WaitForPresentGpu()) return false;
         if (g_presentation) g_presentation->ForgetTargets();
-        g_swapChain.reset();
+        gpu::lsfg::Reset(); g_swapChain.reset();
         g_presentSemaphores.clear();
         g_hasPresentedImage = false;
         g_lastPresentedImage = 0;
         // Same HDR choice as before the surface went away.
         g_swapChain = g_queue->createSwapChain(SwapChainDescription());
         if (!g_swapChain || g_swapChain->isEmpty()) {
-            g_swapChain.reset();
+            gpu::lsfg::Reset(); g_swapChain.reset();
             if (!g_androidSurfaceRebuildFailureLogged)
                 LOG_WARNING("video: Android native surface swapchain recreation pending serial={}", surfaceSerial);
             g_androidSurfaceRebuildFailureLogged = true;
@@ -3577,7 +3578,7 @@ namespace gpu::video
         g_snapshotWidth = g_snapshotHeight = 0;
         g_snapshotFormat = plume::RenderFormat::UNKNOWN;
         if (g_presentation) g_presentation->ForgetTargets();
-        g_swapChain.reset();
+        gpu::lsfg::Reset(); g_swapChain.reset();
         g_presentSemaphores.clear();
         g_d3dFg.reset();
 
@@ -3608,7 +3609,7 @@ namespace gpu::video
         };
         bool swapReady = createSwapchain();
         if (!swapReady && g_d3dFg) {
-            g_swapChain.reset();
+            gpu::lsfg::Reset(); g_swapChain.reset();
             LOG_ERROR("D3D12 FG: provider swapchain creation failed; returning to ordinary presentation");
             g_d3dFg.reset();
             if (queue->recreateNativeQueue()) swapReady = createSwapchain();
@@ -3784,7 +3785,7 @@ namespace gpu::video
         g_hdrCalibrationCache = {};
         settings::SetHdrCalibrationSceneAvailable(false);
         if (g_presentation) g_presentation->ForgetTargets();
-        g_swapChain.reset();
+        gpu::lsfg::Reset(); g_swapChain.reset();
         g_presentSemaphores.clear();
         g_hdrSwapchain = desired;
 #if LO_PLATFORM_MACOS
@@ -4759,7 +4760,10 @@ namespace gpu::video
                 g_fgPresent.Submitted(g_deviceEpoch.load(), submissionSerial);
                 if (sceneCopySource) SceneCopySubmitted(now);
                 FgPresentStart();
-                const bool presented = g_swapChain->present(imageIndex, &signalSemaphore, 1);
+                // Switch LO_FRAMEGEN=1: a generated frame, then this one (gpu/lsfg_frame_gen.h).
+                bool presented = false;
+                if (!gpu::lsfg::Present(g_swapChain.get(), imageIndex, signalSemaphore, presented))
+                    presented = g_swapChain->present(imageIndex, &signalSemaphore, 1);
                 FgPresented(presented);
                 if (!presented) {
                     g_fgPresent.CancelAll(frame_generation::HandoffCancel::DisplayChange);
