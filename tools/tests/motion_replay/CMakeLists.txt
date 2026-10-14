@@ -263,6 +263,7 @@ if(LO_FG_GAME_COMPILE_CHECK)
  endif()
  add_library(fg_game_bridge STATIC
   "${ROOT}/LostOdysseyRecomp/gpu/frame_generation_d3d12.cpp"
+  "${ROOT}/LostOdysseyRecomp/gpu/d3d12_dred.cpp"
   "${ROOT}/LostOdysseyRecomp/gpu/dlss_fg_depth.cpp")
  target_compile_definitions(fg_game_bridge PUBLIC LO_ENABLE_D3D12_FG=1)
  target_link_libraries(fg_game_bridge PUBLIC mv_runtime framegen_d3d12)

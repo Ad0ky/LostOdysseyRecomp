@@ -40,6 +40,7 @@
 #include "driver_pipeline_cache.h"
 #include "pipeline_prepare_progress.h"
 #include "texture_layout.h"
+#include "d3d12_dred.h"
 #include "controller_atlas.h"
 #include "bc_decode.h"
 #include "temporal_scene.h"
@@ -8009,6 +8010,7 @@ void main()
                     LOG_WARNING("[mods] texture {:016x} replacement creation failed {}x{} levels={}; using original", fingerprint, data.width, data.height, levelCount);
                     return ReplacementUpload::Skipped;
                 }
+                if (dred::Enabled()) tex.texture->setName(fmt::format("mod {:016x}", fingerprint));
                 tex.format = hostFormat;
                 for (uint32_t level = 0; level < levelCount; level++)
                 {
@@ -8553,6 +8555,7 @@ void main()
                     LOG_WARNING("renderer: texture creation failed fmt={} {}x{}", format, texWidth, texHeight);
                     return nullptr;
                 }
+                if (dred::Enabled()) tex->texture->setName(fmt::format("guest {:08x}", tex->guestAddress));
 
                 texBytes += upload.size();
                 uint64_t offset = Upload(upload.data(), upload.size(), 512);

@@ -1,5 +1,6 @@
 #include "frame_generation_d3d12.h"
 #if defined(_WIN32) && defined(LO_ENABLE_D3D12_FG)
+#include "d3d12_dred.h"
 #include <os/logger.h>
 #include <cstdlib>
 #include <cstdio>
@@ -23,6 +24,7 @@ D3D12Bridge::~D3D12Bridge() { Shutdown(); }
 void D3D12Bridge::Require(bool success, const std::string& reason) {
     if (success) return;
     LOG_ERROR("D3D12 FG: {}; terminating without releasing uncertain GPU ownership", reason);
+    gpu::dred::LogRemovedDevice(device_ ? device_->d3d : nullptr);
     std::fflush(nullptr);
     // Not ExitProcess: DLL detach in the driver and Streamline can hang after a device loss.
     TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);

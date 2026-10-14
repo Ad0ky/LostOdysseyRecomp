@@ -84,6 +84,7 @@
 #include <plume_vulkan.h>
 #ifdef _WIN32
 #include <plume_d3d12.h>
+#include "d3d12_dred.h"
 #endif
 #if LO_PLATFORM_MACOS
 // Declared the way plume's examples do; plume_metal.h pulls in metal-cpp.
@@ -1611,6 +1612,10 @@ namespace gpu::video
             LOG_ERROR("video: native GPU work stopped backend={} raw_result={}; device restart required",
                 g_vulkan ? "Vulkan" : g_metal ? "Metal" : "D3D12", nativeResult);
         g_submissionState.Stop(nativeResult);
+#if defined(_WIN32) && !defined(LO_VIDEO_SUBMISSION_UNIT)
+        if (first && !g_vulkan && g_device)
+            dred::LogRemovedDevice(static_cast<plume::D3D12Device*>(g_device.get())->d3d);
+#endif
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
         g_fgPresent.CancelAll(frame_generation::HandoffCancel::DeviceLost);
         renderer::CancelFgHandoffs();
@@ -2518,6 +2523,7 @@ namespace gpu::video
                 g_dlssController = std::make_unique<dlss::Controller>(DlssApplicationDataPath(), DlssRuntimePath());
                 g_temporalUpscaler = std::make_unique<TemporalUpscaler>(*g_dlssController);
                 startupWatch.Step("D3D12 interface creation");
+                dred::ConfigureBeforeDeviceCreation(settings::GetConfig().debugLog);
                 g_interface = plume::CreateD3D12Interface();
             }
 #elif LO_PLATFORM_MACOS
@@ -2668,6 +2674,11 @@ namespace gpu::video
             startupWatch.Step("command queue creation");
             g_queue = g_device->createCommandQueue(plume::RenderCommandListType::DIRECT);
             if (!g_queue) return "graphics queue creation failed";
+#ifdef _WIN32
+            // DRED lists unfinished command lists by queue; unnamed ones are the SDKs'.
+            if (!g_vulkan && dred::Enabled())
+                static_cast<plume::D3D12CommandQueue*>(g_queue.get())->d3d->SetName(L"game");
+#endif
 #if defined(LO_ENABLE_STREAMLINE_FG) && defined(_WIN32)
             if (g_fgDispatch && g_fgDispatch->FeatureSupported()) {
                 startupWatch.Step("Streamline device hooks and session");
