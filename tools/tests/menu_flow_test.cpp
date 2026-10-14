@@ -109,8 +109,16 @@ using settings::GraphicsRow;
 
 namespace gpu::frame_plan {
 DlssEffectSnapshot menuFlowDlssEffect{};
+// PlannerObservation::eligible: the last execution of the request that had a scene.
+std::optional<UpscalerExecutionObservation> menuFlowEligible;
 DlssEffectSnapshot CurrentDlssEffect() { return menuFlowDlssEffect; }
-std::optional<UpscalerExecutionObservation> CurrentUpscalerExecution() { return menuFlowDlssEffect.execution; }
+std::optional<UpscalerExecutionObservation> CurrentUpscalerExecution()
+{
+    PlannerObservation observed;
+    observed.execution = menuFlowDlssEffect.execution;
+    observed.eligible = menuFlowEligible;
+    return StatusExecution(observed);
+}
 }
 namespace {
 uint32_t vibrationStrength = 100;
@@ -839,9 +847,63 @@ void CheckBr03DlssMenu(uint8_t* base)
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::UnknownColorEncoding);
     Require(settings::snapshot.notice == L"Color conditions do not support DLSS.", "unsupported color");
     saveState("13-color-unsupported.bmp");
-    show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
-    Require(settings::snapshot.notice == L"No eligible scene this frame.", "no eligible scene");
-    saveState("14-no-eligible-scene.bmp");
+    {
+        // Menus, pause and the title screen draw no scene, so the newest frame
+        // reports NoEligibleScene. The row describes the request's submitted
+        // frame, or its last scene fallback when none (PlannerObservation::eligible).
+        const auto previousExecution = running.execution;
+        auto menuFrame = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+        menuFrame.submissionSerial = 0;
+        menuFrame.reason = DlssEffectReason::NoEligibleScene;
+        running.execution = menuFrame;
+        gpu::frame_plan::menuFlowEligible.reset();
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "title screen or fresh boot: no frame with a scene yet");
+        Require(settings::snapshot.notice.find(L"eligible") == std::wstring::npos, "the menu frame itself is not described");
+        saveState("14-title-not-started.bmp");
+        gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Submitted DLSS Quality output. 1707×960 - 2560×1440",
+                "menu opened after gameplay shows the last game frame");
+        saveState("14-menu-after-gameplay.bmp");
+        settings::edit.dlssQuality = DlssQuality::Performance;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice ==
+                    L"Submitted DLSS Quality output. 1707×960 - 2560×1440 The selected DLSS quality is not applied yet.",
+                "an unsaved quality edit keeps its note after the last game frame");
+        settings::edit.dlssQuality = DlssQuality::Quality;
+        auto stalled = menuFrame;
+        stalled.reason = DlssEffectReason::UnknownColorEncoding;
+        gpu::frame_plan::menuFlowEligible = stalled;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Color conditions do not support DLSS.",
+                "a request that never submitted shows its last scene fallback");
+        saveState("14-menu-after-fallback.bmp");
+        stalled.reason = DlssEffectReason::UnsupportedProjection;
+        gpu::frame_plan::menuFlowEligible = stalled;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"DLSS is not running. Normal rendering is used for now.",
+                "an unnamed scene fallback still says DLSS is not running");
+        auto otherRequest = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        otherRequest.plan.requestSignature = 77;
+        gpu::frame_plan::menuFlowEligible = otherRequest;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "a frame of another request is not described");
+        gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        running.failure = gpu::frame_plan::FailureReason::InvalidInput;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::RequestFailure);
+        Require(settings::snapshot.notice == L"DLSS request failed and fell back. No automatic retry.",
+                "a request failure wins over the last game frame");
+        running.failure.reset();
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::CapabilityUnavailable);
+        Require(settings::snapshot.notice == L"DLSS is not available on this device.",
+                "missing DLSS wins over the last game frame");
+        gpu::frame_plan::menuFlowEligible.reset();
+        running.execution = previousExecution;
+    }
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::FeatureReconfigurePending);
     Require(settings::snapshot.notice == L"Waiting to rebuild DLSS.", "rebuild wait");
     saveState("15-rebuild-waiting.bmp");
@@ -911,6 +973,54 @@ void CheckBr03DlssMenu(uint8_t* base)
     Require(saves == savesAtExecution, "execution status refresh does not save");
     Require(settings::snapshot.rows.size() == size_t(GraphicsRow::Count), "execution status keeps every graphics row");
     Require(settings::active, "execution status refresh leaves the menu open");
+
+    // FSR, XeSS and MetalFX read the same last frame with a scene.
+    for (const auto provider : {Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+    {
+        const std::wstring name = provider == Upscaler::Fsr ? L"FSR" : provider == Upscaler::Xess ? L"XeSS" : L"MetalFX";
+        currentConfig.upscaler = provider;
+        settings::edit.upscaler = provider;
+        settings::edit.fsrQuality = gpu::upscaling::FsrQuality::Quality;
+        running = {};
+        running.hasPlan = true;
+        running.plannedRequest = provider;
+        running.device.backend = Backend::Vulkan;
+        running.device.deviceReady = true;
+        running.device.fsrAvailable = running.device.xessAvailable = running.device.metalFxAvailable = true;
+        running.phase = DlssEffectPhase::Inactive;
+        auto scene = SubmittedObservation(DlssQuality::Quality, 1280, 720, 1920, 1080);
+        scene.plan.requestedUpscaler = provider;
+        scene.plan.consumer = gpu::upscaling::FsrQualityConsumer(provider);
+        scene.plan.fsrQuality = gpu::upscaling::FsrQuality::Quality;
+        scene.actualProvider = provider;
+        auto menuFrame = scene;
+        menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+        menuFrame.submissionSerial = 0;
+        menuFrame.reason = DlssEffectReason::NoEligibleScene;
+        running.execution = menuFrame;
+        gpu::frame_plan::menuFlowDlssEffect = running;
+        gpu::frame_plan::menuFlowEligible.reset();
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "FSR, XeSS and MetalFX before a frame with a scene");
+        gpu::frame_plan::menuFlowEligible = scene;
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == name + L" Quality output submitted. 1280×720 - 1920×1080",
+                "FSR, XeSS and MetalFX after gameplay show the last game frame");
+        auto pending = menuFrame;
+        pending.reason = DlssEffectReason::MotionPipelinePending;
+        gpu::frame_plan::menuFlowEligible = pending;
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == name + L": motion data is still being prepared.",
+                "FSR, XeSS and MetalFX show a fallback in the last game frame");
+    }
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    currentConfig.upscaler = Upscaler::Dlss;
+    settings::edit.upscaler = Upscaler::Dlss;
     notes.close();
     Require(bool(notes), "write BR-03 notice list");
     std::puts("PASS BR-03 menu status from stubbed snapshots: submitted output, waiting, probe, fallback reasons, GPU stopped, unsaved edits");
@@ -2626,6 +2736,66 @@ int main(int argc, char** argv)
             std::puts("PASS Graphics and bilingual DLSS/English FSR section previews from actual Publish/Translate with installed assets");
         }
         CheckBr03DlssMenu(base);
+        if (argc == 3)
+        {
+            // The DLSS row status over a menu frame, with installed fonts in
+            // English and Simplified Chinese: after gameplay and before any scene.
+            using gpu::frame_plan::DlssEffectPhase;
+            using gpu::frame_plan::DlssEffectReason;
+            using gpu::upscaling::DlssQuality;
+            const auto previousEdit = settings::edit;
+            const auto previousConfig = currentConfig;
+            currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+            currentConfig.dlssQuality = DlssQuality::Quality;
+            currentConfig.graphicsBackend = settings::GraphicsBackend::Vulkan;
+            settings::edit = currentConfig;
+            settings::edit.frameGenerationProvider = framegen::Provider::Off;
+            settings::edit.hdr = false;
+            settings::status.clear();
+            settings::tab = 2;
+            settings::row = int(GraphicsRow::DlssQuality);
+            gpu::frame_plan::DlssEffectSnapshot running{};
+            running.hasPlan = true;
+            running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+            running.plannedQuality = DlssQuality::Quality;
+            running.device.backend = gpu::backend::Backend::Vulkan;
+            running.device.deviceReady = true;
+            running.device.dlssAvailable = true;
+            running.phase = DlssEffectPhase::TemporaryFallback;
+            running.reason = DlssEffectReason::NoEligibleScene;
+            auto menuFrame = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+            menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+            menuFrame.submissionSerial = 0;
+            menuFrame.reason = DlssEffectReason::NoEligibleScene;
+            running.execution = menuFrame;
+            gpu::frame_plan::menuFlowDlssEffect = running;
+            for (const bool played : {true, false})
+            {
+                gpu::frame_plan::menuFlowEligible.reset();
+                if (played) gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+                for (const uint32_t language : {0u, 4u})
+                {
+                    settings::edit.uiLanguage = language;
+                    settings::Publish(base, ConfigData);
+                    auto preview = settings::snapshot;
+                    preview.assets = settings::menu_assets::Cached(argv[1], language);
+                    Require(bool(preview.assets), "installed DLSS status assets");
+                    const std::wstring expected = played
+                        ? (language ? L"已提交 DLSS 质量输出。 1707×960 - 2560×1440" : L"Submitted DLSS Quality output. 1707×960 - 2560×1440")
+                        : (language ? L"进入游戏场景后才会开始缩放。" : L"Upscaling starts once the game scene is on screen.");
+                    Require(preview.notice == expected, "translated DLSS status over a menu frame");
+                    std::vector<uint32_t> pixels;
+                    Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "translated DLSS status preview");
+                    WriteBmp(std::filesystem::path(argv[2]) / (std::string("dlss-status-") + (language ? "zh-" : "en-") +
+                        (played ? "last-game-frame.bmp" : "not-started.bmp")), pixels);
+                }
+            }
+            gpu::frame_plan::menuFlowEligible.reset();
+            gpu::frame_plan::menuFlowDlssEffect = {};
+            currentConfig = previousConfig;
+            settings::edit = previousEdit;
+            std::puts("PASS DLSS status after gameplay and before any scene, English and Chinese, installed assets");
+        }
         {
             const auto previousEdit = settings::edit;
             settings::tab = 2;

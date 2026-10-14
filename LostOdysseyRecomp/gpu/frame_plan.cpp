@@ -170,7 +170,7 @@ namespace gpu::frame_plan
             observed.plan.deviceEpoch != device.deviceEpoch ||
             observed.execution->plan.requestSignature != observed.plan.requestSignature ||
             observed.execution->plan.geometryEpoch != observed.plan.geometryEpoch) return {};
-        return observed.execution;
+        return StatusExecution(observed);
     }
     void ReportUpscalerExecution(const UpscalerExecutionObservation& observation)
     {

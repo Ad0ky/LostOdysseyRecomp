@@ -848,8 +848,6 @@ const wchar_t *ReasonSentence(gpu::frame_plan::DlssEffectReason reason)
         return Tr(L"Render resolution query failed.", L"渲染解析度查詢失敗。");
     case DlssEffectReason::InputProbeOnly:
         return Tr(L"Input capture only. DLSS is not run.", L"只採集輸入，不執行 DLSS。");
-    case DlssEffectReason::NoEligibleScene:
-        return Tr(L"No eligible scene this frame.", L"這一幀沒有合格場景。");
     case DlssEffectReason::MotionPipelinePending:
         return Tr(L"Motion data is still being prepared.", L"正在準備運動資料。");
     case DlssEffectReason::UnknownColorEncoding:
@@ -863,10 +861,17 @@ const wchar_t *ReasonSentence(gpu::frame_plan::DlssEffectReason reason)
                   L"DLSS 請求失敗並已回退，不會自動重試。");
     case DlssEffectReason::GpuWorkStopped:
         return Tr(L"GPU work has stopped.", L"GPU 工作已停止。");
+    case DlssEffectReason::NoEligibleScene: // NotStartedSentence
     case DlssEffectReason::None:
         break;
     }
     return nullptr;
+}
+// No frame of the current request has drawn a scene yet: the title screen,
+// a fresh boot, or a change just saved from the in-game menu. Every upscaler.
+const wchar_t *NotStartedSentence()
+{
+    return Tr(L"Upscaling starts once the game scene is on screen.", L"進入遊戲場景後才會開始縮放。");
 }
 const wchar_t *PhaseSentence(gpu::frame_plan::DlssEffectPhase phase)
 {
@@ -893,10 +898,9 @@ const wchar_t *PhaseSentence(gpu::frame_plan::DlssEffectPhase phase)
     }
     return Tr(L"DLSS is not in use.", L"DLSS 目前未啟用。");
 }
-std::wstring SubmittedSentence(const gpu::frame_plan::DlssEffectSnapshot &running)
+std::wstring SubmittedSentence(const gpu::frame_plan::DlssExecutionObservation &execution)
 {
-    return std::wstring(SubmittedModeSentence(running.execution->plan.dlssQuality)) +
-           ExecutionSizeSuffix(running.execution->plan);
+    return std::wstring(SubmittedModeSentence(execution.plan.dlssQuality)) + ExecutionSizeSuffix(execution.plan);
 }
 const wchar_t *BackendPendingSentence(gpu::backend::Backend backend)
 {
@@ -925,8 +929,7 @@ const wchar_t* FsrFallbackSentence(gpu::frame_plan::DlssEffectReason reason)
     using gpu::frame_plan::DlssEffectReason;
     switch (reason) {
     case DlssEffectReason::NoEligibleScene:
-        return Tr(L"FSR: no eligible scene in the latest frame. Menus and transitions may use normal rendering.",
-                  L"FSR：最近一幀沒有合格場景。選單和過場可能使用常規渲染。");
+        return NotStartedSentence();
     case DlssEffectReason::UnknownColorEncoding:
         return Tr(L"FSR: scene color source is not verified. Normal rendering is used for this frame.",
                   L"FSR：場景色彩來源尚未確認，這一幀使用常規渲染。");
@@ -950,7 +953,9 @@ const wchar_t* FsrFallbackSentence(gpu::frame_plan::DlssEffectReason reason)
 // reads quality and size from that submitted frame, not from an unsaved edit or
 // the CPU plan. Submitted means that output was accepted for submission. It does
 // not mean the GPU finished, the image was presented, or the whole frame used DLSS.
-// Active without an execution record stays on the waiting sentence.
+// Active without an execution record stays on the waiting sentence. While the
+// newest frame has no scene, StatusExecution of the same request is described;
+// a failure classified from the snapshot still comes first.
 // An unsaved Off, quality, or backend edit is only a following note.
 std::wstring DlssNotice()
 {
@@ -975,9 +980,10 @@ std::wstring DlssNotice()
             const wchar_t* modes[] = {Tr(L"Quality", L"品質"), Tr(L"Balanced", L"平衡"), Tr(L"Performance", L"效能"), L"Native AA"};
             text = std::wstring(L"MetalFX ") + modes[uint32_t(gpu::upscaling::NormalizeFsrQuality(execution->plan.fsrQuality))] +
                 Tr(L" output submitted.", L" 輸出已提交。") + ExecutionSizeSuffix(execution->plan);
-        } else
-            text = Tr(L"MetalFX: no upscaled scene in the latest frame. Menus and transitions use normal rendering.",
-                      L"MetalFX：最近一幀沒有縮放場景。選單和過場使用常規渲染。");
+        } else if (matchingExecution && gpu::frame_plan::SceneEligible(*execution))
+            text = WithProvider(FsrFallbackSentence(execution->reason), L"MetalFX");
+        else
+            text = NotStartedSentence();
         if (edit.upscaler != gpu::upscaling::Upscaler::MetalFx)
             text += Tr(L" The selected upscaler is not applied yet.", L" 選取的縮放技術尚未套用。");
         return text;
@@ -1021,11 +1027,32 @@ std::wstring DlssNotice()
             fsrText += Tr(L" The selected upscaler is not applied yet.", L" 選取的縮放技術尚未套用。");
         return xess ? WithProvider(std::move(fsrText), name) : fsrText;
     }
+    // The menu itself covers the scene, so its frames report NoEligibleScene.
+    // Describe a submitted frame of this request instead, or the reason of its
+    // last frame with a scene when none was submitted.
+    const bool sceneless = running.phase == gpu::frame_plan::DlssEffectPhase::TemporaryFallback &&
+        running.reason == gpu::frame_plan::DlssEffectReason::NoEligibleScene;
+    const bool lastScene = sceneless && execution && gpu::frame_plan::SceneEligible(*execution) &&
+        execution->actualProvider == gpu::upscaling::Upscaler::Dlss &&
+        execution->plan.deviceEpoch == running.device.deviceEpoch &&
+        execution->plan.requestSignature == running.requestSignature &&
+        execution->plan.geometryEpoch == running.geometryEpoch;
+    const bool lastSubmitted = lastScene && execution->submissionSerial &&
+        execution->outcome == gpu::frame_plan::DlssExecutionOutcome::Submitted &&
+        execution->plan.consumer == gpu::upscaling::TemporalConsumer::DlssSr;
     std::wstring text;
     if (running.phase == gpu::frame_plan::DlssEffectPhase::Active && running.execution)
-        text = SubmittedSentence(running);
+        text = SubmittedSentence(*running.execution);
     else if (running.phase == gpu::frame_plan::DlssEffectPhase::Active)
         text = ReasonSentence(gpu::frame_plan::DlssEffectReason::AwaitingGpuFrame);
+    else if (lastSubmitted)
+        text = SubmittedSentence(*execution);
+    else if (const wchar_t *lastReason = lastScene ? ReasonSentence(execution->reason) : nullptr)
+        text = lastReason;
+    else if (lastScene)
+        text = PhaseSentence(gpu::frame_plan::DlssEffectPhase::TemporaryFallback);
+    else if (sceneless)
+        text = NotStartedSentence();
     else if (const wchar_t *classified = ReasonSentence(running.reason))
         text = classified;
     else
@@ -1038,6 +1065,8 @@ std::wstring DlssNotice()
         if (running.execution)
             appliedQuality = gpu::upscaling::NormalizeDlssQuality(running.execution->plan.dlssQuality);
     }
+    else if (lastSubmitted)
+        appliedQuality = gpu::upscaling::NormalizeDlssQuality(execution->plan.dlssQuality);
     else if (runningDlss)
         appliedQuality = gpu::upscaling::NormalizeDlssQuality(running.plannedQuality);
     if (runningDlss && edit.upscaler != gpu::upscaling::Upscaler::Dlss)
