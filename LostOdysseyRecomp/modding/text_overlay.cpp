@@ -1,6 +1,7 @@
 #include "text_overlay.h"
 #include "cpx_pack.h"
 #include "fpi_index.h"
+#include "fpi_overflow.h"
 #include "mod_api.h"
 #include "model_import.h"
 #include "rebuild_progress.h"
@@ -73,6 +74,7 @@ void PutLe32(std::vector<uint8_t> &out, size_t at, uint32_t value)
 struct Folder
 {
     std::map<std::string, std::vector<Range>> ranges; // by lower-case file name
+    std::map<std::string, fs::path> overflow;         // overflow archives (fpi_overflow.h) by lower-case name
 };
 
 // Rebuilt files after an archive's real end: appended to a cache file, or kept
@@ -200,10 +202,12 @@ std::vector<uint8_t> RebuildModels(const std::string &path, const std::vector<ui
 // then they are stored and freed. A map's meshes are placed from its own
 // folder; the few shared ones placed from elsewhere (kPlacedElsewhere) are
 // rebuilt first and their vertex maps kept for the folders that place them.
+// Files that would end past 4 GiB of their archive go into overflow archives
+// (fpi_overflow.h) in the cache.
 // index: the file's first IndexSize() bytes, patched in place; tails: per
-// archive file name.
+// archive file name; overflows: the folder's overflow archives by name.
 void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &names, std::vector<uint8_t> &index,
-                std::map<std::string, Tail> &tails, const fs::path &cache, Counts &counts)
+                std::map<std::string, Tail> &tails, std::map<std::string, Tail> &overflows, const fs::path &cache, Counts &counts)
 {
     const auto parsed = fpi::Read(index);
     // In archive order, so the reads run forward through each file (slow disks).
@@ -251,7 +255,10 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         return member;
     };
     struct Rebuilt { Member member; std::vector<uint8_t> bytes; bool model = false; };
-    std::mutex storing; // tails, index
+    std::mutex storing; // tails, overflows, index
+    std::vector<std::string> overflowNames;       // this index's overflow archives
+    std::vector<fpi::OverflowFile> overflowFiles; // and the files in them
+    std::vector<bool> overflowTexts;
     auto store = [&](const fpi::File &file, Rebuilt &item, Counts &counts) {
         const auto archive = names.find(parsed.archives.at(file.archive));
         const auto payload = item.member.packed ? cpx_pack::Pack(item.bytes, item.member.stored, fpi::kSector) : item.bytes;
@@ -271,7 +278,30 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
             }
         }
         const uint64_t offset = tail.base + tail.size;
-        if (offset + payload.size() > kMaxOffset) throw std::runtime_error("archive would pass 4 GiB");
+        if (offset + payload.size() > kMaxOffset)
+        {
+            if (cache.empty()) throw std::runtime_error("archive would pass 4 GiB (overflow archives need the mod cache)");
+            if (overflowNames.empty() || overflows.at(overflowNames.back()).size + payload.size() > kMaxOffset)
+            {
+                std::string name;
+                for (size_t n = overflows.size(); name.empty() || names.count(name) || overflows.count(name); ++n)
+                    name = "xenon_mod" + std::to_string(n) + ".fpd";
+                auto &added = overflows[name];
+                added.path = cache / name;
+                added.file.open(added.path, std::ios::binary | std::ios::trunc);
+                if (!added.file) throw std::runtime_error("cannot write " + Utf8(added.path));
+                overflowNames.push_back(name);
+            }
+            auto &overflow = overflows.at(overflowNames.back());
+            const uint64_t at = overflow.size;
+            overflow.Append(payload);
+            overflowFiles.push_back({file.record, file.archive, file.path, uint32_t(overflowNames.size() - 1), at,
+                                     uint32_t(payload.size()), uint32_t(item.bytes.size()), item.member.packed});
+            overflowTexts.push_back(!item.model);
+            ++counts.files;
+            counts.texts += !item.model;
+            return;
+        }
         tail.Append(payload);
 
         // +8: keep the disc and layer byte, point the sector at the copy.
@@ -427,17 +457,46 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         counts.files += c.files; counts.texts += c.texts; counts.unknownKeys += c.unknownKeys;
         counts.failed += c.failed; counts.models += c.models;
     }
+
+    if (overflowFiles.empty()) return;
+    try
+    {
+        index = fpi::AddOverflowArchives(index, overflowNames, overflowFiles);
+        std::string list;
+        for (const auto &name : overflowNames) list += (list.empty() ? "" : ", ") + name;
+        LOG_NOTICE("[mods] {} rebuilt files did not fit in their archives in {}; they are in {}", overflowFiles.size(), Utf8(folder), list);
+    }
+    catch (const std::exception &error)
+    {
+        // The original records are untouched: the game reads the original files.
+        for (size_t i = 0; i < overflowFiles.size(); ++i)
+        {
+            LOG_WARNING("[mods] {} kept original in {}: overflow archive: {}", overflowFiles[i].path, Utf8(folder), error.what());
+            --counts.files;
+            counts.texts -= overflowTexts[i];
+            ++counts.failed;
+        }
+        for (const auto &name : overflowNames)
+        {
+            auto &overflow = overflows.at(name);
+            overflow.file.close();
+            std::error_code ec;
+            fs::remove(overflow.path, ec);
+            overflows.erase(name);
+        }
+    }
 }
 
 // ---- The cache ----------------------------------------------------------------
 // cache/mods/<folder hash>/ holds a folder's patched indexes (<name>.index), its
-// tails (<archive>.tail) and manifest.txt, written last: the key, then one line
-// per index ("index <name>") and tail ("tail <archive> <base> <size>"). The key
+// tails (<archive>.tail), its overflow archives (<name>) and manifest.txt,
+// written last: the key, then one line per index ("index <name>"), tail ("tail
+// <archive> <base> <size>") and overflow archive ("overflow <name> <size>"). The key
 // covers the code that rebuilds the files and the cache format, the selected
 // language pack, the mods' files (path, entry, size, time), and the folder's
 // indexes and archive sizes; any change rebuilds. A game update that leaves the
 // rebuilding code alone keeps the cache.
-constexpr const char *kCacheFormat = "2"; // bump when the rebuilt bytes change for the same inputs
+constexpr const char *kCacheFormat = "3"; // bump when the rebuilt bytes change for the same inputs
 #ifdef LO_MODS_BUILDER_HASH
 // A hash of modding/ and the readers it uses, made by the build.
 constexpr const char *kBuilder = LO_MODS_BUILDER_HASH;
@@ -502,6 +561,14 @@ bool LoadCache(const fs::path &cache, uint64_t key, Folder &result)
             file->path = cache / (value + ".tail");
             if (fs::file_size(file->path, ec) != size || ec) return false;
             loaded.ranges[value].push_back({base, size, nullptr, std::move(file)});
+        }
+        else if (word == "overflow")
+        {
+            uint64_t size = 0;
+            if (!(manifest >> size)) return false;
+            const auto path = cache / value;
+            if (fs::file_size(path, ec) != size || ec) return false;
+            loaded.overflow[value] = path;
         }
         else return false;
     }
@@ -570,7 +637,7 @@ Folder Build(const fs::path &folder)
             building.clear();
         }
     }
-    std::map<std::string, Tail> tails;
+    std::map<std::string, Tail> tails, overflows;
     std::vector<std::string> patched;
     Counts counts;
     for (auto &[name, index] : indexes)
@@ -578,7 +645,7 @@ Folder Build(const fs::path &folder)
         try
         {
             const auto before = counts.files;
-            PatchIndex(folder, names, index, tails, building, counts);
+            PatchIndex(folder, names, index, tails, overflows, building, counts);
             if (counts.files != before) patched.push_back(name);
         }
         catch (const std::exception &error)
@@ -587,6 +654,7 @@ Folder Build(const fs::path &folder)
         }
     }
     for (auto &[name, tail] : tails) tail.file.close();
+    for (auto &[name, overflow] : overflows) overflow.file.close();
     if (counts.files || counts.failed)
         // Keys a copy lacks are normal: a pack made from the DLC copy of a file
         // also applies to the disc copy, which has fewer entries.
@@ -610,6 +678,8 @@ Folder Build(const fs::path &folder)
             }
             for (const auto &[name, tail] : tails)
                 if (tail.size) manifest << "tail " << name << " " << tail.base << " " << tail.size << "\n";
+            for (const auto &[name, overflow] : overflows)
+                if (overflow.size) manifest << "overflow " << name << " " << overflow.size << "\n";
             manifest.close();
             if (!manifest) throw std::runtime_error("cannot write the manifest");
             fs::rename(building / "manifest.txt.part", building / "manifest.txt");
@@ -646,6 +716,8 @@ Folder Build(const fs::path &folder)
                 result.ranges[name].push_back({tail.base, tail.size, nullptr, std::move(file)});
             }
         }
+        for (const auto &[name, overflow] : overflows)
+            if (overflow.size) result.overflow[name] = overflow.path;
     }
     return result;
 }
@@ -737,6 +809,17 @@ std::vector<Range> RangesFor(const fs::path &file)
     if (it == gFolders.end()) it = gFolders.emplace(folder, Build(folder)).first;
     const auto ranges = it->second.ranges.find(name);
     return ranges == it->second.ranges.end() ? std::vector<Range>{} : ranges->second;
+}
+
+fs::path OverflowArchive(const fs::path &file)
+{
+    const auto name = Lower(Utf8(file.filename()));
+    if (!name.ends_with(".fpd")) return {};
+    std::lock_guard lock(gMutex);
+    const auto folder = gFolders.find(file.parent_path().lexically_normal());
+    if (folder == gFolders.end()) return {};
+    const auto it = folder->second.overflow.find(name);
+    return it == folder->second.overflow.end() ? fs::path() : it->second;
 }
 
 bool Range::Read(uint64_t at, uint8_t *out, size_t count) const

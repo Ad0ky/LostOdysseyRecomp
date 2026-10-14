@@ -244,7 +244,7 @@ The steps are the same as above. In addition:
 Limits of map pieces:
 
 - At most 65,536 vertices per model. Most map pieces have a few hundred to a few thousand, so there is room for many times more detail.
-- The first start after a mod is installed or changed, or after a game update that changes how mods are applied, rebuilds the game files it changes: about 20 seconds per disc on an 8-core PC for a mod that replaces every map's pieces, longer on fewer cores. Meanwhile the window shows "Preparing mods" with a progress bar. The rebuilt files are kept in the `cache/mods` folder (in the game folder, or next to the shader cache when the game folder cannot be written) and later starts read them from there. For such a mod they take a few GB. They are removed when the game starts with no mods.
+- The first start after a mod is installed or changed, or after a game update that changes how mods are applied, rebuilds the game files it changes: about half a minute to a minute per disc on an 8-core PC for a mod that replaces every map's pieces, longer on fewer cores. Meanwhile the window shows "Preparing mods" with a progress bar. The rebuilt files are kept in the `cache/mods` folder (in the game folder, or next to the shader cache when the game folder cannot be written) and later starts read them from there. For such a mod they take up to about 6 GB per disc. Rebuilt files that no longer fit in the disc's own 4 GB archives go into extra `xenon_mod0.fpd`, `xenon_mod1.fpd`… files there. They are removed when the game starts with no mods.
 
 `python tools/modding/lo_mod.py archive` packs `overlay/models/` into the `.loarc` like other files.
 

@@ -535,6 +535,14 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
 
     if (hostPath.empty()) hostPath = FileSystem::ResolvePath(name);
     const bool wantWrite = (DesiredAccess & 0x40000000) != 0 || (DesiredAccess & 0x2) != 0 || (DesiredAccess & 0x4) != 0;
+    // A mod overflow archive the patched index names lives in the mod cache.
+    bool overflow = false;
+    if (!wantWrite && !hostPath.empty())
+        if (auto cached = modding::text_overlay::OverflowArchive(hostPath); !cached.empty())
+        {
+            hostPath = std::move(cached);
+            overflow = true;
+        }
 
     std::error_code ec;
     bool exists = !hostPath.empty() && std::filesystem::exists(hostPath, ec);
@@ -623,7 +631,7 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
         _fseeki64(handle->file, 0, SEEK_END);
         handle->size = handle->fileSize = uint64_t(_ftelli64(handle->file));
         _fseeki64(handle->file, 0, SEEK_SET);
-        if (!wantWrite)
+        if (!wantWrite && !overflow)
         {
             handle->ranges = modding::text_overlay::RangesFor(hostPath);
             for (const auto &range : handle->ranges)
@@ -1200,6 +1208,8 @@ uint32_t NtQueryFullAttributesFile(XOBJECT_ATTRIBUTES* Attributes, X_FILE_NETWOR
 {
     std::string name = GuestAnsiString(Attributes ? Attributes->Name.get() : nullptr);
     std::filesystem::path hostPath = FileSystem::ResolvePath(name);
+    if (auto cached = hostPath.empty() ? hostPath : modding::text_overlay::OverflowArchive(hostPath); !cached.empty())
+        hostPath = std::move(cached);
     std::error_code ec;
     if (hostPath.empty() || !std::filesystem::exists(hostPath, ec))
     {

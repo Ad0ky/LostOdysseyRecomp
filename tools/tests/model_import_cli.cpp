@@ -3,8 +3,8 @@
 //     rebuilds one package with one replacement (modding/model_import.h).
 //   LoModelImport --disc <disc folder> --mods <mods folder> --member <archive path> --out <file>
 //     takes the runtime path: mod listing, archive overlay (modding/text_overlay.h),
-//     then reads the member back through the patched index and archive tail and
-//     writes it decoded.
+//     then reads the member back through the patched index, archive tail or overflow
+//     archive and writes it decoded.
 #include <gpu/shader/cpx_decode.h>
 #include <modding/fpi_index.h>
 #include <modding/mod_api.h>
@@ -87,21 +87,24 @@ int Run(std::map<std::string, std::string> &args)
     const auto header = Read(disc / "LO.fpi", 0, 64);
     const auto index = Read(disc / "LO.fpi", 0, modding::fpi::IndexSize(header));
     const auto parsed = modding::fpi::Read(index);
-    for (const auto &file : parsed.files)
+    // The record the game opens: an overflow archive's copy comes first.
+    const auto *file = modding::fpi::Find(parsed, args.at("--member"));
+    if (!file)
     {
-        if (file.path != args.at("--member")) continue;
-        const auto archive = disc / parsed.archives.at(file.archive);
-        auto stored = Read(archive, file.offset, file.size);
-        std::printf("member at %llu, %u bytes stored\n", static_cast<unsigned long long>(file.offset), file.size);
-        std::vector<uint8_t> member = stored;
-        if (stored.size() >= 3 && std::memcmp(stored.data(), "cpx", 3) == 0 && !xenos::resources::cpx::Decode(stored, member))
-            throw std::runtime_error("invalid CPX data");
-        WriteFile(args.at("--out"), member);
-        std::printf("wrote %zu bytes\n", member.size());
-        return 0;
+        std::fprintf(stderr, "member not found\n");
+        return 1;
     }
-    std::fprintf(stderr, "member not found\n");
-    return 1;
+    const auto archive = disc / parsed.archives.at(file->archive);
+    const auto overflow = modding::text_overlay::OverflowArchive(archive);
+    auto stored = overflow.empty() ? Read(archive, file->offset, file->size) : ReadFile(overflow, file->offset, file->size);
+    std::printf("member in %s at %llu, %u bytes stored\n", parsed.archives.at(file->archive).c_str(),
+                static_cast<unsigned long long>(file->offset), file->size);
+    std::vector<uint8_t> member = stored;
+    if (stored.size() >= 3 && std::memcmp(stored.data(), "cpx", 3) == 0 && !xenos::resources::cpx::Decode(stored, member))
+        throw std::runtime_error("invalid CPX data");
+    WriteFile(args.at("--out"), member);
+    std::printf("wrote %zu bytes\n", member.size());
+    return 0;
 }
 }
 

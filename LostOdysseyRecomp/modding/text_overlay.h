@@ -37,6 +37,12 @@ struct Range
 // folder does the rebuilding.
 std::vector<Range> RangesFor(const std::filesystem::path &file);
 
+// Rebuilt files that would end past 4 GiB of their archive (the most the game
+// can address in one) go into overflow archives the patched index adds
+// (fpi_overflow.h). For an overflow archive of a folder whose files were
+// rebuilt: its file in the mod cache, opened in its place; otherwise empty.
+std::filesystem::path OverflowArchive(const std::filesystem::path &file);
+
 // Whether a language pack has a translation for this key of this member
 // (for host text that replaces game text, such as the Quit to Desktop row).
 bool Translates(const std::string &memberPath, const std::string &key);
