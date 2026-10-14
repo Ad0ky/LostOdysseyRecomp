@@ -40,6 +40,10 @@ struct MenuRow
     // The value is literal text, such as a key name: no PlayStation glyph
     // takes the place of a letter.
     bool literal = false;
+    // Opens a page (NR tuning, HDR calibration, Brightness, Controls, Mods,
+    // Achievements): one cell across the value column with the value, the
+    // confirm button and a chevron.
+    bool pageEntry = false;
     // A picture at the start of the row (Achievements page): the name then
     // starts after it. Without an image, iconGlyph is drawn on a dark square.
     std::shared_ptr<const menu_assets::Image> icon;
@@ -54,6 +58,8 @@ struct MenuSnapshot
     int scroll = 0;
     uint32_t language = 0;
     bool playStationPrompts = false;
+    // B confirms and A goes back (the game's swapped button setting).
+    bool confirmB = false;
     std::vector<MenuRow> rows;
     std::wstring help;
     // Graphics-tab DLSS status. Empty on other tabs, so those pages keep one help line.

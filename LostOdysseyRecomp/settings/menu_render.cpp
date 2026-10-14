@@ -1269,6 +1269,29 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             }
             continue;
         }
+        if (row.pageEntry)
+        {
+            // A page entry: one cell across the value column with the value,
+            // then the confirm button and a chevron (drawn: the menu fonts
+            // have no "›").
+            constexpr int buttonSize = 24, chevronWidth = 11, margin = 14, gap = 12;
+            const int right = choiceLeft + choiceWidth;
+            const int chevronLeft = right - margin - chevronWidth;
+            const int buttonLeft = chevronLeft - gap - buttonSize;
+            cell(choiceLeft, y, choiceWidth, rowHeight - 2, focused);
+            const uint32_t valueInk = !row.enabled ? disabled : focused ? selectedInk : ink;
+            text(choiceLeft + margin, y, buttonLeft - gap - choiceLeft - margin, rowHeight - 2, (*choices)[selected], 22,
+                 valueInk, false, 1, focused ? MakeColor(255, 222, 223, 219) : outline, 13);
+            const wchar_t confirm = current.confirmB ? L'B' : L'A';
+            controllerButton(buttonLeft, y + (rowHeight - 2 - buttonSize) / 2, confirm, confirm == L'A', row.enabled);
+            const int middle = y + (rowHeight - 2) / 2;
+            for (int dy = -7; dy <= 7; ++dy)
+            {
+                const int x = chevronLeft + (7 - std::abs(dy)) * 6 / 7;
+                line(x, middle + dy, x + 5, middle + dy, valueInk);
+            }
+            continue;
+        }
         if (row.controllerButtons && choices->size() >= 2)
         {
             for (int option = 0; option < 2; ++option)

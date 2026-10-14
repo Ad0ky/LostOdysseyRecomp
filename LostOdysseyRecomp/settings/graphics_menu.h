@@ -92,7 +92,8 @@ inline uint32_t ShadowResolutionChoice(const Config& config)
 inline bool IsAction(int tab, int row)
 {
     return (tab == 0 && (row == GameControlsRow || row == GameRestoreRow || row == GameMainMenuRow)) ||
-           (tab == 2 && (row == int(GraphicsRow::Brightness) || row == int(GraphicsRow::Save))) ||
+           (tab == 2 && (row == int(GraphicsRow::NeuralRenderingTuning) || row == int(GraphicsRow::HdrCalibration) ||
+                         row == int(GraphicsRow::Brightness) || row == int(GraphicsRow::Save))) ||
            (tab == 3 && (row == SystemAchievementsRow || row == SystemModsRow || row == SystemImportRow || row == SystemShaderBundleRow ||
                          row == SystemSaveRow));
 }
@@ -103,11 +104,15 @@ static_assert(int(GraphicsRow::ShadowResolution) + 1 == int(GraphicsRow::Dynamic
 // Upscaling, neural rendering and frame generation stay one group.
 static_assert(int(GraphicsRow::AntiAliasing) + 1 == int(GraphicsRow::DlssQuality));
 static_assert(int(GraphicsRow::FsrSharpness) + 1 == int(GraphicsRow::DlssNeuralRendering));
-static_assert(int(GraphicsRow::DlssNeuralRendering) + 1 == int(GraphicsRow::FrameGeneration));
+static_assert(int(GraphicsRow::DlssNeuralRendering) + 1 == int(GraphicsRow::NeuralRenderingTuning));
+static_assert(int(GraphicsRow::NeuralRenderingTuning) + 1 == int(GraphicsRow::FrameGeneration));
 static_assert(int(GraphicsRow::FrameGeneration) + 1 == int(GraphicsRow::FrameGenerationMultiplier));
 static_assert(int(GraphicsRow::FrameGenerationMultiplier) + 1 == int(GraphicsRow::AmbientOcclusion));
 static_assert(int(GraphicsRow::AmbientOcclusion) + 1 == int(GraphicsRow::AnisotropicFiltering));
 static_assert(int(GraphicsRow::FrameRate) + 1 == int(GraphicsRow::VariableRefreshRate));
 static_assert(int(GraphicsRow::VariableRefreshRate) + 1 == int(GraphicsRow::PerformanceOverlay));
+// Each sub-page entry sits right under its setting.
+static_assert(int(GraphicsRow::HdrPeak) + 1 == int(GraphicsRow::HdrCalibration));
+static_assert(int(GraphicsRow::HdrCalibration) + 1 == int(GraphicsRow::Brightness));
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
 }

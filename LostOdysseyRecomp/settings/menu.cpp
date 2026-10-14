@@ -1102,6 +1102,9 @@ std::wstring DlssNotice()
 }
 bool GraphicsRowHidden(int r)
 {
+    // A page entry row shows with the setting it belongs to.
+    if (r == int(GraphicsRow::NeuralRenderingTuning)) r = int(GraphicsRow::DlssNeuralRendering);
+    if (r == int(GraphicsRow::HdrCalibration)) r = int(GraphicsRow::HdrPeak);
 #if LO_PLATFORM_ANDROID
     // Android owns the native surface; the renderer derives aspect from its drawable.
     // NGX and frame generation have no Android providers in this build.
@@ -1214,6 +1217,7 @@ void Publish(uint8_t *base, uint32_t config)
     next.brightness = MakeBrightnessCalibration(edit, brightnessOpen.load());
     next.neuralRendering = MakeNeuralRenderingTuning(edit, nrOpen.load());
     const uint32_t flags = PPC_LOAD_U32(config + 4);
+    next.confirmB = (flags & 0x02000000) != 0;
     auto makeChoices = [&](const wchar_t *en, const wchar_t *zh, std::vector<std::wstring> choices,
                            uint32_t selected, bool enabled = true) {
         selected = choices.empty() ? 0 : std::min(selected, uint32_t(choices.size() - 1));
@@ -1342,6 +1346,7 @@ void Publish(uint8_t *base, uint32_t config)
                    (flags & 0x02000000) ? 1 : 0);
         next.rows.back().controllerButtons = true;
         addAction(L"Controls", L"按鍵設定", Tr(L"Open", L"開啟"));
+        next.rows.back().pageEntry = true;
         addAction(L"Restore game defaults", L"恢復遊戲預設設定", Tr(L"Restore", L"恢復"));
         addAction(L"Quit to Main Menu", L"退出到主選單", Tr(L"Return", L"返回"));
         for (int i = 0; i < GameRowCount; ++i)
@@ -1470,6 +1475,9 @@ void Publish(uint8_t *base, uint32_t config)
                    std::min(edit.dlssNeuralRendering, DlssNeuralRenderingMaxPasses));
         neuralRendering.hidden = GraphicsRowHidden(int(GraphicsRow::DlssNeuralRendering));
         placeGraphics(GraphicsRow::DlssNeuralRendering, std::move(neuralRendering));
+        auto nrTuning = makeChoices(L"NR tuning & preview", L"神經渲染調整與預覽", {Tr(L"Open", L"開啟")}, 0);
+        nrTuning.pageEntry = true;
+        placeGraphics(GraphicsRow::NeuralRenderingTuning, std::move(nrTuning));
         const uint32_t afChoice = edit.anisotropicFiltering == 16 ? 4 : edit.anisotropicFiltering == 8 ? 3 :
                                   edit.anisotropicFiltering == 4 ? 2 : edit.anisotropicFiltering == 2 ? 1 : 0;
         placeGraphics(GraphicsRow::AnisotropicFiltering, makeChoices(L"Anisotropic filtering", L"各向異性過濾",
@@ -1547,8 +1555,13 @@ void Publish(uint8_t *base, uint32_t config)
         placeGraphics(GraphicsRow::HdrPeak,
             Row{Tr(L"HDR peak brightness", L"HDR 最高亮度"), peakValue, hdrAvailable,
                 {L"◀", peakValue, L"▶"}, 1});
-        placeGraphics(GraphicsRow::Brightness, makeChoices(L"Brightness / Gamma", L"亮度 / Gamma",
-                   {BrightnessValue(edit.displayBrightness) + L" · " + GammaValue(edit.displayGamma)}, 0));
+        auto calibration = makeChoices(L"HDR calibration", L"HDR 校準", {Tr(L"Open", L"開啟")}, 0, hdrAvailable);
+        calibration.pageEntry = true;
+        placeGraphics(GraphicsRow::HdrCalibration, std::move(calibration));
+        auto brightness = makeChoices(L"Brightness / Gamma", L"亮度 / Gamma",
+                   {BrightnessValue(edit.displayBrightness) + L" · " + GammaValue(edit.displayGamma)}, 0);
+        brightness.pageEntry = true;
+        placeGraphics(GraphicsRow::Brightness, std::move(brightness));
         placeGraphics(GraphicsRow::Save, makeChoices(L"Save graphics settings", L"儲存圖形設定", {Tr(L"Save", L"儲存")}, 0));
     }
     else
@@ -1565,11 +1578,13 @@ void Publish(uint8_t *base, uint32_t config)
         addChoices(L"Debug log", L"除錯日誌", onOff(), edit.debugLog ? 0 : 1);
         if (achievementSummary.empty()) RefreshAchievementSummary();
         addAction(L"Achievements", L"成就", achievementSummary.c_str());
+        next.rows.back().pageEntry = true;
         const bool logUpload = os::log_collection::Supported();
         next.rows.push_back({os::log_collection::Label(edit.uiLanguage),
             !logUpload ? Tr(L"Windows only", L"僅限 Windows") : os::log_collection::Enabled() ? Tr(L"On", L"開") : Tr(L"Off", L"關"),
             logUpload, {}, 0});
         addAction(L"Mods", L"Mod", Tr(L"Open", L"開啟"));
+        next.rows.back().pageEntry = true;
         addAction(L"Import discs & DLC", L"匯入光碟與 DLC", Tr(L"Open", L"開啟"));
         addAction(L"Shader bundle", L"著色器包", Tr(L"Download again", L"重新下載"));
         addAction(L"Save settings", L"儲存設定", Tr(L"Save", L"儲存"));
@@ -1759,6 +1774,10 @@ void Publish(uint8_t *base, uint32_t config)
             if (status) next.help = next.help + (next.help.ends_with(L'。') ? L"" : L" ") + status;
             break;
         }
+        case GraphicsRow::NeuralRenderingTuning:
+            next.help = Tr(L"Tune the model and compare DLSS with DLSS + NR in a live preview.",
+                           L"調整模型，並在即時預覽中比較 DLSS 與 DLSS + NR。");
+            break;
         case GraphicsRow::AnisotropicFiltering:
             next.help = Tr(L"Improves texture clarity at oblique viewing angles. Changes apply immediately after saving.",
                            L"提升斜角觀看時的紋理清晰度。儲存後立即套用。");
@@ -1871,6 +1890,13 @@ void Publish(uint8_t *base, uint32_t config)
         case GraphicsRow::HdrPeak:
             next.help = Tr(L"Press A to calibrate peak brightness against an HDR comparison pattern. Auto follows the active display report.",
                            L"按 A 以 HDR 對比圖校準最高亮度；自動模式跟隨目前顯示器的回報值。");
+            break;
+        case GraphicsRow::HdrCalibration:
+            next.help = graphics_menu::HdrAvailable(edit.graphicsBackend)
+                ? Tr(L"Set peak brightness against an HDR test pattern or the current scene.",
+                     L"以 HDR 測試圖案或目前場景校準最高亮度。")
+                : Tr(L"HDR output is unavailable for this graphics backend.",
+                     L"目前圖形後端無法使用 HDR 輸出。");
             break;
         case GraphicsRow::Brightness:
             next.help = Tr(L"Adjusts the game image's brightness and gamma. Press A to compare against the current scene. Changes apply after saving.",
@@ -2009,7 +2035,7 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogMessage == snapshot.dialogMessage && next.dialogChoices == snapshot.dialogChoices &&
         next.dialogSelection == snapshot.dialogSelection && next.speakerLayout == snapshot.speakerLayout &&
         next.speakerRear == snapshot.speakerRear && next.pageTitle == snapshot.pageTitle &&
-        next.keyLegend == snapshot.keyLegend && next.reorder == snapshot.reorder)
+        next.keyLegend == snapshot.keyLegend && next.reorder == snapshot.reorder && next.confirmB == snapshot.confirmB)
         return;
     next.revision = snapshot.revision + 1;
     snapshot = std::move(next);
@@ -3680,6 +3706,8 @@ PPC_FUNC(sub_822F19B0)
                         int(edit.hdrPaperWhiteNits), 10000));
                 }
                 break;
+            case GraphicsRow::NeuralRenderingTuning:
+            case GraphicsRow::HdrCalibration:
             case GraphicsRow::Brightness:
             case GraphicsRow::Save:
             case GraphicsRow::Count:
@@ -3742,7 +3770,8 @@ PPC_FUNC(sub_822F19B0)
         shaderBundleChoice = 1;
         status.clear();
     }
-    if ((input & 0x1000) && tab == 2 && row == int(GraphicsRow::HdrPeak) &&
+    if ((input & 0x1000) && tab == 2 &&
+        (row == int(GraphicsRow::HdrPeak) || row == int(GraphicsRow::HdrCalibration)) &&
         graphics_menu::HdrAvailable(edit.graphicsBackend))
     {
         calibrationStartAutomatic = edit.hdrPeakAutomatic;
@@ -3842,7 +3871,8 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
-    if ((input & 0x1000) && !(input & 0x2000) && tab == 2 && row == int(GraphicsRow::DlssNeuralRendering) &&
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 2 &&
+        (row == int(GraphicsRow::DlssNeuralRendering) || row == int(GraphicsRow::NeuralRenderingTuning)) &&
         !GraphicsRowHidden(row))
     {
         nrStart = edit;

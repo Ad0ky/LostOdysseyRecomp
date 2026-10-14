@@ -110,6 +110,12 @@ void PointerDrag(float x, float y, bool held);
 //   (menu_render.cpp).
 // - Rows that only apply to one choice (DLSS model, HDR levels) are hidden
 //   while that choice is off (GraphicsRowHidden in menu.cpp).
+// - A page opened from the menu has its own entry row (MenuRow::pageEntry: one
+//   wide cell, the confirm button and a chevron) right under the setting it
+//   belongs to, shown whenever that setting is: NR tuning & preview under DLSS 5
+//   neural rendering, HDR calibration under HDR peak brightness, Brightness
+//   before Save; Controls, Mods and Achievements on their tabs. Confirm on the
+//   setting row itself stays a shortcut.
 // - Help text is one line and shrinks when it is too long. Graphics help shares
 //   the box with the upscaler status, so it is drawn small already: keep it to
 //   what a player needs, with the longest status it can carry, in all five
@@ -164,25 +170,27 @@ enum class GraphicsRow : int
     DlssModel = 11, // shown with DLSS
     FsrSharpness = 12,
     DlssNeuralRendering = 13,
-    FrameGeneration = 14,
-    FrameGenerationMultiplier = 15,
-    AmbientOcclusion = 16,
-    AnisotropicFiltering = 17,
-    DepthOfField = 18,
-    Bloom = 19,
-    MotionBlur = 20,
-    Culling = 21,
-    ScalingQuality = 22,
-    RgbRange = 23,
-    FrameRate = 24,
-    VariableRefreshRate = 25,
-    PerformanceOverlay = 26,
-    Hdr = 27,
-    HdrPaperWhite = 28, // shown with HDR on
-    HdrPeak = 29, // shown with HDR on
-    Brightness = 30,
-    Save = 31,
-    Count = 32,
+    NeuralRenderingTuning = 14, // opens the NR page; shown with the NR row
+    FrameGeneration = 15,
+    FrameGenerationMultiplier = 16,
+    AmbientOcclusion = 17,
+    AnisotropicFiltering = 18,
+    DepthOfField = 19,
+    Bloom = 20,
+    MotionBlur = 21,
+    Culling = 22,
+    ScalingQuality = 23,
+    RgbRange = 24,
+    FrameRate = 25,
+    VariableRefreshRate = 26,
+    PerformanceOverlay = 27,
+    Hdr = 28,
+    HdrPaperWhite = 29, // shown with HDR on
+    HdrPeak = 30, // shown with HDR on
+    HdrCalibration = 31, // opens the HDR peak page; shown with HDR on
+    Brightness = 32, // opens the brightness page
+    Save = 33,
+    Count = 34,
 };
 inline constexpr int MenuTabWidth = 640 / MenuTabCount;
 // Mods page (System → Mods): a list page in the tab layout. A row with a detail

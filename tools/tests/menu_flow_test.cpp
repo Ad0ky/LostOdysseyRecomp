@@ -1177,6 +1177,99 @@ void CaptureHelpRows(uint8_t* base, const char* installRoot)
     std::printf("help captures written to %s\n", folder);
 }
 
+// LO_SUBPAGE_CAPTURE_DIR: the page entry rows (Graphics with HDR and DLSS on,
+// Gameplay, System) and the page each one opens, with the installed faces in
+// English and Simplified Chinese.
+void CaptureSubpageEntries(uint8_t* base, const char* installRoot)
+{
+    const char* folder = std::getenv("LO_SUBPAGE_CAPTURE_DIR");
+    if (!folder || !installRoot) return;
+    using gpu::backend::Backend;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    std::filesystem::create_directories(folder);
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    currentConfig.graphicsBackend = Backend::D3D12;
+    currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+    currentConfig.dlssQuality = gpu::upscaling::DlssQuality::Quality;
+    currentConfig.frameGenerationProvider = framegen::Provider::Off;
+    currentConfig.hdr = true;
+    gpu::frame_plan::DlssEffectSnapshot running{};
+    running.hasPlan = true;
+    running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+    running.device.backend = Backend::D3D12;
+    running.device.deviceReady = running.device.dlssAvailable = true;
+    running.phase = gpu::frame_plan::DlssEffectPhase::Active;
+    running.execution = SubmittedObservation(gpu::upscaling::DlssQuality::Quality, 1707, 960, 2560, 1440);
+    gpu::frame_plan::menuFlowDlssEffect = running;
+    gpu::dlss::g_neuralRenderingState = NrState::MissingRuntime;
+    // A confirms (the game's default button setting).
+    const uint32_t savedFlags = PPC_LOAD_U32(ConfigData + 4);
+    PPC_STORE_U32(ConfigData + 4, savedFlags & ~0x02000000u);
+    const auto capture = [&](uint32_t language, const std::string& name) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        auto preview = settings::snapshot;
+        preview.assets = settings::menu_assets::Cached(installRoot, language);
+        Require(bool(preview.assets), "installed capture assets");
+        std::vector<uint32_t> pixels;
+        Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "page entry capture raster");
+        WriteBmp(std::filesystem::path(folder) / (name + (language ? "-zh-hans.bmp" : "-en.bmp")), pixels);
+    };
+    for (const uint32_t language : {0u, 4u})
+    {
+        settings::edit = currentConfig;
+        settings::tab = 2;
+        for (const auto [row, name] : {std::pair{GraphicsRow::NeuralRenderingTuning, "graphics-nr-tuning-row"},
+                                        std::pair{GraphicsRow::HdrCalibration, "graphics-hdr-calibration-row"},
+                                        std::pair{GraphicsRow::Brightness, "graphics-brightness-row"}})
+        {
+            settings::row = int(row);
+            capture(language, name);
+        }
+        // The pages, as Confirm on those rows opens them (menu.cpp input).
+        settings::row = int(GraphicsRow::NeuralRenderingTuning);
+        settings::nrStart = settings::edit;
+        settings::nrFocus = 0;
+        settings::nrOpen = true;
+        capture(language, "page-nr-tuning-dll-missing");
+        settings::nrOpen = false;
+        settings::row = int(GraphicsRow::HdrCalibration);
+        settings::calibrationStartAutomatic = settings::edit.hdrPeakAutomatic;
+        settings::calibrationStartPeakNits = settings::edit.hdrPeakNits;
+        settings::calibrationFocus = 0;
+        settings::calibrationScenePreview = true;
+        settings::calibrationOpen = true;
+        capture(language, "page-hdr-calibration");
+        settings::calibrationOpen = false;
+        settings::row = int(GraphicsRow::Brightness);
+        settings::brightnessStart = settings::edit.displayBrightness;
+        settings::gammaStart = settings::edit.displayGamma;
+        settings::brightnessFocus = 0;
+        settings::calibrationScenePreview = true;
+        settings::brightnessOpen = true;
+        capture(language, "page-brightness");
+        settings::brightnessOpen = false;
+        settings::tab = 0;
+        settings::row = settings::GameControlsRow;
+        capture(language, "gameplay-controls-row");
+        settings::tab = 3;
+        settings::row = settings::SystemModsRow;
+        capture(language, "system-mods-row");
+    }
+    PPC_STORE_U32(ConfigData + 4, savedFlags);
+    gpu::dlss::g_neuralRenderingState = NrState::Off;
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    currentConfig = savedConfig;
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    std::printf("page entry captures written to %s\n", folder);
+}
+
 void CheckHelpFit(uint8_t* base, const char* installRoot)
 {
     using gpu::backend::Backend;
@@ -1564,6 +1657,35 @@ int main(int argc, char** argv)
             Require(settings::edit.dlssNeuralRendering == 2, "left on the row still cycles passes");
             Require(settings::snapshot.help.find(L"tuning page") != std::wstring::npos ||
                     settings::snapshot.help.find(L"調整頁面") != std::wstring::npos, "the row help mentions the tuning page");
+
+            // Its own entry row, right under it, opens the same page: by
+            // Confirm and by a click. Cancel returns to the entry row.
+            {
+                const int tuning = int(GraphicsRow::NeuralRenderingTuning);
+                press(2);
+                Require(settings::row == tuning && settings::snapshot.rows[size_t(tuning)].pageEntry &&
+                        settings::snapshot.rows[size_t(tuning)].value == L"Open", "down from NR reaches NR tuning & preview");
+                press(0x1000);
+                Require(settings::nrOpen && settings::nrFocus == 0 && settings::snapshot.neuralRendering.open,
+                        "NR tuning & preview opens the NR page");
+                settings::nrFocus = 11; press(0x1000);
+                Require(!settings::nrOpen && settings::row == tuning, "Cancel returns to NR tuning & preview");
+                int visible = 0;
+                for (int i = 0; i < tuning; ++i) visible += !settings::snapshot.rows[size_t(i)].hidden;
+                settings::PointerClick(700, float(150 + (visible - settings::snapshot.scroll) * 43 + 20), false);
+                press(0);
+                Require(settings::nrOpen, "a click on NR tuning & preview opens the NR page");
+                settings::nrFocus = 11; press(0x1000);
+                Require(!settings::nrOpen, "Cancel closes the page opened by a click");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Fsr;
+                press(0);
+                Require(settings::snapshot.rows[size_t(tuning)].hidden &&
+                        settings::snapshot.rows[int(GraphicsRow::DlssNeuralRendering)].hidden,
+                        "NR tuning & preview hides with the NR row");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Dlss;
+                settings::row = int(GraphicsRow::DlssNeuralRendering);
+                press(0);
+            }
 
             // Cancel restores every field, passes included.
             openPage();
@@ -2218,6 +2340,7 @@ int main(int argc, char** argv)
             const auto& rows = settings::snapshot.rows;
             Require(settings::GameRowCount == 10 && rows.size() == size_t(settings::GameRowCount) &&
                     rows[settings::GameControlsRow].name == L"Controls" && rows[settings::GameControlsRow].value == L"Open" &&
+                    rows[settings::GameControlsRow].pageEntry &&
                     rows[settings::GameRestoreRow].name == L"Restore game defaults" &&
                     settings::graphics_menu::IsAction(0, settings::GameControlsRow) &&
                     settings::snapshot.help == L"Button prompts, vibration, and the controller and keyboard buttons.",
@@ -3360,6 +3483,44 @@ int main(int argc, char** argv)
                     "retiring the scene immediately removes HDR preview availability");
             Require(settings::CalibrationKey(27), "close reopened calibration");
             settings::pending = 0; Tick(base);
+            // HDR calibration: its own entry row under HDR peak opens the same page.
+            {
+                const int entry = int(GraphicsRow::HdrCalibration);
+                settings::row = int(GraphicsRow::HdrPeak);
+                settings::pending = 2; Tick(base);
+                Require(settings::row == entry && settings::snapshot.rows[size_t(entry)].pageEntry &&
+                        settings::snapshot.rows[size_t(entry)].enabled, "down from HDR peak reaches HDR calibration");
+                settings::pending = 0x1000; Tick(base);
+                Require(settings::snapshot.calibration.open, "HDR calibration opens the calibration page");
+                Require(settings::CalibrationKey(27), "Escape closes calibration opened from its row");
+                settings::pending = 0; Tick(base);
+                Require(!settings::snapshot.calibration.open && settings::row == entry, "Escape returns to HDR calibration");
+                settings::pending = 2; Tick(base);
+                Require(settings::row == int(GraphicsRow::Brightness) &&
+                        settings::snapshot.rows[int(GraphicsRow::Brightness)].pageEntry, "Brightness follows HDR calibration");
+                // HDR and DLSS on is the longest Graphics list; Save at its end stays in view.
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Dlss;
+                settings::row = int(GraphicsRow::Save);
+                settings::pending = 0; Tick(base);
+                int visible = 0, savedAt = 0;
+                for (int i = 0; i < int(GraphicsRow::Count); ++i)
+                {
+                    if (settings::snapshot.rows[size_t(i)].hidden) continue;
+                    if (i == int(GraphicsRow::Save)) savedAt = visible;
+                    ++visible;
+                }
+                Require(!settings::snapshot.rows[int(GraphicsRow::NeuralRenderingTuning)].hidden &&
+                        !settings::snapshot.rows[size_t(entry)].hidden && savedAt - settings::snapshot.scroll < settings::kMenuVisibleRows &&
+                        settings::snapshot.scroll + settings::kMenuVisibleRows == visible,
+                        "with HDR and DLSS on the list scrolls to Save with both entry rows");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Off;
+                settings::edit.hdr = false;
+                settings::row = int(GraphicsRow::Hdr);
+                settings::pending = 0; Tick(base);
+                Require(settings::snapshot.rows[size_t(entry)].hidden, "HDR off hides HDR calibration");
+                settings::edit.hdr = true;
+                settings::pending = 0; Tick(base);
+            }
             settings::edit.antialiasing = 1;
             settings::pending = 0; Tick(base);
             Require(settings::snapshot.notice.find(L"HDR is paused") == std::wstring::npos &&
@@ -3577,6 +3738,7 @@ int main(int argc, char** argv)
             std::puts("PASS FSR sharpness settings.ini read, validation and save/reload roundtrip");
         }
         CaptureHelpRows(base, argc == 3 ? argv[1] : nullptr);
+        CaptureSubpageEntries(base, argc == 3 ? argv[1] : nullptr);
         CheckHelpFit(base, argc == 3 ? argv[1] : nullptr);
         VirtualFree(base, 0, MEM_RELEASE);
         return 0;
