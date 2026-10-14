@@ -40,8 +40,10 @@ Config Validate(Config value)
     value.displayName = TextValue(std::move(value.displayName));
     value.gameLanguagePack = PackId(std::move(value.gameLanguagePack));
     if (value.displayName.empty() || value.displayIndex > 63) value.displayIndex = 0;
-    if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative &&
-        value.internalResolution != 540 && value.internalResolution != 720 && value.internalResolution != 1080 &&
+    // 540 is the Switch handheld scene height (see below); elsewhere it is not offered.
+    const bool switch540 = LO_PLATFORM_SWITCH && value.internalResolution == 540;
+    if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative && !switch540 &&
+        value.internalResolution != 720 && value.internalResolution != 1080 &&
         value.internalResolution != 1440 && value.internalResolution != 2160)
         value.internalResolution = 0;
 #if LO_PLATFORM_MACOS

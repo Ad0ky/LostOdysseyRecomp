@@ -71,8 +71,8 @@ static void GuestThreadFunc(std::shared_ptr<GuestThreadHandle::Control> state)
     std::snprintf(name, sizeof(name), "Guest %x", state->params.function);
     os::SetCurrentThreadName(name);
 #if LO_PLATFORM_SWITCH
-    state->hostHandle.store(os::switch_platform::CurrentThreadHandle(), std::memory_order_release);
-    if (const int core = state->idealCore.load(std::memory_order_acquire); core >= 0)
+    state->hostHandle.store(os::switch_platform::CurrentThreadHandle(), std::memory_order_seq_cst);
+    if (const int core = state->idealCore.load(std::memory_order_seq_cst); core >= 0)
         os::switch_platform::SetThreadIdealCore(0, core);
 #endif
     state->suspended.wait(true);

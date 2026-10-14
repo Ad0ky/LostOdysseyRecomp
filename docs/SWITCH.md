@@ -174,6 +174,25 @@ timestamps), `LO_GPU_DRAW_TIMING_EVERY=300` (GPU time of every group of four
 draws, every 300th frame), `LO_KERNEL_TRACE=1` (guest kernel calls such as file
 reads; off by default on the console).
 
+Switch behaviour switches (defaults in brackets):
+
+| Switch | Effect |
+|---|---|
+| `LO_SWITCH_RENDER_HEIGHT=540\|720` | Scene height [540 handheld, 720 docked] |
+| `LO_TRIM_VARYINGS=0` | Keep every vertex output (trimming of outputs the fragment shader never reads is on) |
+| `LO_RT32=1` | 32-bit R11G11B10 / R10G10B10A2 host targets for the 7e3 and 2_10_10_10 colour classes (about 3% less GPU time; drops the 7e3 alpha) [FP16] |
+| `LO_ZPD_MODE=xenia` | Made-up occlusion query counts instead of host queries |
+| `LO_SKIP_NOOP_DRAWS=0` | Draw the draws that write no colour, depth or stencil [skipped] |
+| `LO_GUEST_AFFINITY=1` | Map the game's thread affinity to cores 0-2 [off] |
+| `LO_SWITCH_BUTTONS=position` | Positional face buttons [Xbox letters: A=A, B=B, X=X, Y=Y] |
+| `LO_NATIVE_MOVIES=0` | Decode cutscene video with the game's own decoder only [FFmpeg WMV3 on the host] |
+| `LO_MOVIE_GUEST_VIDEO_PRIORITY=<hex>` | Priority of the game's video decoder thread during native movies [0x3F; 0 keeps the game's] |
+| `LO_XAUDIO_WORKER_PRIORITY=<hex>` | Priority of the game's XAudio worker threads [0x2D; 0 keeps 0x3B] |
+
+Diagnostics: `LO_WAIT_PROFILE=1` (the guest's longest waits every 10 s),
+`LO_LOAD_DIAGNOSTICS=1` (host file read statistics every 10 s and guest thread
+dumps for map or battle loads still running after 8, 20, 45 and 90 s).
+
 The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
 written at least once a second; warnings and errors are written at once.
 

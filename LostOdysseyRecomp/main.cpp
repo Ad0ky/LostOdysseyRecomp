@@ -194,29 +194,24 @@ static int RunGuest(uint32_t entry)
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
     // Docking changes the scene resolution (settings::Validate picks 540 in
     // handheld mode, 720 docked): re-apply the settings when the mode changes.
-    os::DetachThread(std::thread([] {
-        os::SetCurrentThreadName("Dock Watch");
-        bool docked = os::switch_platform::IsDocked();
-        for (;;)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool now = os::switch_platform::IsDocked();
-            if (now == docked)
-                continue;
-            docked = now;
-            settings::PreviewConfig(settings::GetConfig());
-            LOG_NOTICE("switch: {} mode, scene at {}p", docked ? "docked" : "handheld",
-                       settings::GetConfig().internalResolution);
-        }
-    }));
-    // Game file reads every 10 s (only intervals with reads), to tell slow SD
-    // reads from other waits during loading screens. With LO_WAIT_PROFILE=1,
-    // also the guest's longest waits of each 10 s. A map or battle load still
-    // unfinished after 8, 20, 45 and 90 s prints what every guest thread waits on.
+    os::switch_platform::OnOperationModeChange([](bool docked) {
+        settings::PreviewConfig(settings::GetConfig());
+        LOG_NOTICE("switch: {} mode, scene at {}p", docked ? "docked" : "handheld",
+                   settings::GetConfig().internalResolution);
+    });
+    // With LO_LOAD_DIAGNOSTICS=1: game file reads every 10 s (only intervals
+    // with reads), to tell slow SD reads from other waits during loading
+    // screens, and for a map or battle load still unfinished after 8, 20, 45
+    // and 90 s what every guest thread waits on. With LO_WAIT_PROFILE=1, the
+    // guest's longest waits of each 10 s.
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("IO Monitor");
         uint64_t watchedLoad = 0;
         int dumpsDone = 0;
+        // LO_LOAD_DIAGNOSTICS=1: thread dumps for slow loads and the host read
+        // statistics (kernel/io/file_system.cpp). Off by default.
+        const char* loadDiagnosticsValue = getenv("LO_LOAD_DIAGNOSTICS");
+        const bool loadDiagnostics = loadDiagnosticsValue && loadDiagnosticsValue[0] == '1';
         static constexpr int kDumpAfterSeconds[] = { 8, 20, 45, 90 };
         for (unsigned tick = 1;; ++tick)
         {
@@ -229,7 +224,8 @@ static int RunGuest(uint32_t entry)
                 const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 const uint64_t seconds = nowMs > startMs ? (nowMs - startMs) / 1000 : 0;
-                if (dumpsDone < int(std::size(kDumpAfterSeconds)) && seconds >= uint64_t(kDumpAfterSeconds[dumpsDone]))
+                if (loadDiagnostics && dumpsDone < int(std::size(kDumpAfterSeconds)) &&
+                    seconds >= uint64_t(kDumpAfterSeconds[dumpsDone]))
                 {
                     ++dumpsDone;
                     LOG_WARNING("slow load: {} still loading after {} s", what, seconds);

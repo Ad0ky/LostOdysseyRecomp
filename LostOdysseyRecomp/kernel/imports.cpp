@@ -702,8 +702,8 @@ static uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint3
             rc = os::switch_platform::SetThreadIdealCore(0, core);
         else if (auto t = ThreadFromHandle(Thread))
         {
-            t->control->idealCore.store(core, std::memory_order_release);
-            if (const uint32_t host = t->control->hostHandle.load(std::memory_order_acquire))
+            t->control->idealCore.store(core, std::memory_order_seq_cst);
+            if (const uint32_t host = t->control->hostHandle.load(std::memory_order_seq_cst))
                 rc = os::switch_platform::SetThreadIdealCore(host, core);
         }
         static std::atomic<uint32_t> logged{0};

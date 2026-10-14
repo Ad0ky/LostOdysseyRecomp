@@ -23,6 +23,8 @@ namespace os::switch_platform
 
     // Docked (true) or handheld (false).
     bool IsDocked();
+    // Calls `callback` when the console is docked or undocked (once registered).
+    void OnOperationModeChange(void (*callback)(bool docked));
 
     // Process memory and thread usage, for failure logs ("used/total MiB ...").
     std::string MemorySummary();

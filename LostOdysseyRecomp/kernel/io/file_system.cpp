@@ -13,6 +13,7 @@
 #include <kernel/function.h>
 #include <modding/text_overlay.h>
 #include <os/logger.h>
+#include <optional>
 #include <os/user_paths.h>
 #ifdef _WIN32
 #include <io.h>
@@ -22,9 +23,22 @@ static std::mutex g_lastOpenedMutex;
 static std::string g_lastOpenedFile;
 
 // Host read timing for the periodic Switch log (FileSystem::TakeReadStatistics).
+// Switch only, with LO_LOAD_DIAGNOSTICS=1: nothing else reads it.
 namespace read_stats
 {
-std::atomic<uint64_t> calls{0}, bytes{0}, nanoseconds{0}, slowest{0}, small{0};
+inline bool Enabled()
+{
+#if LO_PLATFORM_SWITCH
+    static const bool enabled = [] {
+        const char* value = getenv("LO_LOAD_DIAGNOSTICS");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+std::atomic<uint64_t> calls{0}, bytes{0}, nanoseconds{0}, slowest{0}, underSize{0};
 std::mutex filesMutex;
 std::string files; // file names read in this interval, comma-separated, deduplicated
 
@@ -40,7 +54,7 @@ struct Scope
         calls.fetch_add(1, std::memory_order_relaxed);
         bytes.fetch_add(read, std::memory_order_relaxed);
         nanoseconds.fetch_add(ns, std::memory_order_relaxed);
-        if (read < 65536) small.fetch_add(1, std::memory_order_relaxed);
+        if (read < 65536) underSize.fetch_add(1, std::memory_order_relaxed);
         uint64_t previous = slowest.load(std::memory_order_relaxed);
         while (ns > previous && !slowest.compare_exchange_weak(previous, ns, std::memory_order_relaxed)) {}
         std::lock_guard lock(filesMutex);
@@ -690,7 +704,7 @@ std::string FileSystem::TakeReadStatistics()
     const uint64_t b = bytes.exchange(0, std::memory_order_relaxed);
     const uint64_t ns = nanoseconds.exchange(0, std::memory_order_relaxed);
     const uint64_t worst = slowest.exchange(0, std::memory_order_relaxed);
-    const uint64_t smallReads = small.exchange(0, std::memory_order_relaxed);
+    const uint64_t smallReads = underSize.exchange(0, std::memory_order_relaxed);
     std::string names;
     {
         std::lock_guard lock(filesMutex);
@@ -789,13 +803,15 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
         else if (Length)
         {
             clearerr(handle->file);
-            read_stats::Scope readScope(handle->file);
+            std::optional<read_stats::Scope> readScope;
+            if (read_stats::Enabled()) readScope.emplace(handle->file);
             if (_fseeki64(handle->file, int64_t(offset), SEEK_SET) != 0)
                 status = FileIoError(errno);
             else
             {
                 read = fread(Buffer, 1, Length, handle->file);
-                readScope.Done(read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
+                if (readScope)
+                    readScope->Done(read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
                 if (ferror(handle->file))
                     status = FileIoError(errno);
                 else if (read == 0 && feof(handle->file))

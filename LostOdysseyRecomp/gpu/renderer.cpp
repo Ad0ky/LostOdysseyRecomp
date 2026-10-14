@@ -157,6 +157,19 @@ namespace gpu::renderer
 {
     namespace binding = gpu::taa_collection::binding;
     namespace {
+#ifdef LO_GPU_PLUME
+    // R11G11B10_FLOAT comes from tools/patches/plume-switch-perf.patch, which
+    // only the Switch build applies (LO_RT32).
+    constexpr bool IsR11G11B10(plume::RenderFormat format)
+    {
+#if LO_PLATFORM_SWITCH
+        return format == plume::RenderFormat::R11G11B10_FLOAT;
+#else
+        (void)format;
+        return false;
+#endif
+    }
+#endif
         std::atomic<bool> hdrSceneEnabled{false};
         // Scene tags of maps and battles that started loading (game thread),
         // consumed by the renderer's scene prefetch once a frame.
@@ -2079,7 +2092,7 @@ namespace gpu::renderer
                     const uint32_t bpp = format == RenderFormat::R8G8B8A8_UNORM ? 4 :
                         (format == RenderFormat::R16G16B16A16_FLOAT || format == RenderFormat::R32G32_FLOAT) ? 8 :
                         (format == RenderFormat::R32_FLOAT || format == RenderFormat::R16G16_FLOAT ||
-                         format == RenderFormat::R11G11B10_FLOAT || format == RenderFormat::R10G10B10A2_UNORM) ? 4 :
+                         IsR11G11B10(format) || format == RenderFormat::R10G10B10A2_UNORM) ? 4 :
                         format == RenderFormat::R8_UNORM ? 1 : 0;
                     if (!bpp) continue;
                     const uint32_t pitch = (width * bpp + 255) & ~255u;
@@ -5420,7 +5433,7 @@ void main()
                 const bool colorValid = color == RenderFormat::UNKNOWN || color == RenderFormat::R8G8B8A8_UNORM ||
                     color == RenderFormat::R16G16_FLOAT || color == RenderFormat::R16G16B16A16_FLOAT ||
                     color == RenderFormat::R32_FLOAT || color == RenderFormat::R32G32_FLOAT ||
-                    color == RenderFormat::R11G11B10_FLOAT || color == RenderFormat::R10G10B10A2_UNORM;
+                    IsR11G11B10(color) || color == RenderFormat::R10G10B10A2_UNORM;
                 return key.vs != 0 && key.prim <= 32 && colorValid &&
                     (depth == RenderFormat::UNKNOWN || depth == RenderFormat::D32_FLOAT_S8_UINT);
             }
@@ -7392,8 +7405,8 @@ void main()
             // All classes live in FP16 host textures: an 8-bit or 10-bit unorm value is
             // exact in half precision, and keeping one host format keeps resolves and
             // framebuffers simple. Only the interpretation differs between classes.
-            // LO_RT32 (on by default on the Switch, LO_RT32=0 turns it off; elsewhere
-            // LO_RT32=1 turns it on): the two 32-bit 10-bit classes get 32-bit host formats, which
+            // LO_RT32=1 (Switch only for the 7e3 class; off by default until its
+            // image quality is checked): the two 32-bit 10-bit classes get 32-bit host formats, which
             // halves their render target bandwidth (and blends at full rate on GPUs
             // whose FP16x4 blending is half rate, such as the Switch's Maxwell).
             // 2_10_10_10 stays exact in R10G10B10A2. 7e3 goes to R11G11B10_FLOAT:
@@ -7403,18 +7416,16 @@ void main()
             {
                 static const bool enabled = [] {
                     const char* value = getenv("LO_RT32");
-#if LO_PLATFORM_SWITCH
-                    return !value || value[0] != '0';
-#else
                     return value && value[0] == '1' && value[1] == '\0';
-#endif
                 }();
                 return enabled;
             }
 
             static RenderFormat ClassHostFormat(uint32_t colorClass)
             {
+#if LO_PLATFORM_SWITCH
                 if (Rt32Enabled() && colorClass == kClass7e3) return RenderFormat::R11G11B10_FLOAT;
+#endif
                 if (Rt32Enabled() && colorClass == kClass2101010) return RenderFormat::R10G10B10A2_UNORM;
                 switch (colorClass)
                 {

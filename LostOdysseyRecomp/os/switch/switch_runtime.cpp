@@ -338,6 +338,19 @@ bool IsDocked()
     return appletGetOperationMode() == AppletOperationMode_Console;
 }
 
+void OnOperationModeChange(void (*callback)(bool docked))
+{
+    // libnx calls applet hooks from appletMainLoop(), which SDL's event pump
+    // runs (SDL_switchvideo.c).
+    static AppletHookCookie cookie;
+    static void (*s_callback)(bool) = nullptr;
+    if (s_callback) return;
+    s_callback = callback;
+    appletHook(&cookie, [](AppletHookType type, void*) {
+        if (type == AppletHookType_OnOperationMode && s_callback) s_callback(IsDocked());
+    }, nullptr);
+}
+
 std::string MemorySummary()
 {
     u64 used = 0, total = 0, threadsUsed = 0, threadsLimit = 0;
