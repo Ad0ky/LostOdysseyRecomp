@@ -64,6 +64,22 @@ std::atomic<uint32_t> g_presentedSwaps{ 0 }; // global mirror for other subsyste
 namespace gpu
 {
     static std::atomic<uint32_t> g_traceBudget{ 0 };
+
+    // Idle and WAIT_REG_MEM loops pump window events between short waits. On
+    // the Switch an SDL pump polls HID and costs ~0.2 ms, so pumping every
+    // 0.5 ms kept this thread at 50-65% of a core while the GPU had nothing to
+    // do (and took that core from guest threads such as the movie decoder).
+    // Events still arrive every 4 ms; swaps pump unconditionally.
+    static bool IdlePumpDue()
+    {
+#if LO_PLATFORM_SWITCH
+        static thread_local auto last = std::chrono::steady_clock::time_point{};
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last < std::chrono::milliseconds(4)) return false;
+        last = now;
+#endif
+        return true;
+    }
     static const bool g_capturePacketHistory = getenv("LO_GPU_TRACE") != nullptr;
 
     // Opt-in ring of recently executed packets, dumped when the parser derails.
@@ -683,7 +699,7 @@ namespace gpu
                     // Nothing left to execute: a guest polling an occlusion
                     // query result can only be released from here.
                     renderer::ServiceOcclusionQueries();
-                    video::PumpEvents();
+                    if (IdlePumpDue()) video::PumpEvents();
                     if (video::IsHostOverlayActive())
                     {
                         static auto s_lastOverlayPresent = std::chrono::steady_clock::time_point{};
@@ -1268,7 +1284,7 @@ namespace gpu
                 // The guest thread this wait depends on may itself be polling an
                 // occlusion query result: complete it before blocking further.
                 renderer::ServiceOcclusionQueries();
-                video::PumpEvents();
+                if (IdlePumpDue()) video::PumpEvents();
                 if (video::IsHostOverlayActive())
                 {
                     static auto s_lastWaitOverlayPresent = std::chrono::steady_clock::time_point{};

@@ -32,6 +32,10 @@ struct GuestThreadHandle : KernelObject
         GuestThreadParams params;
         std::atomic<bool> suspended;
         kernel::wait::Event completion{true, false};
+        // Switch: the host thread's kernel handle (0 until it starts) and the
+        // ideal core asked for by KeSetAffinityThread before it started (-1: none).
+        std::atomic<uint32_t> hostHandle{0};
+        std::atomic<int> idealCore{-1};
         explicit Control(const GuestThreadParams& p) : params(p), suspended((p.flags & 1) != 0) {}
     };
     std::shared_ptr<Control> control;

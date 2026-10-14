@@ -37,6 +37,11 @@ namespace os::switch_platform
     // every pthread gets; lower numbers run first).
     void SetCurrentThreadPriority(int priority);
 
+    // Kernel handle of the calling thread, and its ideal core (0-2; allowed
+    // cores stay 0-2). handle 0 means the calling thread.
+    uint32_t CurrentThreadHandle();
+    uint32_t SetThreadIdealCore(uint32_t handle, int core);
+
     // Raises the CPU clock while loading (applet CPU boost), off when false.
     void SetLoadingBoost(bool enabled);
 
