@@ -51,6 +51,9 @@ struct NeuralRenderingTuning
 {
     bool open = false;
     bool sceneAvailable = false; // a DLSS frame is held for the preview
+    // Why the preview cannot appear even in a DLSS scene.
+    enum class Blocker : uint8_t { None, MissingRuntime, Unsupported };
+    Blocker blocker = Blocker::None;
     uint32_t passes = 0;
     uint32_t preset = 0, style = 0;
     uint32_t intensity = 100, globalTone = 100, localTone = 100, structure = 100;

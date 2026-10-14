@@ -1632,6 +1632,24 @@ int main(int argc, char** argv)
             settings::pending = 0x2000; Tick(base);
             Require(!settings::restartPrompt && diskConfig.frameGenerationProvider == Provider::Fsr,
                     "Later retains the FSR FG choice for the next launch");
+            // A running DLSS FG session changes its multiplier in place, HDR on or not.
+            settings::Config hdrFg = diskConfig;
+            hdrFg.graphicsBackend = settings::GraphicsBackend::Vulkan;
+            hdrFg.hdr = true;
+            hdrFg.frameGenerationProvider = Provider::Dlss;
+            hdrFg.frameGenerationMode = framegen::Mode::Fixed;
+            hdrFg.frameGenerationMultiplier = 2;
+            currentConfig = diskConfig = hdrFg;
+            settings::edit = hdrFg;
+            gpu::video::menuFlowFgStatus = {};
+            gpu::video::menuFlowFgStatus.sessionProvider = gpu::video::menuFlowFgStatus.requested =
+                gpu::video::menuFlowFgStatus.applied = Provider::Dlss;
+            gpu::video::menuFlowFgStatus.phase = gpu::video::FrameGenerationPhase::Ready;
+            settings::edit.frameGenerationMultiplier = 3;
+            settings::row = int(GraphicsRow::Save);
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::restartPrompt && diskConfig.frameGenerationMultiplier == 3 && diskConfig.hdr,
+                    "an FG multiplier change with HDR on saves without a restart prompt");
             gpu::video::menuFlowFgStatus = {};
             currentConfig = priorCurrent;
             diskConfig = priorDisk;

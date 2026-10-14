@@ -220,6 +220,11 @@ NeuralRenderingTuning MakeNeuralRenderingTuning(const Config &config, bool open)
     NeuralRenderingTuning result;
     result.open = open;
     result.sceneAvailable = nrSceneAvailable.load(std::memory_order_relaxed);
+    using gpu::dlss::NeuralRenderingState;
+    const auto state = gpu::dlss::g_neuralRenderingState.load(std::memory_order_relaxed);
+    result.blocker = state == NeuralRenderingState::MissingRuntime ? NeuralRenderingTuning::Blocker::MissingRuntime :
+        state == NeuralRenderingState::Unsupported ? NeuralRenderingTuning::Blocker::Unsupported :
+        NeuralRenderingTuning::Blocker::None;
     result.passes = std::min(config.dlssNeuralRendering, DlssNeuralRenderingMaxPasses);
     result.preset = config.dlssNrPreset;
     result.style = config.dlssNrStyle;
@@ -1810,8 +1815,8 @@ void Publish(uint8_t *base, uint32_t config)
                          L"影格生成需要 Direct3D 12。請先變更圖形後端並重新啟動。")
                     : Tr(L"Frame generation is unavailable for this backend in this build.", L"此版本的目前圖形後端未包含影格生成功能。");
             else if (GraphicsRow(row) == GraphicsRow::FrameGenerationMultiplier)
-                next.help = Tr(L"Includes the rendered frame. Available multipliers depend on the GPU and driver.",
-                               L"倍數包含原始渲染影格。可用倍數取決於顯示卡與驅動程式。");
+                next.help = Tr(L"Includes the rendered frame. Available multipliers depend on the GPU and driver. Applies immediately after saving.",
+                               L"倍數包含原始渲染影格。可用倍數取決於顯示卡與驅動程式。儲存後立即套用。");
             else if (edit.graphicsBackend == GraphicsBackend::Metal)
                 next.help = Tr(L"MetalFX frame generation uses 2× on supported GPUs with macOS 26 or later.",
                                L"MetalFX 影格生成在 macOS 26 或更新版本及支援的 GPU 上使用 2×。");

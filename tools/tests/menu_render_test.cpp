@@ -598,6 +598,22 @@ int main(int argc, char **argv)
             Require(std::equal(nrPixels.begin() + 360 * 1280, nrPixels.end(), withScene.begin() + 360 * 1280),
                     "scene availability leaves the controls unchanged");
             if (language == 0) write("nr-page-no-scene.ppm");
+            // Without a usable DLL the panel names the cause instead of asking for a scene.
+            const auto noScene = nrPixels;
+            for (const auto blocker : {settings::NeuralRenderingTuning::Blocker::MissingRuntime,
+                                       settings::NeuralRenderingTuning::Blocker::Unsupported})
+            {
+                page.neuralRendering.blocker = blocker;
+                Require(settings::RasterizeMenu(page, 1280, 720, nrPixels), "neural rendering blocker rasterization failed");
+                Require((nrPixels[size_t(200) * 1280 + 640] >> 24) == 255, "blocker panel must cover the preview rectangle");
+                Require(!std::equal(nrPixels.begin() + 100 * 1280, nrPixels.begin() + 340 * 1280, noScene.begin() + 100 * 1280),
+                        "blocker notice differs from the no-scene notice");
+                Require(std::equal(nrPixels.begin() + 360 * 1280, nrPixels.end(), noScene.begin() + 360 * 1280),
+                        "the blocker leaves the controls unchanged");
+                if (language == 0 && blocker == settings::NeuralRenderingTuning::Blocker::MissingRuntime)
+                    write("nr-page-missing-dll.ppm");
+            }
+            page.neuralRendering.blocker = settings::NeuralRenderingTuning::Blocker::None;
         }
         // Each focus draws a different frame (help line and focused cell).
         page.language = 0;

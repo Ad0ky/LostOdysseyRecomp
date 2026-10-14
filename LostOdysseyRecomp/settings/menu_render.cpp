@@ -661,10 +661,19 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         text(mid, 52, NrPreviewRight - mid, 26, tr(L"DLSS + NR", L"DLSS + NR"), 18, ink, false, 1, outline, 13);
         if (!page.sceneAvailable)
         {
+            // Without a usable DLL no frame is ever held; say so rather than
+            // asking for a scene the player may already be in.
+            using Blocker = NeuralRenderingTuning::Blocker;
             fill(NrPreviewLeft, NrPreviewTop, NrPreviewRight - NrPreviewLeft, NrPreviewBottom - NrPreviewTop,
                  MakeColor(255, 40, 45, 50));
             text(NrPreviewLeft + 20, NrPreviewTop + 100, NrPreviewRight - NrPreviewLeft - 40, 70,
-                 tr(L"Play a scene with DLSS on to see a preview.", L"請在開啟 DLSS 的情況下進入遊戲場景以預覽。"),
+                 page.blocker == Blocker::MissingRuntime
+                     ? tr(L"No preview: nvngx_dlssnr.dll is missing or unusable. Put it next to the game and restart.",
+                          L"無法預覽：找不到 nvngx_dlssnr.dll 或無法使用。請將它放在遊戲旁並重新啟動。")
+                 : page.blocker == Blocker::Unsupported
+                     ? tr(L"No preview: this GPU or driver cannot run DLSS 5 neural rendering.",
+                          L"無法預覽：此顯示卡或驅動程式無法執行 DLSS 5 神經渲染。")
+                     : tr(L"Play a scene with DLSS on to see a preview.", L"請在開啟 DLSS 的情況下進入遊戲場景以預覽。"),
                  20, muted, false, 1, outline, 14);
         }
         const auto percent = [](uint32_t value) { return std::to_wstring(value) + L"%"; };
