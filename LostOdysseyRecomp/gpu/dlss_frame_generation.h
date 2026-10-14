@@ -38,6 +38,8 @@ public:
         return ready_ && enabled_ && !failed_ && runtimeState_.Enabled() &&
             runtime_.FeatureCreationFailureCount() == creationFailuresSeen_;
     }
+    // Frames the SDK reports presented, generated ones included; cumulative.
+    uint64_t ActualPresents() const { return actualPresents_; }
 private:
     bool Check(sl::Result result, const char* operation, bool featureRequest = false);
     bool Mode(bool enabled);

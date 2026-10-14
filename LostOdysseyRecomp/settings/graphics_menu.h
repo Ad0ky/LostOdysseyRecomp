@@ -108,5 +108,6 @@ static_assert(int(GraphicsRow::FrameGeneration) + 1 == int(GraphicsRow::FrameGen
 static_assert(int(GraphicsRow::FrameGenerationMultiplier) + 1 == int(GraphicsRow::AmbientOcclusion));
 static_assert(int(GraphicsRow::AmbientOcclusion) + 1 == int(GraphicsRow::AnisotropicFiltering));
 static_assert(int(GraphicsRow::FrameRate) + 1 == int(GraphicsRow::VariableRefreshRate));
+static_assert(int(GraphicsRow::VariableRefreshRate) + 1 == int(GraphicsRow::PerformanceOverlay));
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
 }

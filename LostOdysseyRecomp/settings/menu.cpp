@@ -1466,6 +1466,8 @@ void Publish(uint8_t *base, uint32_t config)
         vsync.singleValue = true;
         placeGraphics(GraphicsRow::VariableRefreshRate, std::move(vsync));
 #endif
+        placeGraphics(GraphicsRow::PerformanceOverlay, makeChoices(L"Performance overlay", L"效能資訊",
+            {Tr(L"Off", L"關"), L"FPS", Tr(L"Detailed", L"詳細")}, std::min(edit.performanceOverlay, 2u)));
         std::vector<std::wstring> providers;
         uint32_t selected = 0;
         for (auto provider : FgProviders()) {
@@ -1756,6 +1758,10 @@ void Publish(uint8_t *base, uint32_t config)
             next.help = Tr(L"Off: each frame shows as soon as it is ready, with the lowest latency, but the picture can tear. On: frames wait for the display to refresh, without tearing. FreeSync / G-SYNC Compatible: for adaptive-sync displays; turn it on in the display and driver too. Applies immediately after saving.",
                            L"關：畫面完成即顯示，延遲最低，但可能出現畫面撕裂。開：等待螢幕刷新再顯示，不會撕裂。FreeSync / G-SYNC Compatible：適用於自適應同步螢幕，需同時在螢幕與驅動程式中啟用。儲存後立即套用。");
 #endif
+            break;
+        case GraphicsRow::PerformanceOverlay:
+            next.help = Tr(L"FPS shows the frame rate in the top-left corner. Detailed adds a bar across the top with the upscaler and its resolution, frame generation, and CPU and GPU load. Applies immediately after saving.",
+                           L"FPS 會在左上角顯示影格率。詳細會在畫面頂端加上一列資訊，包含縮放器與其解析度、影格生成，以及 CPU 與 GPU 負載。儲存後立即套用。");
             break;
         case GraphicsRow::FrameGeneration:
         case GraphicsRow::FrameGenerationMultiplier:
@@ -3586,6 +3592,9 @@ PPC_FUNC(sub_822F19B0)
                 if (sync < 2) edit.vsync = sync == 1;
             }
 #endif
+                break;
+            case GraphicsRow::PerformanceOverlay:
+                edit.performanceOverlay = cycle(std::min(edit.performanceOverlay, 2u), 3);
                 break;
             case GraphicsRow::FrameGeneration:
             {

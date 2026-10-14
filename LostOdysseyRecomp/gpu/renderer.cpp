@@ -91,6 +91,7 @@
 #include <os/thread_name.h>
 #include "color_qualification.h"
 #include "render_timing.h"
+#include "gpu_busy.h"
 #include "render_batch_policy.h"
 #include "render_arena_policy.h"
 #include "resolve_copy_policy.h"
@@ -620,6 +621,9 @@ namespace gpu::renderer
                 std::unique_ptr<RenderCommandList> srContinuation;
                 std::unique_ptr<RenderCommandFence> fence;
                 std::unique_ptr<RenderQueryPool> timingQueries;
+                // This batch wrote both timestamps (LO_RENDER_TIMING or the
+                // Detailed performance overlay); only then are they read.
+                bool timed = false;
                 // Host queries around guest draws inside guest occlusion
                 // queries, reset when the slot's list opens. Query i lives in
                 // pool i / kOcclusionPoolQueries; only pools in use are read.
@@ -715,6 +719,7 @@ namespace gpu::renderer
             uint8_t* uploadMapped = nullptr;
             render_timing::GpuBatches gpuTiming;
             bool timingInitialized = false;
+            bool timingUnavailable = false; // the device has no usable timestamp queries
             bool listOpen = false;
 
             // Guest occlusion queries counted by host queries (see
@@ -4680,11 +4685,15 @@ void main()
                 fgHandoffPool.Collect();
                 for (const auto& e : s.evaluateCaptures) if (e->checkedSubmit) e->completed = true;
                 s.evaluateCaptures.clear();
-                if (s.timingQueries) {
+                if (s.timed) {
+                    s.timed = false;
                     s.timingQueries->queryResults();
                     const auto* results = s.timingQueries->getResults();
-                    if (results) gpuTiming.AddBatch(results[0], results[1]);
-                    else gpuTiming.AddUnavailableBatch();
+                    if (results) gpu_busy::AddBatch(results[0], results[1]);
+                    if (render_timing::Enabled()) {
+                        if (results) gpuTiming.AddBatch(results[0], results[1]);
+                        else gpuTiming.AddUnavailableBatch();
+                    }
                 } else if (render_timing::Enabled()) gpuTiming.AddUnavailableBatch();
                 s.drawProbe.ReadCompleted();
 #if defined(LO_GPU_PLUME)
@@ -4793,10 +4802,16 @@ void main()
                     if (render_timing::Enabled() && !timingInitialized) {
                         timingInitialized = true;
                     }
-                    if (render_timing::Enabled() && !Gpu().timingQueries) {
-                        Gpu().timingQueries = device->createQueryPool(2);
+                    // Timestamps only while LO_RENDER_TIMING or the Detailed
+                    // performance overlay reads them.
+                    const bool timestamps = render_timing::Enabled() || gpu_busy::Requested();
+                    if (timestamps && !Gpu().timingQueries && !timingUnavailable) {
+                        if (device->getCapabilities().queryPools) Gpu().timingQueries = device->createQueryPool(2);
                         if (Gpu().timingQueries && Gpu().timingQueries->getCount() != 2) Gpu().timingQueries.reset();
-                        if (!Gpu().timingQueries) LOG_WARNING("render timing: GPU timestamp queries unavailable");
+                        if (!Gpu().timingQueries) {
+                            timingUnavailable = true;
+                            LOG_WARNING("render timing: GPU timestamp queries unavailable");
+                        }
                         timingQueries = Gpu().timingQueries.get();
                     }
                     if (!video::BeginGpuCommands(commandList)) return false;
@@ -4804,7 +4819,8 @@ void main()
                     if (!vulkan) static_cast<plume::D3D12CommandList*>(commandList)->captureRootBindingStats = render_timing::Enabled();
 #endif
                     Gpu().drawProbe.Begin(device, commandList, frame);
-                    if (timingQueries) {
+                    Gpu().timed = timestamps && timingQueries;
+                    if (Gpu().timed) {
                         commandList->resetQueryPool(timingQueries, 0, 2);
                         commandList->writeTimestamp(timingQueries, 0);
                     }
@@ -4875,7 +4891,7 @@ void main()
                 if (!listOpen) return true;
                 if (motionReplay) motionReplay->SealTimings(commandList);
                 if (!Gpu().srPrefixClosed) Gpu().drawProbe.End(commandList);
-                if (timingQueries) commandList->writeTimestamp(timingQueries, 1);
+                if (Gpu().timed) commandList->writeTimestamp(timingQueries, 1);
                 if (!video::EndGpuCommands(commandList)) {
 #if defined(LO_GPU_PLUME)
                     for (const auto& capture : Gpu().fgUiUses) {

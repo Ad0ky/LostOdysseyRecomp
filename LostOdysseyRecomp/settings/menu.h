@@ -102,8 +102,9 @@ void PointerDrag(float x, float y, bool held);
 //   Controls, Achievements) may scroll.
 // - Graphics order: display -> resolution and shadows -> anti-aliasing,
 //   upscaling (quality, DLSS model, FSR sharpness), DLSS neural rendering and
-//   frame generation -> effects -> frame rate -> HDR and brightness -> Save. A
-//   divider opens each group after the first (menu_render.cpp).
+//   frame generation -> effects -> frame rate (VSync, performance overlay) ->
+//   HDR and brightness -> Save. A divider opens each group after the first
+//   (menu_render.cpp).
 // - Rows that only apply to one choice (DLSS model, HDR levels) are hidden
 //   while that choice is off (GraphicsRowHidden in menu.cpp).
 // Input, help text, pointer hits and the tests use these constants, never
@@ -167,12 +168,13 @@ enum class GraphicsRow : int
     RgbRange = 23,
     FrameRate = 24,
     VariableRefreshRate = 25,
-    Hdr = 26,
-    HdrPaperWhite = 27, // shown with HDR on
-    HdrPeak = 28, // shown with HDR on
-    Brightness = 29,
-    Save = 30,
-    Count = 31,
+    PerformanceOverlay = 26,
+    Hdr = 27,
+    HdrPaperWhite = 28, // shown with HDR on
+    HdrPeak = 29, // shown with HDR on
+    Brightness = 30,
+    Save = 31,
+    Count = 32,
 };
 inline constexpr int MenuTabWidth = 640 / MenuTabCount;
 // Mods page (System → Mods): a list page in the tab layout. A row with a detail

@@ -51,6 +51,7 @@ Config Validate(Config value)
     value.audioMatrixRear = std::clamp((value.audioMatrixRear + 5) / 10 * 10, 90u, 150u);
     value.voiceVolume = std::min(value.voiceVolume, 100u);
     if (value.buttonPrompts > 2) value.buttonPrompts = 0;
+    if (value.performanceOverlay > 2) value.performanceOverlay = 0;
     value.controllerMap = hid::input_map::ValidController(value.controllerMap);
     value.keyboardMap = hid::input_map::ValidKeyboard(value.keyboardMap);
     value.hdrPaperWhiteNits = std::clamp(value.hdrPaperWhiteNits, 80u, 400u);
@@ -293,6 +294,8 @@ Config Read()
             value.achievementNotifications = number == 1;
         else if (key == "achievement_sound" && number <= 1)
             value.achievementSound = number == 1;
+        else if (key == "performance_overlay")
+            value.performanceOverlay = number;
         else if (key == "save_anywhere" && number <= 1)
             value.saveAnywhere = number == 1;
         else if (key == "no_random_encounters" && number <= 1)
@@ -465,6 +468,7 @@ static bool WriteConfig(const Config &value)
            << "\nskip_shader_prebuild=" << (value.skipShaderPrebuild ? 1 : 0)
            << "\nachievement_notifications=" << (value.achievementNotifications ? 1 : 0)
            << "\nachievement_sound=" << (value.achievementSound ? 1 : 0)
+           << "\nperformance_overlay=" << value.performanceOverlay
            << "\nsave_anywhere=" << (value.saveAnywhere ? 1 : 0)
            << "\nno_random_encounters=" << (value.noRandomEncounters ? 1 : 0)
            << "\nfast_forward=" << (value.fastForward ? 1 : 0)

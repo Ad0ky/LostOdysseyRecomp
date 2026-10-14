@@ -2788,15 +2788,22 @@ int main(int argc, char** argv)
             Require(settings::Read().fsrSharpnessPercent == 0, "negative sharpness keeps Off default");
             writeIni("fsr_sharpness=garbage\n");
             Require(settings::Read().fsrSharpnessPercent == 0, "invalid sharpness keeps Off default");
+            writeIni("performance_overlay=2\n");
+            Require(settings::Read().performanceOverlay == 2, "performance overlay reads from INI");
+            writeIni("performance_overlay=3\n");
+            Require(settings::Read().performanceOverlay == 0, "an unknown performance overlay mode reads as Off");
             settings::Config sharpness{};
             sharpness.upscaler = gpu::upscaling::Upscaler::Fsr;
             sharpness.fsrSharpnessPercent = 64;
+            sharpness.performanceOverlay = 1;
             Require(settings::SaveConfig(sharpness), "real config save succeeds in sandbox");
             Require(settings::GetConfig().fsrSharpnessPercent == 64 && settings::Read().fsrSharpnessPercent == 64,
                     "real config retains sharpness after save and disk reload");
             std::ifstream persisted("settings.ini");
             const std::string text((std::istreambuf_iterator<char>(persisted)), std::istreambuf_iterator<char>());
             Require(text.find("fsr_sharpness=64\n") != std::string::npos, "INI writes fsr_sharpness key");
+            Require(text.find("\nperformance_overlay=1\n") != std::string::npos && settings::Read().performanceOverlay == 1,
+                    "INI writes and reloads performance_overlay");
             persisted.close(); // Windows cannot replace settings.ini while this reader holds it.
             sharpness.fsrSharpnessPercent = 102;
             Require(settings::SaveConfig(sharpness) && settings::Read().fsrSharpnessPercent == 100,

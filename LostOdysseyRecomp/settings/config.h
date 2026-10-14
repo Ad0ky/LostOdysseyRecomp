@@ -172,6 +172,9 @@ struct Config
     // Achievement-unlocked toast and its chime (ui/achievement_overlay.cpp). Applied live.
     bool achievementNotifications = true;
     bool achievementSound = true;
+    // Performance overlay over game frames (ui/performance_overlay.cpp): 0 Off,
+    // 1 FPS, 2 Detailed (upscaler, FG, CPU and GPU load). Applied live.
+    uint32_t performanceOverlay = 0;
     bool saveAnywhere = false; // Debug-only preference; defaults off for existing profiles.
     bool noRandomEncounters = false; // Debug-only preference, persisted like saveAnywhere.
     // Debug-menu fast-forward, persisted like saveAnywhere: switch, 0 Hold / 1 Toggle,

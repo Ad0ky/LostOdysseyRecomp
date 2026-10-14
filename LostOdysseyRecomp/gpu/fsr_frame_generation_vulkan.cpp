@@ -352,6 +352,7 @@ bool Session::Requested() const { return impl_->config.provider == framegen::Pro
 bool Session::Available() const { return Requested() && impl_->active; }
 bool Session::Failed() const { return impl_->failed; }
 bool Session::UsesProxySwapchain() const { return impl_->swapContext != nullptr; }
+uint64_t Session::PresentedFrames() const { return impl_->presents + impl_->generations.load(std::memory_order_relaxed); }
 bool Session::Reconfigure(const framegen::Config& config, std::string& reason) {
     auto& s = *impl_;
     Quiesce(); s.config = {};

@@ -49,6 +49,7 @@
 #include <settings/title_entry.h>
 #include <settings/translations.h>
 #include <ui/achievement_overlay.h>
+#include <ui/performance_overlay.h>
 #include <kernel/memory.h>
 #include <os/main_thread.h>
 #include <os/platform.h>
@@ -66,6 +67,7 @@
 #endif
 #include <debug/battle_menu.h>
 #include <debug/menu_overlay.h>
+#include "gpu_busy.h"
 #include <host_ui/host_ui.h>
 #include <host_ui/rasterizer.h>
 
@@ -620,6 +622,19 @@ namespace gpu::video
             std::unique_ptr<plume::RenderBuffer> upload;
             uint32_t width = 0, height = 0;
         } g_achievementToast;
+        // The performance overlay (DrawPerformanceOverlay).
+        struct PerformanceOverlayResources {
+            std::unique_ptr<plume::RenderTexture> texture;
+            std::unique_ptr<plume::RenderBuffer> upload;
+            uint32_t width = 0, height = 0;
+            uint64_t revision = 0;
+            bool active = false; // on since the last frame; turning it off releases this
+        } g_performanceOverlay;
+        // Timestamps around the presentation list (BeginPresentTiming).
+        struct PresentTiming {
+            std::unique_ptr<plume::RenderQueryPool> pool;
+            bool recording = false, pending = false, unavailable = false;
+        } g_presentTiming;
         // The background pipeline preparation bar (DrawPreparationBar).
         struct PreparationBarResources {
             std::unique_ptr<plume::RenderTexture> texture;
@@ -2170,6 +2185,10 @@ namespace gpu::video
         g_cpuFrame.reset(); g_cpuWidth = g_cpuHeight = 0;
         g_titleHint = {};
         g_achievementToast = {};
+        // Keeps `active`, so turning the overlay off later still stops its GPU timing.
+        g_performanceOverlay.texture.reset(); g_performanceOverlay.upload.reset();
+        g_performanceOverlay.width = g_performanceOverlay.height = 0;
+        g_presentTiming = {};
         g_preparationBar = {};
         g_presentedSnapshot.reset(); g_snapshotWidth = g_snapshotHeight = 0; g_snapshotFormat=plume::RenderFormat::UNKNOWN;
         g_hdrCalibrationCache = {};
@@ -4430,6 +4449,139 @@ namespace gpu::video
 #endif
     }
 
+    // GPU busy time of the presentation list for the Detailed performance
+    // overlay (gpu_busy.h); the renderer brackets its own batches. Begin runs
+    // after WaitForPresentGpu, so the previous list's timestamps are complete.
+    static void BeginPresentTiming()
+    {
+#ifdef LO_GPU_PLUME
+        auto& t = g_presentTiming;
+        if (t.pending) {
+            t.pending = false;
+            t.pool->queryResults();
+            if (const auto* results = t.pool->getResults()) gpu_busy::AddBatch(results[0], results[1]);
+        }
+        t.recording = false;
+        if (!gpu_busy::Requested()) return;
+        if (!t.pool && !t.unavailable) {
+            if (g_device->getCapabilities().queryPools) t.pool = g_device->createQueryPool(2);
+            if (t.pool && t.pool->getCount() != 2) t.pool.reset();
+            t.unavailable = !t.pool;
+        }
+        if (!t.pool) return;
+        g_commandList->resetQueryPool(t.pool.get(), 0, 2);
+        g_commandList->writeTimestamp(t.pool.get(), 0);
+        t.recording = true;
+#endif
+    }
+
+    static void EndPresentTiming()
+    {
+#ifdef LO_GPU_PLUME
+        if (g_presentTiming.recording) g_commandList->writeTimestamp(g_presentTiming.pool.get(), 1);
+#endif
+    }
+
+    // Presented frames, generated ones included, while a frame generation
+    // provider generates; each provider counts its own presents. D3D12 FSR
+    // counts none (0), so the overlay shows rendered FPS times the multiplier.
+    struct FgPresents { bool active = false; uint64_t presented = 0; uint32_t multiplier = 2; };
+    static FgPresents FrameGenerationPresents()
+    {
+#if defined(LO_GPU_PLUME) && defined(LO_ENABLE_D3D12_FG) && defined(_WIN32)
+        if (g_d3dFg && g_d3dFg->Available()) {
+            std::lock_guard lock(g_fgSettingsMutex);
+            return {true, g_d3dFg->ActualPresents(), g_fgAppliedConfig.generatedFrames + 1};
+        }
+#endif
+#if defined(LO_GPU_PLUME) && defined(LO_ENABLE_STREAMLINE_FG) && defined(_WIN32)
+        if (g_fgSession && g_fgSession->Available()) return {true, g_fgSession->ActualPresents()};
+#endif
+#if defined(LO_GPU_PLUME) && defined(LO_ENABLE_VULKAN_FSR_FG) && defined(_WIN32)
+        if (g_fsrVulkanFg && g_fsrVulkanFg->Available()) return {true, g_fsrVulkanFg->PresentedFrames()};
+#endif
+#if defined(LO_GPU_PLUME) && defined(__APPLE__) && defined(LO_ENABLE_METALFX_FG)
+        // The generated frame goes through the host swap chain too.
+        if (g_metalFg && g_metalFg->Available()) return {true, g_completedPresentCount};
+#endif
+        return {};
+    }
+
+    // Settings → Graphics → Performance overlay (ui/performance_overlay.cpp)
+    // over game frames. Its image changes about twice a second and is uploaded
+    // only then; the previous present has completed, so the upload buffer can
+    // be rewritten.
+    static void DrawPerformanceOverlay(plume::RenderTexture* backBuffer, uint32_t mode,
+        const frame_plan::FramePlan& plan, uint32_t sourceWidth, uint32_t sourceHeight,
+        std::chrono::steady_clock::time_point now)
+    {
+#ifdef LO_GPU_PLUME
+        namespace overlay = ui::performance_overlay;
+        auto& r = g_performanceOverlay;
+        if (mode == overlay::Off) {
+            overlay::Stop();
+            r = {};
+            return;
+        }
+        if (!g_presentation) return;
+        r.active = true;
+        const uint32_t outputWidth = g_swapChain->getWidth(), outputHeight = g_swapChain->getHeight();
+        if (overlay::Frame(mode, now, outputWidth, outputHeight)) {
+            overlay::Sources sources;
+            sources.backend = g_metal ? "METAL" : g_vulkan ? "VULKAN" : "D3D12";
+            using upscaling::TemporalConsumer;
+            const auto consumer = plan.cpuSerial ? plan.consumer : TemporalConsumer::None;
+            sources.upscaler = upscaling::IsDlssConsumer(consumer) ? "DLSS" : consumer == TemporalConsumer::FsrSr ? "FSR" :
+                consumer == TemporalConsumer::XessSr ? "XeSS" : consumer == TemporalConsumer::MetalFxSr ? "MetalFX" : "NATIVE";
+            sources.renderWidth = plan.cpuSerial ? plan.width : sourceWidth;
+            sources.renderHeight = plan.cpuSerial ? plan.height : sourceHeight;
+            if (std::string_view(sources.upscaler) != "NATIVE") {
+                // The upscaled image as presentation receives it.
+                sources.outputWidth = sourceWidth;
+                sources.outputHeight = sourceHeight;
+            }
+            if (mode == overlay::Detailed) {
+                const auto fg = FrameGenerationPresents();
+                sources.frameGeneration = fg.active;
+                sources.presentedFrames = fg.presented;
+                sources.fgMultiplier = fg.multiplier;
+                sources.gpuBusy = gpu_busy::Total();
+            }
+            overlay::Refresh(sources);
+        }
+        const auto& image = overlay::Current();
+        if (!image.width || !image.height || image.x < 0 || image.y < 0 ||
+            uint32_t(image.x) + image.width > outputWidth || uint32_t(image.y) + image.height > outputHeight)
+            return;
+        if (!r.texture || r.revision != image.revision) {
+            const uint32_t rowPitch = (image.width * 4 + 255) & ~255u;
+            if (!r.texture || r.width != image.width || r.height != image.height) {
+                r.texture = g_device->createTexture(plume::RenderTextureDesc::Texture2D(image.width, image.height, 1,
+                    plume::RenderFormat::R8G8B8A8_UNORM));
+                r.upload = g_device->createBuffer(plume::RenderBufferDesc::UploadBuffer(uint64_t(rowPitch) * image.height));
+                if (!r.texture || !r.upload) { r.texture.reset(); r.upload.reset(); return; }
+                r.width = image.width;
+                r.height = image.height;
+            }
+            auto* mapped = static_cast<uint8_t*>(r.upload->map());
+            if (!mapped) return;
+            for (uint32_t y = 0; y < image.height; ++y)
+                memcpy(mapped + size_t(y) * rowPitch, &image.pixels[size_t(y) * image.width], size_t(image.width) * 4);
+            r.upload->unmap();
+            g_commandList->barriers(plume::RenderBarrierStage::COPY,
+                plume::RenderTextureBarrier(r.texture.get(), plume::RenderTextureLayout::COPY_DEST));
+            g_commandList->copyTextureRegion(plume::RenderTextureCopyLocation::Subresource(r.texture.get()),
+                plume::RenderTextureCopyLocation::PlacedFootprint(r.upload.get(), plume::RenderFormat::R8G8B8A8_UNORM,
+                    image.width, image.height, 1, rowPitch / 4), 0, 0, 0, nullptr);
+            r.revision = image.revision;
+        }
+        g_presentation->DrawOverlay(g_commandList.get(), r.texture.get(), backBuffer, uint32_t(image.x), uint32_t(image.y),
+            image.width, image.height, outputWidth, outputHeight, 1.0f);
+#else
+        (void)backBuffer; (void)mode; (void)plan; (void)sourceWidth; (void)sourceHeight; (void)now;
+#endif
+    }
+
     // Startup pipeline preparation running in the background (renderer): a thin
     // translucent bar along the bottom edge, filled done/total, fading out once
     // done. Only game frames draw it, so the host menus and prompts hide it. The
@@ -4917,6 +5069,9 @@ namespace gpu::video
                         id.allocation, id.generation, fgHandoff.packet->producer->producerSerial, fgHandoff.packet->resolveSerial);
                 }
                 if (!BeginGpuCommands(g_commandList.get())) return;
+                // Settings → Graphics → Performance overlay; Off costs this test.
+                const bool performanceOverlay = presentationConfig.performanceOverlay || g_performanceOverlay.active;
+                if (performanceOverlay) BeginPresentTiming();
                 if (sceneCopySource) RecordSceneCopy(sceneCopySource);
 #if defined(LO_ENABLE_D3D12_FG) && defined(_WIN32)
                 if (g_d3dFg && g_d3dFg->Enabled()) {
@@ -4995,6 +5150,9 @@ namespace gpu::video
                     DrawTitleHint(backBuffer);
                     DrawPreparationBar(backBuffer);
                     DrawAchievementToast(backBuffer);
+                    if (performanceOverlay)
+                        DrawPerformanceOverlay(backBuffer, presentationConfig.performanceOverlay, sourcePlan,
+                            sourceWidth, sourceHeight, now);
                 }
                 else {
                     g_commandList->barriers(plume::RenderBarrierStage::COPY, plume::RenderTextureBarrier(backBuffer, plume::RenderTextureLayout::COPY_DEST));
@@ -5014,6 +5172,7 @@ namespace gpu::video
 #endif
                 g_captureCopy.d3dFenceValue = d3dSignal;
                 PreparePresentImage(backBuffer);
+                if (performanceOverlay) EndPresentTiming();
                 if (!EndGpuCommands(g_commandList.get())) return;
 
                 const plume::RenderCommandList* lists[] = { g_commandList.get() };
@@ -5025,6 +5184,7 @@ namespace gpu::video
                     g_fence.get(), &submissionSerial, &submitResult);
                 FgHostSubmitted(submitted, submissionSerial, submitResult);
                 if (!submitted) { LOG_ERROR("video: GPU presentation submit failed raw_result={}", submitResult); ReadPresentCapture(captureResult, false, false, 0); return; }
+                if (performanceOverlay) g_presentTiming.pending = g_presentTiming.recording;
                 g_fgPresent.Submitted(g_deviceEpoch.load(), submissionSerial);
                 if (sceneCopySource) SceneCopySubmitted(now);
                 FgPresentStart();
