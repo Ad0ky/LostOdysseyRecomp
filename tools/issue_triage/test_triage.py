@@ -23,6 +23,10 @@ class TriageTests(unittest.TestCase):
         model = patch.object(triage, 'ask_claude', return_value='Initial analysis @someone')
         self.model = model.start()
         self.addCleanup(model.stop)
+        for target in ('related.candidates', 'logs.collect'):
+            patcher = patch(target, return_value=[])
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_post_and_request_boundaries(self):
         (self.root / 'README.md').write_text('x' * 10000)
@@ -57,6 +61,28 @@ class TriageTests(unittest.TestCase):
             self.assertIn('Dry run', triage.run(self.env, self.root))
             self.assertEqual(call.call_count, 2)
         self.assertTrue((self.root / 'issue-triage-preview.md').is_file())
+
+    def test_related_and_logs_reach_prompt_and_unknown_refs_are_dropped(self):
+        found = [{'number': 5, 'title': 'Music', 'state': 'closed', 'labels': [], 'created': '2026-10-10', 'excerpt': ''}]
+        self.model.return_value = 'Hello\nPossibly related: #5 (music)\nAlso #77'
+        posted = {'id': 1, 'body': triage.MARKER + '\n\nHello\nPossibly related: #5 (music)'}
+        with patch('related.candidates', return_value=found), \
+                patch('logs.collect', return_value=[{'file': 'a.log', 'digest': 'Header facts:'}]), \
+                patch.object(triage, 'request_json', side_effect=[self.issue, [], self.issue, [], posted]) as call:
+            self.assertIn('Posted', triage.run(self.env, self.root))
+            comment = call.call_args_list[-1].args[3]['body']
+        data = json.loads(self.model.call_args.args[2])
+        self.assertEqual(data['related_candidates'], found)
+        self.assertEqual(data['log_digests'][0]['file'], 'a.log')
+        self.assertIn('Possibly related: #5', comment)
+        self.assertNotIn('#77', comment)
+
+    def test_context_only_does_not_call_model(self):
+        self.env['ISSUE_TRIAGE_CONTEXT_ONLY'] = 'true'
+        with patch.object(triage, 'request_json', side_effect=[self.issue]):
+            out = triage.run(self.env, self.root)
+        self.assertEqual(json.loads(out), {})
+        self.model.assert_not_called()
 
     def test_closed_skip(self):
         with patch.object(triage, 'request_json', return_value={'state': 'closed'}) as call:
