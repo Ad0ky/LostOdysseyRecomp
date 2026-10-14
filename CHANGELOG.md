@@ -33,6 +33,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android: the game starts on devices whose graphics driver refused the display setup (#477).
 - Replaced character models no longer lose parts of their body in game (11 party characters).
 - While the game files for new or changed mods are being prepared at startup, the window shows "Preparing mods" with a progress bar instead of staying black.
+- Android (experimental): phones and tablets with a Mali-G57, G68, G77, G78 or Mali-G610 and newer GPU can run the game with the open-source PanVK driver, which the GPU driver page recommends and downloads.
 
 ### 简体中文
 
@@ -61,6 +62,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android：显卡驱动拒绝显示设置的设备现在可以正常启动（#477）。
 - 替换后的角色模型不再缺少身体部件（队伍中的 11 个角色）。
 - 启动时为新增或改动的 Mod 准备游戏文件期间，窗口会显示“正在准备 Mod”和进度条，不再一直黑屏。
+- Android（实验性）：使用 Mali-G57、G68、G77、G78 或 Mali-G610 及更新 GPU 的手机和平板可以用开源 PanVK 驱动运行游戏，GPU driver 页面会推荐并下载它。
 
 ## [v0.9.32](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.32) — 2026-10-12
 
