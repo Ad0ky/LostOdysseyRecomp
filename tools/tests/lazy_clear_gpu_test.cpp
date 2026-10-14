@@ -5,11 +5,20 @@
 //   eager:     clear at once (plume Vulkan turns whole clears into loadOp CLEAR);
 //   lazy:      gpu/pending_clear.h with the renderer's execution points (and the
 //              drop of owed clears under a transfer over the whole target).
-// Usage: LoLazyClearGpuTest [--vulkan] [seeds]
+// Then constant transfers: for every pair of the transfer's classes, the real
+// transfer shader (gpu/edram_transfer.h) draws from cleared source texels, and
+// edram_transfer::ConstantTransfer's results are cleared into a second target;
+// every texel it accepts must read back the same bytes.
+// Usage: LoLazyClearGpuTest [--vulkan] [seeds] [--mutate]
+// (--mutate alters some constant-transfer results by one FP16 step; the run must then fail.)
+#include <gpu/edram_transfer.h>
 #include <gpu/pending_clear.h>
 #include <gpu/shader/dxc_compiler.h>
 #include <plume_render_interface.h>
 #include <plume_render_interface_builders.h>
+#include <array>
+#include <bit>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -371,6 +380,241 @@ void RunScript(Harness& h, uint32_t seed)
     h.Submit();
 }
 
+// ---- constant transfers ------------------------------------------------------
+namespace et = gpu::edram_transfer;
+using Rgba = std::array<float, 4>;
+
+// Source clear values for one class: every code of every channel as the
+// renderer's clears produce them (guest words unpacked in the source class),
+// then arbitrary floats around FP16 and class rounding boundaries.
+std::vector<Rgba> SourceValues(uint32_t cls, std::mt19937& rng)
+{
+    std::vector<Rgba> values;
+    const uint32_t codes = cls == 0 ? 256 : 1024;
+    for (uint32_t k = 0; k < codes; ++k) {
+        const uint32_t w = cls == 0
+            ? k | (((k * 37 + 11) & 0xFFu) << 8) | (((k * 101 + 7) & 0xFFu) << 16) | (((k * 59) & 0xFFu) << 24)
+            : k | (((k * 397 + 5) & 0x3FFu) << 10) | (((k * 613 + 9) & 0x3FFu) << 20) | ((k & 3u) << 30);
+        Rgba v;
+        et::UnpackGuest(w, cls, v.data());
+        values.push_back(v);
+    }
+    std::uniform_real_distribution<float> unit(-0.25f, 1.25f), mantissa(1.0f, 2.0f);
+    for (int i = 0; i < 3072; ++i) {
+        Rgba v;
+        for (float& x : v) {
+            switch (rng() % 6) {
+            case 0: x = unit(rng); break;
+            case 1: x = std::ldexp(mantissa(rng), int(rng() % 24) - 18); break; // 2^-18 .. 2^6
+            case 2: { // halfway between two FP16 values
+                const uint16_t h = uint16_t(rng() % 0x7BFFu);
+                x = 0.5f * (et::HalfToFloat(h) + et::HalfToFloat(uint16_t(h + 1)));
+                break;
+            }
+            case 3: x = (float(rng() % 1024) + 0.5f) / 1023.0f; break; // 10-bit rounding ties
+            case 4: x = (float(rng() % 256) + 0.5f) / 255.0f; break;   // 8-bit rounding ties
+            default: x = et::Float7e3To32(rng() % 1024) * (1.0f + std::ldexp(float(int(rng() % 9) - 4), -9)); break;
+            }
+        }
+        values.push_back(v);
+    }
+    return values;
+}
+
+struct TransferCheck {
+    RenderDevice& device;
+    RenderCommandQueue& queue;
+    RenderShader* vs;
+    std::unique_ptr<RenderShader> ps;
+    RenderDescriptorSetBuilder constants, textures;
+    std::unique_ptr<RenderPipelineLayout> layout;
+    std::unique_ptr<RenderPipeline> pipeline;
+    size_t checked = 0, accepted = 0, total = 0, renderer = 0, rendererAccepted = 0;
+    bool mutate = false;
+
+    TransferCheck(RenderDevice& d, RenderCommandQueue& q, RenderShader* vertex, bool vulkan) : device(d), queue(q), vs(vertex)
+    {
+        // The renderer binds xeTransfer through its shared constants; here a constant buffer.
+        const std::string source = std::string("Texture2D<float4> src : register(t0, space1);\n"
+            "cbuffer XeTransfer : register(b0, space0) { uint4 xeTransfer; };\n") + et::kTransferHlsl;
+        auto compiled = xenos::CompileCachedHlsl(source, "main", "ps_6_0",
+            vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil);
+        if (!compiled.ok) throw std::runtime_error(compiled.errors);
+        ps = device.createShader(compiled.bytecode.data(), compiled.bytecode.size(), "main",
+            vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL);
+        constants.begin(); constants.addConstantBuffer(0); constants.end();
+        textures.begin(); textures.addTexture(0); textures.end();
+        RenderPipelineLayoutBuilder builder;
+        builder.begin(false, false); builder.addDescriptorSet(constants); builder.addDescriptorSet(textures); builder.end();
+        layout = builder.create(&device);
+        RenderGraphicsPipelineDesc desc;
+        desc.pipelineLayout = layout.get();
+        desc.vertexShader = vs;
+        desc.pixelShader = ps.get();
+        desc.depthEnabled = false;
+        desc.depthWriteEnabled = false;
+        desc.depthFunction = RenderComparisonFunction::ALWAYS;
+        desc.renderTargetFormat[0] = RenderFormat::R16G16B16A16_FLOAT;
+        desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+        desc.renderTargetBlend[0].renderTargetWriteMask = 0xF;
+        desc.renderTargetCount = 1;
+        desc.cullMode = RenderCullMode::NONE;
+        desc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+        pipeline = device.createGraphicsPipeline(desc);
+        if (!ps || !layout || !pipeline) throw std::runtime_error("transfer pipeline");
+    }
+
+    // One class pair. Source texel i is cleared to values[i] (in-pass rectangle
+    // clears; the first values also as whole-target clears, which plume Vulkan
+    // records as loadOp CLEAR); A = the shader's transfer, B = the CPU results
+    // cleared. Returns false on the first differing texel.
+    bool Run(uint32_t srcClass, uint32_t dstClass, const std::vector<Rgba>& values, size_t rendererValues)
+    {
+        constexpr uint32_t W = 256, kWhole = 48, kSmall = 4;
+        const uint32_t n = uint32_t(values.size()), H = (n + W - 1) / W;
+        const auto fp16 = RenderFormat::R16G16B16A16_FLOAT;
+        auto texture = [&](uint32_t w, uint32_t h) {
+            auto t = device.createTexture(RenderTextureDesc::Texture2D(w, h, 1, fp16, RenderTextureFlag::RENDER_TARGET));
+            if (!t) throw std::runtime_error("texture");
+            return t;
+        };
+        auto src = texture(W, H), a = texture(W, H), b = texture(W, H);
+        auto smallSrc = texture(kSmall, kSmall), smallA = texture(kSmall, kSmall), smallB = texture(kSmall, kSmall);
+        std::vector<std::unique_ptr<RenderFramebuffer>> framebuffers;
+        auto framebuffer = [&](RenderTexture* t) {
+            const RenderTexture* colors[] = {t};
+            framebuffers.push_back(device.createFramebuffer(RenderFramebufferDesc(colors, 1, nullptr)));
+            if (!framebuffers.back()) throw std::runtime_error("framebuffer");
+            return framebuffers.back().get();
+        };
+        RenderFramebuffer *srcFb = framebuffer(src.get()), *aFb = framebuffer(a.get()), *bFb = framebuffer(b.get());
+        RenderFramebuffer *smallSrcFb = framebuffer(smallSrc.get()), *smallAFb = framebuffer(smallA.get()), *smallBFb = framebuffer(smallB.get());
+
+        const uint32_t transfer[4] = {srcClass, dstClass, std::bit_cast<uint32_t>(1.0f), std::bit_cast<uint32_t>(1.0f)};
+        auto cbuffer = device.createBuffer(RenderBufferDesc::UploadBuffer(256, RenderBufferFlag::CONSTANT));
+        if (!cbuffer) throw std::runtime_error("constant buffer");
+        std::memcpy(cbuffer->map(), transfer, sizeof(transfer));
+        cbuffer->unmap();
+        auto constantSet = constants.create(&device);
+        constantSet->setBuffer(0, cbuffer.get(), 256);
+        auto srcSet = textures.create(&device), smallSrcSet = textures.create(&device);
+        srcSet->setTexture(0, src.get(), RenderTextureLayout::SHADER_READ);
+        smallSrcSet->setTexture(0, smallSrc.get(), RenderTextureLayout::SHADER_READ);
+
+        std::vector<Rgba> expected(n);
+        std::vector<bool> ok(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            ok[i] = et::ConstantTransfer(values[i].data(), srcClass, dstClass, expected[i].data());
+            // --mutate: one FP16 step off in every 97th result, which the check must catch.
+            if (mutate && i % 97 == 0) expected[i][i % 4] = et::HalfToFloat(uint16_t(et::FloatToHalf(expected[i][i % 4], et::Round::NearestEven) ^ 1u));
+        }
+
+        auto commands = queue.createCommandList();
+        auto fence = device.createCommandFence();
+        if (!commands || !fence) throw std::runtime_error("command list");
+        commands->begin();
+        auto barrier = [&](RenderTexture* t, RenderTextureLayout l) {
+            commands->barriers(l == RenderTextureLayout::COPY_SOURCE ? RenderBarrierStage::COPY : RenderBarrierStage::GRAPHICS,
+                RenderTextureBarrier(t, l));
+        };
+        auto draw = [&](RenderFramebuffer* fb, RenderDescriptorSet* set, uint32_t w, uint32_t h) {
+            commands->setFramebuffer(fb);
+            RenderViewport viewport(0, 0, float(w), float(h));
+            RenderRect scissor{0, 0, int32_t(w), int32_t(h)};
+            commands->setViewports(&viewport, 1);
+            commands->setScissors(&scissor, 1);
+            commands->setGraphicsPipelineLayout(layout.get());
+            commands->setPipeline(pipeline.get());
+            commands->setGraphicsDescriptorSet(constantSet.get(), 0);
+            commands->setGraphicsDescriptorSet(set, 1);
+            commands->drawInstanced(3, 1, 0, 0);
+        };
+        auto color = [](const Rgba& v) { return RenderColor(v[0], v[1], v[2], v[3]); };
+        const RenderColor zero(0, 0, 0, 0);
+
+        // Every texel: rectangle clears of the source, one transfer; the CPU results as clears.
+        barrier(src.get(), RenderTextureLayout::COLOR_WRITE);
+        commands->setFramebuffer(srcFb);
+        commands->clearColor(0, zero);
+        for (uint32_t i = 0; i < n; ++i) {
+            const RenderRect r{int32_t(i % W), int32_t(i / W), int32_t(i % W) + 1, int32_t(i / W) + 1};
+            commands->clearColor(0, color(values[i]), &r, 1);
+        }
+        barrier(src.get(), RenderTextureLayout::SHADER_READ);
+        barrier(a.get(), RenderTextureLayout::COLOR_WRITE);
+        draw(aFb, srcSet.get(), W, H);
+        barrier(b.get(), RenderTextureLayout::COLOR_WRITE);
+        commands->setFramebuffer(bFb);
+        commands->clearColor(0, zero);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (!ok[i]) continue;
+            const RenderRect r{int32_t(i % W), int32_t(i / W), int32_t(i % W) + 1, int32_t(i / W) + 1};
+            commands->clearColor(0, color(expected[i]), &r, 1);
+        }
+        // The first accepted values again through whole-target clears.
+        std::vector<uint32_t> whole;
+        for (uint32_t i = 0; i < n && whole.size() < kWhole; i += 7) if (ok[i]) whole.push_back(i);
+        // Row pitches are multiples of 256 bytes (D3D12 placed footprints).
+        const uint32_t pitch = W * 8, smallPitch = 256, mainBytes = pitch * H, smallBytes = smallPitch * kSmall;
+        auto readback = device.createBuffer(RenderBufferDesc::ReadbackBuffer(2ull * mainBytes + 2ull * smallBytes * whole.size()));
+        if (!readback) throw std::runtime_error("readback");
+        auto copy = [&](RenderTexture* t, uint32_t w, uint32_t h, uint32_t rowPitch, uint64_t offset) {
+            barrier(t, RenderTextureLayout::COPY_SOURCE);
+            commands->copyTextureRegion(RenderTextureCopyLocation::PlacedFootprint(readback.get(), fp16, w, h, 1, rowPitch / 8, offset),
+                RenderTextureCopyLocation::Subresource(t, 0));
+        };
+        copy(a.get(), W, H, pitch, 0);
+        copy(b.get(), W, H, pitch, mainBytes);
+        for (size_t k = 0; k < whole.size(); ++k) {
+            barrier(smallSrc.get(), RenderTextureLayout::COLOR_WRITE);
+            commands->setFramebuffer(smallSrcFb);
+            commands->clearColor(0, color(values[whole[k]]));
+            barrier(smallSrc.get(), RenderTextureLayout::SHADER_READ);
+            barrier(smallA.get(), RenderTextureLayout::COLOR_WRITE);
+            draw(smallAFb, smallSrcSet.get(), kSmall, kSmall);
+            barrier(smallB.get(), RenderTextureLayout::COLOR_WRITE);
+            commands->setFramebuffer(smallBFb);
+            commands->clearColor(0, color(expected[whole[k]]));
+            copy(smallA.get(), kSmall, kSmall, smallPitch, 2ull * mainBytes + 2ull * smallBytes * k);
+            copy(smallB.get(), kSmall, kSmall, smallPitch, 2ull * mainBytes + 2ull * smallBytes * k + smallBytes);
+        }
+        commands->end();
+        const RenderCommandList* lists[] = {commands.get()};
+        queue.executeCommandLists(lists, 1, nullptr, 0, nullptr, 0, fence.get());
+        queue.waitForCommandFence(fence.get());
+
+        const auto* bytes = static_cast<const uint8_t*>(readback->map());
+        auto report = [&](uint32_t i, const uint8_t* got, const uint8_t* want, const char* path) {
+            uint16_t g[4], e[4];
+            std::memcpy(g, got, 8); std::memcpy(e, want, 8);
+            std::printf("FAIL: constant transfer %u -> %u (%s), value %u (%a %a %a %a): shader %04x %04x %04x %04x, clear %04x %04x %04x %04x\n",
+                srcClass, dstClass, path, i, values[i][0], values[i][1], values[i][2], values[i][3],
+                g[0], g[1], g[2], g[3], e[0], e[1], e[2], e[3]);
+        };
+        bool pass = true;
+        for (uint32_t i = 0; i < n && pass; ++i) {
+            if (i < rendererValues) { ++renderer; rendererAccepted += ok[i]; }
+            if (!ok[i]) continue;
+            const size_t at = size_t(i / W) * pitch + size_t(i % W) * 8;
+            ++checked;
+            if (std::memcmp(bytes + at, bytes + mainBytes + at, 8) != 0) { report(i, bytes + at, bytes + mainBytes + at, "rectangle clears"); pass = false; }
+        }
+        for (size_t k = 0; k < whole.size() && pass; ++k) {
+            const uint8_t* got = bytes + 2ull * mainBytes + 2ull * smallBytes * k;
+            for (uint32_t y = 0; y < kSmall && pass; ++y)
+                if (std::memcmp(got + y * smallPitch, got + smallBytes + y * smallPitch, kSmall * 8) != 0) {
+                    report(whole[k], got + y * smallPitch, got + smallBytes + y * smallPitch, "whole clears");
+                    pass = false;
+                }
+            checked += kSmall * kSmall;
+        }
+        for (uint32_t i = 0; i < n; ++i) accepted += ok[i];
+        total += n;
+        readback->unmap();
+        return pass;
+    }
+};
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -378,7 +622,7 @@ int main(int argc, char** argv)
     try {
         const bool vulkan = argc > 1 && std::string(argv[1]) == "--vulkan";
         const int seedArg = vulkan ? 2 : 1;
-        const uint32_t seeds = argc > seedArg ? uint32_t(std::stoul(argv[seedArg])) : 200;
+        const uint32_t seeds = argc > seedArg && argv[seedArg][0] != '-' ? uint32_t(std::stoul(argv[seedArg])) : 200;
         auto api = vulkan ? CreateVulkanInterface() : CreateD3D12Interface();
         if (!api) throw std::runtime_error("render interface");
         auto device = api->createDevice();
@@ -427,6 +671,30 @@ int main(int argc, char** argv)
         }
         std::printf("PASS: %u scripts, reference / eager (loadOp CLEAR) / lazy readbacks byte-identical (%zu bytes each)\n",
             seeds, compared);
+
+        TransferCheck transfers(*device, *queue, shaders.vs.get(), vulkan);
+        for (int i = 1; i < argc; ++i) transfers.mutate |= std::string(argv[i]) == "--mutate";
+        for (uint32_t srcClass = 0; srcClass <= et::kLastClass; ++srcClass) {
+            std::mt19937 rng(1234 + srcClass);
+            const auto values = SourceValues(srcClass, rng);
+            const size_t rendererValues = srcClass == 0 ? 256 : 1024;
+            for (uint32_t dstClass = 0; dstClass <= et::kLastClass; ++dstClass)
+                if (!transfers.Run(srcClass, dstClass, values, rendererValues)) return 1;
+        }
+        std::printf("PASS: constant transfers, %zu texels byte-identical to the transfer shader; %zu of %zu source values "
+            "accepted, %zu of %zu guest-word values\n", transfers.checked, transfers.accepted, transfers.total,
+            transfers.rendererAccepted, transfers.renderer);
+        // Zero and all-ones words (the game's depth fills at z 0 wipe colour views to zero) take the constant path.
+        for (uint32_t srcClass = 0; srcClass <= et::kLastClass; ++srcClass)
+            for (uint32_t dstClass = 0; dstClass <= et::kLastClass; ++dstClass)
+                for (uint32_t word : {0u, 0xFFFFFFFFu}) {
+                    float value[4], out[4];
+                    et::UnpackGuest(word, srcClass, value);
+                    if (!et::ConstantTransfer(value, srcClass, dstClass, out)) {
+                        std::printf("FAIL: word %08x of class %u falls back to the transfer draw for class %u\n", word, srcClass, dstClass);
+                        return 3;
+                    }
+                }
         return 0;
     } catch (const std::exception& e) {
         std::printf("FAIL: %s\n", e.what());

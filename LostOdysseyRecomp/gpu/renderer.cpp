@@ -30,6 +30,7 @@
 #include "guest_writes.h"
 #include "depth_format.h"
 #include "depth_clear_layout.h"
+#include "edram_transfer.h"
 #include "pending_clear.h"
 #include "draw_attachment_policy.h"
 #include "vulkan_object_trace.h"
@@ -2792,7 +2793,7 @@ namespace gpu::renderer
 
             void CompileTransferShader()
             {
-                const char* psSrc =
+                const char* bindings =
                     "Texture2D<float4> src : register(t0, space1);\n"
                     "#ifdef __spirv__\n"
                     "struct XePushConstants { uint64_t vs; uint64_t sharedAddress; uint64_t ps; };\n"
@@ -2803,43 +2804,8 @@ namespace gpu::renderer
                     "  uint4 pad0[2]; uint4 pad1[8]; float4 pad2; float4 pad3; float4 pad4;\n"
                     "  float4 pad5; float4 xeColorMax; uint4 xeTransfer;\n"
                     "};\n"
-                    "#endif\n"
-                    "float Float7e3To32(uint f10) {\n"
-                    "  f10 &= 0x3FFu; if (f10 == 0u) return 0.0;\n"
-                    "  uint mantissa = f10 & 0x7Fu, exponent = f10 >> 7;\n"
-                    "  if (exponent == 0u) { uint lz = firstbithigh(mantissa); uint shift = 7u - lz;\n"
-                    "    exponent = uint(int(1) - int(shift)); mantissa = (mantissa << shift) & 0x7Fu; }\n"
-                    "  return asfloat(((exponent + 124u) << 23) | (mantissa << 16));\n"
-                    "}\n"
-                    "uint Float32To7e3(float f) {\n"
-                    "  if (!(f > 0.0)) return 0u;\n"
-                    "  uint u = asuint(f);\n"
-                    "  if (u >= 0x41FF73FFu) return 0x3FFu;\n"
-                    "  if (u < 0x3E800000u) { uint shift = min(125u - (u >> 23), 24u);\n"
-                    "    u = (0x800000u | (u & 0x7FFFFFu)) >> shift; }\n"
-                    "  else { u += 0xC2000000u; }\n"
-                    "  return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;\n"
-                    "}\n"
-                    "uint PackGuest(float4 v, uint cls) {\n"
-                    "  if (cls == 0u) { uint4 c = uint4(saturate(v) * 255.0 + 0.5);\n"
-                    "    return c.r | (c.g << 8) | (c.b << 16) | (c.a << 24); }\n"
-                    "  uint a = uint(saturate(v.a) * 3.0 + 0.5);\n"
-                    "  uint3 c;\n"
-                    "  if (cls == 1u) c = uint3(saturate(v.rgb) * 1023.0 + 0.5);\n"
-                    "  else c = uint3(Float32To7e3(v.r), Float32To7e3(v.g), Float32To7e3(v.b));\n"
-                    "  return c.r | (c.g << 10) | (c.b << 20) | (a << 30);\n"
-                    "}\n"
-                    "float4 UnpackGuest(uint w, uint cls) {\n"
-                    "  if (cls == 0u) return float4(uint4(w, w >> 8, w >> 16, w >> 24) & 0xFFu) * (1.0 / 255.0);\n"
-                    "  float alpha = float(w >> 30) * (1.0 / 3.0);\n"
-                    "  uint3 c = uint3(w, w >> 10, w >> 20) & 0x3FFu;\n"
-                    "  if (cls == 1u) return float4(float3(c) * (1.0 / 1023.0), alpha);\n"
-                    "  return float4(Float7e3To32(c.x), Float7e3To32(c.y), Float7e3To32(c.z), alpha);\n"
-                    "}\n"
-                    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
-                    "  float4 v = src.Load(int3(int2(pos.x * asfloat(xeTransfer.z), pos.y * asfloat(xeTransfer.w)), 0));\n"
-                    "  return UnpackGuest(PackGuest(v, xeTransfer.x), xeTransfer.y);\n"
-                    "}\n";
+                    "#endif\n";
+                const std::string psSrc = std::string(bindings) + gpu::edram_transfer::kTransferHlsl;
                 xenos::CompiledShader f = xenos::CompileCachedHlsl(psSrc, "main", "ps_6_0", binaryFormat);
                 if (!f.ok)
                 {
@@ -2887,6 +2853,30 @@ namespace gpu::renderer
                 // Only the 32-bit classes share a word layout; wider ones are left alone.
                 if (srcClass > kClass7e3 || dstClass > kClass7e3)
                     return;
+                const uint32_t w = dst.ScaleX(std::min(src.guestWidth, dst.guestWidth));
+                const uint32_t h = dst.ScaleY(std::min(src.guestHeight, dst.guestHeight));
+                // A source that still owes one whole colour clear holds one value
+                // everywhere, so the transfer would write one value too: owe that as
+                // a clear of the destination region instead of drawing. The source
+                // keeps its own clear.
+                if (src.pendingClear.Size() == 1 && src.format == RenderFormat::R16G16B16A16_FLOAT &&
+                    dst.format == RenderFormat::R16G16B16A16_FLOAT)
+                {
+                    const pending_clear::Op& owed = src.pendingClear.Ops()[0];
+                    float value[4];
+                    if (owed.aspects == pending_clear::Color && owed.Whole() &&
+                        edram_transfer::ConstantTransfer(owed.color, srcClass, dstClass, value))
+                    {
+                        std::vector<pending_clear::Rect> rects;
+                        if (w != dst.width || h != dst.height) rects.push_back({0, 0, int32_t(w), int32_t(h)});
+                        QueueClear(dst, pending_clear::ColorOp(value, std::move(rects)));
+#if defined(LO_GPU_PLUME)
+                        HandleFsrAlphaRgbWriter(dst, "tile_owner_transfer");
+#endif
+                        transfers++;
+                        return;
+                    }
+                }
                 RenderPipeline* pipeline = GetTransferPipeline(dst.format);
                 if (!pipeline)
                     return;
@@ -2898,8 +2888,6 @@ namespace gpu::renderer
                 uint64_t offset = Upload(&transferConstants, sizeof(transferConstants));
                 if (offset == UINT64_MAX)
                     return;
-                const uint32_t w = dst.ScaleX(std::min(src.guestWidth, dst.guestWidth));
-                const uint32_t h = dst.ScaleY(std::min(src.guestHeight, dst.guestHeight));
                 if (!Begin()) return;
                 Transition(src, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
