@@ -1736,10 +1736,10 @@
         "Delivery": "Released",
         "Source key": "texture-replacement-mod-loader",
         "Release": "v0.7.0",
-        "Evidence": "PR #68 / 457ba24 shipped Mod API v1, deterministic manifest resolution, reload/disabled fallback, LOTEX1/PNG packer and native menu atlas/font replacement in v0.7.0. Mod API and Wiki CI 36228382565 and 36228744475 succeeded. Remaining scope: arbitrary guest texture/model consumers and real external-manager/game acceptance; do not call the delivered framework Not started."
+        "Evidence": "PR #68 / 457ba24 shipped Mod API v1, deterministic manifest resolution, reload/disabled fallback, LOTEX1/PNG packer and native menu atlas/font replacement in v0.7.0. Mod API and Wiki CI 36228382565 and 36228744475 succeeded. v0.9.52 (2026-10-14, not accepted): character models (#473) and static map models (#475) replaced from glTF exports (#472); overlay.loarc packages (#463, #474); Windows cutscene replacement with H.264 MP4 (#467 to #469; Linux, macOS and Android pending); rebuilt-file cache (#476, #486); party-model material fix (#480). Remaining scope: other guest texture and model consumers, the 4 GiB archive limit for full-map model mods (maintainer decision pending), and real external-manager/game acceptance; do not call the delivered framework Not started."
       },
       "title": "Support texture replacement and a mod loader",
-      "body_sha256": "306729acfb4ee3c597a7ae3ea6f0acbfe941a4bb571c93a23e8073470c452519"
+      "body_sha256": "8061a994bedbe56a8eacf856176ae3c2b1c0b72269abc1fa873b37fa1537a080"
     },
     "switch-platform-alignment": {
       "id": "PVTI_lAHOAAsUY84Biy1azg56fA0",
@@ -2972,14 +2972,14 @@
       "fields": {
         "Kind": "Feature",
         "Area": "Platforms",
-        "Status": "In Progress",
+        "Status": "Done",
         "Delivery": "Released",
-        "Evidence": "Experimental Android arm64 APK published: attached by hand to v0.8.0 at 08:03Z on 2026-10-03, after publication (built locally in WSL), and built by CI as part of v0.8.5 (published 18:45:17Z; PRs #170, #177; not accepted). Release is v0.8.5 because the maintainer had deferred Android out of v0.8.0. PRs #168 and #169 add a GPU driver page that loads a Mesa Turnip Vulkan driver on Qualcomm devices, where the device driver leaves the highlighted menu row's text invisible, and a launcher icon. APKs are signed with the project's debug keystore; there is no release keystore (maintainer decision). Checked on one Adreno 750 tablet (4 KB pages): the v0.8.0 APK reached the title screen; the v0.8.5 APK was not installed. 16 KB pages, other devices and GPUs, audio and controller hot-plug are unverified.",
+        "Evidence": "Closed 2026-10-14: no longer experimental (PRs #481 and #482, in v0.9.52). Unverified: 16 KB pages, other devices and GPUs, audio, controller hot-plug. Experimental Android arm64 APK published: attached by hand to v0.8.0 at 08:03Z on 2026-10-03, after publication (built locally in WSL), and built by CI as part of v0.8.5 (published 18:45:17Z; PRs #170, #177; not accepted). Release is v0.8.5 because the maintainer had deferred Android out of v0.8.0. PRs #168 and #169 add a GPU driver page that loads a Mesa Turnip Vulkan driver on Qualcomm devices, where the device driver leaves the highlighted menu row's text invisible, and a launcher icon. APKs are signed with the project's debug keystore; there is no release keystore (maintainer decision). Checked on one Adreno 750 tablet (4 KB pages): the v0.8.0 APK reached the title screen; the v0.8.5 APK was not installed. 16 KB pages, other devices and GPUs, audio and controller hot-plug are unverified.",
         "Source key": "experimental-android-platform",
         "Release": "v0.8.5"
       },
-      "title": "Experimental Android platform support",
-      "body_sha256": "a2d05e6a1e8b8fa75d28f32196cde7a53eb760caa7df7be9776c4eaa2f7ea0bd"
+      "title": "Android platform support (no longer experimental)",
+      "body_sha256": "b2a44aba31186378b44bc514c808f0de2450da88bd74d36788a895b44a6d2a64"
     },
     "remove-pm4-translator": {
       "id": "PVTI_lAHOAAsUY84Biy1azg816wM",
@@ -2988,11 +2988,11 @@
         "Area": "GPU architecture",
         "Status": "Paused",
         "Delivery": "Deferred",
-        "Evidence": "Moved out of v0.8.0 by the maintainer on 2026-10-03. The native front end (fix/native-frontend-rework, PR #89 closed unmerged) sends about 70% of Uhra plaza draws through the native path but did not lower CmdProc CPU (4K120 ABBA 7.24 vs 7.06 ms/frame). Shader preparation, special draws, recorded commands, events, swap and presentation still need PM4; no PM4-free mode exists.",
+        "Evidence": "Moved out of v0.8.0 by the maintainer on 2026-10-03. The native front end (fix/native-frontend-rework, PR #89 closed unmerged) sends about 70% of Uhra plaza draws through the native path but did not lower CmdProc CPU (4K120 ABBA 7.24 vs 7.06 ms/frame). Shader preparation, special draws, recorded commands, events, swap and presentation still need PM4; no PM4-free mode exists. 2026-10-13 assessment: not worth it before v1.0 (upper bound about 1–1.4 ms per thread vs a ~4 ms gap; PR #89 measured no gain).",
         "Source key": "remove-pm4-translator"
       },
       "title": "Remove the PM4 translator",
-      "body_sha256": "f423d43fd8427cad2b14535367b225a7f3308bf9f466f83b30cdd96b953daa99"
+      "body_sha256": "a778c98821bc3a712d629b5962fe3b6cdbdcbcdddc9967b4d1e24577b3bdaef7"
     },
     "fsr-frame-generation": {
       "id": "PVTI_lAHOAAsUY84Biy1azg83gNM",
@@ -4248,14 +4248,104 @@
       "fields": {
         "Kind": "Feature",
         "Area": "Graphics performance",
-        "Status": "Paused",
-        "Delivery": "Deferred",
-        "Release": "After v1.0.0",
-        "Evidence": "Moved out of v1.0.0 on 2026-10-12 by the maintainer and paused. Phase 0 measurements on the TB321FU (docs PR #405, merged; design in #404) found no GMEM/on-chip gain worth the change. Background from the 2026-10-10 v0.9.22 run: Uhra about 23 FPS, GPU 40-43 ms, about 320 render passes per frame (about 187 full-screen). Not started; no implementation.",
+        "Status": "In Progress",
+        "Delivery": "In progress",
+        "Release": "v1.0.0",
+        "Evidence": "Active again 2026-10-14: the maintainer asked to continue. Branch perf/constant-edram-transfer (GitHub, Gitea and local) carries constant-EDRAM transfers; no PR yet. Shipped step: PR #414 (merged 2026-10-11, in v0.9.32; TB321FU render passes per frame 291 to 172; phase 1 measured about 0.2 ms; tablet 720p 41.4 to 41.8 FPS). Baseline 2026-10-14 hot 720p: frame p95 21.4-21.6 ms vs the 18 ms Android gate (android-frame-time-v100). Measurement checkpoint running on the TB321FU: the two big main-view passes, the Z-prepass, the p95 tail and a Turnip driver comparison. No pass-merge result is accepted yet.",
         "Source key": "render-pass-merging-v100"
       },
       "title": "Merge render passes so tile-based GPUs keep work on chip",
-      "body_sha256": "1bc46f85c564230194513b2e9d5a03d361cb99687152df845759409ba7a13ca0"
+      "body_sha256": "2039d3a0cb1aa0fc94d36d8f396304c2216509f1375721a60e4d327b65b11cf2"
+    },
+    "release-v0-9-52": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAnf7I",
+      "fields": {
+        "Kind": "Release",
+        "Area": "Release Engineering",
+        "Status": "Done",
+        "Delivery": "Released",
+        "Release": "v0.9.52",
+        "Start date": "2026-10-14",
+        "Target date": "2026-10-14",
+        "Evidence": "Published 2026-10-14T04:07:16Z, not a draft; tag v0.9.52 (annotated tag 5dfe9743) points at commit 9769f12e (chore: release v0.9.52, #487). Five assets (GitHub API size and sha256): Windows ZIP 152,384,776 B (28900ce6...), Linux AppImage 78,277,112 B (95498815...), Flatpak 55,253,632 B (b4e95891...), Android APK 46,882,682 B (9364dc6d...), macOS DMG 64,582,347 B (4b9bca9a...). Published, not accepted: packages not downloaded or run here; no player acceptance recorded.",
+        "Source key": "release-v0-9-52"
+      },
+      "title": "Publish achievements, model and cutscene mod replacement and the Android fixes in v0.9.52",
+      "body_sha256": "3be2ebdbdac3513838eb7a35a22b9c77fd619de68d6efd91f1ab61960112f2a8"
+    },
+    "issue-454-steam-face-buttons": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAnf-o",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Input",
+        "Status": "Done",
+        "Delivery": "Released",
+        "Release": "v0.9.52",
+        "Start date": "2026-10-12",
+        "Evidence": "A Nintendo-layout pad used through Steam Input had A/B and X/Y swapped; the maintainer attributed it to the SDL3 runtime (comment 2026-10-12). Fix PR #455 (merged 2026-10-12, in v0.9.52; Steam Input pads keep Steam's face button layout). The maintainer replied on 2026-10-14 04:26Z that v0.9.52 fixes it and closed the Issue as completed at 05:22Z. No reporter confirmation on v0.9.52 is recorded; the reporter's last comment (2026-10-12) reports a Bluetooth pad started with the included exe, and it was not re-tested here.",
+        "Source key": "issue-454-steam-face-buttons"
+      }
+    },
+    "issue-477-android-startup-display-setup": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAngDA",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Platforms",
+        "Status": "Done",
+        "Delivery": "Released",
+        "Release": "v0.9.52",
+        "Start date": "2026-10-14",
+        "Evidence": "Android start failed with 'window surface/swapchain initialization failed' on a Turnip driver; the reporter's log is attached to the Issue. Fix PR #478 (merged 2026-10-14 01:52Z, in v0.9.52): the game retries the display setup without the option the driver rejected. The maintainer pointed to v0.9.52 at 04:26Z; the reporter wrote 'it runs properly now' at 04:43Z and closed the Issue at 04:43:07Z. The confirmation covers startup on the reporter's device. The title also mentions a crash after the shader download; no test of that path is recorded.",
+        "Source key": "issue-477-android-startup-display-setup"
+      }
+    },
+    "issue-491-android-no-sound-after-app-switch": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAngHY",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Platforms",
+        "Status": "In Progress",
+        "Delivery": "In progress",
+        "Start date": "2026-10-14",
+        "Evidence": "Open (created 2026-10-14). The reporter's game audio stops after switching to another app and returning; a log is attached. Analysis in progress; no fix is recorded for this report. PR #461 (Android audio pacing under a busy CPU) is not claimed as its fix.",
+        "Source key": "issue-491-android-no-sound-after-app-switch"
+      }
+    },
+    "dlss-nr-settings-preview-blank": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAngKY",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Settings",
+        "Status": "Todo",
+        "Delivery": "Not started",
+        "Source key": "dlss-nr-settings-preview-blank"
+      },
+      "title": "DLSS-NR settings preview renders nothing",
+      "body_sha256": "04bdb3932e2dfb28a50982e0a0efb1e42783863fff602bc921d83bd65c6df7be"
+    },
+    "fg-multiplier-restart-required": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAngM0",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Frame generation",
+        "Status": "Todo",
+        "Delivery": "Not started",
+        "Source key": "fg-multiplier-restart-required"
+      },
+      "title": "Frame generation multiplier change needs a restart",
+      "body_sha256": "f58908b1ef4f42bafc4c5ca629d72441d0ae2d9f20ad2e334438d0413f122cee"
+    },
+    "issue-492-android-black-artifacts-app-switch": {
+      "id": "PVTI_lAHOAAsUY84Biy1azhAniBA",
+      "fields": {
+        "Kind": "Bug",
+        "Area": "Platforms",
+        "Status": "In Progress",
+        "Delivery": "In progress",
+        "Start date": "2026-10-14",
+        "Evidence": "Open (created 2026-10-14). The reporter sees black rectangular artifacts over the character and environment after the phone screen turns off or the app is switched and returned to; intermittent, sometimes the whole screen. Log and screenshots attached to the Issue. Same reporter as #491. Analysis in progress together with #491; no fix is recorded for this report.",
+        "Source key": "issue-492-android-black-artifacts-app-switch"
+      }
     }
   },
   "project_id": "PVT_kwHOAAsUY84Biy1a"
