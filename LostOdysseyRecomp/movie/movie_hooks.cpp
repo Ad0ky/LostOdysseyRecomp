@@ -1,20 +1,20 @@
 // Native cutscene video. The game's WMV player (the Xbox Windows Media SDK,
-// run as recompiled guest code) decodes 720p WMV3 slower than real time on the
+// run as recompiled guest code) decodes 720p WMV3 at about real time on the
 // Switch, and its GetNextFrame blocks the render thread until a frame is
-// ready, so cutscenes stutter and the whole game stalls. With this on, the
-// guest player is created audio-only (video track -1, a mode it supports) and
-// the video is decoded on a host thread with FFmpeg's VC-1 decoder; frames go
-// into the same Y/U/V textures the guest player would have filled. The guest
-// player still plays the audio; the frame hook starts and steps it the way the
-// stock GetNextFrame does.
+// ready, so cutscenes stutter and the whole game stalls when it falls behind.
+// With this on, the video is also decoded on a host thread with FFmpeg's VC-1
+// decoder and copied into the player's Y/U/V textures, and the guest player
+// is asked never to wait: GetNextFrame's "no wait" flag (descriptor +4 bit 0,
+// read back through the player's vtable +252) makes it return "no new frame"
+// instead of waiting for a sample or sleeping until a frame is due. The guest
+// player is otherwise untouched: it still plays the audio, keeps the movie
+// state and reports the end of the movie.
 //
-// Guest functions involved (see docs/notes or the hooks below):
+// Guest functions involved:
 //   sub_82815060(M)        create the player for movie M (M+20 player, M+44 info)
-//   sub_82CE9728(f, p, o)  player factory; p+24 audio track, p+28 video track
-//   sub_82CE9100(pl, out)  video size: out[0] width, out[1] height
 //   sub_823F0FA8(pl, d)    next frame into descriptor d (render thread)
 //   sub_82CE9248 / sub_82CE9FD8(pl)  pause / resume
-// Set LO_NATIVE_MOVIES=0 to use the guest decoder.
+// Set LO_NATIVE_MOVIES=0 to use the guest decoder alone.
 #include <stdafx.h>
 
 #if LO_HAS_WMV3_DECODER
@@ -39,9 +39,6 @@
 #include <mutex>
 
 extern "C" PPC_FUNC(__imp__sub_82815060);
-extern "C" PPC_FUNC(__imp__sub_82CE9728);
-extern "C" PPC_FUNC(__imp__sub_82CE9100);
-extern "C" PPC_FUNC(__imp__sub_823F02A8);
 extern "C" PPC_FUNC(__imp__sub_823F0FA8);
 extern "C" PPC_FUNC(__imp__sub_82CE9248);
 extern "C" PPC_FUNC(__imp__sub_82CE9FD8);
@@ -83,13 +80,10 @@ struct Movie
     uint32_t shown = 0, late = 0;
     uint32_t lastPts = 0;
     bool loggedEnd = false;
-    bool guestStarted = false, startFailed = false, ended = false;
 };
 
 std::mutex g_mutex;
 std::unique_ptr<Movie> g_movie;
-// Set while sub_82815060 runs for a movie that will be decoded on the host.
-thread_local Movie* t_pending = nullptr;
 
 // Archive and offset of a movie file on the current disc, from its LO.fpi.
 struct Location
@@ -234,7 +228,7 @@ void LogEnd(Movie& movie, const char* why)
 }
 }
 
-// Movie start: open the video on the host and have the guest player skip it.
+// Movie start: open the video on the host as well.
 PPC_FUNC(sub_82815060)
 {
     const uint32_t m = ctx.r3.u32;
@@ -277,17 +271,17 @@ PPC_FUNC(sub_82815060)
         return;
     }
 
-    t_pending = movie.get();
     __imp__sub_82815060(ctx, base);
-    t_pending = nullptr;
 
     const uint32_t player = PPC_LOAD_U32(m + 20);
-    if (!movie->player || movie->player != player)
+    const uint32_t width = PPC_LOAD_U32(m + 120), height = PPC_LOAD_U32(m + 124);
+    if (!player || width != movie->stream->Width() || height != movie->stream->Height())
     {
-        // The factory fell back to the guest decoder (or failed outright).
-        LOG_WARNING("native movie: {} uses the guest decoder (audio-only player unavailable)", movie->name);
+        LOG_WARNING("native movie: {} uses the guest decoder (player {:#x}, textures {}x{})", movie->name, player, width,
+                    height);
         return;
     }
+    movie->player = player;
     movie->stream->Start(DecoderThreadSetup);
     LOG_NOTICE("native movie: {} {}x{} video track {} at {}+{:#x}, player {:#x}", movie->name, movie->stream->Width(),
                movie->stream->Height(), videoTrack, location.archive, location.offset, player);
@@ -295,227 +289,84 @@ PPC_FUNC(sub_82815060)
     g_movie = std::move(movie);
 }
 
-// Player factory: create it without the video track; on failure, as asked.
-PPC_FUNC(sub_82CE9728)
-{
-    Movie* movie = t_pending;
-    if (!movie)
-    {
-        __imp__sub_82CE9728(ctx, base);
-        return;
-    }
-    const uint32_t r3 = ctx.r3.u32, params = ctx.r4.u32, out = ctx.r5.u32;
-    const uint32_t video = PPC_LOAD_U32(params + 28);
-    PPC_STORE_U32(params + 28, 0xFFFFFFFFu);
-    __imp__sub_82CE9728(ctx, base);
-    PPC_STORE_U32(params + 28, video);
-    const uint32_t player = out ? PPC_LOAD_U32(out) : 0;
-    if (ctx.r3.s32 >= 0 && player)
-    {
-        movie->player = player;
-        return;
-    }
-    LOG_WARNING("native movie: audio-only player failed ({:#x}); retrying with video", ctx.r3.u32);
-    t_pending = nullptr; // sub_82CE9100 must report the guest's own size
-    ctx.r3.u64 = r3;
-    ctx.r4.u64 = params;
-    ctx.r5.u64 = out;
-    __imp__sub_82CE9728(ctx, base);
-}
-
-// Video size for the textures: the host stream's (the player has no video).
-PPC_FUNC(sub_82CE9100)
-{
-    Movie* movie = t_pending;
-    if (!movie || !movie->player || ctx.r3.u32 != movie->player)
-    {
-        __imp__sub_82CE9100(ctx, base);
-        return;
-    }
-    const uint32_t out = ctx.r4.u32;
-    const float fps = 29.97f;
-    uint32_t fpsBits;
-    std::memcpy(&fpsBits, &fps, 4);
-    PPC_STORE_U32(out + 0, movie->stream->Width());
-    PPC_STORE_U32(out + 4, movie->stream->Height());
-    PPC_STORE_U32(out + 8, fpsBits);
-    PPC_STORE_U32(out + 12, 0);
-    ctx.r3.u64 = 0;
-}
-
-// Player status: an audio-only player must not stop the frame update.
-PPC_FUNC(sub_823F02A8)
-{
-    const uint32_t player = ctx.r3.u32;
-    __imp__sub_823F02A8(ctx, base);
-    if (ctx.r3.s32 >= 0) return;
-    std::lock_guard lock(g_mutex);
-    if (g_movie && g_movie->player == player) ctx.r3.u64 = 0;
-}
-
-// The stock GetNextFrame (sub_82CF8C38, player vtable +76) also runs the
-// player: on the first call (state 1, or 7 after an end) it prepares the
-// pipeline and resumes the player's worker threads, which decode and play the
-// audio; every call it copies the pipeline status into the player state; at
-// the end of the streams it reports 0x16660026. It cannot run here (it would
-// wait for video samples of a player without video), so these do the same
-// steps through the player's own vtable. Offsets from sub_82CF8C38.
-static uint32_t Virtual(PPCContext& ctx, uint8_t* base, uint32_t object, uint32_t offset, uint32_t r4 = 0)
-{
-    ctx.r3.u64 = object;
-    ctx.r4.u64 = r4;
-    const uint32_t function = PPC_LOAD_U32(PPC_LOAD_U32(object) + offset);
-    PPC_CALL_INDIRECT_FUNC(function);
-    return ctx.r3.u32;
-}
-
-static void ResumeWorker(PPCContext& ctx, uint8_t* base, uint32_t handle)
-{
-    ctx.r3.u64 = handle;
-    sub_82BE27D0(ctx, base); // NtResumeThread wrapper
-}
-
-// Returns a negative HRESULT when the player could not start.
-static int32_t StartGuestPlayer(PPCContext& ctx, uint8_t* base, uint32_t player)
-{
-    const int32_t hr = int32_t(Virtual(ctx, base, player, 160)); // prepare
-    if (hr < 0) return hr;
-    Virtual(ctx, base, player, 12);      // lock
-    Virtual(ctx, base, player, 224);     // set the run event
-    Virtual(ctx, base, player, 264, 2);
-    Virtual(ctx, base, player, 268, 2);  // state: started
-    ResumeWorker(ctx, base, PPC_LOAD_U32(player + 264));
-    ResumeWorker(ctx, base, PPC_LOAD_U32(player + 268));
-    PPC_STORE_U32(player + 240, 1);
-    Virtual(ctx, base, player, 20);      // unlock
-    return hr;
-}
-
-static void EndGuestPlayer(PPCContext& ctx, uint8_t* base, uint32_t player)
-{
-    Virtual(ctx, base, player, 268, 7);  // state: ended
-    if (PPC_LOAD_U32(player + 240))
-    {
-        ResumeWorker(ctx, base, PPC_LOAD_U32(player + 272));
-        PPC_STORE_U32(player + 240, 0);
-    }
-}
-
-// Next frame (render thread): run the guest player (audio), then copy the
-// host frame due now into the locked Y/U/V textures. Never waits for the decoder.
+// Next frame (render thread): let the guest player run without waiting, then
+// copy the host frame due now into the locked Y/U/V textures.
 PPC_FUNC(sub_823F0FA8)
 {
     const uint32_t player = ctx.r3.u32, desc = ctx.r4.u32;
-    bool host = false, startGuest = false;
     {
         std::lock_guard lock(g_mutex);
-        if (g_movie && player && g_movie->player == player && !g_movie->ended)
+        if (!g_movie || !player || g_movie->player != player)
         {
-            host = true;
-            startGuest = !g_movie->guestStarted;
+            // Not ours: stock behaviour.
+            ctx.r3.u64 = player;
+            ctx.r4.u64 = desc;
+            goto guest;
         }
     }
-    if (!host)
     {
-        std::unique_lock lock(g_mutex);
-        const bool ended = g_movie && player && g_movie->player == player;
-        lock.unlock();
-        if (ended)
-        {
-            ctx.r3.u64 = kEndOfMovie;
-            return;
-        }
+        PPC_STORE_U32(desc + 4, PPC_LOAD_U32(desc + 4) | 1); // never wait
         __imp__sub_823F0FA8(ctx, base);
-        return;
-    }
-    PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
-
-    // Guest player steps, without holding g_mutex (they call guest code).
-    const uint32_t state = Virtual(ctx, base, player, 248);
-    if (startGuest && (state == 1 || state == 7))
-    {
-        const int32_t hr = StartGuestPlayer(ctx, base, player);
-        std::lock_guard lock(g_mutex);
-        if (!g_movie || g_movie->player != player) return;
-        if (hr < 0)
+        const uint32_t result = ctx.r3.u32;
+        PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
+        if (int32_t(result) < 0 || result == kEndOfMovie)
         {
-            if (!g_movie->startFailed)
-                LOG_WARNING("native movie: {} guest player start failed ({:#x}); retrying", g_movie->name, uint32_t(hr));
-            g_movie->startFailed = true;
-            ctx.r3.u64 = uint32_t(hr);
+            if (result == kEndOfMovie)
+            {
+                std::lock_guard lock(g_mutex);
+                if (g_movie && g_movie->player == player) LogEnd(*g_movie, "finished");
+            }
+            return; // errors and the end of the movie come from the guest player
+        }
+
+        std::lock_guard lock(g_mutex);
+        Movie* movie = g_movie.get();
+        if (!movie || movie->player != player) return;
+        const uint64_t now = host_ui::GetActiveGameTimeNs();
+        if (!movie->started)
+        {
+            movie->started = true;
+            movie->startNs = now;
+        }
+        const uint32_t timeMs = uint32_t(std::min<uint64_t>(MovieTimeNs(*movie, now) / 1000000, 0xFFFFFFFFu));
+        bool fresh = false;
+        const movie::VideoFrame* frame = movie->stream->FrameAt(timeMs, fresh);
+        // A guest frame the player just wrote (result 0) is replaced by the
+        // host's current frame; without a host frame nothing is shown new.
+        const bool guestWrote = result != kNoNewFrame;
+        if (!frame || (!fresh && !guestWrote))
+        {
+            ctx.r3.u64 = kNoNewFrame;
             return;
         }
-        g_movie->guestStarted = true;
-        LOG_NOTICE("native movie: {} guest player started (state {})", g_movie->name, state);
-    }
-    const uint32_t status = Virtual(ctx, base, player, 260);
-    if (status & 6)
-    {
-        EndGuestPlayer(ctx, base, player);
-        std::lock_guard lock(g_mutex);
-        if (g_movie && g_movie->player == player)
+        const uint32_t w = frame->width, h = frame->height;
+        const uint32_t y = PPC_LOAD_U32(desc + 12), u = PPC_LOAD_U32(desc + 16), v = PPC_LOAD_U32(desc + 20);
+        const uint32_t yPitch = PPC_LOAD_U32(desc + 36), uPitch = PPC_LOAD_U32(desc + 40), vPitch = PPC_LOAD_U32(desc + 44);
+        if (!y || !u || !v || yPitch < w || uPitch < w / 2 || vPitch < w / 2)
         {
-            g_movie->ended = true;
-            LogEnd(*g_movie, "finished");
-        }
-        ctx.r3.u64 = kEndOfMovie;
-        return;
-    }
-    Virtual(ctx, base, player, 268, (status & 1) ? 5 : 3);
-
-    std::unique_lock lock(g_mutex);
-    Movie* movie = g_movie.get();
-    if (!movie || movie->player != player)
-    {
-        ctx.r3.u64 = kNoNewFrame;
-        return;
-    }
-    const uint64_t now = host_ui::GetActiveGameTimeNs();
-    if (!movie->started)
-    {
-        movie->started = true;
-        movie->startNs = now;
-    }
-    const uint32_t timeMs = uint32_t(std::min<uint64_t>(MovieTimeNs(*movie, now) / 1000000, 0xFFFFFFFFu));
-    bool fresh = false;
-    const movie::VideoFrame* frame = movie->stream->FrameAt(timeMs, fresh);
-    if (!fresh || !frame)
-    {
-        // The guest player ends the movie when its audio ends; stop waiting
-        // for that 10 s after the last video frame.
-        if (movie->stream->Finished() && timeMs > movie->lastPts + 10000)
-        {
-            movie->ended = true;
-            LogEnd(*movie, "finished (video)");
-            lock.unlock();
-            EndGuestPlayer(ctx, base, player);
-            ctx.r3.u64 = kEndOfMovie;
-        }
-        else
             ctx.r3.u64 = kNoNewFrame;
+            return;
+        }
+        for (uint32_t row = 0; row < h; ++row)
+            std::memcpy(base + y + size_t(row) * yPitch, frame->y.data() + size_t(row) * w, w);
+        for (uint32_t row = 0; row < h / 2; ++row)
+        {
+            std::memcpy(base + u + size_t(row) * uPitch, frame->u.data() + size_t(row) * (w / 2), w / 2);
+            std::memcpy(base + v + size_t(row) * vPitch, frame->v.data() + size_t(row) * (w / 2), w / 2);
+        }
+        if (fresh)
+        {
+            // A frame more than two frame times old: the decoder is behind.
+            if (timeMs > frame->ptsMs + 67) ++movie->late;
+            if (movie->shown++ == 0)
+                LOG_NOTICE("native movie: {} first frame at {} ms", movie->name, timeMs);
+            movie->lastPts = frame->ptsMs;
+        }
+        ctx.r3.u64 = 0;
         return;
     }
-    const uint32_t w = frame->width, h = frame->height;
-    const uint32_t y = PPC_LOAD_U32(desc + 12), u = PPC_LOAD_U32(desc + 16), v = PPC_LOAD_U32(desc + 20);
-    const uint32_t yPitch = PPC_LOAD_U32(desc + 36), uPitch = PPC_LOAD_U32(desc + 40), vPitch = PPC_LOAD_U32(desc + 44);
-    if (!y || !u || !v || yPitch < w || uPitch < w / 2 || vPitch < w / 2)
-    {
-        ctx.r3.u64 = kNoNewFrame;
-        return;
-    }
-    for (uint32_t row = 0; row < h; ++row)
-        std::memcpy(base + y + size_t(row) * yPitch, frame->y.data() + size_t(row) * w, w);
-    for (uint32_t row = 0; row < h / 2; ++row)
-    {
-        std::memcpy(base + u + size_t(row) * uPitch, frame->u.data() + size_t(row) * (w / 2), w / 2);
-        std::memcpy(base + v + size_t(row) * vPitch, frame->v.data() + size_t(row) * (w / 2), w / 2);
-    }
-    // A frame more than two frame times old: the decoder is behind.
-    if (timeMs > frame->ptsMs + 67) ++movie->late;
-    if (movie->shown++ == 0)
-        LOG_NOTICE("native movie: {} first frame at {} ms", movie->name, timeMs);
-    movie->lastPts = frame->ptsMs;
-    ctx.r3.u64 = 0;
+guest:
+    __imp__sub_823F0FA8(ctx, base);
 }
 
 PPC_FUNC(sub_82CE9248)
