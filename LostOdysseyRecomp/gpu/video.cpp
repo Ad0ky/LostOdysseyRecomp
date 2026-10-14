@@ -640,6 +640,15 @@ namespace gpu::video
 #if defined(__ANDROID__)
         uint64_t g_androidAppliedSurfaceChangeSerial = 0; // Presentation thread only.
         bool g_androidSurfaceRebuildFailureLogged = false;
+        // Output size the frame plan follows, held at its value from before a
+        // pause while the new surface settles (presentation thread only).
+        struct AndroidResumePlanHold {
+            bool active = false, logged = false;
+            uint32_t width = 0, height = 0; // planned before the pause
+            uint32_t surfaceWidth = 0, surfaceHeight = 0;
+            std::chrono::steady_clock::time_point stableSince{};
+        } g_androidResumePlanHold;
+        uint32_t g_androidPlannedWidth = 0, g_androidPlannedHeight = 0;
 #endif
         struct PresentCaptureCopy {
             bool queued = false;
@@ -3053,6 +3062,8 @@ namespace gpu::video
         }
         g_androidAppliedSurfaceChangeSerial = surfaceSerial;
         g_androidSurfaceRebuildFailureLogged = false;
+        if (g_androidPlannedWidth && g_androidPlannedHeight)
+            g_androidResumePlanHold = {true, false, g_androidPlannedWidth, g_androidPlannedHeight};
         g_presentationDisplay.nativeVsyncInitialized = false;
         LOG_INFO("video: Android native surface swapchain recreated window={:#x} serial={}",
             g_androidNativeWindowIdentity.load(), surfaceSerial);
@@ -4169,6 +4180,39 @@ namespace gpu::video
         return width != 0 && height != 0;
     }
 
+    // The frame plan follows the swapchain size. After a pause Android can
+    // hand the surface back in the launcher's or lock screen's orientation and
+    // rotate it a moment later, and each plan at a new size drops every render
+    // target and resolved surface (#492). Until the new surface has kept one
+    // size for a second, plan for the size from before the pause.
+    static void PublishOutputSize(uint32_t width, uint32_t height)
+    {
+#if defined(__ANDROID__)
+        auto& hold = g_androidResumePlanHold;
+        if (hold.active) {
+            const auto now = std::chrono::steady_clock::now();
+            if (width != hold.surfaceWidth || height != hold.surfaceHeight) {
+                hold.surfaceWidth = width;
+                hold.surfaceHeight = height;
+                hold.stableSince = now;
+            }
+            if (now - hold.stableSince < std::chrono::seconds(1)) {
+                if (!hold.logged && (width != hold.width || height != hold.height)) {
+                    hold.logged = true;
+                    LOG_INFO("video: Android surface {}x{} after resume; the frame plan keeps {}x{} until it holds for 1 s",
+                        width, height, hold.width, hold.height);
+                }
+                width = hold.width;
+                height = hold.height;
+            }
+            else hold.active = false;
+        }
+        g_androidPlannedWidth = width;
+        g_androidPlannedHeight = height;
+#endif
+        renderer::SetOutputSize(width, height);
+    }
+
     // Publish pixels, dimensions and provenance together on the presentation thread.
     static void CacheCpuFrame(const std::vector<uint32_t>& pixels, uint32_t width, uint32_t height)
     {
@@ -4640,7 +4684,7 @@ namespace gpu::video
         if (g_available && !PreparePresentation(displayTicket, menuWidth, menuHeight))
             return;
         ServicePendingDlssSizing();
-        renderer::SetOutputSize(menuWidth, menuHeight);
+        PublishOutputSize(menuWidth, menuHeight);
         const auto presentationConfig = settings::GetConfig();
         PresentationOptions presentationOptions{
             presentationConfig.antialiasing == 3 ? Antialiasing::SMAA : static_cast<Antialiasing>(presentationConfig.antialiasing),
@@ -5065,7 +5109,7 @@ namespace gpu::video
         uint32_t menuWidth = 0, menuHeight = 0;
         if (!PreparePresentation(displayTicket, menuWidth, menuHeight))
             return;
-        renderer::SetOutputSize(menuWidth, menuHeight);
+        PublishOutputSize(menuWidth, menuHeight);
         // Without display sync nothing else holds the paused menu to a frame rate.
         if (const auto config = settings::GetConfig(); config.variableRefreshRate || !config.vsync) {
             static FramePacer overlayPacer;

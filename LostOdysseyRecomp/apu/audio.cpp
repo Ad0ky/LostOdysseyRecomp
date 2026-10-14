@@ -49,6 +49,14 @@ namespace apu
         // the driver gave up catching up after a stall; logged with the frames.
         std::atomic<uint32_t> g_starved{ 0 };
         std::atomic<uint32_t> g_clockResets{ 0 };
+#if LO_PLATFORM_ANDROID
+        // steady_clock time the app last returned to the foreground, until the
+        // driver has seen the device drain since then; 0 otherwise. After a
+        // long pause AAudio can fail to restart the stream without an error
+        // callback, and SDL then never takes audio again (#491).
+        std::atomic<std::chrono::steady_clock::rep> g_resumedAt{ 0 };
+        constexpr auto kResumeDrainTimeout = std::chrono::milliseconds(300);
+#endif
 
         uint32_t FrameBytes() { return XAUDIO_NUM_SAMPLES * g_channels * sizeof(float); }
 
@@ -129,6 +137,41 @@ namespace apu
             return g_stream ? std::max(0, SDL_GetAudioStreamQueued(g_stream)) / FrameBytes() : 0;
         }
 
+#if LO_PLATFORM_ANDROID
+        // SDL hands the app lifecycle events only to event watchers, on the
+        // thread that handles the pause or resume, before the app blocks in the
+        // background; they never reach the event queue.
+        bool SDLCALL WatchLifecycle(void*, SDL_Event* event)
+        {
+            if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND)
+                g_resumedAt = std::chrono::steady_clock::now().time_since_epoch().count();
+            else if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND)
+                g_resumedAt = 0;
+            return true;
+        }
+
+        // Driver thread, while the device queue stays full: a device that has
+        // not drained since the app came back to the foreground is opened again.
+        void ReopenIfStalledAfterResume()
+        {
+            auto resumed = g_resumedAt.load(std::memory_order_relaxed);
+            if (!resumed) return;
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            const auto stalled = now - std::chrono::steady_clock::duration(resumed);
+            if (stalled < kResumeDrainTimeout) return;
+            std::lock_guard lock(g_deviceMutex);
+            if (!g_stream) return;
+            // A paused device keeps its queue; the wait starts over when it plays.
+            if (g_paused) { g_resumedAt.compare_exchange_strong(resumed, now.count()); return; }
+            // Lost to a pause that began meanwhile, or to a newer resume.
+            if (!g_resumedAt.compare_exchange_strong(resumed, 0)) return;
+            const uint32_t queued = std::max(0, SDL_GetAudioStreamQueued(g_stream)) / FrameBytes();
+            LOG_WARNING("audio: device not draining {} ms after resume (queued {}), reopened",
+                std::chrono::duration_cast<std::chrono::milliseconds>(stalled).count(), queued);
+            OpenDevice(g_surroundOpen);
+        }
+#endif
+
         void CaptureRequested(const float* stereo, uint32_t frame)
         {
             static const char* requestPath = getenv("LO_AUDIO_CAPTURE_REQUEST");
@@ -201,8 +244,22 @@ namespace apu
                 }
                 else if (!g_outputChannels && g_device) // a request withdrawn before it was applied
                     g_outputChannels = g_channels;
+#if LO_PLATFORM_ANDROID
+                auto resumed = g_resumedAt.load(std::memory_order_relaxed);
+                bool waited = false;
+#endif
                 while (QueuedFrames() >= kQueuedFrames)
+                {
                     os::scheduling::PreciseSleepFor(std::chrono::milliseconds(1));
+#if LO_PLATFORM_ANDROID
+                    waited = true;
+                    ReopenIfStalledAfterResume();
+#endif
+                }
+#if LO_PLATFORM_ANDROID
+                // A full queue went below the limit: the device takes audio again.
+                if (resumed && waited) g_resumedAt.compare_exchange_strong(resumed, 0);
+#endif
 
                 g_client.Dispatch([&](uint32_t callback, uint32_t param)
                 {
@@ -226,6 +283,9 @@ namespace apu
             if (g_audioReady) OpenDevice(surround);
             else LOG_WARNING("audio device unavailable: {}", SDL_GetError());
         }
+#if LO_PLATFORM_ANDROID
+        if (g_audioReady) SDL_AddEventWatch(WatchLifecycle, nullptr);
+#endif
         g_running = true;
         g_thread = os::GuestCodeThread(DriverMain);
         g_thread.detach();
