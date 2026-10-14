@@ -1701,6 +1701,8 @@ namespace gpu::renderer
             uint32_t descriptorBatchLimit = 500;
             uint32_t descriptorSplits = 0, textureSetSplits = 0, samplerVersionSplits = 0;
             uint32_t uploadSplits = 0, arenaSplits = 0;
+            // Draws skipped because they write nothing (see DrawImpl).
+            uint64_t noopDrawsSkipped = 0;
             struct ScopedTimer
             {
                 double& acc;
@@ -9542,6 +9544,35 @@ void main()
                 key.depthFormat = depth ? uint32_t(depth->format) : 0;
                     pipelineLookupTimer.AddTo(tPipelineLookup);
                 }
+                // A draw that writes no colour, no depth and no stencil, outside a
+                // host-measured occlusion query, changes nothing (the translator
+                // has no memexport). Battles issue ~25 such single-point draws a
+                // frame (vs 61722cf30bd5fa6f, gl_PointSize sprites at the screen
+                // centre, presumably light/flare visibility tests whose counts
+                // LO_ZPD_MODE fake modes make up anyway); each binds its own
+                // pipeline and target. LO_SKIP_NOOP_DRAWS=0 draws them.
+                {
+                    static const bool skipNoop = [] {
+                        const char* value = getenv("LO_SKIP_NOOP_DRAWS");
+                        return !(value && value[0] == '0');
+                    }();
+                    const bool writesDepth = depth && (depthControl & 6) == 6;
+                    const bool writesStencil = depth && (depthControl & 1) != 0;
+                    const bool measured = hostOcclusion && occlusion.Active();
+                    if (skipNoop && key.colorMask == 0 && !writesDepth && !writesStencil && !measured)
+                    {
+                        static uint32_t loggedNoop = 0;
+                        if (loggedNoop < 16)
+                        {
+                            ++loggedNoop;
+                            LOG_INFO("renderer: skipped no-op draw f{} #{} vs={:016x} ps={:016x} prim={} indices={} mode={} depthControl={:#x} blend={:#x} target={}x{}",
+                                frame, drawsThisFrame, key.vs, key.ps, info.primitiveType, info.indexCount, modeControl,
+                                depthControl, key.blend, color->width, color->height);
+                        }
+                        ++noopDrawsSkipped;
+                        return;
+                    }
+                }
                 RenderPipeline* pipeline = GetPipeline(key, vs, ps, color->format, depth ? depth->format : RenderFormat::UNKNOWN, true);
                 if (!pipeline)
                 {
@@ -14757,6 +14788,11 @@ void main()
                         r.uploadSplits, r.arenaSplits, r.descriptorHits, r.descriptorMisses);
                 r.descriptorSplits = r.textureSetSplits = r.samplerVersionSplits = r.uploadSplits = r.arenaSplits = 0;
                 r.descriptorHits = r.descriptorMisses = 0;
+            }
+            if (g_renderer->frame % 300 == 0 && g_renderer->noopDrawsSkipped)
+            {
+                LOG_INFO("renderer: {} no-op draws skipped in the last 300 frames", g_renderer->noopDrawsSkipped);
+                g_renderer->noopDrawsSkipped = 0;
             }
             if ((stats || render_timing::Enabled()) && (render_timing::Enabled() || g_renderer->frame % 60 == 0))
             {
