@@ -330,13 +330,28 @@ namespace gpu::video
         std::atomic<uintptr_t> g_androidNativeWindowIdentity{0};
         std::atomic<uint64_t> g_androidSurfaceChangeSerial{0};
         std::atomic<bool> g_androidSurfaceReady{false};
-        bool g_androidWasBackgrounded = false; // SDL event thread only.
+        bool g_androidWasBackgrounded = false; // SDL event thread only (poll loop, lifecycle watcher).
 
         uintptr_t CurrentAndroidNativeWindow()
         {
             if (!g_window) return 0;
             return reinterpret_cast<uintptr_t>(SDL_GetPointerProperty(SDL_GetWindowProperties(g_window),
                 SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
+        }
+
+        // SDL3 hands the app lifecycle events only to event watchers; they never
+        // reach the event queue. SDL calls this from the Android pause handling
+        // inside SDL_PumpEvents on the SDL event thread, before that thread
+        // blocks in the background. The surface goes away now, and the next
+        // window event after the return rebuilds the swapchain even when Android
+        // reuses the same native window.
+        bool SDLCALL WatchAndroidLifecycle(void*, SDL_Event* event)
+        {
+            if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+                g_androidWasBackgrounded = true;
+                g_androidSurfaceReady = false;
+            }
+            return true;
         }
 #endif
 #if LO_PLATFORM_MACOS
@@ -646,7 +661,7 @@ namespace gpu::video
             bool active = false, logged = false;
             uint32_t width = 0, height = 0; // planned before the pause
             uint32_t surfaceWidth = 0, surfaceHeight = 0;
-            std::chrono::steady_clock::time_point stableSince{};
+            std::chrono::steady_clock::time_point since{}, stableSince{};
         } g_androidResumePlanHold;
         uint32_t g_androidPlannedWidth = 0, g_androidPlannedHeight = 0;
 #endif
@@ -2296,6 +2311,13 @@ namespace gpu::video
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, config.width);
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, config.height);
             SDL_SetNumberProperty(windowProperties, SDL_PROP_WINDOW_CREATE_FLAGS_NUMBER, flags);
+#if defined(__ANDROID__)
+            // Landscape only, as the manifest asks. Without the hint SDL requests
+            // every orientation for a resizable window when it creates it, and the
+            // game turns to portrait when the device is held upright. Set here:
+            // SDL_Quit after a startup prompt clears hints.
+            SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
+#endif
             g_window = SDL_CreateWindowWithProperties(windowProperties);
             SDL_DestroyProperties(windowProperties);
             if (!g_window)
@@ -2310,6 +2332,8 @@ namespace gpu::video
             g_androidSurfaceChangeSerial = 0;
             g_androidSurfaceReady = nativeWindow != 0;
             g_androidWasBackgrounded = false;
+            SDL_RemoveEventWatch(WatchAndroidLifecycle, nullptr); // once, also for a recreated window
+            SDL_AddEventWatch(WatchAndroidLifecycle, nullptr);
             LOG_INFO("video: Android native surface initial window={:#x}", nativeWindow);
 #endif
 
@@ -3063,7 +3087,8 @@ namespace gpu::video
         g_androidAppliedSurfaceChangeSerial = surfaceSerial;
         g_androidSurfaceRebuildFailureLogged = false;
         if (g_androidPlannedWidth && g_androidPlannedHeight)
-            g_androidResumePlanHold = {true, false, g_androidPlannedWidth, g_androidPlannedHeight};
+            g_androidResumePlanHold = {true, false, g_androidPlannedWidth, g_androidPlannedHeight, 0, 0,
+                std::chrono::steady_clock::now()};
         g_presentationDisplay.nativeVsyncInitialized = false;
         LOG_INFO("video: Android native surface swapchain recreated window={:#x} serial={}",
             g_androidNativeWindowIdentity.load(), surfaceSerial);
@@ -3459,14 +3484,11 @@ namespace gpu::video
         {
             const bool windowEvent = event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST;
 #if defined(__ANDROID__)
-            if (event.type == SDL_EVENT_WILL_ENTER_BACKGROUND || event.type == SDL_EVENT_DID_ENTER_BACKGROUND) {
-                g_androidWasBackgrounded = true;
-                g_androidSurfaceReady = false;
-            }
-            if (event.type == SDL_EVENT_DID_ENTER_FOREGROUND ||
-                (windowEvent && event.window.windowID == SDL_GetWindowID(g_window) &&
-                 (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_RESTORED ||
-                  event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || event.type == SDL_EVENT_WINDOW_FOCUS_GAINED))) {
+            // The return to the foreground sends RESTORED and FOCUS_GAINED
+            // (the pause is handled in WatchAndroidLifecycle).
+            if (windowEvent && event.window.windowID == SDL_GetWindowID(g_window) &&
+                (event.type == SDL_EVENT_WINDOW_RESIZED || event.type == SDL_EVENT_WINDOW_RESTORED ||
+                 event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED || event.type == SDL_EVENT_WINDOW_FOCUS_GAINED)) {
                 const auto nativeWindow = CurrentAndroidNativeWindow();
                 if (nativeWindow) {
                     const auto previous = g_androidNativeWindowIdentity.exchange(nativeWindow);
@@ -4182,9 +4204,12 @@ namespace gpu::video
 
     // The frame plan follows the swapchain size. After a pause Android can
     // hand the surface back in the launcher's or lock screen's orientation and
-    // rotate it a moment later, and each plan at a new size drops every render
-    // target and resolved surface (#492). Until the new surface has kept one
-    // size for a second, plan for the size from before the pause.
+    // rotate it later, and each plan at a new size drops every render target
+    // and resolved surface (#492). The game is landscape only (main.cpp), so a
+    // surface turned the other way is planned for only after 10 s (a split
+    // screen changed in the background); one of the same orientation once it
+    // has kept its size for a second. Until then, plan for the size from before
+    // the pause.
     static void PublishOutputSize(uint32_t width, uint32_t height)
     {
 #if defined(__ANDROID__)
@@ -4196,16 +4221,21 @@ namespace gpu::video
                 hold.surfaceHeight = height;
                 hold.stableSince = now;
             }
-            if (now - hold.stableSince < std::chrono::seconds(1)) {
+            const bool turned = (width >= height) != (hold.width >= hold.height);
+            if (turned ? now - hold.since < std::chrono::seconds(10) : now - hold.stableSince < std::chrono::seconds(1)) {
                 if (!hold.logged && (width != hold.width || height != hold.height)) {
                     hold.logged = true;
-                    LOG_INFO("video: Android surface {}x{} after resume; the frame plan keeps {}x{} until it holds for 1 s",
+                    LOG_INFO("video: Android surface {}x{} after resume; the frame plan keeps {}x{} until the surface settles",
                         width, height, hold.width, hold.height);
                 }
                 width = hold.width;
                 height = hold.height;
             }
-            else hold.active = false;
+            else {
+                if (turned)
+                    LOG_INFO("video: Android surface still {}x{} 10 s after resume; the frame plan follows it", width, height);
+                hold.active = false;
+            }
         }
         g_androidPlannedWidth = width;
         g_androidPlannedHeight = height;
