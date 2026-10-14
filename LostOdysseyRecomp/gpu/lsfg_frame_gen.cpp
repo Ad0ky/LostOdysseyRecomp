@@ -290,8 +290,10 @@ bool Present(plume::RenderSwapChain* swapChain, uint32_t imageIndex, plume::Rend
     auto& vulkanSwapChain = *static_cast<plume::VulkanSwapChain*>(swapChain);
     if (vulkanSwapChain.vk == VK_NULL_HANDLE) return false;
     // The generated frame is copied byte for byte: any 4-byte UNORM swapchain works.
-    VkFormat format = vulkanSwapChain.textures.empty() ? VK_FORMAT_UNDEFINED : vulkanSwapChain.textures[0].imageFormat;
-    if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_B8G8R8A8_UNORM)
+    // Swapchain textures leave imageFormat unset; the create info has it.
+    const VkFormat format = vulkanSwapChain.createInfo.imageFormat;
+    if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_B8G8R8A8_UNORM &&
+        format != VK_FORMAT_R8G8B8A8_SRGB && format != VK_FORMAT_B8G8R8A8_SRGB)
     {
         Fail("unsupported swapchain format", std::to_string(int(format)));
         return false;
