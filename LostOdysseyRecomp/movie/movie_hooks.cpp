@@ -4,7 +4,9 @@
 // ready, so cutscenes stutter and the whole game stalls. With this on, the
 // guest player is created audio-only (video track -1, a mode it supports) and
 // the video is decoded on a host thread with FFmpeg's VC-1 decoder; frames go
-// into the same Y/U/V textures the guest player would have filled.
+// into the same Y/U/V textures the guest player would have filled. The guest
+// player still plays the audio; the frame hook starts and steps it the way the
+// stock GetNextFrame does.
 //
 // Guest functions involved (see docs/notes or the hooks below):
 //   sub_82815060(M)        create the player for movie M (M+20 player, M+44 info)
@@ -81,6 +83,7 @@ struct Movie
     uint32_t shown = 0, late = 0;
     uint32_t lastPts = 0;
     bool loggedEnd = false;
+    bool guestStarted = false, startFailed = false, ended = false;
 };
 
 std::mutex g_mutex;
@@ -350,17 +353,121 @@ PPC_FUNC(sub_823F02A8)
     if (g_movie && g_movie->player == player) ctx.r3.u64 = 0;
 }
 
-// Next frame (render thread): copy the host frame due now into the locked
-// Y/U/V textures. Never waits for the decoder.
+// The stock GetNextFrame (sub_82CF8C38, player vtable +76) also runs the
+// player: on the first call (state 1, or 7 after an end) it prepares the
+// pipeline and resumes the player's worker threads, which decode and play the
+// audio; every call it copies the pipeline status into the player state; at
+// the end of the streams it reports 0x16660026. It cannot run here (it would
+// wait for video samples of a player without video), so these do the same
+// steps through the player's own vtable. Offsets from sub_82CF8C38.
+static uint32_t Virtual(PPCContext& ctx, uint8_t* base, uint32_t object, uint32_t offset, uint32_t r4 = 0)
+{
+    ctx.r3.u64 = object;
+    ctx.r4.u64 = r4;
+    const uint32_t function = PPC_LOAD_U32(PPC_LOAD_U32(object) + offset);
+    PPC_CALL_INDIRECT_FUNC(function);
+    return ctx.r3.u32;
+}
+
+static void ResumeWorker(PPCContext& ctx, uint8_t* base, uint32_t handle)
+{
+    ctx.r3.u64 = handle;
+    sub_82BE27D0(ctx, base); // NtResumeThread wrapper
+}
+
+// Returns a negative HRESULT when the player could not start.
+static int32_t StartGuestPlayer(PPCContext& ctx, uint8_t* base, uint32_t player)
+{
+    const int32_t hr = int32_t(Virtual(ctx, base, player, 160)); // prepare
+    if (hr < 0) return hr;
+    Virtual(ctx, base, player, 12);      // lock
+    Virtual(ctx, base, player, 224);     // set the run event
+    Virtual(ctx, base, player, 264, 2);
+    Virtual(ctx, base, player, 268, 2);  // state: started
+    ResumeWorker(ctx, base, PPC_LOAD_U32(player + 264));
+    ResumeWorker(ctx, base, PPC_LOAD_U32(player + 268));
+    PPC_STORE_U32(player + 240, 1);
+    Virtual(ctx, base, player, 20);      // unlock
+    return hr;
+}
+
+static void EndGuestPlayer(PPCContext& ctx, uint8_t* base, uint32_t player)
+{
+    Virtual(ctx, base, player, 268, 7);  // state: ended
+    if (PPC_LOAD_U32(player + 240))
+    {
+        ResumeWorker(ctx, base, PPC_LOAD_U32(player + 272));
+        PPC_STORE_U32(player + 240, 0);
+    }
+}
+
+// Next frame (render thread): run the guest player (audio), then copy the
+// host frame due now into the locked Y/U/V textures. Never waits for the decoder.
 PPC_FUNC(sub_823F0FA8)
 {
     const uint32_t player = ctx.r3.u32, desc = ctx.r4.u32;
+    bool host = false, startGuest = false;
+    {
+        std::lock_guard lock(g_mutex);
+        if (g_movie && player && g_movie->player == player && !g_movie->ended)
+        {
+            host = true;
+            startGuest = !g_movie->guestStarted;
+        }
+    }
+    if (!host)
+    {
+        std::unique_lock lock(g_mutex);
+        const bool ended = g_movie && player && g_movie->player == player;
+        lock.unlock();
+        if (ended)
+        {
+            ctx.r3.u64 = kEndOfMovie;
+            return;
+        }
+        __imp__sub_823F0FA8(ctx, base);
+        return;
+    }
+    PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
+
+    // Guest player steps, without holding g_mutex (they call guest code).
+    const uint32_t state = Virtual(ctx, base, player, 248);
+    if (startGuest && (state == 1 || state == 7))
+    {
+        const int32_t hr = StartGuestPlayer(ctx, base, player);
+        std::lock_guard lock(g_mutex);
+        if (!g_movie || g_movie->player != player) return;
+        if (hr < 0)
+        {
+            if (!g_movie->startFailed)
+                LOG_WARNING("native movie: {} guest player start failed ({:#x}); retrying", g_movie->name, uint32_t(hr));
+            g_movie->startFailed = true;
+            ctx.r3.u64 = uint32_t(hr);
+            return;
+        }
+        g_movie->guestStarted = true;
+        LOG_NOTICE("native movie: {} guest player started (state {})", g_movie->name, state);
+    }
+    const uint32_t status = Virtual(ctx, base, player, 260);
+    if (status & 6)
+    {
+        EndGuestPlayer(ctx, base, player);
+        std::lock_guard lock(g_mutex);
+        if (g_movie && g_movie->player == player)
+        {
+            g_movie->ended = true;
+            LogEnd(*g_movie, "finished");
+        }
+        ctx.r3.u64 = kEndOfMovie;
+        return;
+    }
+    Virtual(ctx, base, player, 268, (status & 1) ? 5 : 3);
+
     std::unique_lock lock(g_mutex);
     Movie* movie = g_movie.get();
-    if (!movie || movie->player != player || !player)
+    if (!movie || movie->player != player)
     {
-        lock.unlock();
-        __imp__sub_823F0FA8(ctx, base);
+        ctx.r3.u64 = kNoNewFrame;
         return;
     }
     const uint64_t now = host_ui::GetActiveGameTimeNs();
@@ -370,14 +477,18 @@ PPC_FUNC(sub_823F0FA8)
         movie->startNs = now;
     }
     const uint32_t timeMs = uint32_t(std::min<uint64_t>(MovieTimeNs(*movie, now) / 1000000, 0xFFFFFFFFu));
-    PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
     bool fresh = false;
     const movie::VideoFrame* frame = movie->stream->FrameAt(timeMs, fresh);
     if (!fresh || !frame)
     {
-        if (movie->stream->Finished())
+        // The guest player ends the movie when its audio ends; stop waiting
+        // for that 10 s after the last video frame.
+        if (movie->stream->Finished() && timeMs > movie->lastPts + 10000)
         {
-            LogEnd(*movie, "finished");
+            movie->ended = true;
+            LogEnd(*movie, "finished (video)");
+            lock.unlock();
+            EndGuestPlayer(ctx, base, player);
             ctx.r3.u64 = kEndOfMovie;
         }
         else
