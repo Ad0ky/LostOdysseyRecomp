@@ -24,6 +24,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Settings → Graphics: a new frame generation multiplier applies as soon as you save, with HDR on too, instead of asking for a restart.
 - The DLSS 5 neural rendering page says when `nvngx_dlssnr.dll` is missing or the GPU cannot run it, instead of asking you to play a scene. It also says the game does not include that file.
 - Performance overlay: the bar across the top shows the frame generation frame rate with DLSS frame generation on Vulkan too.
+- TAA and the upscalers keep tracking moving characters and objects after you travel to another area; before, they could lose track of them until you went back, and the image was less stable.
 
 ### 简体中文
 
@@ -43,6 +44,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - 设置 → 图像：修改帧生成倍数后保存即生效，开着 HDR 也一样，不再要求重启。
 - DLSS 5 神经渲染调整页在缺少 `nvngx_dlssnr.dll` 或显卡无法运行时会直接说明，不再提示进入游戏场景，并说明游戏不附带该文件。
 - 性能信息：Vulkan 下开启 DLSS 帧生成时，顶部信息栏也会显示帧生成后的帧率。
+- 前往其他区域后，TAA 和超分会继续跟踪移动的角色和物体；之前它们可能一直跟丢，直到回到原来的区域，画面也因此不够稳定。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 

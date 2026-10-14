@@ -116,6 +116,7 @@ class MotionReplayGPU {
     uint64_t maskBatchAllocations_ = 0;
     uint32_t compilingModules_ = 0;
     static constexpr uint32_t kMaxCompilingModules = 2;
+    std::vector<Module*> compiling_; // map nodes are stable
 public:
     // Render-thread work on the slow paths only (first sight of a shader,
     // module/pipeline creation, target allocation); read by LO_RECORD_TIMING.
@@ -225,13 +226,19 @@ float pixel(float4 p : SV_Position) : SV_Target {
                 return xenos::CompileCachedHlsl(source, "main", profile, format);
             });
             ++compilingModules_;
+            compiling_.push_back(&m);
         }
         if (!m.compilation.valid() || (!wait && m.compilation.wait_for(std::chrono::seconds(0)) != std::future_status::ready))
             return m;
+        CompleteModule(m);
+        return m;
+    }
+    void CompleteModule(Module& m) {
         auto compiled = m.compilation.get();
         --compilingModules_;
+        std::erase(compiling_, &m);
         m.source.clear();
-        if (!compiled.ok) { m.error = compiled.errors; m.failure = Module::Failure::Translation; return m; }
+        if (!compiled.ok) { m.error = compiled.errors; m.failure = Module::Failure::Translation; return; }
         if (testFailNextModuleAllocation_) testFailNextModuleAllocation_ = false;
         else {
             AddElapsed timer{work_.shaderCreateMs};
@@ -244,7 +251,16 @@ float pixel(float4 p : SV_Position) : SV_Target {
             m.failure = Module::Failure::GpuAllocation;
             resourceFailedThisFrame_ = true;
         }
-        return m;
+    }
+    // A compile whose draw stops appearing (a map or view change) would hold one
+    // of the kMaxCompilingModules slots forever, and every module after it would
+    // stay pending, so the frame never gets motion. Finish such compiles here.
+    void ReapCompiledModules() {
+        for (size_t i = 0; i < compiling_.size();) {
+            Module& m = *compiling_[i];
+            if (m.compilation.wait_for(std::chrono::seconds(0)) == std::future_status::ready) CompleteModule(m);
+            else ++i;
+        }
     }
 public:
     const MotionConstantUsage* ConstantUsage(uint64_t vsHash) const {
@@ -310,6 +326,7 @@ public:
         injectPreparePending_ = false;
         drawCount_ = failedDraws_ = 0;
         queued_.clear();
+        ReapCompiledModules();
     }
     void AbortFrame(std::string_view reason = {}) {
         if (!aborted_ && !reason.empty()) error_ = std::string(reason);
