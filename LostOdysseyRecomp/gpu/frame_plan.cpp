@@ -131,8 +131,18 @@ namespace gpu::frame_plan
         const auto identity = StatusIdentityOf(cpuPlan);
         const bool planChanged = identity != loggedStatusPlan;
         loggedStatusPlan = identity;
-        if (planChanged)
+        if (planChanged) {
             NoteDlssRuntime(CurrentDlssEffect());
+            // The status line above describes DLSS only. Say once per device when
+            // the chosen upscaler cannot run at all, e.g. a build without D3D12 FSR.
+            static std::pair<upscaling::Upscaler, uint64_t> warned{upscaling::Upscaler::Off, 0};
+            if (config.upscaler != upscaling::Upscaler::Off && device.deviceReady && !device.gpuWorkStopped &&
+                !device.Available(config.upscaler) && warned != std::pair{config.upscaler, device.deviceEpoch}) {
+                warned = {config.upscaler, device.deviceEpoch};
+                LOG_WARNING("upscaler: {} is unavailable on {} with this device and build; rendering without it",
+                    UpscalerName(config.upscaler), backend::Name(device.backend));
+            }
+        }
     }
     FramePlan CpuPlan() { return cpuPlan; }
     bool NarrowTallView() { return narrowTallView.load(std::memory_order_relaxed); }
