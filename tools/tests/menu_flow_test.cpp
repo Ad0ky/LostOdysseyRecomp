@@ -1048,9 +1048,25 @@ struct HelpAudit
     // A Japanese, Korean or Simplified Chinese line identical to the English
     // one of the same state: its translation key no longer matches.
     std::vector<std::string> untranslated;
+    // English lines whose article "A" PlayStation prompts would draw as a glyph.
+    std::vector<std::string> articleGlyphs;
     void Record(const settings::TextFit& fit, uint32_t language, const std::string& where)
     {
         if (fit.text.empty()) return;
+        // With PlayStation prompts, a glyph followed by a lowercase word other than
+        // "to" is an article "A" (A key, A test sound) turned into the cross
+        // button. Real prompts read "A:", "A /", "Press A to".
+        if (language == 0)
+        {
+            const std::wstring glyphs = settings::PromptGlyphs(fit.text, true);
+            for (size_t i = 0; i + 2 < glyphs.size(); ++i)
+                if (glyphs[i] >= 0xe100 && glyphs[i] <= 0xe103 && glyphs[i + 1] == L' ' && glyphs[i + 2] >= L'a' &&
+                    glyphs[i + 2] <= L'z' && glyphs.compare(i + 2, 3, L"to ") != 0)
+                {
+                    articleGlyphs.push_back(where + ": " + Utf8(fit.text));
+                    break;
+                }
+        }
         auto [it, inserted] = lines.try_emplace({language, fit.text}, HelpLine{fit.scale, where, fit.face});
         if (!inserted && fit.scale < it->second.scale) it->second = {fit.scale, where, fit.face};
     }
@@ -1565,10 +1581,20 @@ void CheckHelpFit(uint8_t* base, const char* installRoot)
                     key.first, line.face, line.where.c_str(), Utf8(key.second).c_str());
     }
     for (const auto& line : audit.untranslated) std::printf("FAIL untranslated: %s\n", line.c_str());
+    for (const auto& line : audit.articleGlyphs) std::printf("FAIL article drawn as a button: %s\n", line.c_str());
     std::printf("help fit: %zu lines measured (%s), %zu below %d%%, %zu untranslated\n", audit.lines.size(),
                 installRoot ? "game faces" : "built-in font", failed, int(kMinHelpFit * 100), audit.untranslated.size());
     Require(failed == 0, "a settings help line shrinks below the minimum");
     Require(audit.untranslated.empty(), "a settings help line has no translation");
+    Require(audit.articleGlyphs.empty(), "an English help line has a bare article A");
+    {
+        const std::wstring cross(1, wchar_t(0xe100)), circle(1, wchar_t(0xe101));
+        Require(settings::PromptGlyphs(L"A key already in use", false) == L"A key already in use", "no glyphs without PlayStation prompts");
+        Require(settings::PromptGlyphs(L"Press A to compare", true) == L"Press " + cross + L" to compare", "Press A becomes the cross");
+        Require(settings::PromptGlyphs(L"A: choose     B: back", true) == cross + L": choose     " + circle + L": back", "A: and B: become faces");
+        Require(settings::PromptGlyphs(L"Pro Logic II or Neural:X receivers", true) == L"Pro Logic II or Neural:X receivers", "Neural:X is a name");
+        Require(settings::PromptGlyphs(L"Scales 4x and 2x", true) == L"Scales 4x and 2x", "4x is not a button");
+    }
     std::puts("PASS settings help lines keep their size in every language, state and page");
 }
 
@@ -3065,7 +3091,7 @@ int main(int argc, char** argv)
             Require(settings::snapshot.rows[3].name == L"broken" && settings::snapshot.rows[3].value == L"Error",
                     "A and RB leave a rejected mod alone");
             settings::pending = 2; Tick(base);
-            Require(settings::snapshot.help == L"A language pack. Choose it in System → Game language." &&
+            Require(settings::snapshot.help == L"This is a language pack. Choose it in System → Game language." &&
                     settings::snapshot.notice == L"Folder: pt-br" && !settings::snapshot.reorder, "a language pack is read-only");
             // Pointer: select Alpha, then its move up cell.
             settings::PointerClick(200, rowY(1), false); Tick(base);

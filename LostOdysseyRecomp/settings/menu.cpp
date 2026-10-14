@@ -563,7 +563,7 @@ std::pair<std::wstring, std::wstring> ModsHelp(const mods_page::Rows &rows)
     std::wstring help;
     if (!mods_page::IsMod(modsEntries[size_t(index)]))
         help = !problem.empty() ? Tr(L"Problem: ", L"問題：") + problem
-                                : Tr(L"A language pack. Choose it in System → Game language.",
+                                : Tr(L"This is a language pack. Choose it in System → Game language.",
                                      L"語言包。請在 系統 → 遊戲語言 中選擇。");
     else if (info.apiVersion == 0)
         help = Tr(L"Not loaded: ", L"未載入：") + problem;
@@ -704,9 +704,9 @@ std::pair<std::wstring, std::wstring> ControlsHelp()
     if (controlsFocus == ControlsSaveRow)
         return {Tr(L"Saves the buttons and keys. They apply at once.", L"儲存按鍵配置，立即套用。"), page};
     if (input >= 0)
-        return {keyboard ? Tr(L"Confirm, then press the key for this input. A key already in use swaps places.",
+        return {keyboard ? Tr(L"Confirm, then press the key for this input. Any key already in use swaps places.",
                               L"確認後，按下要用於此項的鍵盤按鍵。已使用的按鍵會互換。")
-                         : Tr(L"Confirm, then press the controller button for this input. A button already in use swaps places.",
+                         : Tr(L"Confirm, then press the controller button for this input. Any button already in use swaps places.",
                               L"確認後，按下要用於此項的控制器按鍵。已使用的按鍵會互換。"),
                 page};
     return {{}, page};
@@ -1176,7 +1176,7 @@ std::wstring FgNotice()
         text = Tr(L"Frame generation is off.", L"影格生成已關閉。"); break;
     }
     if (running.environmentOverride)
-        text += Tr(L" A diagnostic override controls FG.", L" 影格生成由診斷覆寫控制。");
+        text += Tr(L" The diagnostic override controls FG.", L" 影格生成由診斷覆寫控制。");
     return text;
 }
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
@@ -1657,7 +1657,7 @@ void Publish(uint8_t *base, uint32_t config)
                  L"5.1 會將遊戲的環繞聲混音輸出到 5.1 或 7.1 喇叭，立即套用。");
     if (tab == 1 && row == AudioRearAngleRow && status.empty())
         next.help = edit.audioOutput == AudioOutputMatrix
-            ? Tr(L"A test sound circles the speakers. Sets where the rear channels sound; 110° is the Pro Logic II standard.",
+            ? Tr(L"The test sound circles the speakers. Sets where the rear channels sound; 110° is the Pro Logic II standard.",
                  L"測試聲音會繞著喇叭轉圈。設定後方聲道的位置；110° 為 Pro Logic II 標準。")
             : Tr(L"Select Matrix surround in Audio output to adjust this.",
                  L"在音訊輸出選擇矩陣環繞聲後才能調整。");

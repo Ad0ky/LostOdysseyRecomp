@@ -353,6 +353,11 @@ settings::MenuRect settings::MenuArrowBounds(uint32_t width, uint32_t height, in
             edge(std::ceil(c.offsetX + (x + 38) * c.scale), width), edge(std::ceil(c.offsetY + (y + 24) * c.scale), height)};
 }
 
+std::wstring settings::PromptGlyphs(const std::wstring &value, bool playStation)
+{
+    return PromptText(value, playStation);
+}
+
 settings::MenuRect settings::DrawSpeakerMarker(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, float position,
                                                float rearAngle)
 {
