@@ -12,6 +12,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android: when the screen briefly turns upright as you return to the game, the game no longer rebuilds its graphics, which could leave black blocks over characters and scenery (#492).
 - Android: the game stays in landscape; holding the device upright no longer turns it to portrait.
 - Music and cutscene audio no longer go missing, and battle music no longer plays on after a battle, when the game's sound requests pile up (#497, #499).
+- The game handles its sound requests about ten times faster, so they no longer pile up in busy scenes (#497).
 
 ### 简体中文
 
@@ -19,6 +20,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android：回到游戏时如果屏幕短暂变成竖屏，游戏不再重建画面；之前这可能在角色和场景上留下黑块（#492）。
 - Android：游戏固定横屏，竖着拿设备时不再转成竖屏。
 - 游戏的声音请求积压时，音乐和过场声音不再缺失，战斗结束后战斗音乐也不再继续播放（#497、#499）。
+- 游戏处理声音请求的速度提高到约十倍，繁忙场景里请求不再积压（#497）。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 
