@@ -32,9 +32,11 @@ PPC_FUNC(sub_823CF390)
 // Each tick presents a frame and waits for the GPU to be at most 3 frames
 // behind; with presentation paced at 30 fps that wait alone outlasts the
 // interval, so the queue drains at about one command per frame and a map load
-// takes up to a minute. On the console the GPU presents at 60 Hz and the tick
-// rarely waits. render_fence::LongWait() lets the command processor pace at
-// 60 fps while a fence wait has lasted 250 ms (gpu/command_processor.cpp).
+// takes up to a minute. Measured 2026-10-14: the commands take 3-23 ms in
+// total per wait; the ticks take the rest (one tick per command, ~33 ms each,
+// tick interval 1/30 s), and the tick's frame is held by the guest's two-vblank
+// present interval. render_fence::LoadBoost() makes vblanks faster during such
+// a wait (gpu/command_processor.cpp). Pacing at 60 fps alone changed nothing.
 // Skipping ticks instead (LO_LOAD_TICK_THROTTLE=1, at most one tick every
 // 100 ms between commands) left battle transitions on the loading screen for
 // minutes on 2026-10-14, so it is off by default.
@@ -90,6 +92,25 @@ namespace
         }();
         return on;
     }
+}
+
+bool render_fence::LoadBoost()
+{
+    static const bool on = [] {
+        const char* v = getenv("LO_LOAD_BOOST");
+        return !(v && v[0] == '0');
+    }();
+    return on && LongWait();
+}
+
+uint32_t render_fence::LoadBoostVblankHz()
+{
+    static const uint32_t hz = [] {
+        const char* v = getenv("LO_LOAD_VBLANK_HZ");
+        const unsigned long n = v ? strtoul(v, nullptr, 10) : 0;
+        return n >= 60 && n <= 2000 ? uint32_t(n) : 480u;
+    }();
+    return hz;
 }
 
 void render_fence::CommandBegin(uint32_t command)

@@ -742,7 +742,11 @@ namespace gpu
         {
             // Drop overdue wall-clock deadlines rather than deliver a burst
             // of synthetic catch-up interrupts after a host scheduling stall.
-            std::this_thread::sleep_until(pacer.Schedule(std::chrono::steady_clock::now(), frame_rate::kGuestRefreshHz));
+            // Load boost: faster vblanks while the game thread waits on the
+            // rendering thread, so each loading-screen frame (presented at
+            // the guest's vblank interval) stops holding back the load.
+            const uint32_t vblankHz = render_fence::LoadBoost() ? render_fence::LoadBoostVblankHz() : frame_rate::kGuestRefreshHz;
+            std::this_thread::sleep_until(pacer.Schedule(std::chrono::steady_clock::now(), vblankHz));
             ++m_counter;
 
             // Watchdog: no swap for 5 seconds -> dump what every guest thread waits on.
@@ -1064,17 +1068,11 @@ namespace gpu
             renderer::PreparePresent(frontbuffer);
             renderer::Flush();
             const auto timingPace = std::chrono::steady_clock::now();
-            // Loading screens present at the console's 60 Hz while the game
-            // thread waits on the rendering thread: each loading-screen frame
-            // waits for the GPU, and at 30 fps that wait starves the queued
-            // load commands (cpu/poll_wait.cpp). LO_LOAD_PACE_60=0 turns it off.
-            static const bool loadPace60 = [] {
-                const char* v = getenv("LO_LOAD_PACE_60");
-                return !(v && v[0] == '0');
-            }();
-            uint32_t nativeTarget = GetFrameRateTarget();
-            if (loadPace60 && nativeTarget && nativeTarget < 60 && render_fence::LongWait())
-                nativeTarget = 60;
+            // Load boost (cpu/render_fence.h): loading-screen frames are not
+            // paced; vblanks come faster (VsyncMain) and only about 30 of them
+            // a second reach the display (below).
+            const bool loadBoost = render_fence::LoadBoost();
+            const uint32_t nativeTarget = loadBoost ? 0 : GetFrameRateTarget();
             const auto fpsCap = video::GetFramePacingTarget(nativeTarget);
             const bool timingEnabled = frame_timing::Enabled();
             frame_timing::PacingSample pacing;
@@ -1109,8 +1107,13 @@ namespace gpu
             }
             g_workerStage.store("frontbuffer present", std::memory_order_relaxed);
             const auto presentsBefore = video::CompletedPresentCount();
-            video::PresentFrontbuffer(frontbuffer, width, height, ReadRegister(0x231B),
-                captureTicket.active ? &captureTicket : nullptr, captureTicket.active ? &captureResult : nullptr);
+            static auto s_lastHostPresent = std::chrono::steady_clock::time_point{};
+            if (!loadBoost || captureTicket.active || timingPresent - s_lastHostPresent >= std::chrono::milliseconds(30))
+            {
+                s_lastHostPresent = timingPresent;
+                video::PresentFrontbuffer(frontbuffer, width, height, ReadRegister(0x231B),
+                    captureTicket.active ? &captureTicket : nullptr, captureTicket.active ? &captureResult : nullptr);
+            }
             renderer::CompleteDebugCaptureFrame(captureResult);
             renderer::PollDebugCapture();
             pacing.presentAccepted = video::CompletedPresentCount() > presentsBefore;
