@@ -6,7 +6,7 @@ LostOdysseyRecomp has a Mod Organizer 2 (MO2) game plugin. MO2 maps the mods you
 
 - MO2 2.5 or newer on Windows. It already includes the `basic_games` plugin.
 - The game is set up: you started it once and finished the first-start setup that imports your discs.
-- You know your LostOdysseyRecomp folder: the folder you start the game from, which holds `LostOdysseyRecomp.exe` (the extracted Windows ZIP). In this guide it is `C:\Games\LostOdysseyRecomp`; yours can be anywhere.
+- You know your LostOdysseyRecomp folder: the folder you start the game from, which holds `LostOdysseyRecomp.exe` (the extracted Windows ZIP) and the `game` folder with your imported discs. In this guide it is `C:\Games\LostOdysseyRecomp`; yours can be anywhere. Use that folder, not a newly extracted copy: a new copy has no game data, and the game would ask you to import the discs again.
 
 ## 1. Install the plugins (once)
 
@@ -22,7 +22,7 @@ No `mo2` folder? Your game is older than v0.9.52, the first release to include i
 ## 2. Create an instance for the game
 
 1. Start MO2. If it does not open the instance window by itself, click the first toolbar button (**Manage Instances**) and press **Create new instance**.
-2. Choose **Create a global instance**.
+2. Choose **Create a global instance**. A portable instance, which keeps MO2's files in MO2's own folder (on another drive, for example), works the same way; the steps below do not change.
 
    ![The instance type page with Create a global instance marked](images/mo2/new-instance-type.webp)
 
@@ -30,7 +30,7 @@ No `mo2` folder? Your game is older than v0.9.52, the first release to include i
 
    ![The game page with Show all supported games ticked and Lost Odyssey Recomp listed](images/mo2/new-instance-game.webp)
 
-4. A folder window opens. Go to your LostOdysseyRecomp folder, the one with `LostOdysseyRecomp.exe`, and press **Select Folder**. Look at the folder before you press it: the window starts in the last folder you used, which may be someone else's example or an older install.
+4. A folder window opens. Go to your LostOdysseyRecomp folder, the one with `LostOdysseyRecomp.exe` and your imported `game` folder, and press **Select Folder**. Look at the folder before you press it: the window starts in the last folder you used, which may be someone else's example or an older install.
 5. **Customize the name**: keep it or type your own, then press **Next**. Press **Next** on the profile settings page too.
 6. **Select a folder where the data should be stored**: keep the default and press **Next**. Never choose your game folder here: MO2 would keep its own `mods`, `downloads` and `profiles` folders in it, and its `mods` would be the same folder the game reads mods from.
 7. Press **Next** on the Nexus page (optional), check that the game location on the last page is your LostOdysseyRecomp folder, and press **Finish**.
@@ -74,6 +74,15 @@ MO2 keeps an instance's game folder in the instance's `ModOrganizer.ini`. The ex
 Creating a new instance for the right folder ([step 2](#2-create-an-instance-for-the-game)) works too; install your mods into it again.
 
 If the data folder of an instance is your game folder (step 2.6), create a new instance with the default data folder, then delete the `downloads`, `overwrite`, `profiles` and `webcache` folders MO2 made in your game folder. Keep the game's own `mods` folder.
+
+## If the game asks to import the discs again
+
+Started from MO2, the game looks for your imported discs in MO2's game folder. If that folder has none, the importer opens, and its top line says it was started from Mod Organizer 2. This usually means MO2 points at another copy of the game, such as a newly extracted ZIP. Do not import again: that only adds a second copy of the discs.
+
+1. Close the importer.
+2. Point MO2 at the folder you imported the discs for, as in [If MO2 points to the wrong folder](#if-mo2-points-to-the-wrong-folder).
+
+Moved your game folder after importing? Older versions still look in the old place. Update the game, or delete `game-path.txt` beside `LostOdysseyRecomp.exe` if your discs are in its `game` folder.
 
 ## Export the original assets
 
@@ -179,7 +188,7 @@ Both layouts load together, whatever `--mods-mode` the game is started with. An 
 
 ## What stays outside MO2
 
-Only `mods/` is virtual. Settings, the game's mod order (`mod-list.ini`), saves (`profile/`), logs and shader caches stay in the game folder, so MO2 profiles do not separate them.
+Only `mods/` is virtual. Settings, the game's mod order (`mod-list.ini`), saves (`profile/`), logs, shader caches and the game files rebuilt for model mods (`cache/mods`) stay in the game folder, so MO2 profiles do not separate them.
 
 ## Checking what loaded
 

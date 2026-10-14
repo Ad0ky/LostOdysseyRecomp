@@ -165,6 +165,19 @@ int main()
     Check(!configuredResult.valid && configuredResult.configuredPathRejected,
           "missing configured path was not reported as rejected");
 
+    // A moved game folder: game-path.txt still names the old absolute place and
+    // the imported discs moved along beside the executable. The package default
+    // is used, and the stale entry is still reported.
+    const auto movedDisc = fixture.exe / "game" / "disc1";
+    fixture.Marker(movedDisc);
+    const auto stale = (fixture.root / "old-location" / "game").u8string();
+    fixture.Config(std::string(reinterpret_cast<const char*>(stale.data()), stale.size()) + "\n");
+    const auto movedResult = Resolve(fixture.exe);
+    CheckRoot(movedResult, movedDisc, Source::DefaultSearch,
+              "moved game folder did not find the discs beside the executable");
+    Check(movedResult.configuredPathRejected, "stale game-path.txt was not reported");
+    fs::remove_all(fixture.exe / "game", error);
+
     // --game accepts the same layout forms as game-path.txt: install root,
     // disc1, or default.xex. Recognition stays inside the supplied candidate.
     const auto explicitImported = fixture.root / "explicit-imported";

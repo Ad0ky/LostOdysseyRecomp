@@ -252,10 +252,12 @@ Environment variables override the saved settings for one run:
 
 When `--game` is not given:
 
-1. The program reads `game-path.txt`.
+1. The program reads `game-path.txt`. If the folder it names has no game data, the program uses `game/` beside it instead, so a game folder you moved or copied keeps working.
 2. If that file is absent, it looks for `default.xex` in the data folder's `game/` (per-user packages only).
 3. Then it checks `game/`, the program folder and `../game` next to the program.
 4. If nothing is found, the importer opens.
+
+Each copy of the program looks only beside itself. If the importer opens although you imported the discs before, you started another copy, for example a newly extracted ZIP or the folder a mod manager points at. Close the importer and start the game from the folder that holds your imported `game/`, or point the mod manager at it; importing again only adds a second copy.
 
 ## Updating and keeping user data
 

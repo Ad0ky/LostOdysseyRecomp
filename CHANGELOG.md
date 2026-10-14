@@ -17,6 +17,8 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Windows: the game no longer crashes at startup on Vulkan when ReShade's `dxgi.dll` is in the game folder; that copy of ReShade only works with Direct3D 12 (#506).
 - New Settings → Graphics → Performance overlay: the frame rate in a corner, or a bar across the top with the upscaler and its resolution, frame generation, and CPU and GPU load.
 - Mods that replace models or text no longer rebuild their game files after every game update, only after an update that changes how mods are applied.
+- A game folder moved or copied after importing the discs finds them again instead of asking to import them a second time.
+- Windows: when Mod Organizer 2 starts the game from a folder without imported discs, the importer says so, so you can point MO2 at your game folder instead of importing a second copy.
 
 ### 简体中文
 
@@ -29,6 +31,8 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Windows：游戏文件夹里有 ReShade 的 `dxgi.dll` 时，Vulkan 下启动不再崩溃；这种安装方式的 ReShade 只在 Direct3D 12 下生效（#506）。
 - 新增“设置 → 图像 → 性能信息”：在角落显示帧率，或在画面顶部显示一栏信息，包括超分方式与分辨率、插帧，以及 CPU 和 GPU 负载。
 - 替换模型或文本的 Mod 不再在每次游戏更新后重建游戏文件，只在更新改变了 Mod 的处理方式时才重建。
+- 导入光盘后移动或复制过的游戏文件夹能找到已导入的光盘，不再要求重新导入。
+- Windows：Mod Organizer 2 从没有导入光盘的文件夹启动游戏时，导入器会提示这一点；把 MO2 指向你的游戏文件夹即可，不必再导入一份。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 

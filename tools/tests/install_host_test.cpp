@@ -16,7 +16,8 @@ void Require(bool condition, const char* message)
 
 install::InstallerResult install::ShowInstallerUI(const std::filesystem::path&,
                                                   const std::vector<std::filesystem::path>& sources,
-                                                  const std::filesystem::path& destination)
+                                                  const std::filesystem::path& destination,
+                                                  const std::string&)
 {
     Require(sources.empty(), "installer must let the user choose a source");
     ++shown;

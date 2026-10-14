@@ -148,7 +148,9 @@ struct InstallerResult
 // Shows the self-drawn SDL3 installer window.
 // Returns success status, whether user cancelled, and the selected/installed destination.
 // Sources picked outside the importer (Android's file picker) are scanned at once.
+// A notice is shown in place of the subtitle.
 InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory,
                                 const std::vector<std::filesystem::path>& sources = {},
-                                const std::filesystem::path& initialDest = {});
+                                const std::filesystem::path& initialDest = {},
+                                const std::string& notice = {});
 }

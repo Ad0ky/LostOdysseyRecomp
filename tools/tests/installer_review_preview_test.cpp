@@ -53,7 +53,7 @@ int main()
     for (auto pair : {std::pair{0u, "review-en.bmp"}, std::pair{1u, "review-tw.bmp"},
                       std::pair{2u, "review-ja.bmp"}, std::pair{3u, "review-ko.bmp"},
                       std::pair{4u, "review-zh.bmp"}, std::pair{0u, "review-scrolled.bmp"},
-                      std::pair{0u, "review-error.bmp"}})
+                      std::pair{0u, "review-error.bmp"}, std::pair{0u, "review-notice.bmp"}})
     {
         std::fprintf(stderr, "render review language %u\n", pair.first);
         language = pair.first;
@@ -61,7 +61,12 @@ int main()
         SDL_setenv_unsafe("LO_IMPORTER_PREVIEW_BMP", bmp.string().c_str(), 1);
         SDL_setenv_unsafe("LO_IMPORTER_PREVIEW_SCROLL", pair.second == std::string_view("review-scrolled.bmp") ? "1" : "", 1);
         SDL_setenv_unsafe("LO_IMPORTER_PREVIEW_ERROR", pair.second == std::string_view("review-error.bmp") ? kScanError : "", 1);
-        const auto result = install::ShowInstallerUI(output, {}, output / "unused-fixture-root");
+        // The header line main.cpp shows when Mod Organizer 2 starts a folder without game data.
+        const std::string notice = pair.second == std::string_view("review-notice.bmp")
+            ? "Started from Mod Organizer 2, but this folder has no game data. Imported before? "
+              "Close this and point MO2 at that game folder."
+            : "";
+        const auto result = install::ShowInstallerUI(output, {}, output / "unused-fixture-root", notice);
         if (!result.cancelled || result.success || !std::filesystem::is_regular_file(bmp) ||
             std::filesystem::file_size(bmp) < 1280 * 720 * 3)
             return 1;

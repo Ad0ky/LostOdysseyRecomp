@@ -579,6 +579,16 @@ int main(int argc, char** argv)
     bool writeOk = install::WriteGamePath(tempDir, destGame, writeErr);
     assert(writeOk);
     assert(std::filesystem::exists(tempDir / "game-path.txt"));
+    auto storedGamePath = [&]() {
+        std::ifstream written(tempDir / "game-path.txt", std::ios::binary);
+        std::string stored;
+        std::getline(written, stored);
+        return stored;
+    };
+    // Inside the executable's folder the path is relative, so a moved folder keeps it.
+    assert(storedGamePath() == "destGame");
+    assert(install::WriteGamePath(tempDir, tempDir.parent_path() / "outside-game", writeErr));
+    assert(std::filesystem::path(storedGamePath()).is_absolute());
     std::cout << "[PASS] Game path persistence" << std::endl;
 
     // 5b. A pre-existing lock must reject a second importer without touching the destination.

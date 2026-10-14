@@ -209,7 +209,8 @@ struct UIState : InstallerSessionState
 
 InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory,
                                 const std::vector<std::filesystem::path>& sources,
-                                const std::filesystem::path& initialDest)
+                                const std::filesystem::path& initialDest,
+                                const std::string& notice)
 {
     InstallerResult result;
 
@@ -1242,7 +1243,10 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
             // Header: Lost Odyssey Steel Bar
             DrawBevelPanel(renderer, 0, 0, w, 70, COLOR_STEEL_PANEL);
             ui::DrawString(renderer, 28, 16, "LOST ODYSSEY RECOMP", COLOR_ACCENT_GOLD.r, COLOR_ACCENT_GOLD.g, COLOR_ACCENT_GOLD.b, 255, 1.25f);
-            ui::DrawString(renderer, 28, 42, "Content Importer - Disc & Extracted Folder Setup", COLOR_GOLD_MUTED.r, COLOR_GOLD_MUTED.g, COLOR_GOLD_MUTED.b, 255, 0.9f);
+            if (notice.empty())
+                ui::DrawString(renderer, 28, 42, "Content Importer - Disc & Extracted Folder Setup", COLOR_GOLD_MUTED.r, COLOR_GOLD_MUTED.g, COLOR_GOLD_MUTED.b, 255, 0.9f);
+            else
+                ui::DrawString(renderer, 28, 42, ui::TruncateTextWidth(notice, w - 56, 0.9f), COLOR_RED.r, COLOR_RED.g, COLOR_RED.b, 255, 0.9f);
 
         // Footer / Controller & Keyboard Prompts Bar
         int footerH = 68;

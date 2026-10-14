@@ -466,7 +466,10 @@ int main(int argc, char* argv[])
 
     const auto gameResolution = FindGameRoot(executableDirectory, explicitGamePath);
     auto gameRoot = gameResolution.root;
-    if (gameResolution.configuredPathRejected)
+    if (gameResolution.configuredPathRejected && gameResolution.valid)
+        LOG_WARNING("game-path.txt names a folder without a default.xex; using the game data beside the executable: {}",
+                    FileSystem::PathUtf8(gameRoot));
+    else if (gameResolution.configuredPathRejected)
         LOG_WARNING("game-path.txt did not identify a default.xex; retaining the configured path for installer/error handling");
 
     if (requestedInstall)
@@ -486,12 +489,30 @@ int main(int argc, char* argv[])
 
     if (!explicitGame && !std::filesystem::exists(gameRoot / "default.xex"))
     {
+        // Where no game data was found, and a hint on the importer when importing
+        // again would only add a second copy of the discs.
+        std::string notice;
+#ifdef _WIN32
+        // Mod Organizer 2 runs the game with its virtual file system (usvfs)
+        // loaded. Its game folder having no data usually means MO2 points at
+        // another copy of the game than the one the discs were imported for.
+        if (GetModuleHandleW(L"usvfs_x64.dll"))
+            notice = "Started from Mod Organizer 2, but this folder has no game data. Imported before? "
+                     "Close this and point MO2 at that game folder.";
+#endif
+        if (notice.empty() && gameResolution.configuredPathRejected)
+            notice = "game-path.txt names " + FileSystem::PathUtf8(gameRoot) +
+                     ", which has no game data. Imported before? Close this and fix game-path.txt.";
+        LOG_WARNING("no game data in {} ({}); opening the importer{}{}", FileSystem::PathUtf8(gameRoot),
+                    gameResolution.configuredPathRejected ? std::string("named by game-path.txt")
+                                                          : "searched beside " + FileSystem::PathUtf8(executableDirectory),
+                    notice.empty() ? "" : ": ", notice);
         if (getenv("LO_HEADLESS") || getenv("LO_BACKGROUND"))
         {
             LOG_ERROR("missing default.xex in game root: headless or background environment prevents opening installer UI");
             return 1;
         }
-        const auto result = install::RunHost(executableDirectory, &gameRoot);
+        const auto result = install::RunHost(executableDirectory, &gameRoot, false, {}, notice);
         if (result != install::HostResult::Installed && result != install::HostResult::AlreadyPresent)
             return result == install::HostResult::Cancelled ? 0 : 1;
         if (!std::filesystem::exists(gameRoot / "default.xex"))

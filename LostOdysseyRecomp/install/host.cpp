@@ -7,7 +7,7 @@
 namespace install
 {
 HostResult RunHost(const std::filesystem::path& executableDirectory, std::filesystem::path* gameRoot, bool force,
-                   const std::vector<std::filesystem::path>& sources)
+                   const std::vector<std::filesystem::path>& sources, const std::string& notice)
 {
     if (!gameRoot)
         return HostResult::Failed;
@@ -26,7 +26,7 @@ HostResult RunHost(const std::filesystem::path& executableDirectory, std::filesy
     auto destination = *gameRoot;
     if (destination.filename() == "disc1" && settings::game_path::HasDefaultXex(destination))
         destination = destination.parent_path();
-    auto res = ShowInstallerUI(executableDirectory, sources, destination);
+    auto res = ShowInstallerUI(executableDirectory, sources, destination, notice);
     if (res.cancelled)
         return HostResult::Cancelled;
     if (!res.success)

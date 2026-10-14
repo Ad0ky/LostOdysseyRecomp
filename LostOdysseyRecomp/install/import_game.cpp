@@ -1680,7 +1680,14 @@ bool WriteGamePath(const std::filesystem::path& executableDirectory,
             return false;
         }
 
-        auto u8str = gameDirectory.generic_u8string();
+        // Game data inside the executable's folder is written relative to it
+        // (normally "game"), so the folder still finds it after a move.
+        auto stored = std::filesystem::absolute(gameDirectory, ec).lexically_normal();
+        if (ec) stored = gameDirectory;
+        if (const auto relative = stored.lexically_relative(absExe);
+            !relative.empty() && *relative.begin() != "..")
+            stored = relative;
+        auto u8str = stored.generic_u8string();
         out.write(reinterpret_cast<const char*>(u8str.data()), u8str.size());
         out.put('\n');
         out.flush();
