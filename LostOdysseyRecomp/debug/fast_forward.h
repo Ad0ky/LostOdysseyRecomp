@@ -1,12 +1,14 @@
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <limits>
 #include <mutex>
 
 // One continuous guest clock for mftb and KeTimeStampBundle. Host rendering,
-// UI deadlines and I/O waits keep their own unscaled clocks.
+// UI deadlines and I/O waits keep their own unscaled clocks. The audio driver
+// follows AudioRate(): it mixes that many guest frames per output frame.
 namespace debug_menu::fast_forward {
 inline constexpr unsigned Rates[] = {2, 3, 4, 6, 8};
 inline constexpr uint64_t InputLeaseNs = 250000000;
@@ -77,17 +79,31 @@ struct Control {
         clock.Read(now);
         return {enabled, clock.rate > 1 && !clock.paused, multiplier, mode};
     }
+    unsigned ActiveRate() const { return clock.rate > 1 && !clock.paused ? clock.rate : 1; }
 };
 inline std::mutex mutex;
 inline Control control;
-inline uint64_t GameTimeNs() { std::lock_guard lock(mutex); return control.clock.Read(NowNs()); }
-inline Status GetStatus() { std::lock_guard lock(mutex); return control.Get(NowNs()); }
-inline void Enable(bool enabled) { std::lock_guard lock(mutex); control.Enable(enabled, NowNs()); }
-inline void SetMode(Mode mode) { std::lock_guard lock(mutex); control.SetMode(mode, NowNs()); }
-inline void SetRate(unsigned rate) { std::lock_guard lock(mutex); control.SetRate(rate, NowNs()); }
-inline void SetPaused(bool paused) { std::lock_guard lock(mutex); control.Pause(paused, NowNs()); }
-inline void Release() { std::lock_guard lock(mutex); control.Stop(NowNs()); }
+// The clock's current rate for the audio driver, read without the lock.
+inline std::atomic<unsigned> audioRate{1};
+// Caller holds mutex.
+inline void PublishRate() {
+    const unsigned rate = control.ActiveRate();
+    if (audioRate.load(std::memory_order_relaxed) != rate) audioRate.store(rate, std::memory_order_relaxed);
+}
+inline unsigned AudioRate() { return audioRate.load(std::memory_order_relaxed); }
+inline uint64_t GameTimeNs() {
+    std::lock_guard lock(mutex);
+    const uint64_t value = control.clock.Read(NowNs());
+    PublishRate();
+    return value;
+}
+inline Status GetStatus() { std::lock_guard lock(mutex); const Status status = control.Get(NowNs()); PublishRate(); return status; }
+inline void Enable(bool enabled) { std::lock_guard lock(mutex); control.Enable(enabled, NowNs()); PublishRate(); }
+inline void SetMode(Mode mode) { std::lock_guard lock(mutex); control.SetMode(mode, NowNs()); PublishRate(); }
+inline void SetRate(unsigned rate) { std::lock_guard lock(mutex); control.SetRate(rate, NowNs()); PublishRate(); }
+inline void SetPaused(bool paused) { std::lock_guard lock(mutex); control.Pause(paused, NowNs()); PublishRate(); }
+inline void Release() { std::lock_guard lock(mutex); control.Stop(NowNs()); PublishRate(); }
 inline void Sample(uint8_t lt, uint8_t rt, bool allowed) {
-    std::lock_guard lock(mutex); control.Sample(lt, rt, allowed, NowNs());
+    std::lock_guard lock(mutex); control.Sample(lt, rt, allowed, NowNs()); PublishRate();
 }
 } // namespace debug_menu::fast_forward

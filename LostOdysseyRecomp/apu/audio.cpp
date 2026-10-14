@@ -4,6 +4,7 @@
 #include "matrix_surround.h"
 #include "test_signal.h"
 #include <cpu/guest_thread.h>
+#include <debug/fast_forward.h>
 #include <kernel/memory.h>
 #include <os/guest_code_thread.h>
 #include <os/host_scheduling.h>
@@ -49,6 +50,15 @@ namespace apu
         // the driver gave up catching up after a stall; logged with the frames.
         std::atomic<uint32_t> g_starved{ 0 };
         std::atomic<uint32_t> g_clockResets{ 0 };
+        // Guest frames per output frame in this period: 1, or under
+        // fast-forward up to its rate. The driver runs the guest callback this
+        // many times per period and SubmitFrame averages each run of this many
+        // samples into one, so the game's sound keeps pace with its boosted
+        // clock and plays higher, like a tape.
+        std::atomic<uint32_t> g_guestFramesPerOutput{ 1 };
+        // Driver thread: the most guest frames a fast-forward period may run.
+        constexpr uint32_t kMaxBoostFrames = 8;
+        uint32_t g_boostFrames = kMaxBoostFrames;
 #if LO_PLATFORM_ANDROID
         // steady_clock time the app last returned to the foreground, until the
         // driver has seen the device drain since then; 0 otherwise. After a
@@ -261,11 +271,33 @@ namespace apu
                 if (resumed && waited) g_resumedAt.compare_exchange_strong(resumed, 0);
 #endif
 
-                g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                const auto dispatch = [&](uint32_t frames)
                 {
-                    ctx.ppcContext.r3.u64 = param;
-                    g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
-                });
+                    g_guestFramesPerOutput.store(frames, std::memory_order_relaxed);
+                    for (uint32_t i = 0; i < frames; ++i)
+                    {
+                        g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                        {
+                            ctx.ppcContext.r3.u64 = param;
+                            g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
+                        });
+                    }
+                };
+                if (const uint32_t rate = debug_menu::fast_forward::AudioRate(); rate > 1)
+                {
+                    // Up to `rate` guest frames per period, as many as fit in
+                    // three quarters of it, so the output never runs dry.
+                    const uint32_t frames = std::min(rate, g_boostFrames);
+                    const auto start = std::chrono::steady_clock::now();
+                    dispatch(frames);
+                    const auto spent = std::chrono::steady_clock::now() - start;
+                    if (spent > framePeriod * 3 / 4)
+                        g_boostFrames = std::max(2u, frames - 1);
+                    else if (spent < framePeriod / 2 && frames == g_boostFrames)
+                        g_boostFrames = std::min(g_boostFrames + 1, kMaxBoostFrames);
+                }
+                else
+                    dispatch(1);
             }
         }
     }
@@ -354,10 +386,59 @@ namespace apu
         if (g_stream) SDL_ClearAudioStream(g_stream);
     }
 
+    static void EmitFrame(const uint32_t* words);
+
+    // Averages runs of `rate` guest samples (big-endian float planes of
+    // XAUDIO_NUM_SAMPLES) into whole output frames. Frames arrive one at a
+    // time while the driver waits in Dispatch.
+    static void DecimateFrame(const uint32_t* words, uint32_t rate, bool restart)
+    {
+        static std::array<uint32_t, XAUDIO_NUM_SAMPLES * XAUDIO_NUM_CHANNELS> output;
+        static std::array<float, XAUDIO_NUM_CHANNELS> sum{};
+        static uint32_t summed = 0, written = 0;
+        if (restart)
+        {
+            summed = written = 0;
+            sum.fill(0);
+        }
+        for (uint32_t i = 0; i < XAUDIO_NUM_SAMPLES; ++i)
+        {
+            for (uint32_t c = 0; c < XAUDIO_NUM_CHANNELS; ++c)
+            {
+                const float value = std::bit_cast<float>(ByteSwap(words[c * XAUDIO_NUM_SAMPLES + i]));
+                sum[c] += std::isfinite(value) ? value : 0;
+            }
+            if (++summed < rate) continue;
+            for (uint32_t c = 0; c < XAUDIO_NUM_CHANNELS; ++c)
+                output[c * XAUDIO_NUM_SAMPLES + written] = ByteSwap(std::bit_cast<uint32_t>(sum[c] / float(rate)));
+            sum.fill(0);
+            summed = 0;
+            if (++written == XAUDIO_NUM_SAMPLES)
+            {
+                written = 0;
+                EmitFrame(output.data());
+            }
+        }
+    }
+
     void SubmitFrame(const void* samples)
     {
         if (!samples) return;
         const auto* words = static_cast<const uint32_t*>(samples);
+        // A rate change starts a new run; a partial output frame is dropped.
+        static uint32_t decimating = 0;
+        if (const uint32_t rate = g_guestFramesPerOutput.load(std::memory_order_relaxed); rate > 1)
+        {
+            DecimateFrame(words, rate, rate != decimating);
+            decimating = rate;
+            return;
+        }
+        decimating = 0;
+        EmitFrame(words);
+    }
+
+    static void EmitFrame(const uint32_t* words)
+    {
         std::array<float, XAUDIO_NUM_SAMPLES * 2> stereo{};
         // Guest planes FL, FR, FC, LFE, BL, BR match SDL's 6-channel order
         // FL, FR, FC, LFE, SL/BL, SR/BR, so 5.1 interleaves them unchanged.
