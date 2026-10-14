@@ -32,6 +32,23 @@ if(LO_TARGET_ISA STREQUAL "aarch64")
         "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/idctdsp_init_aarch64.c"
         "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/mdct_neon.S"
         "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/simple_idct_neon.S")
+    if(LO_TARGET_PLATFORM STREQUAL "switch")
+        # Native WMV3 cutscene decoding (LostOdysseyRecomp/movie): the DSP
+        # sources ./configure --enable-decoder=wmv3 selects for aarch64.
+        list(APPEND LO_AVCODEC_ARCH_SOURCES
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/h264chroma_init_aarch64.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/h264cmc_neon.S"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/h264qpel_init_aarch64.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/h264qpel_neon.S"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/hpeldsp_init_aarch64.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/hpeldsp_neon.S"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/pixblockdsp_init_aarch64.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/pixblockdsp_neon.S"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/vc1dsp_init_aarch64.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/videodsp.S"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/aarch64/videodsp_init.c"
+            "${lo_ffmpeg_SOURCE_DIR}/libavcodec/neon/mpegvideo.c")
+    endif()
 else()
     set(LO_AVUTIL_ARCH_SOURCES
         "${lo_ffmpeg_SOURCE_DIR}/libavutil/x86/cpu.c"
@@ -200,6 +217,20 @@ add_library(lo_avcodec STATIC
     "${lo_ffmpeg_SOURCE_DIR}/libavcodec/file_open.c"
     ${LO_AVCODEC_ARCH_SOURCES}
 )
+if(LO_TARGET_PLATFORM STREQUAL "switch")
+    # WMV3 (VC-1 Main) decoder for the cutscenes: the Xbox decoder, run as
+    # recompiled guest code, falls behind real time on the Switch CPU. The
+    # flags are on in ffmpeg-config/switch-aarch64/config.h only; the list is
+    # what ./configure --enable-decoder=wmv3 adds to the XMA-only build.
+    foreach(source blockdsp error_resilience h263 h263_parser h263data h263dec h263dsp h264chroma h264qpel hpeldsp
+            intrax8 intrax8dsp ituh263dec me_cmp mpeg4video mpeg4videodec mpeg_er mpegpicture mpegutils
+            mpegvideo mpegvideo_motion mpegvideodata mpegvideodsp msmpeg4 msmpeg4data msmpeg4dec
+            pixblockdsp qpeldsp rl startcode vc1 vc1_block vc1_loopfilter vc1_mc vc1_pred vc1data vc1dec
+            vc1dsp videodsp wmv2data wmv2dsp)
+        target_sources(lo_avcodec PRIVATE "${lo_ffmpeg_SOURCE_DIR}/libavcodec/${source}.c")
+    endforeach()
+    target_compile_definitions(lo_avcodec PUBLIC LO_HAS_WMV3_DECODER=1)
+endif()
 target_include_directories(lo_avcodec PUBLIC ${LO_FFMPEG_CONFIG_INCLUDE} "${lo_ffmpeg_SOURCE_DIR}")
 target_compile_definitions(lo_avcodec PRIVATE HAVE_AV_CONFIG_H _USE_MATH_DEFINES)
 if(WIN32)
