@@ -12,6 +12,9 @@
 #include <os/logger.h>
 #include <os/user_paths.h>
 #include <version.h>
+#if __has_include(<lo_mods_builder.h>)
+#include <lo_mods_builder.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -430,10 +433,18 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
 // cache/mods/<folder hash>/ holds a folder's patched indexes (<name>.index), its
 // tails (<archive>.tail) and manifest.txt, written last: the key, then one line
 // per index ("index <name>") and tail ("tail <archive> <base> <size>"). The key
-// covers this build's version and cache format, the selected language pack, the
-// mods' files (path, entry, size, time), and the folder's indexes and archive
-// sizes; any change rebuilds.
+// covers the code that rebuilds the files and the cache format, the selected
+// language pack, the mods' files (path, entry, size, time), and the folder's
+// indexes and archive sizes; any change rebuilds. A game update that leaves the
+// rebuilding code alone keeps the cache.
 constexpr const char *kCacheFormat = "2"; // bump when the rebuilt bytes change for the same inputs
+#ifdef LO_MODS_BUILDER_HASH
+// A hash of modding/ and the readers it uses, made by the build.
+constexpr const char *kBuilder = LO_MODS_BUILDER_HASH;
+#else
+// Tools built without it (LoModelImport) key on the version instead.
+constexpr const char *kBuilder = lo_version::Source;
+#endif
 uint64_t gModsKey = 0;
 
 uint64_t Hash(uint64_t hash, std::string_view bytes)
@@ -532,6 +543,16 @@ Folder Build(const fs::path &folder)
     {
         LOG_NOTICE("[mods] rebuilt files for {} read from {}", Utf8(folder), Utf8(cache));
         return result;
+    }
+    if (!cache.empty())
+    {
+        std::ifstream manifest(cache / "manifest.txt");
+        std::string word, value;
+        const bool keyed = manifest >> word >> value && word == "key";
+        LOG_NOTICE("[mods] rebuilding the files for {} (mod code {}): {}", Utf8(folder), kBuilder,
+                   !keyed ? "nothing cached yet"
+                   : value != Hex(key) ? "the mods, the game files or the mod code changed"
+                                       : "the cached files are incomplete");
     }
 
     // PatchIndex counts the packages for the window until the files are in place.
@@ -655,7 +676,7 @@ void List()
     }
     if (models) LOG_NOTICE("[mods] model: {} replacements in {} packages", models, gModels.size());
 
-    uint64_t key = Hash(Hash(0xcbf29ce484222325ull, lo_version::Source), kCacheFormat);
+    uint64_t key = Hash(Hash(0xcbf29ce484222325ull, kBuilder), kCacheFormat);
     key = Hash(key, gLanguagePack);
     // Sizes and times from one listing per folder: a stat per file takes
     // seconds for a pack of tens of thousands of files on Windows.

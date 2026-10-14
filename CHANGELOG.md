@@ -16,6 +16,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Fast-forward now speeds up sound and music too.
 - Windows: the game no longer crashes at startup on Vulkan when ReShade's `dxgi.dll` is in the game folder; that copy of ReShade only works with Direct3D 12 (#506).
 - New Settings → Graphics → Performance overlay: the frame rate in a corner, or a bar across the top with the upscaler and its resolution, frame generation, and CPU and GPU load.
+- Mods that replace models or text no longer rebuild their game files after every game update, only after an update that changes how mods are applied.
 
 ### 简体中文
 
@@ -27,6 +28,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - 快进时声音和音乐也一起加速。
 - Windows：游戏文件夹里有 ReShade 的 `dxgi.dll` 时，Vulkan 下启动不再崩溃；这种安装方式的 ReShade 只在 Direct3D 12 下生效（#506）。
 - 新增“设置 → 图像 → 性能信息”：在角落显示帧率，或在画面顶部显示一栏信息，包括超分方式与分辨率、插帧，以及 CPU 和 GPU 负载。
+- 替换模型或文本的 Mod 不再在每次游戏更新后重建游戏文件，只在更新改变了 Mod 的处理方式时才重建。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 

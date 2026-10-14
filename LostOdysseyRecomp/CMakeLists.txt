@@ -161,6 +161,22 @@ add_custom_target(LoBuildRevision
     BYPRODUCTS "${LO_BUILD_REVISION_HEADER}" VERBATIM)
 add_dependencies(LostOdysseyRecomp LoBuildRevision)
 target_include_directories(LostOdysseyRecomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The game files rebuilt for model and text mods are cached under a key that
+# includes a hash of the code building them (modding/ and the readers it uses):
+# a release that leaves that code alone keeps the cache, any change rebuilds it.
+set(LO_MODS_BUILDER_SOURCES ${LO_RUNTIME_SOURCES})
+list(FILTER LO_MODS_BUILDER_SOURCES INCLUDE REGEX "/modding/")
+list(APPEND LO_MODS_BUILDER_SOURCES "${LO_RUNTIME_ROOT}/gpu/shader/cpx_decode.h" "${LO_RUNTIME_ROOT}/os/json.h")
+set(LO_MODS_BUILDER_LIST "${CMAKE_CURRENT_BINARY_DIR}/lo_mods_builder_sources.txt")
+list(JOIN LO_MODS_BUILDER_SOURCES "\n" LO_MODS_BUILDER_LINES)
+file(CONFIGURE OUTPUT "${LO_MODS_BUILDER_LIST}" CONTENT "${LO_MODS_BUILDER_LINES}\n" @ONLY)
+set(LO_MODS_BUILDER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/lo_mods_builder.h")
+add_custom_command(OUTPUT "${LO_MODS_BUILDER_HEADER}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCE_ROOT=${CMAKE_SOURCE_DIR}" "-DSOURCES=${LO_MODS_BUILDER_LIST}"
+        "-DOUTPUT=${LO_MODS_BUILDER_HEADER}" -P "${CMAKE_SOURCE_DIR}/tools/write_mods_builder_hash.cmake"
+    DEPENDS ${LO_MODS_BUILDER_SOURCES} "${LO_MODS_BUILDER_LIST}" "${CMAKE_SOURCE_DIR}/tools/write_mods_builder_hash.cmake"
+    COMMENT "Hashing the mods rebuild code" VERBATIM)
+target_sources(LostOdysseyRecomp PRIVATE "${LO_MODS_BUILDER_HEADER}")
 # Publish source identity only after the corresponding runtime links successfully.
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/source-version.build.txt" CONTENT "${LO_SOURCE_VERSION}\n")
 add_custom_command(TARGET LostOdysseyRecomp POST_BUILD
