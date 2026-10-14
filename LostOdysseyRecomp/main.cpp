@@ -15,6 +15,7 @@
 #include <apu/audio.h>
 #include <apu/xma.h>
 #include <hid/hid.h>
+#include <debug/map_info.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
 #include <os/detach_thread.h>
@@ -158,6 +159,9 @@ static settings::game_path::Resolution FindGameRoot(
 }
 
 void InstallPhysicalWatchpoint();
+void DumpGuestThreadStates();
+bool GuestWaitProfileEnabled();
+std::string TakeGuestWaitProfile(size_t top);
 
 static int RunGuest(uint32_t entry)
 {
@@ -206,14 +210,39 @@ static int RunGuest(uint32_t entry)
         }
     }));
     // Game file reads every 10 s (only intervals with reads), to tell slow SD
-    // reads from other waits during loading screens.
+    // reads from other waits during loading screens. With LO_WAIT_PROFILE=1,
+    // also the guest's longest waits of each 10 s. A map or battle load still
+    // unfinished after 8, 20, 45 and 90 s prints what every guest thread waits on.
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("IO Monitor");
-        for (;;)
+        uint64_t watchedLoad = 0;
+        int dumpsDone = 0;
+        static constexpr int kDumpAfterSeconds[] = { 8, 20, 45, 90 };
+        for (unsigned tick = 1;; ++tick)
         {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::string what;
+            uint64_t startMs = 0;
+            if (debug_menu::CurrentLoad(what, startMs))
+            {
+                if (startMs != watchedLoad) { watchedLoad = startMs; dumpsDone = 0; }
+                const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                const uint64_t seconds = nowMs > startMs ? (nowMs - startMs) / 1000 : 0;
+                if (dumpsDone < int(std::size(kDumpAfterSeconds)) && seconds >= uint64_t(kDumpAfterSeconds[dumpsDone]))
+                {
+                    ++dumpsDone;
+                    LOG_WARNING("slow load: {} still loading after {} s", what, seconds);
+                    DumpGuestThreadStates();
+                }
+            }
+            if (tick % 10)
+                continue;
             if (const std::string reads = FileSystem::TakeReadStatistics(); !reads.empty())
                 LOG_INFO("switch io: {}", reads);
+            if (GuestWaitProfileEnabled())
+                if (const std::string waits = TakeGuestWaitProfile(12); !waits.empty())
+                    LOG_INFO("guest waits (10 s, longest first):{}", waits);
         }
     }));
     // Memory over time: the console has no swap, and the GPU shares this RAM.

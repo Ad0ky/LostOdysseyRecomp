@@ -22,6 +22,30 @@ std::atomic<void (*)(uint32_t)> sceneListener{nullptr};
 std::atomic<uint32_t> pendingScene{0}, battleScene{0};
 // The snapshot's map as a scene tag, readable without the lock once a frame.
 std::atomic<uint32_t> currentMapScene{0};
+// The unfinished load for the load watch (main.cpp): start in steady-clock ms.
+std::atomic<uint64_t> loadStartMs{0};
+std::string loadWhat; // under mutex
+uint64_t NowMs() {
+    return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+void BeginLoad(std::string what) {
+    {
+        std::lock_guard lock(mutex);
+        loadWhat = std::move(what);
+    }
+    loadStartMs = NowMs();
+}
+void EndLoad() {
+    const uint64_t start = loadStartMs.exchange(0);
+    if (!start) return;
+    std::string what;
+    {
+        std::lock_guard lock(mutex);
+        what = loadWhat;
+    }
+    LOG_NOTICE("scene ready: {} after {:.1f} s", what, (NowMs() - start) / 1000.0);
+}
 uint32_t MapScene(uint32_t id) { return gpu::pipeline_cache::SceneTag(gpu::pipeline_cache::kSceneMap, id); }
 void NotifySceneLoad(uint32_t tag) {
     if (const auto listener = sceneListener.load()) listener(tag);
@@ -162,6 +186,7 @@ void debug_menu::PollSceneLoads(uint8_t* base) {
         }
         const auto text = std::filesystem::path(name).u8string();
         LOG_NOTICE("scene load: map {} id={}", reinterpret_cast<const char*>(text.c_str()), id ? std::to_string(*id) : "-");
+        BeginLoad("map " + std::string(reinterpret_cast<const char*>(text.c_str())));
         if (id) {
             pendingScene = MapScene(*id);
             NotifySceneLoad(MapScene(*id));
@@ -174,6 +199,7 @@ void debug_menu::PollSceneLoads(uint8_t* base) {
     if (requested > 0 && (battlePhase <= 0 || id != battleId)) {
         const auto tag = gpu::pipeline_cache::SceneTag(gpu::pipeline_cache::kSceneBattle, id);
         LOG_NOTICE("scene load: battle id={}", int32_t(id));
+        BeginLoad("battle " + std::to_string(int32_t(id)));
         battleId = id;
         battleScene = tag;
         pendingScene = tag;
@@ -187,10 +213,11 @@ void debug_menu::PollSceneLoads(uint8_t* base) {
     uint32_t pending = pendingScene;
     const uint32_t map = currentMapScene;
     if (pending >> 28 == gpu::pipeline_cache::kSceneBattle) {
-        if (CurrentBattle()) battleStarted = true;
+        if (CurrentBattle() && !battleStarted) { battleStarted = true; EndLoad(); }
         else if (battleStarted && map) pendingScene.compare_exchange_strong(pending, 0u);
     } else if (pending && map == pending) {
         pendingScene.compare_exchange_strong(pending, 0u);
+        EndLoad();
     }
 }
 
@@ -200,6 +227,14 @@ uint32_t debug_menu::CurrentSceneTag() {
     // frame has not left its map.
     const uint32_t map = currentMapScene;
     return map ? map : pendingScene.load();
+}
+
+bool debug_menu::CurrentLoad(std::string& what, uint64_t& startMs) {
+    startMs = loadStartMs;
+    if (!startMs) return false;
+    std::lock_guard lock(mutex);
+    what = loadWhat;
+    return true;
 }
 
 void debug_menu::SetSceneLoadListener(void (*listener)(uint32_t)) {
