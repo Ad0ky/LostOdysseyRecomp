@@ -6,8 +6,11 @@
 #include <os/logger.h>
 #include <os/thread_name.h>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavutil/log.h>
 }
 
 
@@ -107,6 +110,26 @@ namespace apu::xma
 
         bool g_audioDiagnostics = false;
 
+        // The xmaframes decoder takes one frame and returns one frame. When it
+        // rejects a frame's bitstream it consumes the packet without output, so
+        // receive reports EAGAIN; the reason ("Reserved bit", "broken subframe")
+        // reaches only av_log. Keep the first warning or error of each decode.
+        thread_local char t_decoderMessage[160];
+
+        void CaptureDecoderLog(void* object, int level, const char* format, va_list args)
+        {
+            if (level <= AV_LOG_WARNING && !t_decoderMessage[0])
+            {
+                va_list copy;
+                va_copy(copy, args);
+                vsnprintf(t_decoderMessage, sizeof(t_decoderMessage), format, copy);
+                va_end(copy);
+                for (char& c : t_decoderMessage)
+                    if (c == '\n' || c == '\r' || c == '"') c = ' ';
+            }
+            av_log_default_callback(object, level, format, args);
+        }
+
         struct Context
         {
             uint64_t decodedSamples = 0, skippedSamples = 0, writtenSamples = 0;
@@ -131,6 +154,7 @@ namespace apu::xma
             std::array<uint8_t, 2048> pcm{};
             std::array<uint8_t, 4096 + AV_INPUT_BUFFER_PADDING_SIZE> compressed{};
             uint32_t frameBits = 0, copiedBits = 0, packetsSkip = 0;
+            uint32_t framesSent = 0;                // since the context was cleared
             bool frameCrossedPacket = false;
             struct WorkSnapshot { ContextData data; uint32_t skip, copied; };
             std::array<WorkSnapshot, 8> workHistory{};
@@ -144,7 +168,7 @@ namespace apu::xma
             {
                 decodedSamples = skippedSamples = writtenSamples = decodeErrors = explicitSeeks = 0;
                 diagnosticStart = diagnosticReport = {};
-                remainingSubframes = pcmOffset = frameBits = copiedBits = packetsSkip = 0;
+                remainingSubframes = pcmOffset = frameBits = copiedBits = packetsSkip = framesSent = 0;
                 frameCrossedPacket = false;
                 workHistoryCount = 0;
                 hasPublishedInputOffset = false;
@@ -358,10 +382,14 @@ namespace apu::xma
                 if (!PrepareDecoder(ctx, data)) return;
                 ctx.packet->data = ctx.compressed.data();
                 ctx.packet->size = int(bytes + 1);
+                t_decoderMessage[0] = 0;
+                const uint32_t frameIndex = ctx.framesSent++;
                 const int sent = avcodec_send_packet(ctx.decoder, ctx.packet);
                 const int decoded = sent >= 0 ? avcodec_receive_frame(ctx.decoder, ctx.frame) : sent;
                 if (decoded < 0 || ctx.frame->nb_samples != 512 || ctx.frame->format != AV_SAMPLE_FMT_FLTP)
                 {
+                    // Not starvation: every frame we send is complete, so a
+                    // receive EAGAIN means the decoder dropped this frame.
                     if (g_audioDiagnostics) ++ctx.decodeErrors;
                     // Serialized by g_mutex; context reuse must not reset the
                     // process-wide capture budget or hide later scene failures.
@@ -371,10 +399,11 @@ namespace apu::xma
                     const auto* stage = DecodeFailureStage(sent, decoded);
                     if (report.emit)
                     {
-                        LOG_WARNING("xma frame decode failed: result={} context={} stereo={} input={} offset={} bytes={} stage={} send_result={} receive_called={} samples={} format={} failure={} suppressed_global={}",
+                        LOG_WARNING("xma frame decode failed: result={} context={} stereo={} input={} offset={} bytes={} stage={} send_result={} receive_called={} samples={} format={} frame={} reason=\"{}\" failure={} suppressed_global={}",
                             decoded, id, data.isStereo(), data.currentBuffer(), data.inputReadOffset(), bytes + 1,
                             stage, sent, sent >= 0, decoded >= 0 ? ctx.frame->nb_samples : 0,
-                            decoded >= 0 ? ctx.frame->format : -1, report.ordinal, report.suppressed);
+                            decoded >= 0 ? ctx.frame->format : -1, frameIndex,
+                            t_decoderMessage[0] ? t_decoderMessage : "none", report.ordinal, report.suppressed);
                     }
                     if (report.capture)
                     {
@@ -394,7 +423,8 @@ namespace apu::xma
                                 stateFile << "result " << decoded << " channels " << (data.isStereo() ? 2 : 1)
                                           << " rate " << data.sampleRate()
                                           << " stage " << stage << " send_result " << sent
-                                          << " receive_called " << (sent >= 0) << "\n";
+                                          << " receive_called " << (sent >= 0) << " frame " << frameIndex
+                                          << " reason " << t_decoderMessage << "\n";
                                 for (uint32_t word : data.d) stateFile << fmt::format("{:08X} ", word);
                                 stateFile << "\npacket " << packetIndex << " offset " << offset
                                           << " pending_skip " << ctx.packetsSkip << "\n";
@@ -586,6 +616,7 @@ namespace apu::xma
         g_trace = getenv("LO_TRACE_XMA") != nullptr;
         g_audioDiagnostics = getenv("LO_AUDIO_DIAGNOSTICS") != nullptr;
         g_traceContextWrites = getenv("LO_TRACE_XMA_CONTEXT_WRITES") != nullptr;
+        av_log_set_callback(CaptureDecoderLog);
         g_arrayGuest = g_pageAllocator.Alloc(g_pageAllocator.physicalRegion, kContextCount * kContextSize, 0x1000);
         if (!g_arrayGuest)
         {

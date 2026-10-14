@@ -28,6 +28,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Settings help text is readable again: lines that had shrunk to small print, such as DLSS 5 neural rendering, VSync and HDR, are shorter in every menu language; the neural rendering page's missing-DLL message wraps instead of shrinking.
 - Model mods are no longer limited to 4 GB per disc.
 - Settings → Graphics: new rows open the DLSS 5 neural rendering tuning page with its preview and the HDR calibration page, so you no longer need to know that Confirm on the setting opens them. Brightness, Controls, Mods and Achievements show the same open button.
+- When a sound frame cannot be decoded, the log now says why (#524).
 
 ### 简体中文
 
@@ -51,6 +52,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - 设置的说明文字恢复正常大小：DLSS 5 神经渲染、垂直同步、HDR 等缩成小字的说明在所有菜单语言中都已缩短，神经渲染调整页缺少 DLL 的提示改为换行显示，不再缩小。
 - 模型 Mod 不再受每张光盘 4 GB 的限制。
 - 设置 → 图像：新增“神经渲染调整与预览”和“HDR 校准”两行，直接打开对应页面，不必再知道在设置项上按确认才能进入。亮度、按键设置、Mod 和成就也显示同样的打开按钮。
+- 声音帧无法解码时，日志会写明原因（#524）。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 
