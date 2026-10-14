@@ -610,8 +610,11 @@ int main(int argc, char **argv)
                         "blocker notice differs from the no-scene notice");
                 Require(std::equal(nrPixels.begin() + 360 * 1280, nrPixels.end(), noScene.begin() + 360 * 1280),
                         "the blocker leaves the controls unchanged");
-                if (language == 0 && blocker == settings::NeuralRenderingTuning::Blocker::MissingRuntime)
-                    write("nr-page-missing-dll.ppm");
+                if (blocker == settings::NeuralRenderingTuning::Blocker::MissingRuntime)
+                {
+                    if (language == 0) write("nr-page-missing-dll.ppm");
+                    if (language == 4) write("nr-page-missing-dll-zh-hans.ppm");
+                }
             }
             page.neuralRendering.blocker = settings::NeuralRenderingTuning::Blocker::None;
         }

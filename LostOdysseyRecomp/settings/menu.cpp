@@ -1738,7 +1738,7 @@ void Publish(uint8_t *base, uint32_t config)
             const auto state = gpu::dlss::g_neuralRenderingState.load(std::memory_order_relaxed);
             const wchar_t *status =
                 state == NeuralRenderingState::Active ? Tr(L"Running.", L"執行中。") :
-                state == NeuralRenderingState::MissingRuntime ? Tr(L"nvngx_dlssnr.dll is missing or unusable.", L"找不到 nvngx_dlssnr.dll 或無法使用。") :
+                state == NeuralRenderingState::MissingRuntime ? Tr(L"nvngx_dlssnr.dll is missing or unusable. The game does not include it.", L"找不到 nvngx_dlssnr.dll 或無法使用。遊戲不附帶該檔案。") :
                 state == NeuralRenderingState::Unsupported ? Tr(L"This GPU or driver cannot run it.", L"此顯示卡或驅動程式無法執行。") :
                 state == NeuralRenderingState::Failed ? Tr(L"It stopped after an error; see the log.", L"發生錯誤後已停止，請查看記錄檔。") : nullptr;
             if (status) next.help = next.help + L" " + status;

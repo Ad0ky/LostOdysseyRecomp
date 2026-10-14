@@ -668,8 +668,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
                  MakeColor(255, 40, 45, 50));
             text(NrPreviewLeft + 20, NrPreviewTop + 100, NrPreviewRight - NrPreviewLeft - 40, 70,
                  page.blocker == Blocker::MissingRuntime
-                     ? tr(L"No preview: nvngx_dlssnr.dll is missing or unusable. Put it next to the game and restart.",
-                          L"無法預覽：找不到 nvngx_dlssnr.dll 或無法使用。請將它放在遊戲旁並重新啟動。")
+                     ? tr(L"No preview: nvngx_dlssnr.dll is missing or unusable. The game does not include it; put your own copy (tested: 310.8.0.0) next to LostOdysseyRecomp.exe and restart.",
+                          L"無法預覽：找不到 nvngx_dlssnr.dll 或無法使用。遊戲不附帶該檔案，請將自備的副本（測試版本：310.8.0.0）放在 LostOdysseyRecomp.exe 旁並重新啟動。")
                  : page.blocker == Blocker::Unsupported
                      ? tr(L"No preview: this GPU or driver cannot run DLSS 5 neural rendering.",
                           L"無法預覽：此顯示卡或驅動程式無法執行 DLSS 5 神經渲染。")
