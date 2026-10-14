@@ -14,6 +14,8 @@
 //   sub_82815060(M)        create the player for movie M (M+20 player, M+44 info)
 //   sub_823F0FA8(pl, d)    next frame into descriptor d (render thread)
 //   sub_82CE9248 / sub_82CE9FD8(pl)  pause / resume
+//   sub_82CF8140(pl)       the player's video pump thread (player vtable +144,
+//                          thread player+268): runs the guest WMV decoder
 // Set LO_NATIVE_MOVIES=0 to use the guest decoder alone.
 #include <stdafx.h>
 
@@ -42,6 +44,7 @@ extern "C" PPC_FUNC(__imp__sub_82815060);
 extern "C" PPC_FUNC(__imp__sub_823F0FA8);
 extern "C" PPC_FUNC(__imp__sub_82CE9248);
 extern "C" PPC_FUNC(__imp__sub_82CE9FD8);
+extern "C" PPC_FUNC(__imp__sub_82CF8140);
 
 namespace
 {
@@ -391,6 +394,34 @@ PPC_FUNC(sub_82CE9FD8)
         g_movie->paused = false;
         g_movie->pausedNs += host_ui::GetActiveGameTimeNs() - g_movie->pauseStartNs;
     }
+}
+
+// The guest video pump keeps decoding (about one core) although its frames
+// are replaced; at the lowest application priority it only gets CPU time the
+// audio, the game and the host decoder leave over. Nothing waits for it. The
+// audio pump (vtable +140) is a separate thread and keeps its priority.
+// LO_MOVIE_GUEST_VIDEO_PRIORITY=0 keeps the game's priority (hex value: use it).
+PPC_FUNC(sub_82CF8140)
+{
+    bool lower = false;
+    {
+        std::lock_guard lock(g_mutex);
+        lower = g_movie && ctx.r3.u32 && g_movie->player == ctx.r3.u32;
+    }
+#if LO_PLATFORM_SWITCH
+    static const int priority = [] {
+        const char* value = std::getenv("LO_MOVIE_GUEST_VIDEO_PRIORITY");
+        return value && *value ? int(std::strtol(value, nullptr, 16)) : 0x3F;
+    }();
+    if (lower && priority >= 0x2C && priority <= 0x3F)
+    {
+        os::switch_platform::SetCurrentThreadPriority(priority);
+        LOG_NOTICE("native movie: guest video decoder thread priority {:#x}", priority);
+    }
+#else
+    (void)lower;
+#endif
+    __imp__sub_82CF8140(ctx, base);
 }
 
 #endif
