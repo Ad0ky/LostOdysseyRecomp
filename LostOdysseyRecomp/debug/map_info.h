@@ -18,6 +18,10 @@ void PollSceneLoads(uint8_t* base);
 // The battle being fought, else the current map, else the scene being loaded;
 // 0 when unknown. Any thread.
 uint32_t CurrentSceneTag();
+// The map or battle load in progress (from the loader's request until the map
+// is current or the battle has started): its name and start on the steady
+// clock in ms. False when none. Any thread.
+bool CurrentLoad(std::string& what, uint64_t& startMs);
 // Called on the game thread when a map or battle starts loading.
 void SetSceneLoadListener(void (*listener)(uint32_t tag));
 }

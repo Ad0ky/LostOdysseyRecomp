@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <settings/config.h>
 #include <vector>
+#include <algorithm>
 #include <mutex>
 #include <map>
 #include <filesystem>
@@ -25,6 +26,7 @@
 #include <os/logger.h>
 #if LO_PLATFORM_SWITCH
 #include <os/switch_platform.h>
+#include <os/switch_cpu_profiler.h>
 #endif
 #include <os/shader_log.h>
 #include <os/user_paths.h>
@@ -50,6 +52,7 @@ struct ThreadWaitState
     uint32_t r1 = 0;
     uint64_t since = 0;
     PPCContext* ctx = nullptr; // live context, read racily for diagnostics only
+    char name[32] = {};        // host thread name ("Guest 82beca90"), when known
 };
 
 static Mutex g_waitStatesMutex;
@@ -79,25 +82,112 @@ static ThreadWaitState& CurrentWaitState()
         guard.state = new ThreadWaitState();
         guard.state->threadId = GuestThread::GetCurrentThreadId();
         guard.state->ctx = g_ppcContext;
+#if LO_PLATFORM_SWITCH
+        os::switch_cpu_profiler::TryGetCurrentThreadName(guard.state->name, sizeof(guard.state->name));
+#endif
         std::lock_guard lock(g_waitStatesMutex);
         g_waitStates.push_back(guard.state);
     }
     return *guard.state;
 }
 
+// LO_WAIT_PROFILE=1: guest waits of 1 ms or more, summed per thread, kernel
+// call and guest caller, reported by TakeGuestWaitProfile (every 10 s on
+// Switch). Shows what a loading screen or a frozen cutscene is waiting for.
+// Read on first use: env.txt is applied in main(), after static initialisation.
+static bool WaitProfileOn()
+{
+    static const bool on = [] {
+        const char* v = getenv("LO_WAIT_PROFILE");
+        return v && *v && *v != '0';
+    }();
+    return on;
+}
+
+struct WaitProfileEntry
+{
+    uint32_t threadId;
+    const char* thread; // ThreadWaitState::name, never freed
+    const char* what;
+    uint32_t lr;
+    uint32_t object;
+    uint64_t count;
+    uint64_t totalUs;
+    uint64_t maxUs;
+};
+
+static Mutex g_waitProfileMutex;
+static std::vector<WaitProfileEntry> g_waitProfile_entries;
+
+static void RecordGuestWait(const ThreadWaitState& st, const char* what, uint32_t lr, uint32_t object, uint64_t us)
+{
+    const uint32_t threadId = st.threadId;
+    std::lock_guard lock(g_waitProfileMutex);
+    for (auto& e : g_waitProfile_entries)
+    {
+        if (e.threadId == threadId && e.what == what && e.lr == lr)
+        {
+            ++e.count;
+            e.totalUs += us;
+            if (us > e.maxUs) { e.maxUs = us; e.object = object; }
+            return;
+        }
+    }
+    if (g_waitProfile_entries.size() < 1024)
+        g_waitProfile_entries.push_back({ threadId, st.name, what, lr, object, 1, us, us });
+}
+
+bool GuestWaitProfileEnabled() { return WaitProfileOn(); }
+
+// The longest waits since the previous call, one per line; empty when off.
+std::string TakeGuestWaitProfile(size_t top)
+{
+    std::vector<WaitProfileEntry> entries;
+    {
+        std::lock_guard lock(g_waitProfileMutex);
+        entries.swap(g_waitProfile_entries);
+    }
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) { return a.totalUs > b.totalUs; });
+    std::string out;
+    for (size_t i = 0; i < entries.size() && i < top; ++i)
+    {
+        const auto& e = entries[i];
+        out += fmt::format("\n  tid={:#x} [{}] {} lr={:#x} obj={:#x}: {} waits, {:.2f} s total, longest {:.1f} ms",
+            e.threadId, e.thread[0] ? e.thread : "?", e.what, e.lr, e.object, e.count, e.totalUs / 1e6, e.maxUs / 1e3);
+    }
+    return out;
+}
+
 struct WaitScope
 {
     ThreadWaitState& st;
-    WaitScope(const char* what, uint32_t object) : st(CurrentWaitState())
+    const char* what_;
+    uint32_t object_;
+    uint32_t lr_;
+    std::chrono::steady_clock::time_point start_;
+    WaitScope(const char* what, uint32_t object) : st(CurrentWaitState()), what_(what), object_(object)
     {
+        if (WaitProfileOn())
+            start_ = std::chrono::steady_clock::now();
         st.what = what;
         st.object = object;
-        st.lr = g_ppcContext ? uint32_t(g_ppcContext->lr) : 0;
+        st.lr = lr_ = g_ppcContext ? uint32_t(g_ppcContext->lr) : 0;
         st.pcr = g_ppcContext ? g_ppcContext->r13.u32 : 0;
         st.r1 = g_ppcContext ? g_ppcContext->r1.u32 : 0;
         st.since = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     }
-    ~WaitScope() { st.what = "running"; st.object = 0; }
+    ~WaitScope()
+    {
+        if (WaitProfileOn())
+        {
+            const auto us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - start_).count());
+            if (us >= 1000)
+                RecordGuestWait(st, what_, lr_, object_, us);
+        }
+        st.what = "running";
+        st.object = 0;
+    }
 };
 
 void DumpGuestThreadStates()
@@ -129,7 +219,7 @@ void DumpGuestThreadStates()
             bt += fmt::format(" {:#x}", ret);
             frame = caller;
         }
-        LOG_WARNING("  tid={:#x} pcr={:#x} {} obj={:#x} lr={:#x} liveLr={:#x} for {} ms bt:{}", st->threadId, st->pcr, st->what, st->object, st->lr, liveLr, running ? 0 : now - st->since, bt);
+        LOG_WARNING("  tid={:#x} [{}] pcr={:#x} {} obj={:#x} lr={:#x} liveLr={:#x} for {} ms bt:{}", st->threadId, st->name[0] ? st->name : "?", st->pcr, st->what, st->object, st->lr, liveLr, running ? 0 : now - st->since, bt);
     }
 }
 
