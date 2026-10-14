@@ -15,8 +15,19 @@ inline uint64_t NowNs() {
     return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
 }
+// The guest clock (mftb, KeTimeStampBundle) starts here, like a console a
+// minute after power-on, instead of at the host's steady_clock value. The game
+// converts the timebase to seconds and keeps them as 32-bit floats (the
+// rendering thread's loading-screen tick in RenderingThreadMain 0x824856A0,
+// for one). libnx's CLOCK_MONOTONIC is Unix time (~1.8e9 s), where a float
+// step is 128 s: the 1/30 s tick interval vanished, so for 64 s of every 128
+// the rendering thread drew a loading-screen frame before every queued
+// command (loads of 20-67 s), and for the other 64 s none at all. Seen on the
+// Switch on 2026-10-14; a PC up for more than a few days loses precision too.
+inline constexpr uint64_t GuestClockStartNs = 60ull * 1000000000ull;
 struct Clock {
     uint64_t last = 0, value = 0, lease = 0;
+    uint64_t origin = 0; // host steady_clock value at GuestClockStartNs
     unsigned rate = 1;
     bool initialized = false, paused = false;
     void Add(uint64_t elapsed, unsigned factor) {
@@ -24,7 +35,7 @@ struct Clock {
         value += elapsed > room / factor ? room : elapsed * factor;
     }
     uint64_t Read(uint64_t now) {
-        if (!initialized) { initialized = true; last = value = now; }
+        if (!initialized) { initialized = true; last = origin = now; value = GuestClockStartNs; }
         if (now < last) return value;
         if (!paused) {
             const auto boostedEnd = std::clamp(lease, last, now);
@@ -81,6 +92,12 @@ struct Control {
 inline std::mutex mutex;
 inline Control control;
 inline uint64_t GameTimeNs() { std::lock_guard lock(mutex); return control.clock.Read(NowNs()); }
+// Host steady_clock minus guest clock, without paused or fast-forwarded time.
+inline int64_t GuestClockShiftNs() {
+    std::lock_guard lock(mutex);
+    control.clock.Read(NowNs());
+    return int64_t(control.clock.origin) - int64_t(GuestClockStartNs);
+}
 inline Status GetStatus() { std::lock_guard lock(mutex); return control.Get(NowNs()); }
 inline void Enable(bool enabled) { std::lock_guard lock(mutex); control.Enable(enabled, NowNs()); }
 inline void SetMode(Mode mode) { std::lock_guard lock(mutex); control.SetMode(mode, NowNs()); }

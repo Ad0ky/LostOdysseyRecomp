@@ -220,7 +220,10 @@ void XexLoader::StartTimeStampThread()
             {
                 // Keep the kernel bundle on the same pause-aware clock as mftb.
                 uint64_t curInterrupt = host_ui::GetActiveGameTimeNs() / 100;
-                uint64_t pausedDuration100ns = HostInterruptTime100ns() - curInterrupt;
+                // The guest clock starts at GuestClockStartNs, not at the host
+                // steady_clock value: take its origin out of the paused time.
+                const int64_t shift100ns = debug_menu::fast_forward::GuestClockShiftNs() / 100;
+                uint64_t pausedDuration100ns = uint64_t(int64_t(HostInterruptTime100ns()) - int64_t(curInterrupt) - shift100ns);
                 bundle->interruptTime = curInterrupt;
                 bundle->systemTime = HostSystemTime100ns() - pausedDuration100ns;
                 bundle->tickCount = uint32_t(curInterrupt / 10000);
