@@ -3,8 +3,14 @@
 #include "render_fence.h"
 #include <atomic>
 #include <chrono>
+#include <algorithm>
 #include <cstdlib>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <vector>
 #include <os/logger.h>
+#include <kernel/memory.h>
 #include <patches/occlusion_history.h>
 
 extern "C" PPC_FUNC(__imp__sub_823CF390);
@@ -39,6 +45,37 @@ namespace
     std::atomic<uint64_t> g_lastMovieTickMs{0};
     std::atomic<uint32_t> g_ticksRun{0}, g_ticksDeferred{0};
 
+    // What the rendering thread does during a fence wait: queued commands
+    // (by their Execute function) and loading-screen ticks, in microseconds.
+    struct CommandStat { uint32_t execute; uint32_t count; uint64_t us; };
+    std::mutex g_statsMutex;
+    std::vector<CommandStat> g_commandStats;
+    uint64_t g_tickUs = 0, g_tickCount = 0, g_tickMaxUs = 0;
+    uint64_t g_commandUs = 0, g_commandCount = 0;
+    thread_local std::chrono::steady_clock::time_point t_commandStart;
+    thread_local uint32_t t_commandExecute = 0;
+
+    uint64_t ElapsedUs(std::chrono::steady_clock::time_point since)
+    {
+        return uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - since).count());
+    }
+
+    std::string TakeRenderThreadStats()
+    {
+        std::lock_guard lock(g_statsMutex);
+        std::sort(g_commandStats.begin(), g_commandStats.end(),
+            [](const CommandStat& a, const CommandStat& b) { return a.us > b.us; });
+        std::string out = fmt::format("{} commands {:.0f} ms, {} ticks {:.0f} ms (longest {:.1f} ms)",
+            g_commandCount, g_commandUs / 1e3, g_tickCount, g_tickUs / 1e3, g_tickMaxUs / 1e3);
+        for (size_t i = 0; i < g_commandStats.size() && i < 6; ++i)
+            out += fmt::format("; exec {:#x} x{} {:.0f} ms", g_commandStats[i].execute, g_commandStats[i].count,
+                g_commandStats[i].us / 1e3);
+        g_commandStats.clear();
+        g_tickUs = g_tickCount = g_tickMaxUs = g_commandUs = g_commandCount = 0;
+        return out;
+    }
+
     uint64_t NowMs()
     {
         return uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -53,6 +90,34 @@ namespace
         }();
         return on;
     }
+}
+
+void render_fence::CommandBegin(uint32_t command)
+{
+    t_commandExecute = 0;
+    if (!g_fenceWaitSinceMs.load(std::memory_order_relaxed) || command < 0x10000)
+        return;
+    uint8_t* const base = g_memory.base;
+    const uint32_t vtable = PPC_LOAD_U32(command);
+    if (vtable < 0x82000000 || vtable >= 0x84000000)
+        return;
+    t_commandExecute = PPC_LOAD_U32(vtable + 4);
+    t_commandStart = std::chrono::steady_clock::now();
+}
+
+void render_fence::CommandEnd()
+{
+    if (!t_commandExecute)
+        return;
+    const uint64_t us = ElapsedUs(t_commandStart);
+    std::lock_guard lock(g_statsMutex);
+    ++g_commandCount;
+    g_commandUs += us;
+    for (auto& c : g_commandStats)
+        if (c.execute == t_commandExecute) { ++c.count; c.us += us; t_commandExecute = 0; return; }
+    if (g_commandStats.size() < 256)
+        g_commandStats.push_back({ t_commandExecute, 1, us });
+    t_commandExecute = 0;
 }
 
 bool render_fence::LongWait()
@@ -74,9 +139,24 @@ PPC_FUNC(sub_82322478)
     {
         const uint64_t since = g_fenceWaitSinceMs.exchange(0, std::memory_order_acq_rel);
         const uint32_t run = g_ticksRun.exchange(0), deferred = g_ticksDeferred.exchange(0);
+        const std::string stats = TakeRenderThreadStats();
         if (since && NowMs() - since >= 1000)
-            LOG_INFO("render fence wait {:.1f} s: loading-screen ticks run {}, deferred {}",
-                (NowMs() - since) / 1000.0, run, deferred);
+        {
+            static bool loggedIntervals = false;
+            if (!loggedIntervals)
+            {
+                // RenderingThreadMain's tick intervals (seconds): idle, between commands.
+                loggedIntervals = true;
+                uint8_t* const base = g_memory.base;
+                const uint32_t idle = PPC_LOAD_U32(0x822185B8), busy = PPC_LOAD_U32(0x822185B4);
+                float fIdle, fBusy;
+                std::memcpy(&fIdle, &idle, 4);
+                std::memcpy(&fBusy, &busy, 4);
+                LOG_INFO("rendering thread tick interval: idle {} s, between commands {} s", fIdle, fBusy);
+            }
+            LOG_INFO("render fence wait {:.1f} s: loading-screen ticks run {}, deferred {}; rendering thread: {}",
+                (NowMs() - since) / 1000.0, run, deferred, stats);
+        }
     }
 }
 
@@ -96,8 +176,18 @@ PPC_FUNC(sub_823B63E0)
         }
         g_ticksRun.fetch_add(1, std::memory_order_relaxed);
     }
+    const bool measure = g_fenceWaitSinceMs.load(std::memory_order_relaxed) != 0;
+    const auto start = std::chrono::steady_clock::now();
     __imp__sub_823B63E0(ctx, base);
     g_lastMovieTickMs.store(NowMs(), std::memory_order_relaxed);
+    if (measure)
+    {
+        const uint64_t us = ElapsedUs(start);
+        std::lock_guard lock(g_statsMutex);
+        ++g_tickCount;
+        g_tickUs += us;
+        if (us > g_tickMaxUs) g_tickMaxUs = us;
+    }
 }
 
 // GpuPoll for the title GPU timestamp wait lives in debug/gpu_wait_trace.cpp.

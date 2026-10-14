@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <cpu/render_fence.h>
 #include "gpu/frame_plan.h"
 #include "gpu/dlss_status_log.h"
 #include "gpu/video.h"
@@ -401,11 +402,13 @@ PPC_FUNC(sub_823BC138)
 // stack anchor at the execution site before a rollover-capable PM4 append.
 void FramePlanBeforeExecute(PPCRegister& r1, PPCRegister& r31)
 {
+    render_fence::CommandBegin(r31.u32);
     gpu::frame_plan::BeginTaggedRenderCommand(r31.u32, r1.u32);
 }
 void FramePlanAfterExecute()
 {
     gpu::frame_plan::EndRenderCommand();
+    render_fence::CommandEnd();
 }
 void FramePlanDirectCanvas(PPCRegister& r1, PPCRegister& device)
 {
