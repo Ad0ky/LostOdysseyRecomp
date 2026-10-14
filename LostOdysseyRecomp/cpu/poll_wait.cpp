@@ -37,6 +37,10 @@ PPC_FUNC(sub_823CF390)
 // tick interval 1/30 s), and the tick's frame is held by the guest's two-vblank
 // present interval. render_fence::LoadBoost() makes vblanks faster during such
 // a wait (gpu/command_processor.cpp). Pacing at 60 fps alone changed nothing.
+// Tested 2026-10-14 17:07: ticks went from ~33 to ~6.4 ms and each batch
+// drained ~3x faster, but the game then queued ~3x more commands; the share of
+// play time spent in these waits stayed at 23% and the first map load stayed
+// at 41 s. The loading wheel flickered, so the boost is opt-in (LO_LOAD_BOOST=1).
 // Skipping ticks instead (LO_LOAD_TICK_THROTTLE=1, at most one tick every
 // 100 ms between commands) left battle transitions on the loading screen for
 // minutes on 2026-10-14, so it is off by default.
@@ -98,7 +102,7 @@ bool render_fence::LoadBoost()
 {
     static const bool on = [] {
         const char* v = getenv("LO_LOAD_BOOST");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     return on && LongWait();
 }

@@ -12,7 +12,8 @@ namespace render_fence
     // the GPU, which waits for two vblanks (30 fps). The command processor
     // then delivers vblanks at LoadBoostVblankHz (LO_LOAD_VBLANK_HZ, default
     // 480), stops pacing, and shows about 30 loading-screen frames a second.
-    // LO_LOAD_BOOST=0 turns it off.
+    // Off by default: no shorter loads in testing, and the loading wheel
+    // flickered. LO_LOAD_BOOST=1 turns it on.
     bool LoadBoost();
     uint32_t LoadBoostVblankHz();
     // Rendering thread, around each queued command (gpu/frame_plan.cpp hooks
