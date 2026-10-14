@@ -1,3 +1,5 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 2026-10-09 的运行时纹理导入设计与可行性研究。现行的 4× 纹理包见[Mod 指南](../../wiki/Modding.md#4x-hd-texture-pack)，纹理替换说明见[运行时纹理替换](../../wiki/Runtime-Texture-Replacement.md)。
+
 # 运行时纹理导入（含 4× 放大）：设计与可行性
 
 2026-10-09。来源：静态阅读 main 41f0560c 的代码；对 `--export-assets` 全量导出（`_scratch/asset-export-full`，29,435 张）做统计；没有运行游戏。依据一栏：「代码」= 读代码确认，「统计」= 对导出 `index.csv` 的计算，「推断」= 未验证。
@@ -207,4 +209,4 @@ LOTEX2 RGBA8 替换已实现：Texture 资源类型，key 是指纹；读取器�
 ## 导航
 
 - 导出数据：`C:\Users\freefrank\worktrees\LostOdysseyRecomp\_scratch\asset-export-full\textures\index.csv`；统计脚本是一次性的，没有保留。
-- [运行时纹理替换的剩余工作](../wiki/Runtime-Texture-Replacement.md)、[Mod API](../wiki/Modding-API.md)、[高分辨率 CG 替换](hd-cutscene-replacement.zh-CN.md)。
+- [运行时纹理替换的剩余工作](../../wiki/Runtime-Texture-Replacement.md)、[Mod API](../../wiki/Modding-API.md)、[高分辨率 CG 替换](../../notes/hd-cutscene-replacement.zh-CN.md)。

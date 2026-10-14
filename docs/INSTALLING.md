@@ -27,12 +27,14 @@ Download the package for your platform, import the game from your own discs, and
 
 ## Windows quick start
 
-You need Windows x64 and a CPU with AVX. The game uses Vulkan by default; Direct3D 12 can be chosen in the settings.
+You need Windows x64 and a CPU with AVX. The game uses Vulkan by default; Direct3D 12 can be chosen in the settings. Settings you already saved keep their renderer.
 
 1. Download `LostOdysseyRecomp-windows-x64-v0.9.52.zip` from the [latest release](https://github.com/freefrank/LostOdysseyRecomp/releases/latest).
 2. Extract the whole ZIP to a writable folder outside `Program Files`.
 3. Run `LostOdysseyRecomp.exe`. The importer opens when no game is found.
 4. Choose the languages and graphics options. The game may offer to download precompiled shaders first; see [Shader preparation](#shader-preparation).
+
+The ZIP also contains an `mo2` folder with the plugins for Mod Organizer 2; see [Mod Organizer 2](wiki/Mod-Organizer-2.md).
 
 <a id="automatic-content-import"></a>
 
@@ -119,7 +121,7 @@ You need an Apple Silicon Mac with macOS 15 or later. The app is not notarized, 
 
 To approve the app from Terminal instead, run `xattr -dr com.apple.quarantine /Applications/LostOdysseyRecomp.app`, then open it again.
 
-The first start may offer to download the Metal shaders; see [Shader preparation](#shader-preparation). To update, download the new disk image and replace the app in Applications; your saves and settings are stored outside the app and stay. Only one Mac has run the game so far.
+The first start may offer to download the Metal shaders; see [Shader preparation](#shader-preparation). To update, download the new disk image and replace the app in Applications; your saves and settings are stored outside the app and stay.
 
 <a id="android"></a>
 
@@ -132,7 +134,7 @@ You need a 64-bit Android 8.0 or newer device with Vulkan and about 20 GB of fre
    - **Import on the device:** **Game folder → Import disc images…** opens Android's file picker. Pick one of the disc images (`.iso`) on the internal storage, an SD card or a USB drive; the other discs in the same folder are imported with it, then the game starts. For extracted discs, pick `default.xex`. It needs "All files access", which the page asks for.
    - **Copy from a PC:** import the game with the PC version, connect the device over USB in file-transfer mode and copy `disc1`–`disc4` (and `dlc/`) into that `game` folder, so that `game/disc1/default.xex` exists.
    - **Use another folder:** file managers on the device usually cannot write into `Android/data`, so copy the discs anywhere else with one, then choose **Game folder → Choose folder…** and pick the folder that holds `disc1`. This also needs "All files access".
-3. Open the app. On Qualcomm devices the **GPU driver** page appears first, because the phone's own driver makes some menu text invisible: download a Turnip driver there (the page shows the one recommended for your model) and press **Start game**. You can come back later from **CTRL → GPU driver**. If a driver cannot run the game, the game returns to this page and shows why. On Mali devices the page appears first too, because the phone's own driver cannot run the game: download the recommended PanVK driver (Mali-G57, G68, G77, G78 or Mali-G610 and newer). Its author supports Android 15 and newer; on Android 13 and 14 it may not work. If the game does not start with it, press the driver's **Mode** button to switch between direct loading and libadrenotools, or try another release.
+3. Open the app. On Qualcomm devices the **GPU driver** page appears first, because the phone's own driver makes some menu text invisible: download a Turnip driver there (the page shows the one recommended for your model) and press **Start game**. You can come back later from **CTRL → GPU driver**. If a driver cannot run the game, the game returns to this page and shows why. On Mali devices the page appears first too, because the phone's own driver cannot run the game. Mali support is experimental. Download the recommended PanVK-kbase driver there. It needs a Mali-G57, G68, G77, G78 or Mali-G610 and newer GPU (Valhall or later, including Immortalis); Midgard (Mali-T) and Bifrost (Mali-G31, G51, G52, G71, G72, G76) GPUs are not supported. The driver's author supports Android 15 and newer; Android 13 and 14 are not promised. The recommended driver loads in direct mode. If the game does not start with it, press the driver's **Mode** button to switch between "Mode: direct" and "Mode: libadrenotools", or try another release.
 4. Accept the shader download with the on-screen **A** button. **B** skips it and compiles the shaders on the device, which takes minutes.
 
 Touch controls appear over the game. **CTRL** opens their size, opacity and layout settings, the saves page, the game folder page and the GPU driver page. A USB or Bluetooth controller hides the touch controls automatically. Settings are changed on the in-game Settings page.
@@ -144,8 +146,6 @@ With **Automatic updates** on, the app checks for a new version at startup and o
 
 <a id="android-logs"></a>
 **Logs** for a bug report: turn on **Settings → System → Debug log**, play until the problem happens, then choose **CTRL → Saves and logs → Export logs…** and save the ZIP, for example in Download. It holds the logs of the last three runs, `native-stderr.log` and, if the app itself failed, `java-crash-*.txt`. If the game crashed or stayed black, open the app once more and export from the CTRL menu. The same files are in `Android/data/io.github.freefrank.lostodyssey/files/logs/` for a PC over USB. With adb, `adb logcat -s LostOdyssey` shows the same lines live.
-
-Only one tablet has been tested so far.
 
 ## First launch and settings
 

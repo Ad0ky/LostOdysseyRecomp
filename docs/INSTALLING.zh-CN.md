@@ -27,12 +27,14 @@
 
 ## Windows 快速开始
 
-需要 Windows x64 和支持 AVX 的 CPU。默认使用 Vulkan，也可以在设置中改用 Direct3D 12。
+需要 Windows x64 和支持 AVX 的 CPU。默认使用 Vulkan，也可以在设置中改用 Direct3D 12。已保存的设置保留原来的渲染器。
 
 1. 从[最新发布页](https://github.com/freefrank/LostOdysseyRecomp/releases/latest)下载 `LostOdysseyRecomp-windows-x64-v0.9.52.zip`。
 2. 把整个 ZIP 解压到可写目录，不要放在 `Program Files` 下。
 3. 运行 `LostOdysseyRecomp.exe`。找不到游戏时会打开导入器。
 4. 选择语言和图形选项。游戏可能会先询问是否下载预编译着色器，见[着色器准备](#shader-preparation)。
+
+ZIP 中还有一个 `mo2` 文件夹，里面是 Mod Organizer 2 的插件，用法见[Mod Organizer 2](wiki/Mod-Organizer-2.md)。
 
 <a id="automatic-content-import"></a>
 
@@ -119,7 +121,7 @@ flatpak run io.github.freefrank.LostOdysseyRecomp
 
 也可以在终端运行 `xattr -dr com.apple.quarantine /Applications/LostOdysseyRecomp.app` 来批准应用，然后再次打开。
 
-首次启动可能会询问是否下载 Metal 着色器，见[着色器准备](#shader-preparation)。更新时下载新的磁盘映像，替换“应用程序”中的应用；存档和设置在应用之外，会保留。目前只在一台 Mac 上运行过。
+首次启动可能会询问是否下载 Metal 着色器，见[着色器准备](#shader-preparation)。更新时下载新的磁盘映像，替换“应用程序”中的应用；存档和设置在应用之外，会保留。
 
 <a id="android"></a>
 
@@ -132,7 +134,7 @@ flatpak run io.github.freefrank.LostOdysseyRecomp
    - **在设备上导入：** **Game folder → Import disc images…** 会打开 Android 的文件选择器。在内部存储、SD 卡或 U 盘上选一个光盘镜像（`.iso`），同一文件夹里的其他光盘会一起导入，完成后直接启动游戏。已解出的光盘请选 `default.xex`。需要“所有文件访问”权限，页面会先请求。
    - **从电脑复制：** 先用电脑版导入游戏，再用 USB 文件传输模式连接设备，把 `disc1`–`disc4`（和 `dlc/`）复制到上面的 `game` 文件夹，使 `game/disc1/default.xex` 存在。
    - **使用其他文件夹：** 设备上的文件管理器一般写不进 `Android/data`，可以用它把光盘复制到其他任意位置，再在 **Game folder → Choose folder…** 选中包含 `disc1` 的文件夹。同样需要“所有文件访问”权限。
-3. 打开应用。高通设备会先显示 **GPU driver** 页面，因为手机自带的驱动会让部分菜单文字不可见：在这里下载 Turnip 驱动（页面会显示推荐给你机型的版本），然后按 **Start game**。之后可从 **CTRL → GPU driver** 再进入。如果某个驱动无法运行游戏，游戏会回到这个页面并说明原因。Mali 设备同样会先显示这个页面，因为手机自带的驱动无法运行游戏：下载推荐的 PanVK 驱动（需要 Mali-G57、G68、G77、G78 或 Mali-G610 及更新的 GPU）。它的作者支持 Android 15 及以上；Android 13 和 14 不一定能用。如果用它启动不了游戏，按驱动旁的 **Mode** 按钮在直接加载和 libadrenotools 之间切换，或者换一个版本。
+3. 打开应用。高通设备会先显示 **GPU driver** 页面，因为手机自带的驱动会让部分菜单文字不可见：在这里下载 Turnip 驱动（页面会显示推荐给你机型的版本），然后按 **Start game**。之后可从 **CTRL → GPU driver** 再进入。如果某个驱动无法运行游戏，游戏会回到这个页面并说明原因。Mali 设备同样会先显示这个页面，因为手机自带的驱动无法运行游戏。Mali 支持仍是实验性的。在这里下载推荐的 PanVK-kbase 驱动。它需要 Mali-G57、G68、G77、G78 或 Mali-G610 及更新的 GPU（Valhall 及之后，包括 Immortalis）；Midgard（Mali-T）和 Bifrost（Mali-G31、G51、G52、G71、G72、G76）GPU 不受支持。驱动作者支持 Android 15 及以上；Android 13 和 14 不作保证。推荐的驱动默认以直接模式加载。如果用它启动不了游戏，按驱动旁的 **Mode** 按钮在“Mode: direct”和“Mode: libadrenotools”之间切换，或者换一个版本。
 4. 用屏幕上的 **A** 键接受着色器下载。**B** 跳过并在设备上编译，需要几分钟。
 
 游戏画面上有触摸按键。**CTRL** 可以调整触摸按键的大小、透明度和布局，也能进入 Saves、Game folder 和 GPU driver 页面。连接 USB 或蓝牙手柄后触摸按键自动隐藏。设置在游戏内的设置页面修改。
@@ -144,8 +146,6 @@ flatpak run io.github.freefrank.LostOdysseyRecomp
 
 <a id="android-logs"></a>
 **日志**用于反馈问题：先在**设置 → 系统**打开“调试日志”，玩到问题出现，然后选择 **CTRL → Saves and logs → Export logs…**，把 ZIP 保存到例如 Download。ZIP 里有最近三次运行的日志、`native-stderr.log`，应用本身出错时还有 `java-crash-*.txt`。游戏闪退或一直黑屏时，再打开一次应用，从 CTRL 菜单导出。这些文件也在 `Android/data/io.github.freefrank.lostodyssey/files/logs/`，可以用 USB 复制到电脑。使用 adb 时，`adb logcat -s LostOdyssey` 可以实时看到同样的内容。
-
-目前只在一台平板上测试过。
 
 ## 首次设置和普通设置
 

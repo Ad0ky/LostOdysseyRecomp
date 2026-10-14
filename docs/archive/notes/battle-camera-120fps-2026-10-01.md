@@ -1,3 +1,5 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 2026-10-01 对 #117 战斗相机旋转问题的调查，修复已随 v0.7.35 发布。当前说明见[原生 90/120 FPS](../../notes/native-90-120fps.md)，现行状态见[当前状态](../../STATUS.md)。
+
 # Battle camera spin at 90/120 FPS (#117) — 2026-10-01
 
 Status: fixed in `LostOdysseyRecomp/patches/battle_camera_smoother.cpp`. A model of the game's algorithm and an in-game A/B run in the opening battle confirm the fix.

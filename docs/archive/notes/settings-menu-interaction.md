@@ -1,6 +1,8 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 2026-09-24 设置菜单交互与重绘修复的检查点。现行设置菜单说明见[设置菜单与显示选项](../../notes/settings-menu.md)，现行状态见[当前状态](../../STATUS.md)。
+
 # Settings menu interaction and redraw — 2026-09-24
 
-> **Historical checkpoint.** Version, issue, process and pending-work statements below describe their original date. Recheck current delivery and acceptance in [STATUS](../STATUS.md) and [ROADMAP](../ROADMAP.md).
+> **Historical checkpoint.** Version, issue, process and pending-work statements below describe their original date. Recheck current delivery and acceptance in [STATUS](../../STATUS.md) and [ROADMAP](../../ROADMAP.md).
 
 Source repair, not a published-release or full-game acceptance claim.
 
@@ -30,7 +32,7 @@ still only moves the focus to Save
 2026-10-07T07:08:08Z as `6ed90748`; Enter had only moved the focus, so a display
 choice was never written). The Graphics tab has also gained GPU and Display rows
 (hidden with one adapter or display), so "all 11 graphics rows" above is the
-2026-09-24 count. See [settings menu](settings-menu.md).
+2026-09-24 count. See [settings menu](../../notes/settings-menu.md).
 
 ## Redraw cost
 

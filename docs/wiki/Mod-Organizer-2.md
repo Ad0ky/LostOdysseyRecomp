@@ -17,7 +17,7 @@ LostOdysseyRecomp has a Mod Organizer 2 (MO2) game plugin. MO2 maps the mods you
 
 After you update the game, copy the two files again and replace the old ones; MO2 loads them when it starts.
 
-No `mo2` folder? Your game is from before it was added. Update the game, or download the files from [GitHub](https://github.com/freefrank/LostOdysseyRecomp/tree/main/tools/modding/mo2) (open a file, then press **Download raw file**).
+No `mo2` folder? Your game is older than v0.9.52, the first release to include it. Update the game, or download the files from [GitHub](https://github.com/freefrank/LostOdysseyRecomp/tree/main/tools/modding/mo2) (open a file, then press **Download raw file**).
 
 ## 2. Create an instance for the game
 

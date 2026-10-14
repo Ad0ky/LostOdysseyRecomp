@@ -1,3 +1,5 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 2026-09-30 项目审查的 13 项修复记录，修复已随 v0.7.25 发布（见[当前状态](../../STATUS.md)）。测试入口见[测试目录](../../../tools/tests/README.md)。
+
 # Project review fixes — 2026-09-30
 
 Review baseline: `8c7b749dae3b5162c82d7a31b560bced713f86af` (`main`).
@@ -23,7 +25,7 @@ The changes address these 13 confirmed findings (4 P1, 9 P2):
 
 ## Verification
 
-The independent [CMake/CTest suite](../../tools/tests/review_regressions/CMakeLists.txt)
+The independent [CMake/CTest suite](../../../tools/tests/review_regressions/CMakeLists.txt)
 has 14 Linux tests. The integrated run passed all 14 with ASan/UBSan enabled
 for the applicable fixtures. The GPU parser was checked again after its final
 packet-boundary change. Audio and GPU callback regressions also passed separate
@@ -34,7 +36,7 @@ functions each fail at the intended regression assertion.
 The SDL tests compile both the fixture UI and actual production POSIX updater
 implementation, verify all localized instruction/command widths, and exercise
 dummy-driver returns. Allocation/file/parser/exit fixtures use production code
-with synthetic guest storage or driver stubs. See [test commands](../../tools/tests/README.md#project-review-regressions-2026-09-30).
+with synthetic guest storage or driver stubs. See [test commands](../../../tools/tests/README.md#project-review-regressions-2026-09-30).
 
 The first pass ran in a cloud checkout without private game input or
 generated PPC sources, so it did not build or launch the full runtime.

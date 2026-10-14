@@ -12,7 +12,7 @@
 | Read delivered changes | [Changelog](../CHANGELOG.md) |
 | Find outstanding work | [Roadmap](ROADMAP.md) / [简体中文](ROADMAP.zh-CN.md), with the [Maintainer Project](https://github.com/users/freefrank/projects/3) |
 | Find a subsystem investigation | [Notes index](notes/README.md), grouped by topic and document role; superseded notes are in the [archive](archive/README.md) |
-| See every cutscene played on three machines | [Cutscene tour](CUTSCENE_TOUR.md) / [过场巡游](CUTSCENE_TOUR.zh-CN.md) |
+| Read the 2026-10 cutscene tour report (archived) | [Cutscene tour](archive/CUTSCENE_TOUR.md) / [过场巡游](archive/CUTSCENE_TOUR.zh-CN.md); the current tool is in [tools/tours](../tools/tours/README.md) |
 | Find development, analysis or test commands | [Tool catalog](../tools/README.md) / [Test catalog](../tools/tests/README.md) |
 | Understand diagnostics and consent | [Privacy](../PRIVACY.md) / [隐私说明](../PRIVACY.zh-CN.md) |
 | Create a mod | [Modding guide](wiki/Modding.md) |
@@ -35,6 +35,8 @@ Reusable investigation methods and constraints may also be summarized in Basic M
 |---|---|
 | [Engineering principles](LORecomp_ENGINEERING_PRINCIPLES.zh-CN.md) | Correctness, performance, supported data and proportionate validation |
 | [Portable shader packs](PORTABLE_SHADER_PACK.md) | Vulkan/DX12 distribution, tools and historical pack measurements |
+| [macOS releases](MACOS_RELEASE.md) | macOS app packaging and release checks |
+| [Linux AArch64 build](LINUX_ARM64.md) | Experimental source-build path for Linux arm64; not a published artifact |
 | [Repository synchronization](PUBLISHING.md) | Remote selection and publication workflow |
 | [Release packaging](../tools/release/README.md) | Package assembly and release-note extraction; the release workflow runs on Gitea Actions and publishes to GitHub |
 | [Pull request checks and releases](notes/ci-gitea.md) | Gitea Actions workflows (PR checks and release packaging), runners and the `gitea/<workflow>` status reported back to GitHub |

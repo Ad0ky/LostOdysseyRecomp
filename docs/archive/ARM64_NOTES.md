@@ -1,3 +1,5 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 早期 x86-64 与 AArch64 行为差异清单，记录来自 MikeRavenelle 分支，不是本集成的复测。当前 Linux AArch64 构建路径见[Linux AArch64 / ARM64 build](../LINUX_ARM64.md)，当前限制见[当前状态](../STATUS.md)。
+
 # x86-64 vs AArch64: behavior differences
 
 The recompiled PowerPC code was only ever run on x86-64 before the macOS port. This
@@ -7,7 +9,7 @@ so Linux AArch64 (and any other ARM target) starts from known ground.
 The measurements and completed statements below are historical notes from the
 MikeRavenelle fork at [`b7951cd`](https://github.com/MikeRavenelle/LostOdysseyRecomp/tree/b7951cd5aa0830b5342aeb3efa835f878e227796).
 They are not M1 Max re-tests for this integration. Current build and validation
-limits are tracked in [development status](STATUS.md).
+limits are tracked in [development status](../STATUS.md).
 
 ## Handled
 

@@ -1,6 +1,6 @@
 # Modding LostOdysseyRecomp
 
-These pages describe the mod system on the main branch: mod format v1 and v2 (mod folders with their own overlay files). The newest release may not include the latest changes.
+These pages describe the mod system as of v0.9.52: mod format v1 and v2 (mod folders with their own overlay files).
 
 ## 4x HD texture pack
 
@@ -37,7 +37,9 @@ To remove the pack, delete `mods\hd-textures-4x\`, or turn it off in Settings �
 | Mod folders | One folder per mod: `mods/<id>/mod.ini` with a name, version and author, plus its own `overlay/` files found by name. The order in `mod-list.ini` (next to `settings.ini`), then `priority`, decides between mods. Settings → System → Mods turns mods on or off and changes their order. See [Creating mods](Creating-Mods.md#mod-folders-recommended). |
 | External manager overlay | Deterministic top-level `overlay/` paths that a manager orders, and an isolated resolution mode. |
 | Exporting original artwork | `LostOdysseyRecomp.exe --export-assets <folder>` writes your game's textures (PNG plus `index.csv` with mod keys and fingerprints), movies and text (JSON per game text file, the starting point for translations). With `--export-kinds models,animations` it also writes 3D models and animation sets as glTF (`.glb`); edited character models can go back into a mod. Also available from an MO2 tool. See [Creating mods](Creating-Mods.md#export-the-original-assets). |
-| Mod Organizer 2 | Game plugin in `tools/modding/mo2`; MO2 maps mods onto `mods/`. See [Mod Organizer 2](Mod-Organizer-2.md). |
+| Overlay archives | A mod folder can hold its `overlay/` files in one `overlay.loarc` archive instead of thousands of loose files, made with `lo_mod.py archive`. See [Creating mods](Creating-Mods.md#ship-a-mod-as-one-archive). |
+| Rebuilt game files | Files that replaced models or translations rebuild once, then are kept compressed in `cache/mods`; a window shows **Preparing mods** while this runs. See [Creating mods](Creating-Mods.md#replace-a-model). |
+| Mod Organizer 2 | The game plugin and export tool are in the Windows ZIP's `mo2` folder (source: `tools/modding/mo2`); MO2 maps mods onto `mods/`. See [Mod Organizer 2](Mod-Organizer-2.md). |
 
 Mods do not modify `LO.fpi`, FPD archives or other imported game files. Mod packages contain data, not automatically loaded native libraries.
 

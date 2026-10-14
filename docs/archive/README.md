@@ -191,4 +191,20 @@ docs/archive/ 下的根目录文档和 audits/。原先的 RELEASE-v0.1/v0.2/v0.
 | [android-probe-tb321fu-2026-10-02.txt](notes/android-probe-tb321fu-2026-10-02.txt) | 上篇引用的设备探针原始数据 | [Android 打包说明](../../packaging/android/README.md) |
 | [Developer-tool recovery record — 2026-09-24](notes/developer-tool-recovery-2026-09-24.md) | 2026-09-24 开发工具恢复清单，迁移已完成 | [工具目录](../../tools/README.md) |
 
+## 2026-10-14 归档的文档
+
+2026-10-14 整理（v0.9.52 之后）：下列文档的主题已完成、已被现行文档取代，或其中的说明只对应原日期。它们用 `git mv` 移入，文首加了归档提示；指向它们的链接已改指这里。
+
+| 文档 | 归档原因 | 当前入口 |
+|---|---|---|
+| [MetalFX Temporal 设计](METALFX_TEMPORAL_DESIGN.md) | 2026-09-29 阶段的设计草稿，测量来自 MikeRavenelle 分支，不是本集成复测 | [Vulkan 帧生成、FSR 4 与 MetalFX](../notes/vulkan-fg-fsr4-metalfx.md) |
+| [过场巡游报告](CUTSCENE_TOUR.md) / [中文](CUTSCENE_TOUR.zh-CN.md) | 2026-10-04 至 05 一次三机过场巡游的结果，不代表当前画面 | [巡游工具](../../tools/tours/README.md) / [过场 jitter 审查](../notes/jitter-cutscene-tour-2026-10-04.md) |
+| [x86-64 与 AArch64 行为差异](ARM64_NOTES.md) | 早期 AArch64 差异清单，记录来自 MikeRavenelle 分支，不是本集成的复测 | [Linux AArch64 构建](../LINUX_ARM64.md) / [当前状态](../STATUS.md) |
+| [Battle camera spin at 90/120 FPS (#117)](notes/battle-camera-120fps-2026-10-01.md) | #117 的调查记录，修复已随 v0.7.35 发布 | [原生 90/120 FPS](../notes/native-90-120fps.md) |
+| [Battle dialogue timing at 90/120 FPS (#148)](notes/issue-148-battle-dialogue-timing.md) | #148 的调查记录，修复已随 v0.8.5 发布 | [原生 90/120 FPS](../notes/native-90-120fps.md) |
+| [Screen-sampling candidate batch — 2026-09-25](notes/jitter-screen-batch-2026-09-25.md) | 屏幕采样候选批次的试验检查点 | [jitter 覆盖审查](../notes/jitter-coverage-2026-09-25.md) |
+| [运行时纹理导入（含 4× 放大）：设计与可行性](notes/texture-import-research.zh-CN.md) | 2026-10-09 的设计与可行性研究，相关功能已有现行 Mod 文档 | [Mod 指南（4× 纹理包）](../wiki/Modding.md#4x-hd-texture-pack) / [运行时纹理替换](../wiki/Runtime-Texture-Replacement.md) |
+| [Project review fixes — 2026-09-30](notes/PROJECT_REVIEW_FIXES_20260930.md) | 2026-09-30 项目审查的 13 项修复记录，修复已随 v0.7.25 发布 | [当前状态](../STATUS.md) / [测试目录](../../tools/tests/README.md) |
+| [Settings menu interaction and redraw — 2026-09-24](notes/settings-menu-interaction.md) | 2026-09-24 设置菜单交互与重绘修复的检查点 | [设置菜单与显示选项](../notes/settings-menu.md) |
+
 各快照保留其记录日期和当时内容，归档提示与相对链接按当前位置调整；新结论写入当前文档或专项笔记。

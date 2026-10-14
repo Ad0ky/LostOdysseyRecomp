@@ -1,8 +1,10 @@
+> **历史归档 / Historical snapshot — 2026-10-14.** 2026-09-29 阶段记录的 MetalFX 设计草稿，测量来自 MikeRavenelle 分支，不是当前验证。现行 MetalFX 说明见[Vulkan 帧生成、FSR 4 与 MetalFX](../notes/vulkan-fg-fsr4-metalfx.md)，当前验证边界见[当前状态](../STATUS.md)。
+
 # MetalFX Temporal: design
 
 The measurements and phase labels in this historical design note come from the
 MikeRavenelle fork at [`b7951cd`](https://github.com/MikeRavenelle/LostOdysseyRecomp/tree/b7951cd5aa0830b5342aeb3efa835f878e227796).
-They are not M1 Max re-tests for this integration. See [development status](STATUS.md)
+They are not M1 Max re-tests for this integration. See [development status](../STATUS.md)
 for the current build and validation boundary.
 
 Status, 2026-09-29: phase 1 done. Upscaler setting 3 (`upscaler=3`, quality from
