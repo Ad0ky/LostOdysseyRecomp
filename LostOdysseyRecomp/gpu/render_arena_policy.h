@@ -12,7 +12,11 @@ namespace gpu::render_arena
     // Lost Odyssey frame uploads far less than a 128 MiB half. Shaders still
     // clamp fetches at 1 GiB (common_hlsl.h, baked into the shader pack); the
     // ring only hands out offsets inside the buffer.
-    inline constexpr uint64_t kVertexArenaSize = 256ull << 20;
+    // 256 MiB wrapped about every 10 s on the field, and each wrap drops the
+    // cached geometry of one half: a 270-350 ms hitch while it is uploaded
+    // again. 512 MiB halves how often that happens; peak RAM use seen so far
+    // (2.4 GiB of 3.19) leaves room for it.
+    inline constexpr uint64_t kVertexArenaSize = 512ull << 20;
 #else
     inline constexpr uint64_t kVertexArenaSize = 1024ull << 20;
 #endif

@@ -364,6 +364,16 @@ std::string MemorySummary()
     return text;
 }
 
+uint32_t CurrentThreadHandle()
+{
+    return threadGetCurHandle();
+}
+
+uint32_t SetThreadIdealCore(uint32_t handle, int core)
+{
+    return svcSetThreadCoreMask(handle ? Handle(handle) : CUR_THREAD_HANDLE, core, 0x7);
+}
+
 void SetCurrentThreadPriority(int priority)
 {
     svcSetThreadPriority(CUR_THREAD_HANDLE, u32(priority));

@@ -7,6 +7,9 @@
 #include <os/thread_name.h>
 #include <host_ui/host_ui.h>
 #include <cstdio>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #include "ppc_context.h"
 
 // The generated mftb helper links to this runtime clock without depending on
@@ -67,6 +70,11 @@ static void GuestThreadFunc(std::shared_ptr<GuestThreadHandle::Control> state)
     char name[16];
     std::snprintf(name, sizeof(name), "Guest %x", state->params.function);
     os::SetCurrentThreadName(name);
+#if LO_PLATFORM_SWITCH
+    state->hostHandle.store(os::switch_platform::CurrentThreadHandle(), std::memory_order_release);
+    if (const int core = state->idealCore.load(std::memory_order_acquire); core >= 0)
+        os::switch_platform::SetThreadIdealCore(0, core);
+#endif
     state->suspended.wait(true);
     GuestThread::Start(state->params);
     state->completion.Set();

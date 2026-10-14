@@ -23,6 +23,9 @@
 #include <apu/audio.h>
 #include <apu/xma.h>
 #include <os/logger.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_platform.h>
+#endif
 #include <os/shader_log.h>
 #include <os/user_paths.h>
 #include <host_ui/host_ui.h>
@@ -582,8 +585,42 @@ static int KeQueryBasePriorityThread(uint32_t thread)
 #endif
 }
 
+#if LO_PLATFORM_SWITCH
+// LO_GUEST_AFFINITY=1: the Xbox 360 has three cores with two hardware threads
+// each (affinity bits 0-5). The game pins its threads with KeSetAffinityThread
+// (XSetThreadProcessor); here hardware thread n becomes the ideal core n / 2 of
+// the Switch's three. The allowed mask stays cores 0-2 so Horizon can still move
+// a thread. Without it every pthread starts on the process's default core.
+static bool GuestAffinityEnabled()
+{
+    static const bool enabled = [] {
+        const char* value = getenv("LO_GUEST_AFFINITY");
+        return value && value[0] == '1';
+    }();
+    return enabled;
+}
+#endif
+
 static uint32_t KeSetAffinityThread(uint32_t Thread, uint32_t Affinity, be<uint32_t>* lpPreviousAffinity)
 {
+#if LO_PLATFORM_SWITCH
+    if (GuestAffinityEnabled() && (Affinity & 0x3F))
+    {
+        const int core = int(__builtin_ctz(Affinity & 0x3F)) / 2;
+        uint32_t rc = 0;
+        if (Thread == CURRENT_THREAD_HANDLE)
+            rc = os::switch_platform::SetThreadIdealCore(0, core);
+        else if (auto t = ThreadFromHandle(Thread))
+        {
+            t->control->idealCore.store(core, std::memory_order_release);
+            if (const uint32_t host = t->control->hostHandle.load(std::memory_order_acquire))
+                rc = os::switch_platform::SetThreadIdealCore(host, core);
+        }
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 48)
+            LOG_INFO("guest affinity: thread {:#x} mask {:#x} -> core {} (rc {:#x})", Thread, Affinity, core, rc);
+    }
+#endif
     if (lpPreviousAffinity)
         *lpPreviousAffinity = 2;
     return 0;
