@@ -1,5 +1,6 @@
 #include <stdafx.h>
 #include "command_processor.h"
+#include <cpu/render_fence.h>
 #include "movie_clear.h"
 #include "frame_plan.h"
 #include "display_gamma.h"
@@ -1063,7 +1064,18 @@ namespace gpu
             renderer::PreparePresent(frontbuffer);
             renderer::Flush();
             const auto timingPace = std::chrono::steady_clock::now();
-            const auto fpsCap = video::GetFramePacingTarget(GetFrameRateTarget());
+            // Loading screens present at the console's 60 Hz while the game
+            // thread waits on the rendering thread: each loading-screen frame
+            // waits for the GPU, and at 30 fps that wait starves the queued
+            // load commands (cpu/poll_wait.cpp). LO_LOAD_PACE_60=0 turns it off.
+            static const bool loadPace60 = [] {
+                const char* v = getenv("LO_LOAD_PACE_60");
+                return !(v && v[0] == '0');
+            }();
+            uint32_t nativeTarget = GetFrameRateTarget();
+            if (loadPace60 && nativeTarget && nativeTarget < 60 && render_fence::LongWait())
+                nativeTarget = 60;
+            const auto fpsCap = video::GetFramePacingTarget(nativeTarget);
             const bool timingEnabled = frame_timing::Enabled();
             frame_timing::PacingSample pacing;
             {
