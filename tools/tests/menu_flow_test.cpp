@@ -6,6 +6,7 @@
 #define SDL_MAIN_HANDLED // This host fixture supplies its own main and does not initialize SDL.
 #include <SDL3/SDL.h>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <tuple>
 extern "C" int SDLCALL MenuFlowPushEvent(SDL_Event* event);
@@ -92,7 +93,8 @@ namespace gpu::video {
 FrameGenerationStatus menuFlowFgStatus{};
 FrameGenerationStatus GetFrameGenerationStatus() { return menuFlowFgStatus; }
 std::vector<std::string> GpuDeviceNames() { return {}; }
-std::string ActiveGpuDeviceName() { return {}; }
+std::string menuFlowActiveGpu;
+std::string ActiveGpuDeviceName() { return menuFlowActiveGpu; }
 std::vector<display_choice::Display> Displays() { return {}; }
 }
 
@@ -494,7 +496,7 @@ void CheckBr03DlssMenu(uint8_t* base)
         Require(!model.hidden && model.enabled && model.choices == std::vector<std::wstring>{L"M", L"L"} &&
                 model.selectedChoice == 0 && model.value == L"M", "DLSS model offers M (default) and L with DLSS");
     }
-    Require(settings::snapshot.help == L"M: steadier and sharper than older DLSS models at a moderate cost. L: the steadiest image with the least ghosting, but slower, especially on RTX 20 and 30 series.",
+    Require(settings::snapshot.help == L"M: steadier and sharper than older models, moderate cost. L: steadiest, least ghosting, but slower, mainly on RTX 20 and 30.",
             "DLSS model help explains the cost of each model");
     settings::pending = 8; Tick(base);
     Require(settings::edit.dlssModel == 1 && settings::snapshot.rows[int(GraphicsRow::DlssModel)].value == L"L",
@@ -568,7 +570,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution.",
             "size pending comes from the classified reason, not sizingState");
     saveState("03-size-pending.bmp");
 
@@ -579,7 +581,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is waiting for the graphics device. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is waiting for the graphics device.",
             "device wait comes from the classified reason, not deviceReady");
 
     running.device.deviceReady = true;
@@ -596,7 +598,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Balanced;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"Submitted DLSS Quality output. The selected DLSS quality is not applied yet.",
+    Require(settings::snapshot.notice == L"Submitted DLSS Quality output. The new quality is not applied yet.",
             "editing quality does not replace the submitted Quality output");
     Require(settings::snapshot.notice.find(L"Performance") == std::wstring::npos,
             "CPU plan quality is not described as the submitted mode");
@@ -649,14 +651,14 @@ void CheckBr03DlssMenu(uint8_t* base)
             "backend edit keeps the DLSS preference");
     Require(settings::snapshot.rows[int(GraphicsRow::Backend)].enabled && settings::snapshot.rows[int(GraphicsRow::Backend)].selectedChoice == 1, "Vulkan cell stays selectable");
     Require(settings::snapshot.rows[int(GraphicsRow::AntiAliasing)].enabled && !settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden, "pending backend does not hide DLSS");
-    Require(settings::snapshot.notice == needsVulkan + L" Still using Direct3D 12 until restart. DLSS is checked after restart.",
+    Require(settings::snapshot.notice == needsVulkan + L" Still on Direct3D 12 until restart.",
             "pending backend is added after the current plan and does not replace it");
     Require(saves == savesAtCycle, "selecting Vulkan does not save by itself");
     saveState("05-backend-pending.bmp");
     settings::pending = 8;
     Tick(base);
     Require(settings::edit.graphicsBackend == settings::GraphicsBackend::D3D11, "Direct3D 11 remains selectable");
-    Require(settings::snapshot.notice == needsVulkan + L" Still using Direct3D 12 until restart. DLSS is checked after restart.",
+    Require(settings::snapshot.notice == needsVulkan + L" Still on Direct3D 12 until restart.",
             "an unapplied backend still names the running device");
 
     settings::edit.graphicsBackend = settings::GraphicsBackend::D3D12;
@@ -691,16 +693,16 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"已提交 DLSS 质量输出。 1280×720 - 1920×1080", "simplified status");
+    Require(settings::snapshot.notice == L"已提交 DLSS 质量输出。1280×720 - 1920×1080", "simplified status");
     saveState("06-active-simplified.bmp");
     settings::edit.uiLanguage = 1;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"已提交 DLSS 品質輸出。 1280×720 - 1920×1080", "traditional status");
+    Require(settings::snapshot.notice == L"已提交 DLSS 品質輸出。1280×720 - 1920×1080", "traditional status");
     settings::edit.uiLanguage = 2;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS 品質出力を提出しました。 1280×720 - 1920×1080", "japanese status");
+    Require(settings::snapshot.notice == L"DLSS 品質出力を提出。1280×720 - 1920×1080", "japanese status");
     settings::edit.uiLanguage = 3;
     settings::pending = 0;
     Tick(base);
@@ -719,13 +721,13 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution.",
             "an open graphics page reads a new result without reopening");
     Require(settings::snapshot.notice.find(L"1280") == std::wstring::npos, "a querying result does not keep the submitted size");
     settings::edit.upscaler = Upscaler::Off;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now. The Off choice is not applied yet.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. The Off choice is not applied yet.",
             "an unsaved Off choice does not replace a plan that is still querying resolution");
     Require(settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden && settings::snapshot.rows.size() == size_t(GraphicsRow::Count),
             "turning DLSS off hides quality and keeps the row count");
@@ -762,7 +764,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Balanced;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == activePlan + L" The selected DLSS quality is not applied yet.",
+    Require(settings::snapshot.notice == activePlan + L" The new quality is not applied yet.",
             "Active Quality stays visible when Balanced is not saved");
     Require(settings::snapshot.notice.find(L"DLSS Balanced") == std::wstring::npos, "unsaved Balanced is not described as submitted");
     Require(settings::snapshot.notice.find(L"Performance") == std::wstring::npos, "CPU plan quality is not described as submitted");
@@ -871,7 +873,7 @@ void CheckBr03DlssMenu(uint8_t* base)
         settings::edit.dlssQuality = DlssQuality::Performance;
         show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
         Require(settings::snapshot.notice ==
-                    L"Submitted DLSS Quality output. 1707×960 - 2560×1440 The selected DLSS quality is not applied yet.",
+                    L"Submitted DLSS Quality output. 1707×960 - 2560×1440 The new quality is not applied yet.",
                 "an unsaved quality edit keeps its note after the last game frame");
         settings::edit.dlssQuality = DlssQuality::Quality;
         auto stalled = menuFrame;
@@ -884,7 +886,7 @@ void CheckBr03DlssMenu(uint8_t* base)
         stalled.reason = DlssEffectReason::UnsupportedProjection;
         gpu::frame_plan::menuFlowEligible = stalled;
         show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
-        Require(settings::snapshot.notice == L"DLSS is not running. Normal rendering is used for now.",
+        Require(settings::snapshot.notice == L"DLSS is not running for now.",
                 "an unnamed scene fallback still says DLSS is not running");
         auto otherRequest = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
         otherRequest.plan.requestSignature = 77;
@@ -895,7 +897,7 @@ void CheckBr03DlssMenu(uint8_t* base)
         gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
         running.failure = gpu::frame_plan::FailureReason::InvalidInput;
         show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::RequestFailure);
-        Require(settings::snapshot.notice == L"DLSS request failed and fell back. No automatic retry.",
+        Require(settings::snapshot.notice == L"DLSS request failed; no automatic retry.",
                 "a request failure wins over the last game frame");
         running.failure.reset();
         show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::CapabilityUnavailable);
@@ -920,7 +922,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     Require(settings::snapshot.notice == L"Render resolution is unavailable.", "resolution unavailable");
     running.failure = gpu::frame_plan::FailureReason::InvalidInput;
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::RequestFailure);
-    Require(settings::snapshot.notice == L"DLSS request failed and fell back. No automatic retry.",
+    Require(settings::snapshot.notice == L"DLSS request failed; no automatic retry.",
             "request failure names the fallback and does not promise a retry");
     Require(settings::snapshot.notice.find(L"InvalidInput") == std::wstring::npos, "failure enum is not shown");
     Require(settings::snapshot.notice.find(L"will retry") == std::wstring::npos, "request failure does not promise a retry");
@@ -956,7 +958,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Quality;
     show(DlssEffectPhase::Active, DlssEffectReason::None);
     Require(settings::snapshot.notice ==
-                L"Submitted DLSS Balanced output. 1500×844 - 2560×1440 The selected DLSS quality is not applied yet.",
+                L"Submitted DLSS Balanced output. 1500×844 - 2560×1440 The new quality is not applied yet.",
             "submitted Balanced stays visible when the edit is still Quality");
     Require(settings::snapshot.notice.find(L"Quality output") == std::wstring::npos, "the edit is not described as submitted");
 
@@ -1024,6 +1026,457 @@ void CheckBr03DlssMenu(uint8_t* base)
     notes.close();
     Require(bool(notes), "write BR-03 notice list");
     std::puts("PASS BR-03 menu status from stubbed snapshots: submitted output, waiting, probe, fallback reasons, GPU stopped, unsaved edits");
+}
+
+// Help lines are single lines: one that is too long for its box is drawn
+// smaller until it is unreadable. Every help line a settings page can show, in
+// every menu language and with the longest status it can carry, must keep at
+// least this share of its normal size. With an installation the game's own
+// faces are measured, otherwise the built-in font.
+constexpr double kMinHelpFit = 0.85;
+struct HelpLine
+{
+    double scale = 1;
+    std::string where;
+    const char* face = "";
+};
+struct HelpAudit
+{
+    std::array<std::shared_ptr<const settings::menu_assets::Assets>, 5> assets{};
+    // The smallest scale of each distinct text, per language.
+    std::map<std::pair<uint32_t, std::wstring>, HelpLine> lines;
+    // A Japanese, Korean or Simplified Chinese line identical to the English
+    // one of the same state: its translation key no longer matches.
+    std::vector<std::string> untranslated;
+    void Record(const settings::TextFit& fit, uint32_t language, const std::string& where)
+    {
+        if (fit.text.empty()) return;
+        auto [it, inserted] = lines.try_emplace({language, fit.text}, HelpLine{fit.scale, where, fit.face});
+        if (!inserted && fit.scale < it->second.scale) it->second = {fit.scale, where, fit.face};
+    }
+    // Both prompt styles: PlayStation faces move a line with A/B/X/Y to the built-in font.
+    void Measure(settings::MenuSnapshot shown, const std::string& where)
+    {
+        shown.assets = assets[shown.language];
+        for (const bool playStation : {false, true})
+        {
+            shown.playStationPrompts = playStation;
+            const auto fit = settings::MeasureHelp(shown);
+            const std::string at = where + (playStation ? " (PlayStation prompts)" : "");
+            Record(fit.help, shown.language, at);
+            Record(fit.notice, shown.language, at);
+        }
+    }
+    // A help box under the list with this help and notice.
+    void MeasureBox(uint32_t language, std::wstring help, std::wstring notice, const std::string& where)
+    {
+        settings::MenuSnapshot shown;
+        shown.language = language;
+        shown.help = std::move(help);
+        shown.notice = std::move(notice);
+        Measure(std::move(shown), where);
+    }
+    // Also a line with an English sentence in it: four or more plain lowercase
+    // words, which no Japanese, Korean or Chinese line has.
+    void CompareWithEnglish(const std::wstring& english, const std::wstring& text, uint32_t language, const std::string& where)
+    {
+        if (language < 2 || text.empty()) return;
+        int words = 0;
+        for (size_t start = 0; start < text.size();)
+        {
+            size_t end = text.find_first_of(L" \n", start);
+            if (end == std::wstring::npos) end = text.size();
+            std::wstring word = text.substr(start, end - start);
+            while (!word.empty() && std::wcschr(L",.;:()", word.back())) word.pop_back();
+            words += word.size() >= 2 && std::all_of(word.begin(), word.end(), [](wchar_t c) { return c >= L'a' && c <= L'z'; });
+            start = end + 1;
+        }
+        if (text == english || words >= 4)
+            untranslated.push_back(std::to_string(language) + " " + where + ": " + Utf8(text));
+    }
+};
+
+// LO_HELP_CAPTURE_DIR: every settings row with the installed faces in English
+// and Simplified Chinese, for before / after pictures of help text changes.
+// Graphics rows show DLSS with a submitted frame; the NR row also with each
+// runtime state.
+void CaptureHelpRows(uint8_t* base, const char* installRoot)
+{
+    const char* folder = std::getenv("LO_HELP_CAPTURE_DIR");
+    if (!folder || !installRoot) return;
+    using gpu::backend::Backend;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    std::filesystem::create_directories(folder);
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    gpu::video::menuFlowActiveGpu = "NVIDIA GeForce RTX 5080";
+    currentConfig.graphicsBackend = Backend::D3D12;
+    currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+    currentConfig.dlssQuality = gpu::upscaling::DlssQuality::Quality;
+    currentConfig.frameGenerationProvider = framegen::Provider::Off;
+    currentConfig.hdr = false;
+    gpu::frame_plan::DlssEffectSnapshot running{};
+    running.hasPlan = true;
+    running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+    running.device.backend = Backend::D3D12;
+    running.device.deviceReady = running.device.dlssAvailable = true;
+    running.phase = gpu::frame_plan::DlssEffectPhase::Active;
+    running.execution = SubmittedObservation(gpu::upscaling::DlssQuality::Quality, 1707, 960, 2560, 1440);
+    gpu::frame_plan::menuFlowDlssEffect = running;
+    const auto capture = [&](uint32_t language, const std::string& name) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        auto preview = settings::snapshot;
+        preview.assets = settings::menu_assets::Cached(installRoot, language);
+        Require(bool(preview.assets), "installed capture assets");
+        std::vector<uint32_t> pixels;
+        Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "help capture raster");
+        WriteBmp(std::filesystem::path(folder) / (name + (language ? "-zh-hans.bmp" : "-en.bmp")), pixels);
+    };
+    for (const uint32_t language : {0u, 4u})
+    {
+        for (const int tab : {0, 1, 2, 3})
+        {
+            const int count = tab == 0 ? settings::GameRowCount : tab == 1 ? settings::AudioRowCount :
+                              tab == 2 ? int(GraphicsRow::Count) : settings::SystemRowCount;
+            for (int row = 0; row < count; ++row)
+            {
+                settings::edit = currentConfig;
+                settings::tab = tab;
+                settings::row = row;
+                if (tab == 1) settings::edit.audioOutput = settings::AudioOutputMatrix;
+                capture(language, "tab" + std::to_string(tab) + "-row" + std::to_string(row));
+                if (tab == 1 && row == settings::AudioOutputRow)
+                {
+                    settings::edit.audioOutput = settings::AudioOutputSurround;
+                    capture(language, "tab1-row" + std::to_string(row) + "-surround-on-stereo");
+                }
+            }
+        }
+        settings::edit = currentConfig;
+        settings::tab = 2;
+        settings::row = int(GraphicsRow::DlssNeuralRendering);
+        const std::pair<NrState, const char*> states[] = {{NrState::Active, "running"}, {NrState::MissingRuntime, "dll-missing"},
+            {NrState::Unsupported, "unsupported"}, {NrState::Failed, "failed"}};
+        for (const auto& [state, name] : states)
+        {
+            gpu::dlss::g_neuralRenderingState = state;
+            capture(language, std::string("nr-help-") + name);
+        }
+        gpu::dlss::g_neuralRenderingState = NrState::Off;
+    }
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::video::menuFlowActiveGpu.clear();
+    currentConfig = savedConfig;
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    std::printf("help captures written to %s\n", folder);
+}
+
+void CheckHelpFit(uint8_t* base, const char* installRoot)
+{
+    using gpu::backend::Backend;
+    using gpu::frame_plan::DlssEffectPhase;
+    using gpu::frame_plan::DlssEffectReason;
+    using gpu::upscaling::Upscaler;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    HelpAudit audit;
+    if (installRoot)
+        for (uint32_t language = 0; language < 5; ++language)
+        {
+            audit.assets[language] = settings::menu_assets::Cached(installRoot, language);
+            Require(bool(audit.assets[language]), "installed menu assets for every menu language");
+        }
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    const auto savedFg = gpu::video::menuFlowFgStatus;
+    const auto savedOutput = apu::menuFlowOutput;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    gpu::video::menuFlowActiveGpu = "NVIDIA GeForce RTX 5080 Laptop GPU";
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::video::menuFlowFgStatus = {};
+
+    // Each tab's rows through the real Publish, in states that change their help.
+    struct Graphics
+    {
+        const char* name;
+        Backend backend;
+        Upscaler upscaler;
+        uint32_t antialiasing;
+        framegen::Provider fg;
+        bool hdr;
+        uint32_t frameRate;
+    };
+    const Graphics graphics[] = {
+        {"D3D12 TAA", Backend::D3D12, Upscaler::Off, 3, framegen::Provider::Off, false, 60},
+        {"D3D12 DLSS", Backend::D3D12, Upscaler::Dlss, 0, framegen::Provider::Dlss, true, 120},
+        {"D3D12 FSR", Backend::D3D12, Upscaler::Fsr, 0, framegen::Provider::Fsr, true, 60},
+        {"D3D12 XeSS", Backend::D3D12, Upscaler::Xess, 0, framegen::Provider::Xess, false, 60},
+        {"Vulkan DLSS", Backend::Vulkan, Upscaler::Dlss, 0, framegen::Provider::Dlss, true, 60},
+        {"Vulkan FSR", Backend::Vulkan, Upscaler::Fsr, 0, framegen::Provider::Fsr, true, 60},
+        {"Metal MetalFX", Backend::Metal, Upscaler::MetalFx, 0, framegen::Provider::MetalFx, true, 60},
+    };
+    const NrState nrStates[] = {NrState::Off, NrState::Active, NrState::MissingRuntime, NrState::Unsupported, NrState::Failed};
+    const char* nrNames[] = {"off", "running", "DLL missing", "unsupported", "failed"};
+    std::map<std::string, std::wstring> english;
+    const auto publish = [&](uint32_t language, const std::string& where) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        const auto& shown = settings::snapshot;
+        audit.Measure(shown, where);
+        if (language == 0) english[where] = shown.help + L"\n" + shown.notice;
+        else audit.CompareWithEnglish(english[where], shown.help + L"\n" + shown.notice, language, where);
+    };
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        for (const int tab : {0, 1, 3})
+        {
+            const int count = tab == 0 ? settings::GameRowCount : tab == 1 ? settings::AudioRowCount : settings::SystemRowCount;
+            settings::edit = savedConfig;
+            settings::tab = tab;
+            for (int row = 0; row < count; ++row)
+                for (const uint32_t output : {settings::AudioOutputStereo, settings::AudioOutputSurround, settings::AudioOutputMatrix})
+                    for (const bool pack : {false, true})
+                    {
+                        settings::edit.audioOutput = output;
+                        apu::menuFlowOutput = apu::Output::Stereo;
+                        settings::edit.gameLanguagePack = pack ? "pt-br" : "";
+                        settings::row = row;
+                        publish(language, "tab " + std::to_string(tab) + " row " + std::to_string(row) +
+                            " audio " + std::to_string(output) + (pack ? " language pack" : ""));
+                    }
+        }
+        settings::tab = 2;
+        for (const auto& state : graphics)
+            for (int row = 0; row < int(GraphicsRow::Count); ++row)
+            {
+                const bool nr = row == int(GraphicsRow::DlssNeuralRendering);
+                for (size_t n = 0; n < (nr ? std::size(nrStates) : 1); ++n)
+                {
+                    settings::edit = savedConfig;
+                    settings::edit.graphicsBackend = state.backend;
+                    settings::edit.upscaler = state.upscaler;
+                    settings::edit.antialiasing = state.antialiasing;
+                    settings::edit.frameGenerationProvider = state.fg;
+                    settings::edit.hdr = state.hdr;
+                    settings::edit.frameRate = state.frameRate;
+                    gpu::dlss::g_neuralRenderingState = nrStates[n];
+                    settings::row = row;
+                    publish(language, std::string("Graphics row ") + std::to_string(row) + " " + state.name +
+                        (nr ? std::string(" NR ") + nrNames[n] : std::string()));
+                }
+            }
+        gpu::dlss::g_neuralRenderingState = NrState::Off;
+    }
+    settings::edit = savedConfig;
+
+    // Graphics notices: every upscaler status against every unsaved edit.
+    // Each provider's sentence first, then what is not applied yet.
+    struct Running
+    {
+        std::string name;
+        gpu::frame_plan::DlssEffectSnapshot effect;
+        std::optional<gpu::frame_plan::DlssExecutionObservation> eligible;
+    };
+    const auto runningStates = [&](Upscaler provider) {
+        std::vector<Running> states;
+        gpu::frame_plan::DlssEffectSnapshot base{};
+        base.device.backend = Backend::D3D12;
+        base.device.deviceReady = true;
+        base.device.dlssAvailable = base.device.fsrAvailable = base.device.xessAvailable = base.device.metalFxAvailable = true;
+        base.hasPlan = true;
+        base.plannedRequest = provider;
+        auto submitted = SubmittedObservation(gpu::upscaling::DlssQuality::Performance, 1920, 1080, 3840, 2160);
+        submitted.actualProvider = provider;
+        submitted.plan.requestedUpscaler = provider;
+        submitted.plan.consumer = provider == Upscaler::Dlss ? gpu::upscaling::TemporalConsumer::DlssSr
+                                                             : gpu::upscaling::FsrQualityConsumer(provider);
+        submitted.plan.fsrQuality = gpu::upscaling::FsrQuality::Performance;
+        for (int phase = 0; phase <= int(DlssEffectPhase::GpuStopped); ++phase)
+            for (int reason = 0; reason <= int(DlssEffectReason::UnsupportedProjection); ++reason)
+            {
+                auto effect = base;
+                effect.phase = DlssEffectPhase(phase);
+                effect.reason = DlssEffectReason(reason);
+                const std::string at = "phase " + std::to_string(phase) + " reason " + std::to_string(reason);
+                states.push_back({at, effect, {}});
+                auto withExecution = effect;
+                withExecution.execution = submitted;
+                states.push_back({at + " submitted", withExecution, {}});
+                auto fallback = submitted;
+                fallback.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+                fallback.reason = DlssEffectReason(reason);
+                withExecution.execution = fallback;
+                states.push_back({at + " fallback", withExecution, {}});
+                // The menu frame has no scene; the last game frame is described.
+                auto menuFrame = fallback;
+                menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+                menuFrame.reason = DlssEffectReason::NoEligibleScene;
+                menuFrame.submissionSerial = 0;
+                auto sceneless = effect;
+                sceneless.phase = DlssEffectPhase::TemporaryFallback;
+                sceneless.reason = DlssEffectReason::NoEligibleScene;
+                sceneless.execution = menuFrame;
+                states.push_back({at + " last game frame submitted", sceneless, submitted});
+                states.push_back({at + " last game frame fallback", sceneless, fallback});
+                auto failed = effect;
+                failed.failure = gpu::frame_plan::FailureReason{};
+                states.push_back({at + " failed", failed, {}});
+            }
+        for (const auto device : {0, 1, 2})
+        {
+            auto effect = base;
+            if (device == 0) effect.device.gpuWorkStopped = true;
+            if (device == 1) effect.device.deviceReady = false;
+            if (device == 2) effect.device.fsrAvailable = effect.device.xessAvailable = effect.device.metalFxAvailable = false;
+            states.push_back({"device " + std::to_string(device), effect, {}});
+        }
+        return states;
+    };
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::edit.uiLanguage = language;
+        for (const auto provider : {Upscaler::Dlss, Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+            for (const auto& running : runningStates(provider))
+                for (const auto edited : {Upscaler::Off, Upscaler::Dlss, Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+                    for (const auto backends : {std::pair{Backend::D3D12, Backend::D3D12}, std::pair{Backend::Vulkan, Backend::D3D12},
+                                                std::pair{Backend::D3D12, Backend::Vulkan}, std::pair{Backend::D3D12, Backend::D3D11},
+                                                std::pair{Backend::D3D12, Backend::Metal}})
+                        for (const bool otherQuality : {false, true})
+                        {
+                            currentConfig = savedConfig;
+                            currentConfig.upscaler = provider;
+                            settings::edit = currentConfig;
+                            settings::edit.uiLanguage = language;
+                            settings::edit.upscaler = edited;
+                            settings::edit.graphicsBackend = backends.first;
+                            settings::edit.dlssQuality = otherQuality ? gpu::upscaling::DlssQuality::Dlaa
+                                                                      : gpu::upscaling::DlssQuality::Performance;
+                            settings::edit.fsrQuality = otherQuality ? gpu::upscaling::FsrQuality::NativeAA
+                                                                     : gpu::upscaling::FsrQuality::Performance;
+                            auto effect = running.effect;
+                            effect.device.backend = backends.second;
+                            gpu::frame_plan::menuFlowDlssEffect = effect;
+                            gpu::frame_plan::menuFlowEligible = running.eligible;
+                            audit.MeasureBox(language, L"-", settings::DlssNotice(),
+                                "upscaler notice " + std::to_string(int(provider)) + " " + running.name + " edit " +
+                                std::to_string(int(edited)) + (otherQuality ? " other quality" : ""));
+                        }
+        // Frame generation status, and the restart after DLSS FG on D3D12.
+        for (int phase = 0; phase <= int(gpu::video::FrameGenerationPhase::RestartRequired); ++phase)
+            for (const auto provider : {framegen::Provider::Dlss, framegen::Provider::Fsr, framegen::Provider::MetalFx, framegen::Provider::Xess})
+                for (const bool overridden : {false, true})
+                    for (const bool afterDlss : {false, true})
+                    {
+                        gpu::video::menuFlowFgStatus = {};
+                        gpu::video::menuFlowFgStatus.phase = gpu::video::FrameGenerationPhase(phase);
+                        gpu::video::menuFlowFgStatus.applied = provider;
+                        gpu::video::menuFlowFgStatus.requested = provider;
+                        gpu::video::menuFlowFgStatus.environmentOverride = overridden;
+                        if (afterDlss) gpu::video::menuFlowFgStatus.sessionProvider = framegen::Provider::Dlss;
+                        audit.MeasureBox(language, L"-", settings::FgNotice(), "FG notice phase " + std::to_string(phase));
+                    }
+    }
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::video::menuFlowFgStatus = savedFg;
+    currentConfig = savedConfig;
+
+    // The list pages: Controls (help over the page note), Mods, Achievements.
+    const auto savedControlsFocus = settings::controlsFocus;
+    const auto savedCaptureRow = settings::captureRow;
+    const auto savedModsFocus = settings::modsFocus;
+    const auto savedAchievementsFocus = settings::achievementsFocus;
+    const auto savedAchievements = settings::achievementItems;
+    settings::achievementItems = settings::achievements_page::MenuFlowAchievementItems(false);
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::edit.uiLanguage = language;
+        for (int focus = 0; focus < settings::ControlsRowCount; ++focus)
+            for (const int capture : {0, 1, 2})
+            {
+                settings::controlsFocus = focus;
+                settings::captureRow = capture ? focus : -1;
+                settings::captureMode = capture;
+                const auto [help, note] = settings::ControlsHelp();
+                audit.MeasureBox(language, help, note, "Controls row " + std::to_string(focus));
+            }
+        const auto rows = settings::mods_page::Layout({}, settings::mods_page::CanOpenFolder);
+        for (const int focus : {rows.empty, rows.open, rows.save})
+        {
+            if (focus < 0) continue;
+            settings::modsFocus = focus;
+            const auto [help, note] = settings::ModsHelp(rows);
+            // The mods folder path is the player's own.
+            audit.MeasureBox(language, help, note == settings::PathText(modding::Root()) ? L"" : note,
+                             "Mods row " + std::to_string(focus));
+        }
+        for (int focus = 0; focus < settings::AchievementsFirstRow + int(settings::achievementItems.size()); ++focus)
+        {
+            settings::achievementsFocus = focus;
+            audit.MeasureBox(language, settings::AchievementsHelp(), L"", "Achievements row " + std::to_string(focus));
+        }
+    }
+    settings::controlsFocus = savedControlsFocus;
+    settings::captureRow = savedCaptureRow;
+    settings::captureMode = 0;
+    settings::modsFocus = savedModsFocus;
+    settings::achievementsFocus = savedAchievementsFocus;
+    settings::achievementItems = savedAchievements;
+
+    // Full pages: neural rendering (help line and preview message), brightness, HDR peak.
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::MenuSnapshot page;
+        page.language = language;
+        page.neuralRendering.open = true;
+        for (int focus = 0; focus < settings::NrFocusCount; ++focus)
+            for (const auto blocker : {settings::NeuralRenderingTuning::Blocker::None,
+                                       settings::NeuralRenderingTuning::Blocker::MissingRuntime,
+                                       settings::NeuralRenderingTuning::Blocker::Unsupported})
+            {
+                page.neuralRendering.focus = focus;
+                page.neuralRendering.blocker = blocker;
+                audit.Measure(page, "NR page focus " + std::to_string(focus));
+            }
+        page.neuralRendering.open = false;
+        page.brightness.open = true;
+        audit.Measure(page, "Brightness page");
+        page.brightness.open = false;
+        page.calibration.open = true;
+        audit.Measure(page, "HDR peak page");
+    }
+
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    apu::menuFlowOutput = savedOutput;
+    gpu::video::menuFlowActiveGpu.clear();
+
+    std::vector<std::pair<std::pair<uint32_t, std::wstring>, HelpLine>> sorted(audit.lines.begin(), audit.lines.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.scale < b.second.scale; });
+    size_t failed = 0;
+    for (const auto& [key, line] : sorted)
+    {
+        if (line.scale >= 0.97) break;
+        const bool fails = line.scale < kMinHelpFit;
+        failed += fails;
+        std::printf("%s help fit %3d%% lang %u %s [%s]: %s\n", fails ? "FAIL" : "    ", int(line.scale * 100 + 0.5),
+                    key.first, line.face, line.where.c_str(), Utf8(key.second).c_str());
+    }
+    for (const auto& line : audit.untranslated) std::printf("FAIL untranslated: %s\n", line.c_str());
+    std::printf("help fit: %zu lines measured (%s), %zu below %d%%, %zu untranslated\n", audit.lines.size(),
+                installRoot ? "game faces" : "built-in font", failed, int(kMinHelpFit * 100), audit.untranslated.size());
+    Require(failed == 0, "a settings help line shrinks below the minimum");
+    Require(audit.untranslated.empty(), "a settings help line has no translation");
+    std::puts("PASS settings help lines keep their size in every language, state and page");
 }
 
 int main(int argc, char** argv)
@@ -1849,7 +2302,7 @@ int main(int argc, char** argv)
                     settings::snapshot.rows[settings::AudioVoiceVolumeRow].name == L"Voice volume" &&
                     settings::snapshot.rows[settings::AudioVoiceVolumeRow].sliderPercent == 100,
                     "Voice volume follows Sound effects at 100%");
-            Require(settings::snapshot.help.find(L"Spoken dialogue in cutscenes") != std::wstring::npos, "Voice volume help");
+            Require(settings::snapshot.help.find(L"Cutscene dialogue volume") != std::wstring::npos, "Voice volume help");
             settings::pending = 8; Tick(base);
             Require(settings::edit.voiceVolume == 100 && saves == beforeSaves + 1 && applies == beforeApplies,
                     "right at 100 clamps without saving");
@@ -2799,7 +3252,7 @@ int main(int argc, char** argv)
                     preview.assets = settings::menu_assets::Cached(argv[1], language);
                     Require(bool(preview.assets), "installed DLSS status assets");
                     const std::wstring expected = played
-                        ? (language ? L"已提交 DLSS 质量输出。 1707×960 - 2560×1440" : L"Submitted DLSS Quality output. 1707×960 - 2560×1440")
+                        ? (language ? L"已提交 DLSS 质量输出。1707×960 - 2560×1440" : L"Submitted DLSS Quality output. 1707×960 - 2560×1440")
                         : (language ? L"进入游戏场景后才会开始缩放。" : L"Upscaling starts once the game scene is on screen.");
                     Require(preview.notice == expected, "translated DLSS status over a menu frame");
                     std::vector<uint32_t> pixels;
@@ -3123,6 +3576,8 @@ int main(int argc, char** argv)
             std::filesystem::remove_all(sandbox);
             std::puts("PASS FSR sharpness settings.ini read, validation and save/reload roundtrip");
         }
+        CaptureHelpRows(base, argc == 3 ? argv[1] : nullptr);
+        CheckHelpFit(base, argc == 3 ? argv[1] : nullptr);
         VirtualFree(base, 0, MEM_RELEASE);
         return 0;
     }

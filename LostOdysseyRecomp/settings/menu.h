@@ -110,6 +110,11 @@ void PointerDrag(float x, float y, bool held);
 //   (menu_render.cpp).
 // - Rows that only apply to one choice (DLSS model, HDR levels) are hidden
 //   while that choice is off (GraphicsRowHidden in menu.cpp).
+// - Help text is one line and shrinks when it is too long. Graphics help shares
+//   the box with the upscaler status, so it is drawn small already: keep it to
+//   what a player needs, with the longest status it can carry, in all five
+//   languages. LoMenuFlowTest fails a line below 85% of its size (run it with
+//   the game folder to measure the game's own fonts).
 // Input, help text, pointer hits and the tests use these constants, never
 // literal row numbers.
 inline constexpr int MenuTabCount = 4;

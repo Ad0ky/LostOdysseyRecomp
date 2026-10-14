@@ -84,6 +84,24 @@ struct MenuSnapshot
     // just TitleHintBounds of the output.
     bool titleHint = false;
 };
+// How a single line of explanatory text fits its box: scale 1 when it is drawn
+// at its normal size, below 1 when the renderer shrinks it to fit the width.
+// Same face choice and metrics as RasterizeMenu; face is "body", "title", "abc"
+// (the game's faces) or "host" (the built-in font).
+struct TextFit
+{
+    std::wstring text;
+    double scale = 1;
+    const char *face = "";
+};
+// The explanatory lines of the page a snapshot shows: under the list the help
+// box (help alone, or help over the notice); on the neural rendering page its
+// help line and the preview message; on a calibration page its key legend.
+struct HelpFit
+{
+    TextFit help, notice;
+};
+HelpFit MeasureHelp(const MenuSnapshot &snapshot);
 // The list cursor arrow, top-left corner in the 1280x720 layout.
 struct MenuArrow
 {
