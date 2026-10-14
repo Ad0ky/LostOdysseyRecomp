@@ -103,17 +103,22 @@ static std::filesystem::path ExecutableDirectory()
 // D3D12. Vulkan never uses it, but SDL3 loads DXGI.DLL by name at video init,
 // which picks that copy, and NVIDIA's Vulkan driver then presents through it
 // and crashes (#323). On Vulkan, load the system copy first: later loads by
-// name bind to the module already loaded. Runs before any SDL window.
+// name bind to the module already loaded. Runs before any SDL window, and only
+// works while the exe imports no DLL that imports dxgi.dll, such as d3d11.dll
+// (keep those delay-loaded, #506).
 static void PreferSystemDxgiOnVulkan(const std::filesystem::path& executableDirectory)
 {
     std::error_code error;
     const auto local = executableDirectory / "dxgi.dll";
     if (!std::filesystem::exists(local, error)) return;
-    auto configured = settings::GraphicsBackend::D3D12;
+    // As settings::Validate: no line or an unknown value means the default backend.
+    auto configured = settings::Config{}.graphicsBackend;
     std::ifstream input(os::user_paths::SettingsPath());
     for (std::string line; std::getline(input, line);)
-        if (line.rfind("graphics_backend=", 0) == 0)
-            configured = settings::GraphicsBackend(std::strtoul(line.c_str() + 17, nullptr, 10));
+        if (line.rfind("graphics_backend=", 0) == 0) {
+            const auto saved = settings::GraphicsBackend(std::strtoul(line.c_str() + 17, nullptr, 10));
+            configured = gpu::backend::Known(saved) ? saved : settings::Config{}.graphicsBackend;
+        }
     if (gpu::backend::Requested(configured, getenv("LO_GRAPHICS_API")) != gpu::backend::Backend::Vulkan) return;
     const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     wchar_t loaded[MAX_PATH]{};
@@ -123,7 +128,8 @@ static void PreferSystemDxgiOnVulkan(const std::filesystem::path& executableDire
         return;
     }
     if (std::filesystem::equivalent(loaded, local, error))
-        LOG_WARNING("Vulkan: {} (ReShade or another D3D tool) was already loaded and may crash Vulkan presentation",
+        LOG_WARNING("Vulkan: {} (ReShade or another D3D tool) was already loaded and may crash Vulkan presentation; "
+            "remove or rename it, install ReShade for Vulkan instead, or switch the renderer to Direct3D 12",
             FileSystem::PathUtf8(local));
     else
         LOG_INFO("Vulkan: {} (ReShade or another D3D tool) is not loaded; it only works with Direct3D 12",

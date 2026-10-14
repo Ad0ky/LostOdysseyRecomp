@@ -226,8 +226,12 @@ if(LO_BUILD_GPU)
     if(WIN32)
         # Vulkan runs never load the D3D12 runtime; video.cpp probes both DLLs
         # before the D3D12 attempt so a missing one falls back instead of faulting.
+        # d3d11/mfplat serve only replacement cutscene movies. A static d3d11
+        # import pulls in dxgi.dll at process start, before main.cpp can keep a
+        # ReShade dxgi.dll out of Vulkan runs (#506).
         target_link_libraries(LostOdysseyRecomp PRIVATE d3d12 dxgi delayimp)
-        target_link_options(LostOdysseyRecomp PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll)
+        target_link_options(LostOdysseyRecomp PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll
+            /DELAYLOAD:d3d11.dll /DELAYLOAD:mfplat.dll)
     endif()
     lo_enable_dlss(LostOdysseyRecomp)
     lo_enable_streamline_fg(LostOdysseyRecomp)

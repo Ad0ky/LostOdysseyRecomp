@@ -40,7 +40,11 @@ int gMfUsers = 0;
 
 bool MfAcquire() {
     std::lock_guard lock(gMfMutex);
-    if (gMfUsers == 0 && FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))) return false;
+    // The game exe delay-loads mfplat.dll, and a failed delay load faults instead of
+    // returning. Windows N editions lack it without the Media Feature Pack.
+    if (gMfUsers == 0 && (!LoadLibraryExW(L"mfplat.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32) ||
+                          FAILED(MFStartup(MF_VERSION, MFSTARTUP_LITE))))
+        return false;
     ++gMfUsers;
     return true;
 }
@@ -86,7 +90,7 @@ public:
         if (track.samples.empty()) { error = "track has no samples"; return false; }
         if (track.bitDepth != 8 || track.chromaFormat != 1) { error = "only 8-bit 4:2:0 H.264 is supported"; return false; }
         if (!started_) {
-            if (!MfAcquire()) { error = "MFStartup failed"; return false; }
+            if (!MfAcquire()) { error = "Media Foundation unavailable"; return false; }
             started_ = true;
         }
         // The Microsoft decoder drops frames on the GPU path below 64 rows (seen at 64x32, 64x48, 96x48).
