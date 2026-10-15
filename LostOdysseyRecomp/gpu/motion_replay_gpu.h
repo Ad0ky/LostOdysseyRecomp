@@ -862,6 +862,30 @@ public:
         for (const auto& entry : retired_) if (entry.texture) ++count;
         return count;
     }
+    uint64_t HeldBytes() const {
+        uint64_t bytes = 0;
+        for (const auto& [image, format] : {std::pair{&velocity_, plume::RenderFormat::R16G16_FLOAT},
+                 std::pair{&depths_, plume::RenderFormat::R32G32_FLOAT}, std::pair{&tags_, plume::RenderFormat::R32_UINT},
+                 std::pair{&reactive_, plume::RenderFormat::R8_UNORM}, std::pair{&cameraMask_, plume::RenderFormat::R8_UNORM}})
+            if (image->texture) bytes += uint64_t(width_) * height_ * plume::RenderFormatSize(format);
+        return bytes;
+    }
+    // No temporal consumer: the targets and their framebuffers go to
+    // fence-qualified retirement. Compiled shaders and pipelines stay, so turning
+    // motion back on costs only the next BeginScene's allocation.
+    uint64_t ReleaseTargets() {
+        const uint64_t bytes = HeldBytes();
+        ++targetGeneration_;
+        free_.clear(); // completed batches; their framebuffers bind the targets
+        Retire(drawFramebuffer_, boundDepth_); Retire(clearFramebuffer_);
+        boundDepth_ = nullptr;
+        for (Image* image : {&velocity_, &depths_, &tags_, &reactive_, &cameraMask_}) {
+            if (image->texture) retired_.push_back({serial_, nullptr, {}, std::move(image->texture)});
+            image->layout = plume::RenderTextureLayout::UNKNOWN;
+        }
+        width_ = height_ = 0;
+        return bytes;
+    }
     // A later TAA/diagnostic read may be in another submission than Finish().
     // Include it before that submission is stamped by the renderer.
     void RecordConsumerUse() { ++serial_; }

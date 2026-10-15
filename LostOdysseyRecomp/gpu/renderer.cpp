@@ -1541,6 +1541,48 @@ namespace gpu::renderer
             float srFrameDeltaMilliseconds = 0;
             bool srTimeReset = true;
             bool actualRasterJitterCaptured=false;
+            // With no temporal consumer, history and motion targets are released
+            // once the Settings menu closes, or after kTemporalIdleRelease if the
+            // change came another way. Settings applies TAA and upscaler choices
+            // while the menu stays open, so nothing is released until it closes.
+            // Replay shaders and pipelines stay: they are what a re-enable would wait for.
+            static constexpr std::chrono::seconds kTemporalIdleRelease{10};
+            std::chrono::steady_clock::time_point temporalIdleSince{};
+            bool temporalIdleMenu = false, temporalImagesHeld = false, temporalRecreateLog = false;
+            uint64_t TemporalImageBytes()
+            {
+                uint64_t bytes = motionReplay ? motionReplay->HeldBytes() : 0;
+                for (auto* owner : {temporalHistory.get(), hdrTemporalHistory.get(), sceneTaaHdrHistory.get()})
+                    if (owner) bytes += owner->HeldBytes();
+                return bytes;
+            }
+            // Once per frame, with this frame's consumer selection.
+            void UpdateTemporalIdle(bool active)
+            {
+                if (active) {
+                    temporalIdleSince = {}; temporalIdleMenu = false; temporalImagesHeld = true;
+                    if (temporalRecreateLog)
+                        if (const uint64_t bytes = TemporalImageBytes()) {
+                            temporalRecreateLog = false;
+                            LOG_INFO("renderer: temporal consumer back; history and motion targets recreated ({:.1f} MiB)", double(bytes) / (1 << 20));
+                        }
+                    return;
+                }
+                if (!temporalImagesHeld) return;
+                const auto now = std::chrono::steady_clock::now();
+                if (temporalIdleSince == std::chrono::steady_clock::time_point{}) temporalIdleSince = now;
+                if (video::IsHostOverlayActive()) { temporalIdleMenu = true; return; }
+                if (!temporalIdleMenu && now - temporalIdleSince < kTemporalIdleRelease) return;
+                uint64_t bytes = 0;
+                for (auto* owner : {temporalHistory.get(), hdrTemporalHistory.get(), sceneTaaHdrHistory.get()})
+                    if (owner) bytes += owner->ReleaseImages();
+                if (motionReplay) bytes += motionReplay->ReleaseTargets();
+                motionView = {};
+                hdrTemporalOutput = sceneTaaHdrOutput = sceneTaaHdrSource = sceneTaaSdrOutput = nullptr;
+                temporalSupportedFrame = ~0ull; ++temporalEpoch;
+                temporalImagesHeld = false; temporalRecreateLog = bytes != 0;
+                if (bytes) LOG_INFO("renderer: no temporal consumer; released {:.1f} MiB of history and motion targets", double(bytes) / (1 << 20));
+            }
             uint64_t appliedPlanEpoch=~0ull;
             resolution::Size internalSize{}, requestedInternalSize{};
             resolution::ShadowResolutionState shadowState;
@@ -9762,6 +9804,7 @@ void main()
                             LOG_ERROR("renderer: HDR scene TAA twin initialization failed; HDR pauses under TAA");
                         }
                     }
+                    UpdateTemporalIdle(temporal::TemporalConsumerActive(temporalExperiment, temporalInputProbe, dlssSrRequested, nativeFgInputs));
                 }
                 const bool temporalActive = temporal::TemporalConsumerActive(temporalExperiment, temporalInputProbe, dlssSrRequested, nativeFgInputs);
                 const bool trackTemporalScene = !debugCaptureDir.empty() || temporalActive || activeSpatialAA || aoActive;

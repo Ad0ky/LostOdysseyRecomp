@@ -33,6 +33,11 @@ class SrHybridMotionGPU {
     Batch* active_ = nullptr;
     uint64_t completed_ = 0;
     bool initAttempted_ = false, resourceFailed_ = false;
+    bool releasing_ = false; // No consumer: batches go as their fences complete.
+    void DropCompleted() {
+        std::erase_if(batches_, [this](const auto& batch) { return batch->serial <= completed_; });
+        releasing_ = !batches_.empty();
+    }
     static constexpr size_t kMaxBatches = 8;
     static void Describe(plume::RenderDescriptorSetBuilder& b) {
         b.begin(); b.addTexture(0); b.addTexture(1); b.addTexture(2);
@@ -122,12 +127,26 @@ public:
     void RecordConsumerUse(uint64_t serial) {
         if (active_) active_->serial = std::max(active_->serial,serial);
     }
-    void ReleaseCompletedThrough(uint64_t serial) { completed_ = std::max(completed_,serial); }
+    void ReleaseCompletedThrough(uint64_t serial) {
+        completed_ = std::max(completed_,serial);
+        if (releasing_) DropCompleted();
+    }
+    uint64_t HeldBytes() const {
+        uint64_t bytes = 0;
+        for (const auto& batch : batches_)
+            bytes += uint64_t(batch->width) * batch->height * (plume::RenderFormatSize(plume::RenderFormat::R16G16_FLOAT) +
+                plume::RenderFormatSize(plume::RenderFormat::R8_UNORM));
+        return bytes;
+    }
+    // No temporal consumer: completed batches go now, the others once their
+    // fences complete. The pipeline stays; Render allocates again.
+    void Release() { active_ = nullptr; DropCompleted(); }
     MotionFrameView Render(plume::RenderDevice* device, plume::RenderCommandList* commands,
         plume::RenderTexture* depth, const Camera& current, const Camera* previous,
         const MotionFrameView* geometry, uint64_t frame, uint64_t epoch, uint64_t allocation,
         uint32_t width, uint32_t height, double jx, double jy, bool reset, uint64_t serial) {
         resourceFailed_ = false;
+        releasing_ = false;
         if (!device || !commands || !serial ||
             !ImageMatches(depth,device,width,height,plume::RenderFormat::R32_FLOAT,VK_FORMAT_R32_SFLOAT)) return {};
         // A stale ready view is a contract failure, not a coverage gap.
