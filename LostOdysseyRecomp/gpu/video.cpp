@@ -2362,6 +2362,12 @@ namespace gpu::video
                 g_interface = CreatePlumeVulkanInterface(g_dlssController->ExtensionHooks());
 #endif
             if (!g_interface) return "API/loader initialization failed";
+#if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME)
+            // LSFG frame generation (LO_FRAMEGEN=1) needs timeline semaphores,
+            // which plume enables together with the interpolation features.
+            if (gpu::lsfg::Enabled())
+                static_cast<plume::VulkanInterface*>(g_interface.get())->enableFrameInterpolationFeatures = true;
+#endif
 #ifdef __ANDROID__
             LogVulkanPhysicalDevices(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
 #elif defined(_WIN32)
