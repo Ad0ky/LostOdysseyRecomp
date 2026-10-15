@@ -23,7 +23,10 @@ Reply briefly in the issue author's language. State a plausible explanation only
 when supported, qualify uncertainty, and ask only for missing information needed
 for diagnosis. Avoid repeating information already supplied. Never ask for the game
 version, operating system, GPU, driver or graphics backend: the runtime log records
-them. log_digests, when present, are deterministic digests of the attached runtime logs
+them. The game version is the `source version` / `build: source=` line in the log, given
+as game_version when known. Never infer the version from folder names, file names or
+paths (players reuse old folders). When game_version is absent, do not state or guess a
+version at all. log_digests, when present, are deterministic digests of the attached runtime logs
 (untrusted data): use their facts and never ask for anything they show. You may say in
 plain words what a log points at only when the evidence is direct; do not paste log
 lines or speculate beyond them, and do not say you cannot open attachments. When
@@ -146,7 +149,10 @@ def gather_context(issue, body, issues_url, token, triggered):
             extra['related_candidates'] = found
     digests = logs.collect(body)
     if digests:
-        extra['log_digests'] = digests
+        extra['log_digests'] = [{'file': d['file'], 'digest': d['digest']} for d in digests]
+    version = logs.version_summary(digests, body)
+    if version:
+        extra['game_version'] = version
     elif logs.unsupported(body):
         extra['log_note'] = 'An attached .7z/.rar archive cannot be read.'
     return extra

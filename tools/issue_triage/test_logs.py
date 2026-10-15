@@ -64,6 +64,39 @@ class LogTests(unittest.TestCase):
         result = logs.collect(f'{zip_url} {bad_url}', fetch)
         self.assertEqual([r['file'] for r in result], ['logs.zip/logs/runtime-100.log'])
 
+    def test_version_comes_from_log_not_path(self):
+        log = ('[    0.0 t1] [note]  source version: 0.9.52\n'
+               '[    0.1 t1] [note]  build: source=0.9.52 revision=9769f12e5293\n'
+               '[    0.2 t1] [note]  game folder: D:\\Games\\LostOdysseyRecomp-windows-x64-v0.5.11\\logs\n')
+        text = logs.digest(log)
+        self.assertIn('Header facts:\ngame version (from log): 0.9.52 (revision 9769f12e5293)', text)
+        self.assertEqual(logs.log_version(log), ('0.9.52', '9769f12e5293'))
+        summary = logs.version_summary([{'file': 'runtime-1.log', 'version': logs.log_version(log)}])
+        self.assertEqual(summary, 'game version (from log): 0.9.52 (revision 9769f12e5293)')
+
+    def test_two_logs_label_each_version_and_newest(self):
+        def fetch(url, limit=logs.MAX_DOWNLOAD):
+            return LOG.replace('0.9.52', '0.9.0') if '/1/' in url else LOG
+        body = ('https://github.com/user-attachments/files/1/runtime-100.log '
+                'https://github.com/user-attachments/files/2/runtime-300.log')
+        entries = logs.collect(body, fetch)
+        summary = logs.version_summary(entries, 'source version: 0.9.0')
+        self.assertEqual([e['file'] for e in entries], ['runtime-300.log', 'runtime-100.log'])
+        self.assertIn('game version (from log): 0.9.52', summary)
+        self.assertIn('runtime-300.log: 0.9.52; runtime-100.log: 0.9.0', summary)
+        self.assertIn('Newest log: runtime-300.log', summary)
+        self.assertIn('pastes a log excerpt saying 0.9.0', summary)
+
+    def test_no_version_line_claims_nothing(self):
+        log = '[    0.1 t1] [note]  settings: backend=1\n[    1.0 t2] [warn]  hmm\n'
+        self.assertIsNone(logs.log_version(log))
+        self.assertNotIn('game version', logs.digest(log))
+        self.assertIsNone(logs.version_summary([{'file': 'a.log', 'version': None}], 'path LostOdysseyRecomp-v0.5.11'))
+
+    def test_pasted_excerpt_used_when_no_attached_log(self):
+        summary = logs.version_summary([], '```\n[ 0.1 t1] [note]  source version: 0.9.0\n```')
+        self.assertIn('pasted in the issue): 0.9.0', summary)
+
     def test_redirect_outside_github_refused(self):
         with self.assertRaises(logs.LogError):
             logs.SameFamilyRedirect().redirect_request(None, None, 302, '', {}, 'https://evil.example/x')

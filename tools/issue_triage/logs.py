@@ -22,6 +22,9 @@ ALLOWED_HOSTS = ('github.com', 'githubusercontent.com')
 LINE = re.compile(r'^\[\s*[\d.]+ \w+\] \[(\w+)\]\s+(.*)$')
 HEADER = re.compile(r'(source version|build:|host OS|host architecture|mods:|game edition|settings:|'
                     r'LO_\* switches|video device:|video: \w+ on )', re.I)
+VERSION = r'\d+(?:\.\d+)+(?:[-+][\w.]+)?'
+SOURCE_VERSION = re.compile(r'source version:\s*(' + VERSION + ')', re.I)
+BUILD_SOURCE = re.compile(r'build:.*?\bsource=(' + VERSION + r')(?:.*?\brevision=([0-9a-f]{6,40}))?', re.I)
 LEVELS = ('warn', 'warning', 'error', 'fatal', 'crit', 'critical')
 
 
@@ -73,9 +76,60 @@ def _cut(line, size):
     return line if len(line) <= size else line[:size - 3] + '...'
 
 
+def log_version(text, scan=120):
+    """(version, revision or None) from the `source version:` / `build: source=... revision=...` header lines, else None.
+    Only these lines count: folder names, file names and paths say nothing about the running build."""
+    version = revision = None
+    for line in text.splitlines()[:scan]:
+        m = SOURCE_VERSION.search(line)
+        if m and not version:
+            version = m.group(1)
+        m = BUILD_SOURCE.search(line)
+        if m:
+            version = version or m.group(1)
+            revision = revision or m.group(2)
+    return (version, revision) if version else None
+
+
+def _describe(found):
+    return found[0] + (f' (revision {found[1]})' if found[1] else '')
+
+
+def pasted_versions(body):
+    """Distinct versions named by log header lines pasted into the issue text, in order of appearance."""
+    text = str(body or '')
+    found = [m.group(1) for m in sorted(list(SOURCE_VERSION.finditer(text)) + list(BUILD_SOURCE.finditer(text)),
+                                        key=lambda m: m.start())]
+    return list(dict.fromkeys(found))
+
+
+def version_summary(entries, body=''):
+    """One plain statement of the game version, from attached logs (newest first) and pasted log text; None if unknown."""
+    seen = [(e['file'], e['version']) for e in entries if e.get('version')]
+    pasted = pasted_versions(body)
+    if seen:
+        newest_name, newest = seen[0]
+        text = f'game version (from log): {_describe(newest)}'
+        if len(entries) > 1:
+            text += '. Attached logs, newest first: ' + '; '.join(
+                f'{name}: {_describe(v)}' if v else f'{name}: no version line' for name, v in
+                [(e['file'], e.get('version')) for e in entries]) + f'. Newest log: {newest_name}'
+        others = [v for v in pasted if v != newest[0]]
+        if others:
+            text += ('. The issue text also pastes a log excerpt saying ' + ', '.join(others)
+                     + '; the attached newest log takes precedence')
+        return text
+    if pasted:
+        return 'game version (from log excerpt pasted in the issue): ' + ', '.join(pasted) +             ('. Excerpts disagree; the version is uncertain' if len(pasted) > 1 else '')
+    return None
+
+
 def digest(text, issues=60, tail=60, cut=220):
     lines = text.splitlines()
     header = []
+    found = log_version(text)
+    if found:
+        header.append('game version (from log): ' + _describe(found))
     for line in lines[:120]:
         m = LINE.match(line)
         if m and m.group(1).lower() not in LEVELS and HEADER.match(m.group(2)):
@@ -153,10 +207,14 @@ def collect(body, fetch=download):
                 sources.append((name, fetch(url)))
         except LogError:
             continue
+    def newest(item):
+        m = re.search(r'runtime-(\d+)\.log$', item[0], re.I)
+        return int(m.group(1)) if m else 0
+    sources.sort(key=newest, reverse=True)
     for name, text in sources[:MAX_LOGS]:
         if TOTAL - used < 1000:
             break
         item = fit(text, min(PER_LOG, TOTAL - used))
-        result.append({'file': name, 'digest': item})
+        result.append({'file': name, 'version': log_version(text), 'digest': item})
         used += len(item)
     return result
