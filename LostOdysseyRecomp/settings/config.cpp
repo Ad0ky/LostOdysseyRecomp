@@ -35,7 +35,7 @@ Config Validate(Config value)
     value.gameLanguagePack = PackId(std::move(value.gameLanguagePack));
     if (value.displayName.empty() || value.displayIndex > 63) value.displayIndex = 0;
     if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative &&
-        value.internalResolution != 720 && value.internalResolution != 1080 &&
+        value.internalResolution != 540 && value.internalResolution != 720 && value.internalResolution != 1080 &&
         value.internalResolution != 1440 && value.internalResolution != 2160)
         value.internalResolution = 0;
 #if LO_PLATFORM_MACOS
