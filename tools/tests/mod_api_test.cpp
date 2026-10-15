@@ -123,17 +123,22 @@ void Resolution(const fs::path& root) {
     Write(overlay, Lotex(key));
     assert(Resolve(request)->modId == "provider");
     Reload(); assert(Resolve(request)->modId == "@overlay");
+    // Every mode reads all three; overlay (kept for old launch options) orders them like combined.
     Env("LO_MODS_MODE", "overlay"); Reload();
-    const auto calls = provider->calls;
     assert(Mode() == ResolutionMode::Overlay && Resolve(request)->modId == "@overlay");
     fs::remove(overlay);
-    assert(!Resolve(request) && provider->calls == calls); // A disabled manager mod cannot reappear via a provider/manifest.
+    assert(Resolve(request)->modId == "provider");
     Write(overlay, Lotex(key));
     Env("LO_MODS_MODE", "standalone"); Reload();
     assert(Resolve(request)->modId == "provider");
     UnregisterProvider(AssetKind::Image, provider.get());
     provider.reset();
-    assert(Resolve(request)->modId == "first");
+    assert(Resolve(request)->modId == "first"); // standalone: mod folders before the top-level overlay,
+    const std::string onlyKey = "bin/xenon/loc/int/menu/test.xxx#22:Only_Overlay";
+    const AssetRequest onlyOverlay{{AssetKind::Image, onlyKey}, {}};
+    Write(root / OverlayRelativePath(onlyOverlay.id), Lotex(onlyKey));
+    Reload(); assert(Resolve(onlyOverlay)->modId == "@overlay"); // which still fills in what no mod folder has
+    fs::remove(root / OverlayRelativePath(onlyOverlay.id));
     Env("LO_MODS", "0"); Reload(); assert(!Resolve(request));
     Env("LO_MODS", nullptr); Env("LO_MODS_MODE", "invalid"); Reload();
     assert(!Resolve(request) && !Diagnostics().empty());
@@ -281,7 +286,9 @@ void Textures(const fs::path& root) {
     assert(Resolve(texture)->modId == "@overlay" && !ReadTextureReplacement(fingerprint, 18, 2, 2, UINT64_MAX, &error));
     fs::remove_all(root / "tex"); fs::remove_all(overlay.parent_path());
     BlockCompressedTextures(root, fingerprint);
-    Env("LO_MODS_MODE", "overlay"); Reload(); assert(!HasTextureReplacements());
+    Reload();
+    const bool textures = HasTextureReplacements();
+    Env("LO_MODS_MODE", "overlay"); Reload(); assert(HasTextureReplacements() == textures);
     Env("LO_MODS_MODE", nullptr); Reload();
 }
 void Texts(const fs::path& root) {
@@ -303,9 +310,10 @@ void Texts(const fs::path& root) {
     Reload();
     texts = ListTexts();
     assert(texts.size() == 2 && texts[0].modId == "@overlay" && texts[1].id.key == jmd && Resolve(text)->modId == "@overlay");
-    Env("LO_MODS_MODE", "standalone"); Reload();
+    Env("LO_MODS_MODE", "standalone"); Reload(); // the mod folder wins; the overlay still adds the other file
     texts = ListTexts();
-    assert(texts.size() == 1 && texts[0].modId == "lang");
+    assert(texts.size() == 2 && texts[0].modId == "lang" && texts[1].id.key == jmd && texts[1].modId == "@overlay" &&
+           Resolve(text)->modId == "lang");
     Env("LO_MODS_MODE", nullptr);
     fs::remove_all(root / "lang"); fs::remove_all(root / "overlay/text"); Reload();
     assert(ListTexts().empty());
@@ -327,8 +335,18 @@ void Languages(const fs::path& root) {
     const auto texts = ListTexts(packs[0]);
     assert(texts.size() == 1 && texts[0].id.key == menu && texts[0].modId == "pt-br");
     assert(ListTexts().empty()); // A pack applies only when selected.
+    // fonts/<package path>/<font>.lofont, keyed <package path>#<font>; the font name keeps its case.
+    const std::string fonts = "bin/xenon/loc/int/menu/rpfontscommon_int.xxx";
+    Write(root / "pt/fonts" / fonts / "Maru23.lofont", "x");
+    Write(root / "pt/fonts/BIN/Xenon/loc/int/menu/rpfontstitle_int.xxx/Title.LOFONT", "x");
+    Write(root / "pt/fonts" / fonts / "notes.txt", "x");
+    Write(root / "pt/fonts/Loose.lofont", "x");
+    Reload();
+    const auto glyphs = ListFonts(LanguagePacks()[0]);
+    assert(glyphs.size() == 2 && glyphs[0].id.kind == AssetKind::Font && glyphs[0].id.key == fonts + "#Maru23" &&
+           glyphs[1].id.key == "bin/xenon/loc/int/menu/rpfontstitle_int.xxx#Title" && glyphs[0].modId == "pt-br");
     Env("LO_MODS_MODE", "overlay"); Reload(); assert(LanguagePacks().size() == 1);
-    Env("LO_MODS", "0"); Reload(); assert(LanguagePacks().empty() && ListTexts(packs[0]).empty());
+    Env("LO_MODS", "0"); Reload(); assert(LanguagePacks().empty() && ListTexts(packs[0]).empty() && ListFonts(packs[0]).empty());
     Env("LO_MODS", nullptr); Env("LO_MODS_MODE", nullptr);
     for (const auto* dir : {"pt", "bad", "zz-copy"}) fs::remove_all(root / dir);
     Reload(); assert(LanguagePacks().empty());
@@ -453,12 +471,11 @@ void FormatV2(const fs::path& root, const fs::path& list) {
     Write(overlay, tex);
     Reload(); assert(Resolve(texture)->modId == "@overlay");
     Env("LO_MODS_MODE", "standalone"); Reload(); assert(Resolve(texture)->modId == "zz");
-    Env("LO_MODS_MODE", "overlay"); Reload();
+    Env("LO_MODS_MODE", "overlay"); Reload(); // mod folders still load, after the overlay
     {
         const auto mods = ListMods();
-        assert(Resolve(texture)->modId == "@overlay" && !Resolve({{AssetKind::Texture, "00000000000000cd"}, {}}));
-        assert(Find(mods, "hd") && std::none_of(mods.begin(), mods.end(), [](const ModInfo& m) { return m.active; }));
-        assert(ModIds().empty() && ListTexts().empty());
+        assert(Resolve(texture)->modId == "@overlay" && Resolve({{AssetKind::Texture, "00000000000000cd"}, {}})->modId == "hd");
+        assert(Find(mods, "hd")->active && !ModIds().empty() && !ListTexts().empty());
     }
     Env("LO_MODS_MODE", nullptr);
     fs::remove_all(overlay.parent_path());
@@ -482,6 +499,156 @@ void FormatV2(const fs::path& root, const fs::path& list) {
 
     fs::remove_all(root / "hd"); fs::remove_all(root / "zz"); fs::remove(list);
     Reload(); assert(!HasTextureReplacements());
+}
+// A .loarc as lo_mod.py archive writes it; sorted = false keeps the given name order.
+std::string Loarc(std::vector<std::pair<std::string, std::string>> entries, uint32_t kinds, bool sorted = true) {
+    if (sorted) std::sort(entries.begin(), entries.end());
+    auto put = [](std::string& out, uint64_t value, int bytes) { for (int i = 0; i != bytes; ++i) out.push_back(char(value >> (8 * i))); };
+    std::string data(64, '\0'), index;
+    for (const auto& [name, bytes] : entries) {
+        data.resize((data.size() + 4095) / 4096 * 4096, '\0');
+        put(index, data.size(), 8); put(index, bytes.size(), 8); put(index, name.size(), 4);
+        index += name;
+        data += bytes;
+    }
+    std::string header("LOARC1\r\n", 8);
+    put(header, 64, 4); put(header, entries.size(), 4); put(header, data.size(), 8); put(header, index.size(), 8); put(header, kinds, 4);
+    header.resize(64, '\0');
+    return header + data.substr(64) + index;
+}
+// A mod's overlay/ files as one overlay.loarc; loose files of the same mod win.
+void Archives(const fs::path& root) {
+    const AssetRequest ab{{AssetKind::Texture, "00000000000000ab"}, {}}, cd{{AssetKind::Texture, "00000000000000cd"}, {}};
+    const auto texAb = Lotex2(0xab, 18, 2, 2, std::string(16, 'p')), texCd = Lotex2(0xcd, 18, 2, 2, std::string(16, 'q'));
+    const std::string menu = "bin/xenon/loc/int/menu/menu_int.dat", json = "{\"a\":\"b\"}";
+    const uint32_t kinds = 1u << uint32_t(AssetKind::Texture) | 1u << uint32_t(AssetKind::Text) | 1u << uint32_t(AssetKind::Image);
+    const auto archive = root / "arc/overlay.loarc";
+    Write(root / "arc/mod.ini", "api_version=2\nid=arc\npriority=100\n");
+    Write(archive, Loarc({{"overlay/textures/fp-00000000000000ab.lotex2", texAb}, {"overlay/textures/fp-00000000000000cd.lotex2", texCd},
+        {"overlay/text/" + menu + ".json", json}, {OverlayRelativePath(request.id).generic_string(), Lotex(key)},
+        {"overlay/future/x.bin", "x"}}, kinds));
+    Reload();
+    assert(HasTextureReplacements());
+    const auto resolved = Resolve(ab);
+    assert(resolved && resolved->modId == "arc" && resolved->path == archive && resolved->offset % 4096 == 0 && resolved->size == texAb.size());
+    assert(DescribeAsset(*resolved).ends_with(".loarc:overlay/textures/fp-00000000000000ab.lotex2"));
+    assert(ReadTextureReplacement(0xab, 18, 2, 2, UINT64_MAX) && ReadTextureReplacement(0xcd, 18, 2, 2, UINT64_MAX));
+    assert(Resolve(request)->modId == "arc" && ReadImageReplacement(request, 2, 1));
+    const auto texts = ListTexts();
+    assert(texts.size() == 1 && texts[0].modId == "arc" && texts[0].size == json.size());
+    {
+        std::ifstream in;
+        uint64_t length = 0;
+        std::string bytes(json.size(), '\0');
+        assert(OpenAsset(texts[0], in, length) && length == json.size() && in.read(bytes.data(), bytes.size()) && bytes == json);
+        const auto mods = ListMods();
+        const auto* arc = Find(mods, "arc");
+        assert(arc && arc->overlayFiles == 4 && arc->problems.size() == 1); // the unknown name is skipped and reported
+    }
+    // A loose file beats the same name in the mod's archive.
+    Write(root / "arc" / OverlayRelativePath(ab.id), texAb);
+    Reload();
+    assert(Resolve(ab)->size == kWholeFile && Resolve(cd)->path == archive);
+    // An archive that shrank after Initialize fails in the reader; at the next
+    // Initialize its header is rejected and the mod keeps only its loose files.
+    fs::resize_file(archive, 4096 + 8);
+    std::string error;
+    assert(!ReadTextureReplacement(0xcd, 18, 2, 2, UINT64_MAX, &error) && error.find(".loarc:overlay/textures/") != std::string::npos);
+    Reload();
+    assert(!Resolve(cd) && Resolve(ab) && Find(ListMods(), "arc")->problems.size() == 1);
+    // A damaged index adds nothing.
+    Write(archive, Loarc({{"overlay/textures/fp-00000000000000cd.lotex2", texCd}, {"overlay/textures/fp-00000000000000ab.lotex2", texAb}}, kinds, false));
+    Reload();
+    assert(!Resolve(cd) && Find(ListMods(), "arc")->problems.size() == 1);
+    fs::remove_all(root / "arc");
+    Reload(); assert(!HasTextureReplacements());
+}
+// Movie keys are the original file name stem; replacements are MP4 files.
+void Movies(const fs::path& root) {
+    const AssetRequest mv{{AssetKind::Movie, "mv_00v"}, {}};
+    assert(OverlayRelativePath({AssetKind::Movie, "MV_00V"}) == fs::path("overlay/movies/mv_00v.mp4"));
+    for (const auto* bad : {"../x", "mv.00v", "", "a/b", "a\\b", "a#1:b", "mv 00v", "mv-00v"})
+        assert(OverlayRelativePath({AssetKind::Movie, bad}).empty() && !Resolve({{AssetKind::Movie, bad}, {}}));
+    assert(!OverlayRelativePath({AssetKind::Movie, std::string(64, 'a')}).empty());
+    assert(OverlayRelativePath({AssetKind::Movie, std::string(65, 'a')}).empty());
+    // A manifest line, any key case.
+    Write(root / "mvm/movies/mv_00v.mp4", "mp4");
+    Write(root / "mvm/mod.ini", "api_version=1\nid=mvm\nmovie:MV_00V=movies/mv_00v.mp4\nmovie:../x=movies/mv_00v.mp4\n");
+    Initialize(root);
+    {
+        const auto resolved = Resolve({{AssetKind::Movie, "Mv_00V"}, {}});
+        assert(resolved && resolved->modId == "mvm" && resolved->id.key == "mv_00v" && resolved->size == kWholeFile);
+        assert(Find(ListMods(), "mvm")->manifestEntries == 1 && Find(ListMods(), "mvm")->problems.size() == 1);
+        assert(!Resolve({{AssetKind::Movie, "mv_01v"}, {}}));
+    }
+    fs::remove_all(root / "mvm");
+    // A loose file in an api_version=2 folder, file name in any case.
+    Write(root / "mvl/mod.ini", "api_version=2\nid=mvl\n");
+    Write(root / "mvl/overlay/Movies/MV_00V.mp4", "mp4");
+    Write(root / "mvl/overlay/movies/mv.00v.mp4", "x");
+    Write(root / "mvl/overlay/movies/mv_00v.loasset", "x");
+    Reload();
+    {
+        const auto resolved = Resolve(mv);
+        assert(resolved && resolved->modId == "mvl" && resolved->id.key == "mv_00v" && resolved->size == kWholeFile);
+        assert(Find(ListMods(), "mvl")->overlayFiles == 1);
+    }
+    fs::remove_all(root / "mvl");
+    // An archive entry.
+    const auto archive = root / "mva/overlay.loarc";
+    Write(root / "mva/mod.ini", "api_version=2\nid=mva\n");
+    Write(archive, Loarc({{"overlay/movies/mv_00v.mp4", "mp4data"}, {"overlay/movies/MV_01V.mp4", "x"}}, 1u << uint32_t(AssetKind::Movie)));
+    Reload();
+    {
+        const auto resolved = Resolve(mv);
+        assert(resolved && resolved->modId == "mva" && resolved->path == archive && resolved->size == 7);
+        assert(DescribeAsset(*resolved).ends_with(".loarc:overlay/movies/mv_00v.mp4"));
+        std::ifstream in;
+        uint64_t length = 0;
+        std::string bytes(7, '\0');
+        assert(OpenAsset(*resolved, in, length) && length == 7 && in.read(bytes.data(), 7) && bytes == "mp4data");
+        assert(!Resolve({{AssetKind::Movie, "mv_01v"}, {}})); // archive names must already be lower case
+        assert(Find(ListMods(), "mva")->overlayFiles == 1 && Find(ListMods(), "mva")->problems.size() == 1);
+    }
+    fs::remove_all(root / "mva");
+    Reload();
+}
+// Model keys are package#export:object; the file sits at the path --export-assets gives the model.
+void Models(const fs::path& root) {
+    assert(OverlayRelativePath({AssetKind::Model, "Bin/Xenon/chr/pc/pc_000a0_m.xxx#0:pc_000a0_m"}) ==
+           fs::path("overlay/models/bin/xenon/chr/pc/pc_000a0_m.xxx/pc_000a0_m.0.glb").make_preferred());
+    // Loose files in an api_version=2 folder; names without a package folder or export index are skipped.
+    Write(root / "mdl/mod.ini", "api_version=2\nid=mdl\n");
+    Write(root / "mdl/overlay/models/bin/xenon/chr/pc/pc_000a0_m.xxx/pc_000a0_m.0.glb", "glb");
+    Write(root / "mdl/overlay/models/pc_010a0_m.0.glb", "x");
+    Write(root / "mdl/overlay/models/a.xxx/pc_010a0_m.glb", "x");
+    Initialize(root);
+    {
+        const auto models = ListModels();
+        assert(models.size() == 1 && models[0].id.key == "bin/xenon/chr/pc/pc_000a0_m.xxx#0:pc_000a0_m" && models[0].modId == "mdl");
+        assert(Find(ListMods(), "mdl")->overlayFiles == 1);
+    }
+    // Every mode reads both layouts: the top-level overlay wins, except in standalone.
+    Write(root / "overlay/models/bin/xenon/chr/pc/pc_000a0_m.xxx/pc_000a0_m.0.glb", "glb");
+    for (const std::string mode : {"combined", "overlay", "standalone"}) {
+        Env("LO_MODS_MODE", mode.c_str()); Reload();
+        const auto models = ListModels();
+        assert(models.size() == 1 && models[0].modId == (mode == "standalone" ? "mdl" : "@overlay"));
+    }
+    Env("LO_MODS_MODE", nullptr);
+    fs::remove_all(root / "overlay/models");
+    fs::remove_all(root / "mdl");
+    // An archive entry (names are lower case).
+    const auto archive = root / "mda/overlay.loarc";
+    Write(root / "mda/mod.ini", "api_version=2\nid=mda\n");
+    Write(archive, Loarc({{"overlay/models/a.xxx/m.3.glb", "glb"}}, 1u << uint32_t(AssetKind::Model)));
+    Reload();
+    {
+        const auto models = ListModels();
+        assert(models.size() == 1 && models[0].id.key == "a.xxx#3:m" && models[0].path == archive && models[0].size == 3);
+    }
+    fs::remove_all(root / "mda");
+    Reload(); assert(ListModels().empty());
 }
 // LO_MOD_TEST_INDEX_FILES=<n>: time Initialize over one mod with n texture files.
 void IndexBench(const fs::path& root) {
@@ -530,7 +697,10 @@ int main() {
     Texts(root);
     Languages(root);
     FormatV2(root, temp.path / "mod-list.ini");
+    Archives(root);
+    Movies(root);
+    Models(root);
     IndexBench(root);
     Shutdown(); assert(!Resolve(request));
-    std::cout << "Mod API, image, texture, text and language pack contracts, mod folders and mod list, manager isolation and reload tests passed\n";
+    std::cout << "Mod API, image, texture, text and language pack contracts, mod folders, archives and mod list, mods modes and reload tests passed\n";
 }

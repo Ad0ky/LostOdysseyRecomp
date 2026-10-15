@@ -51,6 +51,9 @@ struct NeuralRenderingTuning
 {
     bool open = false;
     bool sceneAvailable = false; // a DLSS frame is held for the preview
+    // Why the preview cannot appear even in a DLSS scene.
+    enum class Blocker : uint8_t { None, MissingRuntime, Unsupported };
+    Blocker blocker = Blocker::None;
     uint32_t passes = 0;
     uint32_t preset = 0, style = 0;
     uint32_t intensity = 100, globalTone = 100, localTone = 100, structure = 100;
@@ -85,34 +88,48 @@ BrightnessCalibration GetBrightnessCalibration();
 bool CalibrationKey(uint32_t key);
 void PointerDrag(float x, float y, bool held);
 // Settings menu layout rules. Follow them when adding or moving a row:
-// - Tabs: 0 Gameplay (retail game options, controller options, game actions),
+// - Tabs: 0 Gameplay (retail game options, Controls page, game actions),
 //   1 Audio (voice language, volumes, audio output, rear angle), 2 Graphics (display, rendering,
-//   frame rate, HDR), 3 System (interface and game language, updates, TAA
-//   shader collection, Mods, Import discs & DLC, Save).
+//   frame rate, HDR), 3 System (interface and game language, updates, debug log,
+//   Achievements, TAA shader collection, Mods, Import discs & DLC, Shader bundle, Save).
 // - Gameplay starts with the seven retail guest settings in their retail order;
 //   host rows follow them.
-// - Host rows are grouped by topic. Controller rows (button prompts, vibration,
-//   future ones) go to Gameplay, not Audio.
-// - Actions come last on their tab: Restore / Quit to Main Menu on Gameplay,
-//   Brightness / Save on Graphics, Mods / Import / Save on System.
+// - Host rows are grouped by topic. Controller and keyboard settings (button
+//   prompts, vibration, button and key layouts, future ones) go on the
+//   Controls page, opened from Gameplay's Controls row; not on Audio.
+// - Actions come last on their tab: Controls / Restore / Quit to Main Menu on
+//   Gameplay, Brightness / Save on Graphics, Mods / Import / Shader bundle /
+//   Save on System.
 // - Gameplay, Audio and System fit the visible rows (kMenuVisibleRows) and never
-//   scroll; only Graphics scrolls.
-// - Graphics order: display -> resolution and shadows -> anti-aliasing,
+//   scroll; only Graphics scrolls. The pages opened from a row (Mods,
+//   Controls, Achievements) may scroll.
+// - Graphics order: display -> graphics preset -> resolution and shadows -> anti-aliasing,
 //   upscaling (quality, DLSS model, FSR sharpness), DLSS neural rendering and
-//   frame generation -> effects -> frame rate -> HDR and brightness -> Save. A
-//   divider opens each group after the first (menu_render.cpp).
+//   frame generation -> effects -> frame rate (VSync, performance overlay) ->
+//   HDR and brightness -> Save. A divider opens each group after the first
+//   (menu_render.cpp).
 // - Rows that only apply to one choice (DLSS model, HDR levels) are hidden
 //   while that choice is off (GraphicsRowHidden in menu.cpp).
+// - A page opened from the menu has its own entry row (MenuRow::pageEntry: one
+//   wide cell, the confirm button and a chevron) right under the setting it
+//   belongs to, shown whenever that setting is: NR tuning & preview under DLSS 5
+//   neural rendering, HDR calibration under HDR peak brightness, Brightness
+//   before Save; Controls, Mods and Achievements on their tabs. Confirm on the
+//   setting row itself stays a shortcut.
+// - Help text is one line and shrinks when it is too long. Graphics help shares
+//   the box with the upscaler status, so it is drawn small already: keep it to
+//   what a player needs, with the longest status it can carry, in all five
+//   languages. LoMenuFlowTest fails a line below 85% of its size (run it with
+//   the game folder to measure the game's own fonts).
 // Input, help text, pointer hits and the tests use these constants, never
 // literal row numbers.
 inline constexpr int MenuTabCount = 4;
 // Gameplay tab (0).
 inline constexpr int GameRetailRowCount = 7;
-inline constexpr int GamePromptRow = 7;
-inline constexpr int GameVibrationRow = 8;
-inline constexpr int GameRestoreRow = 9;
-inline constexpr int GameMainMenuRow = 10;
-inline constexpr int GameRowCount = 11;
+inline constexpr int GameControlsRow = 7; // opens the Controls page
+inline constexpr int GameRestoreRow = 8;
+inline constexpr int GameMainMenuRow = 9;
+inline constexpr int GameRowCount = 10;
 // Audio tab (1).
 inline constexpr int AudioVoiceRow = 0;
 inline constexpr int AudioMusicRow = 1;
@@ -126,12 +143,14 @@ inline constexpr int SystemUiLanguageRow = 0;
 inline constexpr int SystemGameLanguageRow = 1;
 inline constexpr int SystemUpdatesRow = 2;
 inline constexpr int SystemDebugLogRow = 3;
-inline constexpr int SystemCollectionRow = 4;
-inline constexpr int SystemModsRow = 5; // opens the Mods page
-inline constexpr int SystemImportRow = 6;
-inline constexpr int SystemSaveRow = 7;
-inline constexpr int SystemRowCount = 8;
-static_assert(GamePromptRow == GameRetailRowCount && GameMainMenuRow + 1 == GameRowCount);
+inline constexpr int SystemAchievementsRow = 4; // opens the Achievements page
+inline constexpr int SystemCollectionRow = 5;
+inline constexpr int SystemModsRow = 6; // opens the Mods page
+inline constexpr int SystemImportRow = 7;
+inline constexpr int SystemShaderBundleRow = 8; // downloads the shader bundle again on the next start
+inline constexpr int SystemSaveRow = 9;
+inline constexpr int SystemRowCount = 10;
+static_assert(GameControlsRow == GameRetailRowCount && GameMainMenuRow + 1 == GameRowCount);
 static_assert(AudioRearAngleRow + 1 == AudioRowCount && SystemSaveRow + 1 == SystemRowCount);
 // Logical ids for the graphics tab (2). MenuSnapshot::row stores these as int.
 // Count is the tab length, not the on-screen viewport.
@@ -143,32 +162,36 @@ enum class GraphicsRow : int
     Display = 3,
     AspectRatio = 4,
     OutputResolution = 5,
-    RenderResolution = 6,
-    ShadowResolution = 7,
-    DynamicShadows = 8,
-    AntiAliasing = 9,
-    DlssQuality = 10,
-    DlssModel = 11, // shown with DLSS
-    FsrSharpness = 12,
-    DlssNeuralRendering = 13,
-    FrameGeneration = 14,
-    FrameGenerationMultiplier = 15,
-    AmbientOcclusion = 16,
-    AnisotropicFiltering = 17,
-    DepthOfField = 18,
-    Bloom = 19,
-    MotionBlur = 20,
-    Culling = 21,
-    ScalingQuality = 22,
-    RgbRange = 23,
-    FrameRate = 24,
-    VariableRefreshRate = 25,
-    Hdr = 26,
-    HdrPaperWhite = 27, // shown with HDR on
-    HdrPeak = 28, // shown with HDR on
-    Brightness = 29,
-    Save = 30,
-    Count = 31,
+    Preset = 6, // derived from the rows below; not saved
+    RenderResolution = 7,
+    ShadowResolution = 8,
+    DynamicShadows = 9,
+    AntiAliasing = 10,
+    DlssQuality = 11,
+    DlssModel = 12, // shown with DLSS
+    FsrSharpness = 13,
+    DlssNeuralRendering = 14,
+    NeuralRenderingTuning = 15, // opens the NR page; shown with the NR row
+    FrameGeneration = 16,
+    FrameGenerationMultiplier = 17,
+    AmbientOcclusion = 18,
+    AnisotropicFiltering = 19,
+    DepthOfField = 20,
+    Bloom = 21,
+    MotionBlur = 22,
+    Culling = 23,
+    ScalingQuality = 24,
+    RgbRange = 25,
+    FrameRate = 26,
+    VariableRefreshRate = 27,
+    PerformanceOverlay = 28,
+    Hdr = 29,
+    HdrPaperWhite = 30, // shown with HDR on
+    HdrPeak = 31, // shown with HDR on
+    HdrCalibration = 32, // opens the HDR peak page; shown with HDR on
+    Brightness = 33, // opens the brightness page
+    Save = 34,
+    Count = 35,
 };
 inline constexpr int MenuTabWidth = 640 / MenuTabCount;
 // Mods page (System → Mods): a list page in the tab layout. A row with a detail
@@ -176,8 +199,35 @@ inline constexpr int MenuTabWidth = 640 / MenuTabCount;
 // the focused mod has move up / move down cells beside the value column.
 inline constexpr int ModsCellsWidth = 240;
 inline constexpr int ModsMoveLeft = 1112, ModsMoveWidth = 64, ModsMoveGap = 8;
+// Achievements page (System → Achievements): a list page. Notifications (On /
+// Silent / Off, applied and saved at once), a summary title that is never
+// focused, then one row per achievement: icon, name, text, gamerscore and date.
+inline constexpr int AchievementsNotificationsRow = 0;
+inline constexpr int AchievementsSummaryRow = 1;
+inline constexpr int AchievementsFirstRow = 2;
+// Controls page (Gameplay → Controls): a list page. Button prompts and
+// Vibration, then a titled section per device with a row for each Xbox 360
+// input in hid/input_map.h order (the keyboard adds the left stick), then
+// Restore and Save. The section titles are never focused.
+inline constexpr int ControlsPromptRow = 0;
+inline constexpr int ControlsVibrationRow = 1;
+inline constexpr int ControlsControllerTitle = 2;
+inline constexpr int ControlsControllerFirst = 3;  // 16 rows: A .. D-pad right
+inline constexpr int ControlsKeyboardTitle = 19;
+inline constexpr int ControlsKeyboardFirst = 20;   // 20 rows: A .. left stick right
+inline constexpr int ControlsRestoreRow = 40;
+inline constexpr int ControlsSaveRow = 41;
+inline constexpr int ControlsRowCount = 42;
+// A capture waits this long for a button or key.
+inline constexpr int ControlsCaptureSeconds = 5;
 // Called by input polling before returning the guest-facing controller state.
-bool FilterInput(uint16_t &buttons, int16_t leftX, int16_t leftY);
+// defaultButtons is the same input on the default layouts, which the Controls
+// page uses.
+bool FilterInput(uint16_t &buttons, int16_t leftX, int16_t leftY, uint16_t defaultButtons);
+// Key presses (SDL scancodes) before shortcuts and game input. True when a
+// capture on the Controls page takes the key: Escape cancels a capture, a
+// keyboard capture takes every key.
+bool CaptureKey(uint32_t scancode, bool repeat);
 // Snapshot rendered on the presentation thread, never accessing guest memory.
 bool DrawMenu(std::vector<uint32_t> &pixels, uint64_t &revision, uint32_t width = 1280, uint32_t height = 720);
 void PointerClick(float x, float y, bool reverse);

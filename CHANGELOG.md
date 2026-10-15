@@ -8,6 +8,158 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 
 ### English
 
+- Language packs can add missing letters to the Japanese fonts too, including the dream fonts on uncompressed pages.
+- Live mod reload keeps the active and open files safe while preparing another configuration, and edited translated text reloads from disk.
+- Memory used by a finished replacement cutscene is now released shortly after playback ends.
+
+### 简体中文
+
+- 语言包也可以给日文字体补充缺少的字母，包括使用未压缩页面的梦境字体。
+- 实时重载 Mod 时，准备另一套配置不会删除当前或仍在使用的文件，修改后的译文也会从磁盘重新加载。
+- 替换过场视频播放结束后会及时释放所占内存。
+
+## [v0.9.57](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.57) — 2026-10-15
+
+### English
+
+- Android: the sound comes back after you switch to another app or turn the screen off and return to the game (#491).
+- Android: when the screen briefly turns upright as you return to the game, the game no longer rebuilds its graphics, which could leave black blocks over characters and scenery (#492).
+- Android: the game stays in landscape; holding the device upright no longer turns it to portrait.
+- Depth of field at 0% and Bloom off now skip the game's blur passes for those effects instead of only hiding them, so they take less GPU time: in Uhra about 13% less per frame. The picture stays the same.
+- New Settings → Graphics → Graphics preset: both choices run the original 720p at 30 FPS. Low-end also turns off dynamic shadows, motion blur, depth of field and bloom and uses the standard scaling filter, for weak hardware; Original brings the game's effects back.
+- Music and cutscene audio no longer go missing, and battle music no longer plays on after a battle, when the game's sound requests pile up (#497, #499).
+- The game handles its sound requests about ten times faster, so they no longer pile up in busy scenes (#497).
+- Fast-forward now speeds up sound and music too.
+- Windows: the game no longer crashes at startup on Vulkan when ReShade's `dxgi.dll` is in the game folder; that copy of ReShade only works with Direct3D 12 (#506).
+- New Settings → Graphics → Performance overlay: the frame rate in a corner, or a bar across the top with the upscaler and its resolution, frame generation, and CPU and GPU load.
+- Mods that replace models or text no longer rebuild their game files after every game update, only after an update that changes how mods are applied.
+- A game folder moved or copied after importing the discs finds them again instead of asking to import them a second time.
+- Windows: when Mod Organizer 2 starts the game from a folder without imported discs, the importer says so, so you can point MO2 at your game folder instead of importing a second copy.
+- Importing the discs stores the archives that are the same on several discs once, about 5.8 GB less for all four discs. For a game folder imported before, start the game once with `--compact-game-data`.
+- Settings → Graphics: the DLSS, FSR, XeSS and MetalFX status line shows the quality and resolution of the last game frame instead of "No eligible scene this frame".
+- Settings → Graphics: a new frame generation multiplier applies as soon as you save, with HDR on too, instead of asking for a restart.
+- The DLSS 5 neural rendering page says when `nvngx_dlssnr.dll` is missing or the GPU cannot run it, instead of asking you to play a scene. It also says the game does not include that file.
+- Performance overlay: the bar across the top shows the frame generation frame rate with DLSS frame generation on Vulkan too.
+- TAA and the upscalers keep tracking moving characters and objects after you travel to another area; before, they could lose track of them until you went back, and the image was less stable.
+- Settings help text is readable again: lines that had shrunk to small print, such as DLSS 5 neural rendering, VSync and HDR, are shorter in every menu language; the neural rendering page's missing-DLL message wraps instead of shrinking.
+- Model mods are no longer limited to 4 GB per disc.
+- Settings → Graphics: new rows open the DLSS 5 neural rendering tuning page with its preview and the HDR calibration page, so you no longer need to know that Confirm on the setting opens them. Brightness, Controls, Mods and Achievements show the same open button.
+- When a sound frame cannot be decoded, the log now says why (#524).
+- Windows, Direct3D 12: with Settings → System → Debug log on, the log records what the graphics card was doing when it stops responding. It takes effect at the next launch and costs a few percent of GPU time (#524).
+- TAA and the upscalers (DLSS, FSR, XeSS) take less CPU and GPU time; in Uhra the frame rate is about 8% higher.
+- Model mods: while you play, the game prepares the other discs' mod files in the background, so a later disc switch takes seconds instead of a minute or two.
+- Model mods: turning a mod off and on again, or going back to your previous set of mods, starts without rebuilding the mod files; the game keeps the files of the current and the previous set.
+- Settings → System → Mods applies a saved mod list without a restart: texture mods change at once, model mods from the next area you enter. Party members' models still change after a restart.
+- Windows, Vulkan: when the graphics card stops working, the closing message on AMD cards says to turn off FSR Upscaling / Radeon Super Resolution in AMD Software or to switch to DirectX 12; on any card, if it happens right after startup, the message offers to start with DirectX 12 next time (#337, #533).
+- Pressing START on the title screen opens the menu right away, without the "Updating gamer profile" message and its one-second wait.
+- Turning TAA or an upscaler off now frees the graphics memory it used once you close Settings, about 350 MB at 4K, instead of keeping it until you restart the game.
+- The achievement notification no longer draws a piece of itself over the "Y: Settings" hint on the title screen, nor over the loading bar or the performance overlay.
+- The MO2 export tool's Scan game data now lists models and animation sets; before, it found none.
+- The MO2 export tool names models with the game's own names in the chosen text language, such as "Kaim" or "Uhra - Main Street", sorts them into groups such as Party, Monsters and Maps, shows a picture of the selected model, and opens Explorer at an exported model, ready for Blender. New wiki page: Open models in Blender.
+- Windows, Direct3D 12: FSR frame generation gives a higher frame rate, most of all in battles, and the performance overlay shows its real frame rate instead of an estimate marked with ~.
+- Language packs can add the letters the game's fonts lack, such as Polish, Russian or Arabic ones: `lo_mod.py font-glyphs` draws them from a TrueType or OpenType font in the style of each game font, and `--export-assets --export-kinds fonts` exports what it needs. See [Creating mods](docs/wiki/Creating-Mods.md#add-letters-the-fonts-lack).
+
+### 简体中文
+
+- Android：切到其他应用或关屏后再回到游戏，声音会恢复（#491）。
+- Android：回到游戏时如果屏幕短暂变成竖屏，游戏不再重建画面；之前这可能在角色和场景上留下黑块（#492）。
+- Android：游戏固定横屏，竖着拿设备时不再转成竖屏。
+- 景深设为 0% 或关闭泛光后，游戏会跳过这两种效果的模糊渲染，而不只是把结果隐藏，GPU 耗时更少：在乌拉每帧约少 13%。画面不变。
+- 新增“设置 → 图像 → 画质预设”：两个选项都以原版的 720p、30 FPS 运行。低配还会关闭动态阴影、动态模糊、景深和泛光，并使用标准缩放过滤，适合较弱的硬件；原版恢复游戏原有的效果。
+- 游戏的声音请求积压时，音乐和过场声音不再缺失，战斗结束后战斗音乐也不再继续播放（#497、#499）。
+- 游戏处理声音请求的速度提高到约十倍，繁忙场景里请求不再积压（#497）。
+- 快进时声音和音乐也一起加速。
+- Windows：游戏文件夹里有 ReShade 的 `dxgi.dll` 时，Vulkan 下启动不再崩溃；这种安装方式的 ReShade 只在 Direct3D 12 下生效（#506）。
+- 新增“设置 → 图像 → 性能信息”：在角落显示帧率，或在画面顶部显示一栏信息，包括超分方式与分辨率、插帧，以及 CPU 和 GPU 负载。
+- 替换模型或文本的 Mod 不再在每次游戏更新后重建游戏文件，只在更新改变了 Mod 的处理方式时才重建。
+- 导入光盘后移动或复制过的游戏文件夹能找到已导入的光盘，不再要求重新导入。
+- Windows：Mod Organizer 2 从没有导入光盘的文件夹启动游戏时，导入器会提示这一点；把 MO2 指向你的游戏文件夹即可，不必再导入一份。
+- 导入光盘时，多张光盘里相同的资源包只存一份，四张光盘约省 5.8 GB。之前导入的游戏目录，用 `--compact-game-data` 启动一次即可。
+- 设置 → 图像：DLSS、FSR、XeSS 和 MetalFX 的状态行显示最后一帧游戏画面的质量和分辨率，不再显示“这一帧没有合格场景”。
+- 设置 → 图像：修改帧生成倍数后保存即生效，开着 HDR 也一样，不再要求重启。
+- DLSS 5 神经渲染调整页在缺少 `nvngx_dlssnr.dll` 或显卡无法运行时会直接说明，不再提示进入游戏场景，并说明游戏不附带该文件。
+- 性能信息：Vulkan 下开启 DLSS 帧生成时，顶部信息栏也会显示帧生成后的帧率。
+- 前往其他区域后，TAA 和超分会继续跟踪移动的角色和物体；之前它们可能一直跟丢，直到回到原来的区域，画面也因此不够稳定。
+- 设置的说明文字恢复正常大小：DLSS 5 神经渲染、垂直同步、HDR 等缩成小字的说明在所有菜单语言中都已缩短，神经渲染调整页缺少 DLL 的提示改为换行显示，不再缩小。
+- 模型 Mod 不再受每张光盘 4 GB 的限制。
+- 设置 → 图像：新增“神经渲染调整与预览”和“HDR 校准”两行，直接打开对应页面，不必再知道在设置项上按确认才能进入。亮度、按键设置、Mod 和成就也显示同样的打开按钮。
+- 声音帧无法解码时，日志会写明原因（#524）。
+- Windows Direct3D 12：打开“设置 → 系统 → 调试日志”后，显卡停止响应时日志会记下它当时在做什么。下次启动时生效，会多占几个百分点的 GPU 时间（#524）。
+- TAA 和超分（DLSS、FSR、XeSS）占用的 CPU 和 GPU 时间更少；在乌拉，帧率约提高 8%。
+- 模型 Mod：游戏运行时会在后台准备其他光盘的 Mod 文件，之后切换光盘只要几秒，不再等一两分钟。
+- 模型 Mod：关掉再打开某个 Mod，或换回上一套 Mod 组合时，启动不再重建 Mod 文件；游戏会保留当前和上一套组合的文件。
+- 设置 → 系统 → Mod 保存后不用重启即可生效：贴图 Mod 立即生效，模型 Mod 从进入下一个区域起生效。队伍成员的模型仍需重启后更换。
+- Windows Vulkan：显卡停止工作时，AMD 显卡上的关闭提示会建议在 AMD Software 里关闭 FSR Upscaling / Radeon Super Resolution，或改用 DirectX 12；不论哪种显卡，如果刚启动就出现，提示都会询问下次是否改用 DirectX 12 启动（#337、#533）。
+- 在标题画面按 START 后直接打开菜单，不再显示“正在更新玩家档案”提示，也不再等约一秒。
+- 关闭 TAA 或超分后，退出设置时会释放它占用的显存（4K 下约 350 MB），不再一直占到重启游戏。
+- 成就通知不再在标题画面的“Y：设置”提示上，也不再在加载进度条和性能叠加层上，画出自己的一块。
+- MO2 导出工具的“Scan game data”现在会列出模型和动画；之前一个也找不到。
+- MO2 导出工具用游戏里的名字标注模型，例如“凯姆”“乌拉・中央大街”（随“Text language”切换语言），按队伍、怪物、地图等分组，显示选中模型的预览图，并能导出模型后在资源管理器中选中它，方便拖进 Blender。新增 Wiki 页面《在 Blender 中打开模型》。
+- Windows Direct3D 12：FSR 帧生成的帧率更高，战斗中最明显；性能信息显示它的实际帧率，不再是带 ~ 的估算值。
+- 语言包可以补充游戏字体缺少的字母，例如波兰语、俄语或阿拉伯语字母：`lo_mod.py font-glyphs` 用 TrueType 或 OpenType 字体按每个游戏字体的样式绘制这些字母，`--export-assets --export-kinds fonts` 导出它需要的信息。见[制作 Mod](docs/wiki/Creating-Mods.md#add-letters-the-fonts-lack)。
+
+## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
+
+### English
+
+- Achievements: unlocking one of the game's 36 achievements shows an Xbox 360-style notification with a sound, framed by the app's medallion. Settings → System → Achievements lists them all with your unlock dates and turns the notification on, silent or off.
+- New app icon.
+- Vulkan is now the default renderer on Windows too. Existing settings keep their renderer.
+- Settings → System → Shader bundle downloads the shader bundle again.
+- Nintendo-layout controllers used through Steam Input follow Steam's button layout setting again instead of having A/B and X/Y swapped.
+- Android: CTRL → Saves and logs exports the logs to a ZIP for bug reports.
+- Android: the app is now named Lost Odyssey Recomp instead of Lost Odyssey (development).
+- Settings → Gameplay → Controls changes the controller buttons and keyboard keys; Button prompts and Vibration moved there.
+- Android: less crackling in the sound when the device is busy or hot.
+- If the graphics driver stops working, the game says so and closes instead of freezing on the last picture.
+- Mods can ship their files as one `overlay.loarc` archive instead of thousands of loose files; `tools/modding/lo_mod.py archive` makes it.
+- The MO2 export tool previews what it will export: a list of the textures, movies, text, models and animations, with a picture, the video, the text or the model's counts of the selected one.
+- The MO2 export tool can export 3D models and animations as glTF (.glb) files for reference; the models can include their textures.
+- Mods can replace character, monster and moving-object models with models edited from the export, for example in Blender. See [Creating mods](docs/wiki/Creating-Mods.md#replace-a-model).
+- Mods can replace buildings, ground and other map pieces too, for example with more detailed versions; the map's light and shadow follow the new shape.
+- The game files that mods rebuild (replaced models, translated text) are made once, using every CPU core, and kept compressed in `cache/mods`; later starts read them from there.
+- The MO2 export tool can export only the rows you select (Export selected).
+- Mods load in every `--mods-mode`: overlay packages and mod folders always load together, and the mode only decides which one wins when both change the same thing.
+- The MO2 export tool shows the game folder it reads and says how to fix it when it is not your LostOdysseyRecomp folder.
+- The Windows download includes the Mod Organizer 2 plugins in a `mo2` folder.
+- Windows: mods can replace cutscene videos with H.264 MP4 files, for example 4K at 60 fps; the game keeps the original sound and subtitles. Topaz Video AI's MP4 files work as they are. See [Creating mods](docs/wiki/Creating-Mods.md#replace-a-cutscene-video).
+- Cutscene replacements up to 1% longer or shorter than the original are fitted to its length, so they stay in time with the sound.
+- Android: the game starts on devices whose graphics driver refused the display setup (#477).
+- While the game files for new or changed mods are being prepared at startup, the window shows "Preparing mods" with a progress bar instead of staying black.
+- Android (experimental): phones and tablets with a Mali-G57, G68, G77, G78 or Mali-G610 and newer GPU can run the game with the open-source PanVK driver, which the GPU driver page recommends and downloads.
+
+### 简体中文
+
+- 成就：解锁游戏的 36 个成就之一时，会显示 Xbox 360 风格的通知并播放提示音，圆框是本作图标的勋章。设置 → 系统 → 成就列出全部成就和解锁日期，也可以把通知设为开启、静音或关闭。
+- 新的应用图标。
+- Windows 版也默认使用 Vulkan。已有设置保留原来的渲染器。
+- 设置 → 系统 → 着色器包可以重新下载着色器包。
+- 通过 Steam Input 使用的任天堂布局手柄重新按 Steam 的按键布局设置工作，A/B 和 X/Y 不再对调。
+- Android：CTRL → Saves and logs 可以把日志导出成 ZIP，用于反馈问题。
+- Android：应用名称由 Lost Odyssey (development) 改为 Lost Odyssey Recomp。
+- 设置 → 游戏 → 按键设置可以更改手柄按键和键盘按键；按键提示和震动也移到了这里。
+- Android：设备繁忙或发热时，声音的爆音更少。
+- 显卡驱动停止工作时，游戏会弹出提示并关闭，不再停在最后一帧。
+- Mod 可以把文件打成一个 `overlay.loarc` 包发布，不用再带成千上万个散文件；用 `tools/modding/lo_mod.py archive` 打包。
+- MO2 导出工具可以预览要导出的内容：列出材质、影片、文本、模型和动画，选中一项可以看图片、播放影片、查看文本或模型的数量信息。
+- MO2 导出工具可以把 3D 模型和动画导出为 glTF（.glb）文件，供参考；模型可以带上贴图。
+- Mod 可以替换角色、怪物和会动的物件的模型，模型从导出文件改出来，例如用 Blender。见[制作 Mod](docs/wiki/Creating-Mods.md#replace-a-model)。
+- Mod 也可以替换建筑、地面等地图模型，例如换成更精细的版本；地图的光照和阴影会跟着新模型走。
+- Mod 重建的游戏文件（替换的模型、翻译的文本）只生成一次，用满所有 CPU 核心，压缩后保存在 `cache/mods`，之后启动直接读取。
+- MO2 导出工具可以只导出你选中的行（Export selected）。
+- 任何 `--mods-mode` 下 Mod 都会加载：overlay 包和 Mod 文件夹总是一起加载，模式只决定两者改了同一处时谁优先。
+- MO2 导出工具会显示它读取的游戏目录；目录不是你的 LostOdysseyRecomp 文件夹时，会提示怎么改。
+- Windows 下载包里带有 Mod Organizer 2 插件，放在 `mo2` 文件夹中。
+- Windows：Mod 可以用 H.264 MP4 替换过场影片，例如 4K 60 帧；声音和字幕仍用原版；Topaz Video AI 导出的 MP4 可以直接用。见[制作 Mod](docs/wiki/Creating-Mods.md#replace-a-cutscene-video)。
+- 比原版长或短不超过 1% 的替换影片会被拉到原版的长度，画面和声音保持同步。
+- Android：显卡驱动拒绝显示设置的设备现在可以正常启动（#477）。
+- 启动时为新增或改动的 Mod 准备游戏文件期间，窗口会显示“正在准备 Mod”和进度条，不再一直黑屏。
+- Android（实验性）：使用 Mali-G57、G68、G77、G78 或 Mali-G610 及更新 GPU 的手机和平板可以用开源 PanVK 驱动运行游戏，GPU driver 页面会推荐并下载它。
+
+## [v0.9.32](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.32) — 2026-10-12
+
+### English
+
 - At 60 FPS, scenes that can't quite hold 60 no longer drop straight to 30, for example on Steam Deck.
 - New VSync setting in Settings → Graphics: Off, On or FreeSync / G-SYNC Compatible. It replaces the FreeSync / G-SYNC Compatible switch.
 - New Voice volume in Settings → Audio: cutscene dialogue has its own volume instead of following Sound effects. Voices in battle still follow Sound effects (#394).
@@ -21,6 +173,11 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Black shapes no longer flicker on the sea around Saman and the Experimental Staff (#424).
 - Vulkan: less GPU time per frame, for a higher frame rate where the GPU sets the limit, for example on Steam Deck and Android.
 - The shader packs change; the first start after updating offers to download the new packs.
+- Music no longer stays stuck on the previous area's track after several item fanfares; it used to recover only after a battle or a restart (#375).
+- Android: fewer stutters once the device gets hot; the game's threads no longer run on the slow cores.
+- Android: the game's own code runs a little faster.
+- Android: Import disc images opens Android's file picker. Picking one disc image is enough; the other discs in its folder come along. Disc images on SD cards and USB drives can now be imported.
+- Less CPU time and memory use: model data is no longer re-checked every frame, and large models no longer occasionally draw with outdated data.
 
 ### 简体中文
 
@@ -37,6 +194,11 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Saman 和 Experimental Staff 一带的海面不再闪烁黑色色块（#424）。
 - Vulkan：每帧 GPU 时间更少，在 GPU 决定帧率的设备上（例如 Steam Deck 和 Android）帧率更高。
 - 着色器包随之更新，更新后首次启动会提示下载新的着色器包。
+- 道具获得的音效响过几次之后，音乐不再卡在上一个区域的曲子上；以前要打一场仗或重启才恢复（#375）。
+- Android：设备发热后卡顿更少，游戏线程不再跑到慢核上。
+- Android：游戏本身的代码运行稍快一些。
+- Android：Import disc images 改用 Android 的文件选择器，选一个光盘镜像即可，同一文件夹里的其他光盘会一起导入。SD 卡和 U 盘上的光盘镜像现在也能导入了。
+- CPU 和内存占用更少：不再每帧重新核对模型数据；大模型也不会再偶尔用旧数据绘制。
 
 ## [v0.9.22](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.22) — 2026-10-10
 

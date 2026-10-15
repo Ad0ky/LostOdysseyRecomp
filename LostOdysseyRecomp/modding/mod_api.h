@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <iosfwd>
 #include <memory>
 #include <optional>
 #include <string>
@@ -15,19 +16,30 @@ inline constexpr uint32_t kModApiVersion = 2;
 // Texture keys are renderer fingerprints: exactly 16 lowercase hex digits.
 // Text keys are archive member paths (bin/xenon/loc/int/menu/menu_int.dat); the
 // file is the translation JSON that --export-assets writes for that member.
+// Movie keys are the original video's file name stem in lower case (mv_00v for
+// bin/xenon/mov/mv_00v.wmv): 1-64 of [a-z0-9_], ASCII case-insensitive; the
+// file is an H.264 MP4.
+// Model keys are package#export:object like image keys; the file is a glTF
+// binary at overlay/models/<package path>/<object>.<export index>.glb, the path
+// --export-assets gives the model (modding/model_import.h).
 enum class AssetKind : uint32_t { Image = 1, Font = 2, Model = 3, Movie = 4, Texture = 5, Text = 6 };
 enum class ResolutionMode : uint32_t { Combined, Standalone, Overlay };
 struct AssetId { AssetKind kind = AssetKind::Image; std::string key; };
 struct AssetRequest { AssetId id; std::filesystem::path originalPath; };
+// ResolvedAsset::size of a loose file: all of path.
+inline constexpr uint64_t kWholeFile = ~0ull;
 struct ResolvedAsset {
     AssetId id;
     std::filesystem::path path;
     std::string modId;
     int32_t priority = 0;
+    // An entry of a mod archive (overlay.loarc) is bytes [offset, offset + size) of path.
+    uint64_t offset = 0, size = kWholeFile;
 };
 struct Diagnostic { std::filesystem::path manifest; size_t line = 0; std::string message; };
 // A mods folder with a language.ini (id, name, base) is a language pack: its
-// text/ folder holds translation JSON in the --export-assets text/ layout. It
+// text/ folder holds translation JSON in the --export-assets text/ layout, its
+// optional fonts/ folder glyphs for letters the game's fonts lack. It
 // applies only while the player has it selected in Settings, in every mode.
 // id is lower case; base is a three-letter game language code (int, jpn...).
 struct LanguagePack { std::string id, name, base; std::filesystem::path folder; };
@@ -46,7 +58,7 @@ struct ModInfo {
     bool manifestEnabled = true;                    // mod.ini enabled=
     bool listEnabled = true;                        // mod-list.ini: false only for <id>=off
     bool active = false;                            // contributes files in this snapshot
-    size_t overlayFiles = 0;                        // files found under overlay/ (active mods only)
+    size_t overlayFiles = 0;                        // files under overlay/ and in .loarc archives (active mods only)
     size_t manifestEntries = 0;                     // valid resource lines in mod.ini
     std::vector<Diagnostic> problems;
 };
@@ -58,10 +70,12 @@ public:
 
 // Snapshot replacement; decoded caches must observe Generation().
 // LO_MODS_DIR overrides root; LO_MODS=0 disables all resolution, including providers.
-// LO_MODS_MODE=overlay isolates external managers from mod folders AND providers.
-// The default combined mode keeps top-level overlay > provider > mod folders.
+// Every mode reads the top-level overlay, providers and mod folders; it only sets
+// which wins. The default combined mode (and overlay, kept for old launch
+// options) keeps top-level overlay > provider > mod folders; LO_MODS_MODE=
+// standalone asks provider > mod folders > top-level overlay.
 // Mod folders follow modList (mod-list.ini, the in-game manager's order), then
-// priority. Each api_version=2 folder's overlay/ is listed once, on a thread
+// priority. Each api_version=2 folder's overlay/ and .loarc archives are listed once, on a thread
 // Initialize starts (MO2's VFS lists slowly); Resolve, ListTexts and ListMods
 // wait for it and then are hash lookups. Containment is lexical: files may
 // resolve through a VFS (MO2) or symlinks. An empty modList means no list file.
@@ -92,11 +106,21 @@ bool HasTextureReplacements();
 // Every text replacement Resolve would return, one per member path (top-level
 // overlay files first, then mod folders in order). Providers are not asked.
 std::vector<ResolvedAsset> ListTexts();
+// Every model replacement, one per key, in the same order as ListTexts.
+std::vector<ResolvedAsset> ListModels();
 // Installed language packs by folder name; a repeated id keeps the first.
 std::vector<LanguagePack> LanguagePacks();
 // The pack's text/ files, one per member path.
 std::vector<ResolvedAsset> ListTexts(const LanguagePack& pack);
+// The pack's fonts/ files (glyphs it adds to the game's fonts, modding/font_patch.h):
+// fonts/<package member path>/<font>.lofont, keyed <package member path>#<font>.
+std::vector<ResolvedAsset> ListFonts(const LanguagePack& pack);
 std::optional<ResolvedAsset> Resolve(const AssetRequest& request);
+// Opens a resolved file at its first byte; length is its size. An archive
+// entry ends before the archive does, so readers stop at length.
+bool OpenAsset(const ResolvedAsset& asset, std::ifstream& in, uint64_t& length);
+// The file, or the archive and entry name, for messages.
+std::string DescribeAsset(const ResolvedAsset& asset);
 // Providers are trusted host extensions, not DLLs loaded from mod packages.
 // Shared ownership keeps an in-flight callback alive during unregistration.
 bool RegisterProvider(AssetKind kind, std::shared_ptr<AssetProvider> provider);
@@ -106,7 +130,9 @@ void UnregisterProvider(AssetKind kind, const AssetProvider* provider);
 // object case and UTF-8 bytes are preserved. Invalid identities return empty.
 std::string MakeManifestKey(std::string_view package, uint32_t exportIndex, std::string_view object);
 // Textures: overlay/textures/fp-<16 hex digits>.lotex2; text: overlay/text/<member
-// path>.json, the export's text/ layout; other kinds hash the key. The same
-// names work in a mod folder's own overlay/ (api_version=2).
+// path>.json, the export's text/ layout; movies: overlay/movies/<key>.mp4; other
+// kinds hash the key (key-fnv1a64-<hash>.lotex for images, .loasset). The same
+// names work in a mod folder's own overlay/ (api_version=2) and, '/'-separated
+// and lower case, as the entry names of its .loarc archives.
 std::filesystem::path OverlayRelativePath(const AssetId& id);
 }

@@ -41,6 +41,7 @@
 #include "updater/apply_mode.h"
 #include "version.h"
 #include "install/host.h"
+#include "install/import_game.h"
 #include "modding/mod_api.h"
 #include "modding/asset_export.h"
 #include "modding/text_overlay.h"
@@ -123,17 +124,22 @@ static std::filesystem::path ExecutableDirectory()
 // D3D12. Vulkan never uses it, but SDL3 loads DXGI.DLL by name at video init,
 // which picks that copy, and NVIDIA's Vulkan driver then presents through it
 // and crashes (#323). On Vulkan, load the system copy first: later loads by
-// name bind to the module already loaded. Runs before any SDL window.
+// name bind to the module already loaded. Runs before any SDL window, and only
+// works while the exe imports no DLL that imports dxgi.dll, such as d3d11.dll
+// (keep those delay-loaded, #506).
 static void PreferSystemDxgiOnVulkan(const std::filesystem::path& executableDirectory)
 {
     std::error_code error;
     const auto local = executableDirectory / "dxgi.dll";
     if (!std::filesystem::exists(local, error)) return;
-    auto configured = settings::GraphicsBackend::D3D12;
+    // As settings::Validate: no line or an unknown value means the default backend.
+    auto configured = settings::Config{}.graphicsBackend;
     std::ifstream input(os::user_paths::SettingsPath());
     for (std::string line; std::getline(input, line);)
-        if (line.rfind("graphics_backend=", 0) == 0)
-            configured = settings::GraphicsBackend(std::strtoul(line.c_str() + 17, nullptr, 10));
+        if (line.rfind("graphics_backend=", 0) == 0) {
+            const auto saved = settings::GraphicsBackend(std::strtoul(line.c_str() + 17, nullptr, 10));
+            configured = gpu::backend::Known(saved) ? saved : settings::Config{}.graphicsBackend;
+        }
     if (gpu::backend::Requested(configured, getenv("LO_GRAPHICS_API")) != gpu::backend::Backend::Vulkan) return;
     const HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     wchar_t loaded[MAX_PATH]{};
@@ -143,7 +149,8 @@ static void PreferSystemDxgiOnVulkan(const std::filesystem::path& executableDire
         return;
     }
     if (std::filesystem::equivalent(loaded, local, error))
-        LOG_WARNING("Vulkan: {} (ReShade or another D3D tool) was already loaded and may crash Vulkan presentation",
+        LOG_WARNING("Vulkan: {} (ReShade or another D3D tool) was already loaded and may crash Vulkan presentation; "
+            "remove or rename it, install ReShade for Vulkan instead, or switch the renderer to Direct3D 12",
             FileSystem::PathUtf8(local));
     else
         LOG_INFO("Vulkan: {} (ReShade or another D3D tool) is not loaded; it only works with Direct3D 12",
@@ -156,6 +163,37 @@ static settings::game_path::Resolution FindGameRoot(
     const std::optional<std::filesystem::path>& explicitGame)
 {
     return settings::game_path::Resolve(executableDirectory, explicitGame);
+}
+
+// --compact-game-data: store disc archives that are identical on several discs
+// once (links), log the space freed and exit without starting the game.
+static int CompactGameDataCommand(const std::filesystem::path& gameRoot)
+{
+    LOG_NOTICE("compact game data: {}", FileSystem::PathUtf8(gameRoot));
+    std::error_code ec;
+    const auto before = std::filesystem::space(gameRoot, ec).available;
+    try
+    {
+        int reported = -1;
+        const auto result = install::CompactGameData(gameRoot, [&](uint64_t done, uint64_t total, std::string_view) {
+            const int percent = total ? int(done * 100 / total) : 100;
+            if (percent / 10 != reported / 10)
+            {
+                reported = percent;
+                LOG_NOTICE("compact game data: compared {}%", percent);
+            }
+        });
+        const auto after = std::filesystem::space(gameRoot, ec).available;
+        LOG_NOTICE("compact game data: freed {} bytes (free space grew by {} bytes); {} copies replaced, "
+                   "{} archive bytes stored once in all, {} not shared",
+                   result.freedBytes, after > before ? after - before : 0, result.replaced, result.sharedBytes, result.failed);
+        return 0;
+    }
+    catch (const std::exception& error)
+    {
+        LOG_ERROR("compact game data failed: {}", error.what());
+        return 1;
+    }
 }
 
 void InstallPhysicalWatchpoint();
@@ -178,6 +216,7 @@ static int RunGuest(uint32_t entry)
         hid::Init(); // otherwise the video thread initialises it
     hid::SetVibrationStrength(settings::GetConfig().vibrationPercent);
     hid::SetPromptStyle(settings::GetConfig().buttonPrompts);
+    hid::SetInputMaps(settings::GetConfig().controllerMap, settings::GetConfig().keyboardMap);
 
 #if LO_PLATFORM_SWITCH
     os::switch_platform::SetLoadingBoost(false);
@@ -256,6 +295,7 @@ static int RunGuest(uint32_t entry)
 #endif
     LOG_INFO("starting guest at {:#x}", entry);
     os::SetCurrentThreadName("Guest Main");
+    os::scheduling::PreferPerformanceCores(true);
     GuestThread::Start({ entry, 0, 0 });
 
     LOG_INFO("guest main thread returned");
@@ -325,8 +365,9 @@ int main(int argc, char* argv[])
         return gpu::renderer::RunSceneCopyPromotionSelfTest(std::filesystem::u8path(argv[i + 1]));
     }
 #endif
-    bool explicitGame=false, requestedSetup=false, setupOnly=false, prepareShadersOnly=false, requestedInstall=false;
+    bool explicitGame=false, requestedSetup=false, setupOnly=false, prepareShadersOnly=false, requestedInstall=false, compactGameData=false;
     std::optional<std::filesystem::path> explicitGamePath;
+    std::vector<std::filesystem::path> installSources;
     for(int i=1;i<argc;++i) {
         if (strcmp(argv[i], "--game") == 0)
         {
@@ -338,6 +379,10 @@ int main(int argc, char* argv[])
         setupOnly |= strcmp(argv[i],"--setup-only")==0;
         prepareShadersOnly |= strcmp(argv[i],"--prepare-shaders-only")==0;
         requestedInstall |= strcmp(argv[i],"--install")==0;
+        compactGameData |= strcmp(argv[i],"--compact-game-data")==0;
+        // Disc images picked in Android's file picker; the importer scans them at once.
+        if (strcmp(argv[i], "--install-source") == 0 && i + 1 < argc)
+            installSources.push_back(std::filesystem::u8path(argv[i + 1]));
         // Mod Organizer 2 cannot set environment variables for the game, so
         // its executable arguments carry the mod mode instead.
         if (strcmp(argv[i], "--mods-mode") == 0 && i + 1 < argc)
@@ -423,6 +468,8 @@ int main(int argc, char* argv[])
         }
         else LOG_WARNING("could not open log file: {}", FileSystem::PathUtf8(logPath));
     }
+    if (compactGameData)
+        return CompactGameDataCommand(FindGameRoot(executableDirectory, explicitGamePath).root);
     InstallCrashHandler();
 #if defined(_WIN32) && (defined(LO_ENABLE_STREAMLINE_FG) || defined(LO_ENABLE_D3D12_FG))
     LOG_INFO("FG: process physical-pixel awareness set={} error={}", fgDpiSet, fgDpiError);
@@ -568,12 +615,15 @@ int main(int argc, char* argv[])
 
     const auto gameResolution = FindGameRoot(executableDirectory, explicitGamePath);
     auto gameRoot = gameResolution.root;
-    if (gameResolution.configuredPathRejected)
+    if (gameResolution.configuredPathRejected && gameResolution.valid)
+        LOG_WARNING("game-path.txt names a folder without a default.xex; using the game data beside the executable: {}",
+                    FileSystem::PathUtf8(gameRoot));
+    else if (gameResolution.configuredPathRejected)
         LOG_WARNING("game-path.txt did not identify a default.xex; retaining the configured path for installer/error handling");
 
     if (requestedInstall)
     {
-        const auto result = install::RunHost(executableDirectory, &gameRoot, true);
+        const auto result = install::RunHost(executableDirectory, &gameRoot, true, installSources);
         const bool installed = result == install::HostResult::Installed || result == install::HostResult::AlreadyPresent;
 #if LO_PLATFORM_ANDROID
         // The game folder page starts the importer; a finished import goes
@@ -597,12 +647,30 @@ int main(int argc, char* argv[])
 #endif
     if (!explicitGame && !std::filesystem::exists(gameRoot / "default.xex"))
     {
+        // Where no game data was found, and a hint on the importer when importing
+        // again would only add a second copy of the discs.
+        std::string notice;
+#ifdef _WIN32
+        // Mod Organizer 2 runs the game with its virtual file system (usvfs)
+        // loaded. Its game folder having no data usually means MO2 points at
+        // another copy of the game than the one the discs were imported for.
+        if (GetModuleHandleW(L"usvfs_x64.dll"))
+            notice = "Started from Mod Organizer 2, but this folder has no game data. Imported before? "
+                     "Close this and point MO2 at that game folder.";
+#endif
+        if (notice.empty() && gameResolution.configuredPathRejected)
+            notice = "game-path.txt names " + FileSystem::PathUtf8(gameRoot) +
+                     ", which has no game data. Imported before? Close this and fix game-path.txt.";
+        LOG_WARNING("no game data in {} ({}); opening the importer{}{}", FileSystem::PathUtf8(gameRoot),
+                    gameResolution.configuredPathRejected ? std::string("named by game-path.txt")
+                                                          : "searched beside " + FileSystem::PathUtf8(executableDirectory),
+                    notice.empty() ? "" : ": ", notice);
         if (getenv("LO_HEADLESS") || getenv("LO_BACKGROUND"))
         {
             LOG_ERROR("missing default.xex in game root: headless or background environment prevents opening installer UI");
             return 1;
         }
-        const auto result = install::RunHost(executableDirectory, &gameRoot);
+        const auto result = install::RunHost(executableDirectory, &gameRoot, false, {}, notice);
         if (result != install::HostResult::Installed && result != install::HostResult::AlreadyPresent)
             return result == install::HostResult::Cancelled ? 0 : 1;
         if (!std::filesystem::exists(gameRoot / "default.xex"))
@@ -632,6 +700,7 @@ int main(int argc, char* argv[])
                    c.frameGenerationMultiplier, c.hdr, c.ambientOcclusion, c.shadowResolution, c.debugLog);
         const auto pack = settings::GameLanguagePack();
         modding::text_overlay::SelectLanguagePack(pack);
+        modding::text_overlay::EnablePrebuild();
         if (!pack.empty())
             LOG_NOTICE("settings: game language {} with language pack {}", settings::GameLanguage(), pack);
         else if (!c.gameLanguagePack.empty())
@@ -706,9 +775,11 @@ int main(int argc, char* argv[])
         packRequest.configuredBackend = settings::GetConfig().graphicsBackend;
         packRequest.uiLanguage = settings::GetConfig().uiLanguage;
         packRequest.unboundXex = XexLoader::UnboundIdentityPrefix();
+        packRequest.redownload = updater::shader_pack::TakeRedownloadRequest();
+        if (packRequest.redownload) LOG_INFO("shader pack: redownload requested from Settings");
         LOG_INFO("shader pack: {}", updater::shader_pack::PrepareAtStartup(packRequest));
         // The pipeline recipe corpus comes from the same index, on its own thread.
-        updater::shader_pack::StartCorpusDownload(settings::GetConfig().automaticUpdates);
+        updater::shader_pack::StartCorpusDownload(settings::GetConfig().automaticUpdates, packRequest.redownload);
     }
 
     // Exercise the same renderer preparation as ordinary startup, without

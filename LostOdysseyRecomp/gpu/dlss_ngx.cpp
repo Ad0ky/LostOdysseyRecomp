@@ -1273,7 +1273,10 @@ void Controller::QueryNeuralRenderingExtensions(VkPhysicalDevice device, std::ve
 const nr::Snippet* Controller::NeuralRenderingSnippet(const SrConfig& config) {
 #if defined(_WIN32) && defined(LO_DLSS_SDK)
     if (!config.neuralRenderingPasses) {
-        g_neuralRenderingState.store(NeuralRenderingState::Off, std::memory_order_relaxed);
+        // Off, but the settings page still learns that the DLL cannot run here.
+        g_neuralRenderingState.store(nrSupported_ ? NeuralRenderingState::Off :
+            backend_ == Backend::D3D12 || nrMissingAtDeviceCreation_ ? NeuralRenderingState::MissingRuntime :
+            NeuralRenderingState::Unsupported, std::memory_order_relaxed);
         return nullptr;
     }
     if (nrFailed_) return nullptr;

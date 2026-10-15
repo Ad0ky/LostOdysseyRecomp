@@ -5,6 +5,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // The archive index of a disc (LO.fpi) or a DLC (LODLC00x.fpi, whose one
@@ -28,8 +29,23 @@ struct Index
 {
     uint32_t disc = 0;
     std::vector<std::string> archives; // lower-case file names, in archive order
+    std::vector<std::string> prefixes; // each archive's folder ("" for the root), '/' separators
     std::vector<File> files;
 };
+
+// The record the game opens for a path: it tries the archives whose folder holds
+// the path by folder length, shortest first, then in archive order
+// (sub_82853DA8, sub_828548A0). Mod overflow archives (fpi_overflow.h) have no
+// folder, so their copies come before the originals.
+inline const File *Find(const Index &index, std::string_view path)
+{
+    const File *best = nullptr;
+    for (const auto &file : index.files)
+        if (file.path == path && (!best || index.prefixes[file.archive].size() < index.prefixes[best->archive].size() ||
+                                  (index.prefixes[file.archive].size() == index.prefixes[best->archive].size() && file.archive < best->archive)))
+            best = &file;
+    return best;
+}
 
 constexpr uint32_t kFlagCpx = 0x40;
 constexpr uint64_t kSector = 2048;
@@ -110,10 +126,14 @@ inline Index Read(std::span<const uint8_t> index)
     {
         const auto ar = size_t(begin) + i * 48;
         result.archives.push_back(names.Name(Le32(index, ar + 24)));
-        const auto base = ar + Le32(index, ar + 4);
+        // Relative to the record, in 32 bits as the game adds it: overflow archives
+        // (fpi_overflow.h) move the table past the records it points back to.
+        const auto base = size_t(uint32_t(ar + Le32(index, ar + 4)));
         Require(base <= index.size(), "invalid FPI archive record");
         struct Folder { uint32_t index, count, depth; std::string path; };
-        const auto prefix = names.Name(Le32(index, ar + 20));
+        auto prefix = names.Name(Le32(index, ar + 20));
+        for (auto &c : prefix) if (c == '\\') c = '/';
+        result.prefixes.push_back(prefix);
         std::vector<Folder> pending{{0, Le16(index, ar + 2), 0, prefix.empty() ? "" : prefix + "/"}};
         std::set<uint32_t> visited;
         while (!pending.empty())

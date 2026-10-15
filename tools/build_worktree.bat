@@ -9,6 +9,11 @@ rem plus copies of the main checkout's generated, gitignored files: LostOdysseyR
 rem LostOdysseyRecompLib\config and LostOdysseyRecompLib\private (image_disc*.bin and .sym).
 rem LostOdysseyRecomp\kernel\imports_stubs.cpp has to be a copy, not a hard link: it is
 rem regenerated and would write into the main checkout.
+rem The FSR D3D12 conversion shader is compiled into this worktree's out\fsr-dx12-adapter, from
+rem its own source. LO_REQUIRE_FSR stops the configure when the main checkout lacks
+rem out\fsr-shaders-vk or out\fsr-dx12-shaders (tools\fsr\*.py, docs\BUILDING.md); without it a
+rem missing folder silently builds an exe whose FSR is unavailable. XeSS comes from
+rem <deps>\xess-sdk-3.0.2, as in release builds.
 setlocal
 if not defined LO_MAIN_CHECKOUT for /f "tokens=1,* delims= " %%A in ('git -C "%~dp0." worktree list --porcelain') do if "%%A"=="worktree" if not defined LO_MAIN_CHECKOUT set "LO_MAIN_CHECKOUT=%%B"
 if not defined LO_MAIN_CHECKOUT (
@@ -24,6 +29,10 @@ set "T=%~1"
 if not defined T set "T=LostOdysseyRecomp"
 call "%~dp0setup_windows.bat" || exit /b 1
 cd /d "%~dp0.."
+set "A=%CD:\=/%/out/fsr-dx12-adapter"
+if not exist out\fsr-dx12-adapter\adapter-manifest.json (
+  python tools\fsr\prepare_adapter_shaders_dx12.py --dxc tools\XenosRecomp\thirdparty\dxc-bin\bin\x64\dxc.exe --output out\fsr-dx12-adapter || exit /b 1
+)
 if not exist out\build\windows-clang\build.ninja (
   cmake --preset windows-clang ^
     -DLO_DLSS_SDK_ROOT="%D%/nvidia-dlss-37495948" ^
@@ -33,9 +42,11 @@ if not exist out\build\windows-clang\build.ninja (
     -DLO_FSR_VULKAN_FG_RUNTIME="%D%/fidelityfx-sdk-v1.1.4/PrebuiltSignedDLL/amd_fidelityfx_vk.dll" ^
     -DLO_FSR_SHADER_DIR="%MAIN%/out/fsr-shaders-vk" ^
     -DLO_FSR_DX12_SHADER_DIR="%MAIN%/out/fsr-dx12-shaders" ^
-    -DLO_FSR_DX12_ADAPTER_DIR="%MAIN%/out/fsr-dx12-adapter" ^
-    -DLO_ENABLE_DLSS=ON -DLO_ENABLE_FSR=ON -DLO_ENABLE_STREAMLINE_FG=ON ^
-    -DLO_ENABLE_D3D12_DLSS_FG=ON -DLO_ENABLE_FSR_FG=ON -DLO_ENABLE_VULKAN_FSR_FG=ON || exit /b 1
+    -DLO_FSR_DX12_ADAPTER_DIR="%A%" ^
+    -DLO_XESS_SDK_ROOT="%D%/xess-sdk-3.0.2" ^
+    -DLO_ENABLE_DLSS=ON -DLO_ENABLE_FSR=ON -DLO_REQUIRE_FSR=ON -DLO_ENABLE_STREAMLINE_FG=ON ^
+    -DLO_ENABLE_D3D12_DLSS_FG=ON -DLO_ENABLE_FSR_FG=ON -DLO_ENABLE_VULKAN_FSR_FG=ON ^
+    -DLO_ENABLE_XESS=ON -DLO_ENABLE_XESS_FG=ON || exit /b 1
 )
 cmake --build out\build\windows-clang --target %T% -j %LO_BUILD_JOBS% || exit /b 1
 echo BUILD OK

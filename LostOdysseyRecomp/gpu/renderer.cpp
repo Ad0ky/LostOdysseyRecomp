@@ -4,6 +4,7 @@
 #include "scene_copy_promotion_policy.h"
 #include "scene_copy_promotion_shaders.h"
 #include "bloom_prefilter.h"
+#include "post_blur.h"
 #include <stdafx.h>
 #include <os/atomic_ref.h>
 #include <condition_variable>
@@ -12,6 +13,10 @@
 #include <os/user_paths.h>
 #include "render_resolution.h"
 #include "movie_clear.h"
+#if !defined(LO_RENDERER_P2_EMBEDDED_TEST)
+#include "movie_yuv_shader.h"
+#include <movie/movie_player.h>
+#endif
 #include "video.h"
 #include "command_processor.h"
 #include "register_snapshot.h"
@@ -26,6 +31,7 @@
 #include "guest_writes.h"
 #include "depth_format.h"
 #include "depth_clear_layout.h"
+#include "edram_transfer.h"
 #include "pending_clear.h"
 #include "draw_attachment_policy.h"
 #include "vulkan_object_trace.h"
@@ -35,6 +41,7 @@
 #include "driver_pipeline_cache.h"
 #include "pipeline_prepare_progress.h"
 #include "texture_layout.h"
+#include "d3d12_dred.h"
 #include "controller_atlas.h"
 #include "bc_decode.h"
 #include "temporal_scene.h"
@@ -86,6 +93,7 @@
 #include <os/thread_name.h>
 #include "color_qualification.h"
 #include "render_timing.h"
+#include "gpu_busy.h"
 #include "render_batch_policy.h"
 #include "render_arena_policy.h"
 #include "resolve_copy_policy.h"
@@ -497,6 +505,11 @@ namespace gpu::renderer
             uint64_t nextFullScanFrame = 0;
             uint32_t writeGeneration = 0;        // guest_writes generation at the last look
             uint64_t replacementPending = 0; // fingerprint of a mod replacement still being read
+            // A texture mods can replace (eligible by shape and format, whether or not
+            // a mod has it now), made in this textureModsEpoch: re-created at its next
+            // lookup after the mod list changes in game.
+            bool modReplaceable = false;
+            uint32_t modsEpoch = 0;
 
             // The source remains BC3. Only a verified controller atlas owns an
             // optional, single-mip RGBA PlayStation child; retirement of the
@@ -640,6 +653,9 @@ namespace gpu::renderer
                 std::unique_ptr<RenderCommandList> srContinuation;
                 std::unique_ptr<RenderCommandFence> fence;
                 std::unique_ptr<RenderQueryPool> timingQueries;
+                // This batch wrote both timestamps (LO_RENDER_TIMING or the
+                // Detailed performance overlay); only then are they read.
+                bool timed = false;
                 // Host queries around guest draws inside guest occlusion
                 // queries, reset when the slot's list opens. Query i lives in
                 // pool i / kOcclusionPoolQueries; only pools in use are read.
@@ -674,6 +690,10 @@ namespace gpu::renderer
                 // a distinct output while commands in the slot remain in flight.
                 std::vector<std::unique_ptr<HostTexture>> bloomPrefilterTextures;
                 size_t bloomPrefilterUsed = 0;
+                // Cutscene replacement planes read by this slot's commands, and
+                // the decoded picture they hold.
+                std::unique_ptr<HostTexture> movieLuma, movieChroma;
+                uint64_t movieSerial = 0;
                 uint64_t temporalSerial = 0, hdrTemporalSerial = 0, sceneTaaHdrSerial = 0, motionSerial = 0, aoSerial = 0;
                 std::vector<std::shared_ptr<void>> aoUses;
 #if defined(LO_RENDERER_P2_EMBEDDED_TEST)
@@ -731,6 +751,7 @@ namespace gpu::renderer
             uint8_t* uploadMapped = nullptr;
             render_timing::GpuBatches gpuTiming;
             bool timingInitialized = false;
+            bool timingUnavailable = false; // the device has no usable timestamp queries
             bool listOpen = false;
 
             // Guest occlusion queries counted by host queries (see
@@ -773,6 +794,7 @@ namespace gpu::renderer
             uint8_t* arenaMapped = nullptr;
             using VertexEntry = geometry_prepare::VertexEntry;
             std::vector<uint32_t> indexScratch, primitiveScratch;
+            std::vector<RenderTargetKey> clearViewScratch; // other views of a clear rectangle's tiles
             geometry_prepare::VertexCache vertexCache;
             geometry_prepare::IndexCache indexCache;
             uint64_t indexCacheHits = 0, indexCacheMisses = 0;
@@ -1093,6 +1115,53 @@ namespace gpu::renderer
             temporal::SuspectTracker suspectTracker;
             temporal::JitterMissLog jitterMissLog;
             double mvTrackCpuMs = 0;
+            // Camera-static replay skipping (MotionReplayGPU kCameraHlsl): a frame may
+            // skip the replay of draws that only the scene camera moved when every
+            // other depth writer into the scene depth replays.
+            struct CameraStaticState {
+                uint64_t frame = ~0ull;
+                // Depth writers outside motion tracking: before the scene camera
+                // (allocations) and into its allocation after it.
+                std::array<uint64_t, 4> preAnchorDepth{};
+                uint32_t preAnchorCount = 0, untrackedDepth = 0;
+                bool preAnchorOverflow = false;
+                int8_t allowed = -1; // decided at the first tracked draw
+                bool unsafe = false;
+                // Skipping waits this long after a frame that could not give the
+                // skipped draws camera motion, and stops for good if the camera
+                // passes cannot be built on this device.
+                uint64_t holdUntil = 0;
+                bool disabled = false;
+                uint32_t skipped = 0, markers = 0;
+                float jx = 0, jy = 0;
+                // The last frame whose scene camera HistoryOwner keeps as the next
+                // frame's previous camera, and that camera's VP bits.
+                uint64_t keptFrame = ~0ull, keptEpoch = 0;
+                std::array<uint32_t, 16> keptVp{};
+                temporal::Viewport keptViewport{};
+                uint64_t camerasApplied = 0, camerasDropped = 0;
+                void Hold(uint64_t f) { holdUntil = std::max(holdUntil, f + 60); }
+                void Begin(uint64_t f) {
+                    if (frame == f) return;
+                    if (unsafe) Hold(frame);
+                    frame = f; preAnchorCount = untrackedDepth = skipped = markers = 0;
+                    preAnchorOverflow = unsafe = false; allowed = -1; jx = jy = 0;
+                }
+                bool PreAnchorWrote(uint64_t allocation) const {
+                    return preAnchorOverflow || std::find(preAnchorDepth.begin(), preAnchorDepth.begin() + preAnchorCount, allocation) !=
+                        preAnchorDepth.begin() + preAnchorCount;
+                }
+                // Depth written outside motion tracking (a draw, clear or fill).
+                void NoteUntrackedDepth(uint64_t f, uint64_t allocation, bool sceneCameraKnown, uint64_t sceneAllocation) {
+                    Begin(f);
+                    if (sceneCameraKnown) {
+                        if (allocation == sceneAllocation) { ++untrackedDepth; unsafe = true; }
+                    } else if (!PreAnchorWrote(allocation)) {
+                        if (preAnchorCount < preAnchorDepth.size()) preAnchorDepth[preAnchorCount++] = allocation;
+                        else preAnchorOverflow = true;
+                    }
+                }
+            } cameraStatic;
             uint64_t mvScratchBytes = 0;
             const temporal::MotionOptions motionOptions = temporal::MotionOptions::Environment();
             std::unique_ptr<temporal::MotionReplayGPU> motionReplay;
@@ -1346,6 +1415,56 @@ namespace gpu::renderer
                 dlssFrame.publishedPlan = observation.plan;
                 dlssFrame.publishedSubmitted = observation.outcome == frame_plan::DlssExecutionOutcome::Submitted;
             }
+            // Tracked draws in this frame may skip a camera-static replay: the frame
+            // continues the previous one, whose scene camera HistoryOwner kept, and
+            // no depth writer outside motion tracking has touched the scene depth.
+            bool CameraStaticAllowed(const temporal::SceneAnchor* sceneCamera) {
+                auto& s = cameraStatic;
+                s.Begin(frame);
+                // Metal (queued replay draws) has not been checked against a full
+                // replay yet; it keeps replaying every draw.
+                if (s.allowed < 0)
+                    s.allowed = motionOptions.staticSkip && !video::IsMetal() && !s.disabled && frame >= s.holdUntil && sceneCamera &&
+                        s.keptFrame + 1 == frame && s.keptEpoch == temporalEpoch &&
+                        !s.PreAnchorWrote(sceneCamera->depthAllocation) && CameraContinuous(*sceneCamera);
+                return s.allowed > 0 && !s.unsafe;
+            }
+            // A camera cut resets temporal history anyway; near the old camera's
+            // plane its reprojection is also too unstable to stand in for a replay.
+            bool CameraContinuous(const temporal::SceneAnchor& sceneCamera) const {
+                temporal::Matrix current{}, previous{};
+                for (unsigned i = 0; i < 16; ++i) {
+                    current[i] = std::bit_cast<float>(sceneCamera.vpBits[i]);
+                    previous[i] = std::bit_cast<float>(cameraStatic.keptVp[i]);
+                }
+                const auto c = temporal::Camera::Create(current, sceneCamera.viewport);
+                const auto p = temporal::Camera::Create(previous, cameraStatic.keptViewport);
+                return c && p && temporal::ContinuousHistoryCamera(*c, *p);
+            }
+            // The camera reprojection the skipped draws were classified against:
+            // HistoryOwner's current and previous cameras are exactly the scene
+            // anchors of this and the previous frame.
+            std::optional<temporal::SrHybridConstants> CameraStaticConstants(temporal::HistoryOwner* history) const {
+                const auto& s = cameraStatic;
+                if (s.frame != frame || !s.skipped || s.unsafe || !temporalScene.Draws()) return {};
+                const auto current = history->CurrentCameraForCapture(), previous = history->PreviousCameraForCapture();
+                if (!current || !previous) return {};
+                const auto& anchor = temporalScene.Anchor().vpBits;
+                bool unchanged = true;
+                for (unsigned i = 0; i < 16; ++i) {
+                    const uint32_t c = std::bit_cast<uint32_t>(float(current->VP()[i]));
+                    const uint32_t p = std::bit_cast<uint32_t>(float(previous->VP()[i]));
+                    if (c != anchor[i] || p != s.keptVp[i]) return {};
+                    unchanged = unchanged && c == p;
+                }
+                auto constants = temporal::MakeSrHybridConstants(*current, &*previous, history->InputWidth(), history->InputHeight(),
+                    s.jx, s.jy, false);
+                if (!constants) return {};
+                const auto& cr = current->Raster(); const auto& pr = previous->Raster();
+                constants->options[1] = unchanged && cr.width == pr.width && cr.height == pr.height && cr.ndcYSign == pr.ndcYSign &&
+                    cr.halfPixelNdcX == pr.halfPixelNdcX && cr.halfPixelNdcY == pr.halfPixelNdcY ? 1u : 0u;
+                return constants;
+            }
             void FinishMotion(temporal::HistoryOwner* history) {
                 if (!motionOptions.enabled || !history || motionFinalizedFrame == frame) return;
                 motionFinalizedFrame = frame;
@@ -1353,8 +1472,27 @@ namespace gpu::renderer
                 const auto& flags = drawTemporalTracker.FinalizeFrame();
                 timer.AddTo(mvTrackCpuMs);
                 if (motionReplay && !drawTemporalTracker.Failed()) {
-                    motionView = motionReplay->Finish(commandList, history->CurrentDepth(), flags, history->ResetInitializationRequired());
+                    std::optional<temporal::SrHybridConstants> camera;
+                    if (cameraStatic.frame == frame && cameraStatic.skipped) {
+                        camera = CameraStaticConstants(history);
+                        ++(camera ? cameraStatic.camerasApplied : cameraStatic.camerasDropped);
+                    }
+                    motionView = motionReplay->Finish(commandList, history->CurrentDepth(), flags, history->ResetInitializationRequired(),
+                        camera ? &*camera : nullptr);
                     if (motionView.ready) history->RecordExternalRead();
+                    if (cameraStatic.frame == frame && cameraStatic.skipped && motionView.ready && !motionReplay->CameraFrameThisFrame()) {
+                        cameraStatic.Hold(frame);
+                        if (motionReplay->CameraUnavailable() && !cameraStatic.disabled) {
+                            cameraStatic.disabled = true;
+                            LOG_WARNING("mv: camera motion passes unavailable; every draw replays: {}", motionReplay->LastError());
+                        }
+                    }
+                }
+                // This frame's scene camera is the next frame's previous camera.
+                if (history->CurrentCameraForCapture() && temporalScene.Draws()) {
+                    cameraStatic.keptFrame = frame; cameraStatic.keptEpoch = temporalEpoch;
+                    cameraStatic.keptVp = temporalScene.Anchor().vpBits;
+                    cameraStatic.keptViewport = temporalScene.Anchor().viewport;
                 }
                 if (motionOptions.log) {
                     const auto& st = drawTemporalTracker.Stats();
@@ -1377,9 +1515,13 @@ namespace gpu::renderer
                     const bool firstState = !seen && motionFinishDistinct < motionFinishStates.size();
                     if (firstState) motionFinishStates[motionFinishDistinct++] = state;
                     if (firstState || frame % 120 == 0) {
-                        LOG_INFO("mv: frame={} epoch={} tracker_failed={} tracker_finalized={} tracked={} matched={} unmatched={} overflow={} late={} replay_draws={} replay_failed={} replay_cleared={} replay_finalized={} aborted={} resource_failed={} pending_pipeline={} pending_batches={} ready={} empty_reason={} replay_error={} suppressed_draw={} suppressed_finish={}",
+                        LOG_INFO("mv: frame={} epoch={} tracker_failed={} tracker_finalized={} tracked={} matched={} unmatched={} camera_static={} not_scene_camera={} relative={} constants={} shared={} raster={} static_skips={} marker_draws={} static_allowed={} static_unsafe={} untracked_scene_depth={} pre_anchor_scene_depth={} camera_fill={} cameras_applied={} cameras_dropped={} overflow={} late={} replay_draws={} replay_failed={} replay_cleared={} replay_finalized={} aborted={} resource_failed={} pending_pipeline={} pending_batches={} ready={} empty_reason={} replay_error={} suppressed_draw={} suppressed_finish={}",
                             frame, temporalEpoch, trackerFailed, drawTemporalTracker.Finalized(),
                             st.trackedCurrentDraws, st.matchedPreviousDraws, st.unmatchedDraws,
+                            st.cameraStaticDraws, st.staticNotSceneCamera, st.staticRelative, st.staticConstants,
+                            st.staticShared, st.staticRaster, cameraStatic.skipped, cameraStatic.markers, int(cameraStatic.allowed),
+                            cameraStatic.unsafe, cameraStatic.untrackedDepth, cameraStatic.PreAnchorWrote(temporalScene.Anchor().depthAllocation),
+                            motionReplay && motionReplay->CameraFrameThisFrame(), cameraStatic.camerasApplied, cameraStatic.camerasDropped,
                             st.overflowDraws, st.lateDraws, motionReplay ? motionReplay->DrawCount() : 0,
                             motionReplay ? motionReplay->FailedDraws() : 0, cleared, replayFinalized, aborted,
                             motionReplay && motionReplay->ResourceFailedThisFrame(), pending,
@@ -1430,6 +1572,48 @@ namespace gpu::renderer
             float srFrameDeltaMilliseconds = 0;
             bool srTimeReset = true;
             bool actualRasterJitterCaptured=false;
+            // With no temporal consumer, history and motion targets are released
+            // once the Settings menu closes, or after kTemporalIdleRelease if the
+            // change came another way. Settings applies TAA and upscaler choices
+            // while the menu stays open, so nothing is released until it closes.
+            // Replay shaders and pipelines stay: they are what a re-enable would wait for.
+            static constexpr std::chrono::seconds kTemporalIdleRelease{10};
+            std::chrono::steady_clock::time_point temporalIdleSince{};
+            bool temporalIdleMenu = false, temporalImagesHeld = false, temporalRecreateLog = false;
+            uint64_t TemporalImageBytes()
+            {
+                uint64_t bytes = motionReplay ? motionReplay->HeldBytes() : 0;
+                for (auto* owner : {temporalHistory.get(), hdrTemporalHistory.get(), sceneTaaHdrHistory.get()})
+                    if (owner) bytes += owner->HeldBytes();
+                return bytes;
+            }
+            // Once per frame, with this frame's consumer selection.
+            void UpdateTemporalIdle(bool active)
+            {
+                if (active) {
+                    temporalIdleSince = {}; temporalIdleMenu = false; temporalImagesHeld = true;
+                    if (temporalRecreateLog)
+                        if (const uint64_t bytes = TemporalImageBytes()) {
+                            temporalRecreateLog = false;
+                            LOG_INFO("renderer: temporal consumer back; history and motion targets recreated ({:.1f} MiB)", double(bytes) / (1 << 20));
+                        }
+                    return;
+                }
+                if (!temporalImagesHeld) return;
+                const auto now = std::chrono::steady_clock::now();
+                if (temporalIdleSince == std::chrono::steady_clock::time_point{}) temporalIdleSince = now;
+                if (video::IsHostOverlayActive()) { temporalIdleMenu = true; return; }
+                if (!temporalIdleMenu && now - temporalIdleSince < kTemporalIdleRelease) return;
+                uint64_t bytes = 0;
+                for (auto* owner : {temporalHistory.get(), hdrTemporalHistory.get(), sceneTaaHdrHistory.get()})
+                    if (owner) bytes += owner->ReleaseImages();
+                if (motionReplay) bytes += motionReplay->ReleaseTargets();
+                motionView = {};
+                hdrTemporalOutput = sceneTaaHdrOutput = sceneTaaHdrSource = sceneTaaSdrOutput = nullptr;
+                temporalSupportedFrame = ~0ull; ++temporalEpoch;
+                temporalImagesHeld = false; temporalRecreateLog = bytes != 0;
+                if (bytes) LOG_INFO("renderer: no temporal consumer; released {:.1f} MiB of history and motion targets", double(bytes) / (1 << 20));
+            }
             uint64_t appliedPlanEpoch=~0ull;
             resolution::Size internalSize{}, requestedInternalSize{};
             resolution::ShadowResolutionState shadowState;
@@ -1601,6 +1785,7 @@ namespace gpu::renderer
                 uint32_t format = 0, width = 0, height = 0;
                 bool blockCompressed = true;
                 std::chrono::steady_clock::time_point queued;
+                uint32_t epoch = 0; // textureModsEpoch when queued; an older read is dropped
                 std::optional<modding::TextureData> data;
                 std::string error;
                 bool bcSkipped = false;
@@ -1645,6 +1830,11 @@ namespace gpu::renderer
             static constexpr uint64_t kReplacementReadyFrames = 300;
             struct ReadyReplacement { modding::TextureData data; uint32_t format, width, height; uint64_t frame; };
             std::unordered_set<uint64_t> replacementsQueued, replacementsMissing;
+            // modding::Generation() as last seen: a change (the Mods page saved a new
+            // list, modding::Reload) starts a new epoch, and replaceable textures made
+            // in an older one are made again with the new mods.
+            uint64_t textureModsGeneration = ~0ull;
+            uint32_t textureModsEpoch = 0;
             std::unordered_map<uint64_t, ReadyReplacement> replacementsReady;
             uint64_t controllerAtlasFamilyFrame = ~0ull;
             bool controllerAtlasPlayStationFamily = false;
@@ -2823,7 +3013,7 @@ namespace gpu::renderer
 
             void CompileTransferShader()
             {
-                const char* psSrc =
+                const char* bindings =
                     "Texture2D<float4> src : register(t0, space1);\n"
                     "#ifdef __spirv__\n"
                     "struct XePushConstants { uint64_t vs; uint64_t sharedAddress; uint64_t ps; };\n"
@@ -2834,43 +3024,8 @@ namespace gpu::renderer
                     "  uint4 pad0[2]; uint4 pad1[8]; float4 pad2; float4 pad3; float4 pad4;\n"
                     "  float4 pad5; float4 xeColorMax; uint4 xeTransfer;\n"
                     "};\n"
-                    "#endif\n"
-                    "float Float7e3To32(uint f10) {\n"
-                    "  f10 &= 0x3FFu; if (f10 == 0u) return 0.0;\n"
-                    "  uint mantissa = f10 & 0x7Fu, exponent = f10 >> 7;\n"
-                    "  if (exponent == 0u) { uint lz = firstbithigh(mantissa); uint shift = 7u - lz;\n"
-                    "    exponent = uint(int(1) - int(shift)); mantissa = (mantissa << shift) & 0x7Fu; }\n"
-                    "  return asfloat(((exponent + 124u) << 23) | (mantissa << 16));\n"
-                    "}\n"
-                    "uint Float32To7e3(float f) {\n"
-                    "  if (!(f > 0.0)) return 0u;\n"
-                    "  uint u = asuint(f);\n"
-                    "  if (u >= 0x41FF73FFu) return 0x3FFu;\n"
-                    "  if (u < 0x3E800000u) { uint shift = min(125u - (u >> 23), 24u);\n"
-                    "    u = (0x800000u | (u & 0x7FFFFFu)) >> shift; }\n"
-                    "  else { u += 0xC2000000u; }\n"
-                    "  return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;\n"
-                    "}\n"
-                    "uint PackGuest(float4 v, uint cls) {\n"
-                    "  if (cls == 0u) { uint4 c = uint4(saturate(v) * 255.0 + 0.5);\n"
-                    "    return c.r | (c.g << 8) | (c.b << 16) | (c.a << 24); }\n"
-                    "  uint a = uint(saturate(v.a) * 3.0 + 0.5);\n"
-                    "  uint3 c;\n"
-                    "  if (cls == 1u) c = uint3(saturate(v.rgb) * 1023.0 + 0.5);\n"
-                    "  else c = uint3(Float32To7e3(v.r), Float32To7e3(v.g), Float32To7e3(v.b));\n"
-                    "  return c.r | (c.g << 10) | (c.b << 20) | (a << 30);\n"
-                    "}\n"
-                    "float4 UnpackGuest(uint w, uint cls) {\n"
-                    "  if (cls == 0u) return float4(uint4(w, w >> 8, w >> 16, w >> 24) & 0xFFu) * (1.0 / 255.0);\n"
-                    "  float alpha = float(w >> 30) * (1.0 / 3.0);\n"
-                    "  uint3 c = uint3(w, w >> 10, w >> 20) & 0x3FFu;\n"
-                    "  if (cls == 1u) return float4(float3(c) * (1.0 / 1023.0), alpha);\n"
-                    "  return float4(Float7e3To32(c.x), Float7e3To32(c.y), Float7e3To32(c.z), alpha);\n"
-                    "}\n"
-                    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
-                    "  float4 v = src.Load(int3(int2(pos.x * asfloat(xeTransfer.z), pos.y * asfloat(xeTransfer.w)), 0));\n"
-                    "  return UnpackGuest(PackGuest(v, xeTransfer.x), xeTransfer.y);\n"
-                    "}\n";
+                    "#endif\n";
+                const std::string psSrc = std::string(bindings) + gpu::edram_transfer::kTransferHlsl;
                 xenos::CompiledShader f = xenos::CompileCachedHlsl(psSrc, "main", "ps_6_0", binaryFormat);
                 if (!f.ok)
                 {
@@ -2918,6 +3073,30 @@ namespace gpu::renderer
                 // Only the 32-bit classes share a word layout; wider ones are left alone.
                 if (srcClass > kClass7e3 || dstClass > kClass7e3)
                     return;
+                const uint32_t w = dst.ScaleX(std::min(src.guestWidth, dst.guestWidth));
+                const uint32_t h = dst.ScaleY(std::min(src.guestHeight, dst.guestHeight));
+                // A source that still owes one whole colour clear holds one value
+                // everywhere, so the transfer would write one value too: owe that as
+                // a clear of the destination region instead of drawing. The source
+                // keeps its own clear.
+                if (src.pendingClear.Size() == 1 && src.format == RenderFormat::R16G16B16A16_FLOAT &&
+                    dst.format == RenderFormat::R16G16B16A16_FLOAT)
+                {
+                    const pending_clear::Op& owed = src.pendingClear.Ops()[0];
+                    float value[4];
+                    if (owed.aspects == pending_clear::Color && owed.Whole() &&
+                        edram_transfer::ConstantTransfer(owed.color, srcClass, dstClass, value))
+                    {
+                        std::vector<pending_clear::Rect> rects;
+                        if (w != dst.width || h != dst.height) rects.push_back({0, 0, int32_t(w), int32_t(h)});
+                        QueueClear(dst, pending_clear::ColorOp(value, std::move(rects)));
+#if defined(LO_GPU_PLUME)
+                        HandleFsrAlphaRgbWriter(dst, "tile_owner_transfer");
+#endif
+                        transfers++;
+                        return;
+                    }
+                }
                 RenderPipeline* pipeline = GetTransferPipeline(dst.format);
                 if (!pipeline)
                     return;
@@ -2929,8 +3108,6 @@ namespace gpu::renderer
                 uint64_t offset = Upload(&transferConstants, sizeof(transferConstants));
                 if (offset == UINT64_MAX)
                     return;
-                const uint32_t w = dst.ScaleX(std::min(src.guestWidth, dst.guestWidth));
-                const uint32_t h = dst.ScaleY(std::min(src.guestHeight, dst.guestHeight));
                 if (!Begin()) return;
                 Transition(src, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
                 Transition(dst, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
@@ -4723,11 +4900,15 @@ void main()
                 fgHandoffPool.Collect();
                 for (const auto& e : s.evaluateCaptures) if (e->checkedSubmit) e->completed = true;
                 s.evaluateCaptures.clear();
-                if (s.timingQueries) {
+                if (s.timed) {
+                    s.timed = false;
                     s.timingQueries->queryResults();
                     const auto* results = s.timingQueries->getResults();
-                    if (results) gpuTiming.AddBatch(results[0], results[1]);
-                    else gpuTiming.AddUnavailableBatch();
+                    if (results) gpu_busy::AddBatch(results[0], results[1]);
+                    if (render_timing::Enabled()) {
+                        if (results) gpuTiming.AddBatch(results[0], results[1]);
+                        else gpuTiming.AddUnavailableBatch();
+                    }
                 } else if (render_timing::Enabled()) gpuTiming.AddUnavailableBatch();
                 s.drawProbe.ReadCompleted();
 #if defined(LO_GPU_PLUME)
@@ -4836,10 +5017,16 @@ void main()
                     if (render_timing::Enabled() && !timingInitialized) {
                         timingInitialized = true;
                     }
-                    if (render_timing::Enabled() && !Gpu().timingQueries) {
-                        Gpu().timingQueries = device->createQueryPool(2);
+                    // Timestamps only while LO_RENDER_TIMING or the Detailed
+                    // performance overlay reads them.
+                    const bool timestamps = render_timing::Enabled() || gpu_busy::Requested();
+                    if (timestamps && !Gpu().timingQueries && !timingUnavailable) {
+                        if (device->getCapabilities().queryPools) Gpu().timingQueries = device->createQueryPool(2);
                         if (Gpu().timingQueries && Gpu().timingQueries->getCount() != 2) Gpu().timingQueries.reset();
-                        if (!Gpu().timingQueries) LOG_WARNING("render timing: GPU timestamp queries unavailable");
+                        if (!Gpu().timingQueries) {
+                            timingUnavailable = true;
+                            LOG_WARNING("render timing: GPU timestamp queries unavailable");
+                        }
                         timingQueries = Gpu().timingQueries.get();
                     }
                     if (!video::BeginGpuCommands(commandList)) return false;
@@ -4847,7 +5034,8 @@ void main()
                     if (!vulkan) static_cast<plume::D3D12CommandList*>(commandList)->captureRootBindingStats = render_timing::Enabled();
 #endif
                     Gpu().drawProbe.Begin(device, commandList, frame);
-                    if (timingQueries) {
+                    Gpu().timed = timestamps && timingQueries;
+                    if (Gpu().timed) {
                         commandList->resetQueryPool(timingQueries, 0, 2);
                         commandList->writeTimestamp(timingQueries, 0);
                     }
@@ -4918,7 +5106,7 @@ void main()
                 if (!listOpen) return true;
                 if (motionReplay) motionReplay->SealTimings(commandList);
                 if (!Gpu().srPrefixClosed) Gpu().drawProbe.End(commandList);
-                if (timingQueries) commandList->writeTimestamp(timingQueries, 1);
+                if (Gpu().timed) commandList->writeTimestamp(timingQueries, 1);
                 if (!video::EndGpuCommands(commandList)) {
 #if defined(LO_GPU_PLUME)
                     for (const auto& capture : Gpu().fgUiUses) {
@@ -5296,6 +5484,14 @@ void main()
 
             void QueueClear(HostTexture& tex, pending_clear::Op op)
             {
+                // A depth fill leaves a surface no replay draws; the clear value 0 is "nothing".
+                // Only a frame with a motion consumer tracks it.
+                if (motionOptions.staticSkip && (temporalExperiment || temporalInputProbe || dlssSrRequested || nativeFgInputs) &&
+                    IsDepthTarget(tex) && (op.aspects & pending_clear::Depth) && op.depth != 0.0f) {
+                    const bool sceneCameraKnown = temporalScene.Frame() == frame && temporalScene.Draws() != 0;
+                    cameraStatic.NoteUntrackedDepth(frame, tex.allocationSerial, sceneCameraKnown,
+                        sceneCameraKnown ? temporalScene.Anchor().depthAllocation : 0);
+                }
                 MarkFgWritable(tex, "edram_clear");
                 if (tex.pendingClear.Size() >= pending_clear::Queue::kMaxOps) RunPendingClears(tex);
                 tex.pendingClear.Record(std::move(op), tex.width, tex.height);
@@ -5327,7 +5523,7 @@ void main()
             // Runs the queue on the target's own framebuffer, which stays bound.
             void RunPendingClears(HostTexture& tex)
             {
-                const auto ops = tex.pendingClear.Take();
+                auto ops = tex.pendingClear.Take();
                 const bool depthTarget = IsDepthTarget(tex);
                 const auto layout = depthTarget ? RenderTextureLayout::DEPTH_WRITE : RenderTextureLayout::COLOR_WRITE;
                 if (tex.layout != layout) {
@@ -5336,6 +5532,14 @@ void main()
                 }
                 commandList->setFramebuffer(FramebufferFor(depthTarget ? nullptr : &tex, depthTarget ? &tex : nullptr));
                 ReplayClears(tex, ops);
+                tex.pendingClear.Recycle(std::move(ops));
+            }
+
+            void ReplayPendingClears(HostTexture& tex)
+            {
+                auto ops = tex.pendingClear.Take();
+                ReplayClears(tex, ops);
+                tex.pendingClear.Recycle(std::move(ops));
             }
 
             // Binds colour/depth (either may be null) for a pass and starts it
@@ -5351,8 +5555,8 @@ void main()
                         RunPendingClears(*tex);
                 RenderFramebuffer* framebuffer = GetFramebuffer(color, depth);
                 commandList->setFramebuffer(framebuffer);
-                if (color && !color->pendingClear.Empty()) ReplayClears(*color, color->pendingClear.Take());
-                if (depth && !depth->pendingClear.Empty()) ReplayClears(*depth, depth->pendingClear.Take());
+                if (color && !color->pendingClear.Empty()) ReplayPendingClears(*color);
+                if (depth && !depth->pendingClear.Empty()) ReplayPendingClears(*depth);
                 return framebuffer;
             }
 
@@ -6298,6 +6502,9 @@ void main()
                     xenos::portable_pack::Reader* pack = reader ? reader.get() : nullptr;
                     if (job->shader) {
                         LoadShaderJob(*job, pack);
+                    } else if (video::GpuWorkStopped()) {
+                        // A lost device fails every creation and logs each one
+                        // (#533); finish the job as failed without the call.
                     } else if (!job->needVs && !job->needPs) {
                         const auto started = std::chrono::steady_clock::now();
                         try { job->pipeline = device->createGraphicsPipeline(job->desc); }
@@ -7458,6 +7665,11 @@ void main()
                     activePlan = committedPlan;
                     activePlanFailed = activePlan.geometryEpoch != 0 && failedPlanEpochs.contains(activePlan.geometryEpoch);
                     activePlanGeneration = framePlanGeneration.load(std::memory_order_relaxed);
+#if defined(LO_GPU_PLUME)
+                    // Only FSR publishes or reads FSR alpha; leaving it drops what it left.
+                    if (fsrAlphaBridge && activePlan.requestedUpscaler != upscaling::Upscaler::Fsr)
+                        fsrAlphaBridge->Invalidate();
+#endif
                 }
                 if (activePlanFailed)
                     return false;
@@ -7955,7 +8167,8 @@ void main()
                     {
                         std::lock_guard lock(reader.mutex);
                         // Without device BC (textureBcFallback) DDS payloads stay unread.
-                        reader.queue.push_back({fingerprint, format, width, height, !textureBcFallback, std::chrono::steady_clock::now()});
+                        reader.queue.push_back({fingerprint, format, width, height, !textureBcFallback, std::chrono::steady_clock::now(),
+                            textureModsEpoch});
                     }
                     if (!reader.thread.joinable()) reader.thread = std::thread([&reader] { reader.Run(); });
                     reader.wake.notify_one();
@@ -7986,10 +8199,28 @@ void main()
                     std::lock_guard lock(replacementReader.mutex);
                     done.swap(replacementReader.done);
                 }
+                if (const uint64_t generation = modding::Generation(); generation != textureModsGeneration)
+                {
+                    // The mods changed in game: what was found missing, failed or read
+                    // belongs to the old list.
+                    if (textureModsGeneration != ~0ull)
+                    {
+                        ++textureModsEpoch;
+                        replacementsQueued.clear();
+                        replacementsMissing.clear();
+                        replacementsReady.clear();
+                        textureReplacementFailures.clear();
+                        textureReplacementsLogged.clear();
+                        textureBcReplacementWarned = false;
+                        LOG_INFO("[mods] texture replacements: the mod list changed; replaceable textures are made again");
+                    }
+                    textureModsGeneration = generation;
+                }
                 const auto now = std::chrono::steady_clock::now();
                 auto& cost = replacementCost;
                 for (auto& read : done)
                 {
+                    if (read.epoch != textureModsEpoch) continue;
                     replacementsQueued.erase(read.fingerprint);
                     if (!read.data)
                     {
@@ -8066,6 +8297,7 @@ void main()
                     LOG_WARNING("[mods] texture {:016x} replacement creation failed {}x{} levels={}; using original", fingerprint, data.width, data.height, levelCount);
                     return ReplacementUpload::Skipped;
                 }
+                if (dred::Enabled()) tex.texture->setName(fmt::format("mod {:016x}", fingerprint));
                 tex.format = hostFormat;
                 for (uint32_t level = 0; level < levelCount; level++)
                 {
@@ -8318,8 +8550,10 @@ void main()
                 {
                     recentTexture = {key, it, texturesVersion};
                     HostTexture* cached = it->second.get();
-                    // An original whose mod replacement was read since: re-create it.
-                    const bool replacementArrived = cached->replacementPending && ReplacementArrived(*cached);
+                    // An original whose mod replacement was read since, or any replaceable
+                    // texture made before the mod list changed: re-create it.
+                    const bool replacementArrived = (cached->replacementPending && ReplacementArrived(*cached)) ||
+                        (cached->modReplaceable && cached->modsEpoch != textureModsEpoch);
                     // Guest bytes get another look only when they can have changed
                     // since the last one: in every frame for an untiled texture (its
                     // layout is the CPU's; the movie decoder rewrites its linear planes
@@ -8475,10 +8709,10 @@ void main()
                 // Mod replacements (docs/wiki/Modding-API.md, Runtime textures) match
                 // tiled 2D base levels by fingerprint. Resolves returned earlier;
                 // packed-tail and partial-block base levels never qualify.
-                const bool replaceable = dimension == 1 && tiled && base != 0 && sourceMip == 0 &&
+                const bool modReplaceable = dimension == 1 && tiled && base != 0 && sourceMip == 0 &&
                     (format == 2 || format == 6 || format == 18 || format == 19 || format == 20) &&
-                    std::min(width, height) > 16 && width % fi.blockWidth == 0 && height % fi.blockHeight == 0 &&
-                    modding::HasTextureReplacements();
+                    std::min(width, height) > 16 && width % fi.blockWidth == 0 && height % fi.blockHeight == 0;
+                const bool replaceable = modReplaceable && modding::HasTextureReplacements();
                 const bool logFingerprint = textureFingerprintLog && dimension == 1 && !fi.convertToRgba8;
                 const size_t baseRowBytes = size_t(blocksX) * fi.bytesPerBlock;
                 const uint64_t fingerprint = replaceable || logFingerprint
@@ -8506,6 +8740,8 @@ void main()
                 tex->guestAddress = sourceAddress;
                 tex->guestBytes = uint32_t(guestBytes);
                 tex->checkedFrame = frame;
+                tex->modReplaceable = modReplaceable;
+                tex->modsEpoch = textureModsEpoch;
                 // writeGeneration stays 0: a file read that landed before or during
                 // this upload makes the next bind look at the bytes once more.
                 if (controller_atlas::Candidate(dimension, format, originalWidth, originalHeight,
@@ -8628,6 +8864,7 @@ void main()
                     LOG_WARNING("renderer: texture creation failed fmt={} {}x{}", format, texWidth, texHeight);
                     return nullptr;
                 }
+                if (dred::Enabled()) tex->texture->setName(fmt::format("guest {:08x}", tex->guestAddress));
 
                 texBytes += upload.size();
                 uint64_t offset = Upload(upload.data(), upload.size(), 512);
@@ -8656,7 +8893,8 @@ void main()
             // its EDRAM tiles as physical rectangles: MapDepthClear, the coalescing
             // sorts (Vulkan) and the scaling to the target's resolution. The result
             // depends only on these inputs, and the title repeats the same clears
-            // every frame, so recent mappings are kept.
+            // every frame, so the mappings are kept: about a hundred distinct ones
+            // per frame in Uhra. The bound only stops growth.
             struct DepthClearMapKey {
                 uint32_t srcPitch, srcMsaa, dstPitch, dstHeight, dstMsaa, scaleWidth, scaleHeight;
                 bool coalesce;
@@ -8667,24 +8905,33 @@ void main()
                         area.left == o.area.left && area.top == o.area.top && area.right == o.area.right && area.bottom == o.area.bottom;
                 }
             };
-            struct DepthClearMap { DepthClearMapKey key{}; std::vector<pending_clear::Rect> rects; bool valid = false; };
-            std::array<DepthClearMap, 16> depthClearMaps{};
-            size_t depthClearMapNext = 0;
-            std::vector<pending_clear::Rect> MappedDepthClear(const DepthClearMapKey& key, const HostTexture& target)
+            struct DepthClearMapKeyHash {
+                size_t operator()(const DepthClearMapKey& k) const noexcept {
+                    uint64_t hash = 0xcbf29ce484222325ull;
+                    for (const uint64_t v : {uint64_t(k.srcPitch) | uint64_t(k.srcMsaa) << 32, uint64_t(k.dstPitch) | uint64_t(k.dstHeight) << 32,
+                        uint64_t(k.dstMsaa) | uint64_t(k.coalesce) << 32, uint64_t(k.scaleWidth) | uint64_t(k.scaleHeight) << 32,
+                        uint64_t(uint32_t(k.area.left)) | uint64_t(uint32_t(k.area.top)) << 32,
+                        uint64_t(uint32_t(k.area.right)) | uint64_t(uint32_t(k.area.bottom)) << 32})
+                        hash = (hash ^ v) * 0x100000001b3ull;
+                    return size_t(hash ^ (hash >> 32));
+                }
+            };
+            static constexpr size_t kDepthClearMaps = 1024;
+            std::unordered_map<DepthClearMapKey, std::vector<pending_clear::Rect>, DepthClearMapKeyHash> depthClearMaps;
+            std::vector<DepthClearRect> depthClearScratch;
+            // Valid until the next call.
+            const std::vector<pending_clear::Rect>& MappedDepthClear(const DepthClearMapKey& key, const HostTexture& target)
             {
-                for (const auto& map : depthClearMaps)
-                    if (map.valid && map.key == key) return map.rects;
-                auto mapped = MapDepthClear(key.srcPitch, key.srcMsaa, key.area, key.dstPitch, key.dstHeight, key.dstMsaa);
+                if (const auto it = depthClearMaps.find(key); it != depthClearMaps.end()) return it->second;
+                auto& mapped = depthClearScratch;
+                MapDepthClear(mapped, key.srcPitch, key.srcMsaa, key.area, key.dstPitch, key.dstHeight, key.dstMsaa);
                 if (key.coalesce) CoalesceDepthClearRects(mapped);
-                auto& map = depthClearMaps[depthClearMapNext];
-                depthClearMapNext = (depthClearMapNext + 1) % depthClearMaps.size();
-                map.key = key;
-                map.rects.clear();
-                map.rects.reserve(mapped.size());
-                for (const auto& r : mapped) map.rects.push_back({int32_t(target.ScaleX(uint32_t(r.left))), int32_t(target.ScaleY(uint32_t(r.top))),
+                if (depthClearMaps.size() >= kDepthClearMaps) depthClearMaps.clear();
+                auto& rects = depthClearMaps[key];
+                rects.reserve(mapped.size());
+                for (const auto& r : mapped) rects.push_back({int32_t(target.ScaleX(uint32_t(r.left))), int32_t(target.ScaleY(uint32_t(r.top))),
                     int32_t(target.ScaleX(uint32_t(r.right))), int32_t(target.ScaleY(uint32_t(r.bottom)))});
-                map.valid = true;
-                return map.rects;
+                return rects;
             }
 
             // InvalidateRange's compact copy of every cached texture's key: a resolve
@@ -9003,6 +9250,7 @@ void main()
 
             std::unique_ptr<RenderPipeline> CreatePipeline(const PipelineKey& key, Shader* vs, Shader* ps, bool trace, bool fastLink = false)
             {
+                if (video::GpuWorkStopped()) return nullptr; // every creation fails on a lost device
                 if (nativeVulkan && key.prim == 1 && vs && vs->shader && vk_object_trace::Permit())
                     std::fprintf(stderr, "VK_OBJECT_TRACE route=renderer event=point_pipeline vs_hash=0x%llx module=0x%llx uses_point_size_metadata=%u color_mask=%u depth_format=%u\n",
                         vk_object_trace::Id(key.vs), vk_object_trace::Id(static_cast<const VulkanShader*>(vs->shader.get())->vk),
@@ -9128,38 +9376,16 @@ void main()
             }
 
             // ---- vertex buffers ------------------------------------------------------------
-            // A cached vertex/index source is compared with its snapshot once per
-            // sync epoch. Between two sync points only an unsynchronized guest CPU
-            // write racing the GPU can change memory a draw already read; such a
-            // write is seen at the next epoch instead of at the next draw.
-            // LO_REVALIDATE_VERIFY=1 compares skipped sources too and logs mismatches.
-            uint64_t revalidationChecks = 0, revalidationSkips = 0, revalidationMismatches = 0;
-            uint64_t revalidationEpoch = 0;
-            template<class Matches>
-            bool SourceMatches(uint64_t& validatedEpoch, Matches&& matches, uint32_t address)
-            {
-                static const bool verify = [] { const char* v = getenv("LO_REVALIDATE_VERIFY"); return v && strcmp(v, "0") != 0; }();
-                const uint64_t epoch = g_commandProcessor.SyncEpoch();
-                if (validatedEpoch == epoch) {
-                    ++revalidationSkips;
-                    if (!verify || matches()) return true;
-                    static uint32_t reported = 0;
-                    if (reported++ < 32)
-                        LOG_ERROR("renderer: source {:#x} changed within sync epoch {} (frame {})", address, epoch, frame);
-                    ++revalidationMismatches;
-                    validatedEpoch = 0;
-                    return false;
-                }
-                ++revalidationChecks;
-                const bool ok = matches();
-                validatedEpoch = ok ? epoch : 0;
-                return ok;
-            }
+            // A cached vertex or index source is taken again only after a guest write
+            // was noted in its range (gpu/guest_writes.h): a D3D Unlock, a buffer bound
+            // to memory, a kernel file read. Sources in the title's command buffer
+            // (DrawVerticesUP data) change with every draw and are not cached.
+            uint64_t sourceRetakes = 0, sourceDirect = 0; // LO_RENDER_TIMING, since the previous line
 
-            // Sources already found and validated in the current sync epoch, by
-            // key hash: a repeat skips the map lookup. Valid while the cache's
-            // version is unchanged (no entry added, removed or recaptured since).
-            struct VertexLookup { uint64_t key = 0, epoch = 0, version = 0; geometry_prepare::VertexEntry* entry = nullptr; };
+            // Sources already found unchanged at the current published write count,
+            // by key hash: a repeat skips the map lookup. Valid while the cache's
+            // version is unchanged (no entry added, removed or refreshed since).
+            struct VertexLookup { uint64_t key = 0, published = 0, version = 0; geometry_prepare::VertexEntry* entry = nullptr; };
             std::array<VertexLookup, 256> vertexLookups{};
 
             // Returns the arena offset of the swapped copy of a guest vertex buffer.
@@ -9167,14 +9393,11 @@ void main()
             {
                 const size_t bytes = size_t(sizeDwords) * 4;
                 const uint64_t key = (uint64_t(address) << 32) | (uint64_t(sizeDwords) << 2) | endian;
-                static const bool verify = [] { const char* v = getenv("LO_REVALIDATE_VERIFY"); return v && strcmp(v, "0") != 0; }();
+                const bool direct = gpu::guest_writes::InCommandBuffer(address & 0x1FFFFFFFu, uint32_t(bytes));
                 auto& lookup = vertexLookups[(key * 0x9E3779B97F4A7C15ull) >> 56];
-                const uint64_t epoch = g_commandProcessor.SyncEpoch();
-                if (!vertexTimingEnabled && !verify && lookup.entry && lookup.key == key && lookup.epoch == epoch &&
-                    lookup.version == vertexCache.Version())
+                if (!vertexTimingEnabled && !direct && lookup.entry && lookup.key == key &&
+                    lookup.published == gpu::guest_writes::Published() && lookup.version == vertexCache.Version())
                 {
-                    // What the map path does for a source validated this epoch.
-                    ++revalidationSkips;
                     lookup.entry->lastFrame = frame;
                     return lookup.entry->offset;
                 }
@@ -9185,32 +9408,33 @@ void main()
                     vertexTiming.initialBuckets = vertexCache.bucket_count();
                     vertexTiming.initialEvictions = vertexCache.Evictions();
                 }
-                auto it = [&] {
+                auto it = vertexCache.end();
+                if (!direct) {
                     VertexStageTimer timer(vertexTiming.find, vertexTimingEnabled, address, bytes);
-                    return vertexCache.find(key);
-                }();
+                    it = vertexCache.find(key);
+                }
                 bool changed = false;
                 if (it != vertexCache.end())
                 {
-                    const bool matches = [&] {
+                    const bool unchanged = [&] {
                         VertexStageTimer timer(vertexTiming.match, vertexTimingEnabled, address, bytes);
-                        return SourceMatches(it->second.validatedEpoch,
-                            [&] { return it->second.content.Matches(guest, bytes); }, address);
+                        return geometry_prepare::Unchanged(it->second.stamp, address, bytes);
                     }();
-                    if (gpu::render_arena::VertexCacheReusable(matches))
+                    if (unchanged)
                     {
                         it->second.lastFrame = frame;
-                        if (it->second.validatedEpoch == epoch)
-                            lookup = {key, epoch, vertexCache.Version(), &it->second};
+                        lookup = {key, it->second.stamp.checked, vertexCache.Version(), &it->second};
                         return it->second.offset;
                     }
-                    // Contents changed. Overwriting the arena copy in place would
-                    // corrupt draws already recorded into an open command list, so
-                    // allocate fresh; the entry itself is refreshed below.
+                    // Written since. Overwriting the arena copy in place would corrupt
+                    // draws already recorded into an open command list, so allocate
+                    // fresh; the entry itself is refreshed below.
                     if (it->second.slot == uint8_t(gpuSlot))
                         vertexRevalidations++;
+                    ++sourceRetakes;
                     changed = true;
                 }
+                sourceDirect += direct;
 
                 // Allocate (16-byte aligned, 16 bytes of slack for the shader's
                 // last fetch). Prefer the current half; if it is full, append to
@@ -9230,47 +9454,36 @@ void main()
                 uint64_t& local = gpuSlots[allocSlot].arenaOffset;
                 const uint64_t offset = gpu::render_arena::SlotBase(allocSlot) + local;
                 local += needed;
-                if (changed) {
-                    // Same key, same size: refresh the entry and reuse its snapshot
-                    // storage instead of erasing it and inserting a new allocation.
-                    auto& entry = it->second;
-                    entry.offset = offset;
-                    entry.lastFrame = frame;
-                    entry.slot = uint8_t(allocSlot);
-                    entry.validatedEpoch = g_commandProcessor.SyncEpoch();
-                    {
-                        VertexStageTimer timer(vertexTiming.capture, vertexTimingEnabled, address, bytes);
-                        vertexCache.Recapture(it, guest, bytes);
-                    }
-                    {
-                        VertexStageTimer timer(vertexTiming.copy, vertexTimingEnabled, address, bytes);
-                        geometry_prepare::CopyDwordsSwapped(arenaMapped + offset, guest, sizeDwords, endian);
-                        memset(arenaMapped + offset + bytes, 0, 16);
-                    }
-                    vertexUploads++;
-                    vertexBytesUploaded += bytes;
-                    return offset;
-                }
-                VertexEntry entry{ offset, {}, frame, uint8_t(allocSlot) };
-                entry.validatedEpoch = g_commandProcessor.SyncEpoch();
-                {
+                geometry_prepare::SourceStamp stamp;
+                if (!direct) {
                     VertexStageTimer timer(vertexTiming.capture, vertexTimingEnabled, address, bytes);
-                    entry.content.Capture(guest, bytes, vertexCache.TakeSpare(bytes));
+                    stamp = geometry_prepare::TakeStamp(address, bytes);
                 }
                 {
                     VertexStageTimer timer(vertexTiming.copy, vertexTimingEnabled, address, bytes);
                     geometry_prepare::CopyDwordsSwapped(arenaMapped + offset, guest, sizeDwords, endian);
                     memset(arenaMapped + offset + bytes, 0, 16);
                 }
+                vertexUploads++;
+                vertexBytesUploaded += bytes;
+                if (direct) return offset;
+                if (changed) {
+                    // Same key, same size: refresh the entry in place.
+                    auto& entry = it->second;
+                    entry.offset = offset;
+                    entry.lastFrame = frame;
+                    entry.slot = uint8_t(allocSlot);
+                    entry.stamp = stamp;
+                    vertexCache.Refreshed();
+                    return offset;
+                }
                 const size_t bucketsBefore = vertexTimingEnabled ? vertexCache.bucket_count() : 0;
                 {
                     VertexStageTimer timer(vertexTiming.insert, vertexTimingEnabled, address, bytes);
-                    vertexCache.emplace(key, std::move(entry));
+                    vertexCache.emplace(key, VertexEntry{ offset, frame, uint8_t(allocSlot), stamp });
                 }
                 if (vertexTimingEnabled && vertexCache.bucket_count() != bucketsBefore)
                     ++vertexTiming.rehashes;
-                vertexUploads++;
-                vertexBytesUploaded += bytes;
                 return offset;
             }
 
@@ -9315,10 +9528,6 @@ void main()
                 if (modeControl != 6) consecutiveResolveCopies.Invalidate();
                 if (!ApplyInternalResolution())
                     return;
-#if defined(LO_GPU_PLUME)
-                if (fsrAlphaBridge && activePlan.requestedUpscaler != upscaling::Upscaler::Fsr)
-                    fsrAlphaBridge->Invalidate();
-#endif
                 // LO_DRAW_LIMIT=<n>: only record the first n draws of each frame,
                 // to bisect which pass ruins the image.
                 static const uint32_t drawLimit = getenv("LO_DRAW_LIMIT") ? strtoul(getenv("LO_DRAW_LIMIT"), nullptr, 10) : 0;
@@ -9755,6 +9964,7 @@ void main()
                             LOG_ERROR("renderer: HDR scene TAA twin initialization failed; HDR pauses under TAA");
                         }
                     }
+                    UpdateTemporalIdle(temporal::TemporalConsumerActive(temporalExperiment, temporalInputProbe, dlssSrRequested, nativeFgInputs));
                 }
                 const bool temporalActive = temporal::TemporalConsumerActive(temporalExperiment, temporalInputProbe, dlssSrRequested, nativeFgInputs);
                 const bool trackTemporalScene = !debugCaptureDir.empty() || temporalActive || activeSpatialAA || aoActive;
@@ -9822,6 +10032,7 @@ void main()
                         render_batch::CpuTimer<> mvTimer(motionOptions.timing);
                         drawTemporalTracker.BeginFrame(frame, temporalEpoch);
                         mvTimer.AddTo(mvTrackCpuMs);
+                        cameraStatic.Begin(frame);
                         if (motionView.frame != frame || motionView.epoch != temporalEpoch) motionView = {};
                         if (motionOptions.replay && !motionReplay && !motionInitFailed) {
                             motionReplay = std::make_unique<temporal::MotionReplayGPU>();
@@ -10005,6 +10216,13 @@ void main()
                 // rejects any underlying replay sample in the validity-mask pass.
                 const bool motionLocallyMaskedClipWriter = motionDepthWrite &&
                     key.vs == 0x8bbd4da701845d16ull && temporalSlot < 0 && info.indexCount == 6;
+                // A depth writer that does not replay must not leave the scene depth
+                // to the camera-static class: block skipping before the scene camera,
+                // or invalidate this frame's skipped pixels after it.
+                if (motionOptions.staticSkip && temporalActive && depth && (depthControl & 6) == 6 &&
+                    (!motionDepthWrite || motionLocallyMaskedClipWriter))
+                    cameraStatic.NoteUntrackedDepth(frame, depth->allocationSerial, temporalScene.Draws() != 0,
+                        temporalScene.Draws() ? temporalScene.Anchor().depthAllocation : 0);
                 // Save only the words jitter can change. Collect copies the FULL
                 // VS bank once and restores this proven matrix window in its arena.
                 std::array<uint32_t, 16> motionOriginalVP;
@@ -10365,11 +10583,20 @@ void main()
                         std::optional<binding::Texture> selectedBinding;
                         if (slot == 0 && !debugCaptureDir.empty() && ps && (ps->info.textureSlotMask & 1) && bank == sceneCopyBank)
                             selectedBinding.emplace();
-                        HostTexture* tex = (fetch[0] & 3) == 2 ? GetTexture(fetch, dimension,
+                        // The tone map's depth of field (slot 2) and bloom (slot 3)
+                        // textures are not rendered when they contribute nothing
+                        // (post_blur.h): bind the black dummy instead of what the
+                        // address last held, so the zeroed terms stay zero.
+                        bool unusedPostBlur = false;
+                        if (s == ps && key.ps == color_qualification::kTonemapPS && (slot == 2 || slot == 3)) {
+                            const auto post = settings::GetConfig();
+                            unusedPostBlur = slot == 2 ? post_blur::SkipDepthOfField(post) : post_blur::SkipBloom(post);
+                        }
+                        HostTexture* tex = !unusedPostBlur && (fetch[0] & 3) == 2 ? GetTexture(fetch, dimension,
                             selectedBinding ? &*selectedBinding : nullptr) : nullptr;
                         if (!tex)
                         {
-                            if (PlanSuppressed())
+                            if (PlanSuppressed() && !unusedPostBlur)
                             {
                                 failedPlan = true;
                                 return;
@@ -11142,8 +11369,8 @@ void main()
                 }
 
                 // Index buffer / primitive conversion. Static geometry skips
-                // ConvertIndices and primitive expansion on an exact-content
-                // hit; the cached output is already post-expansion.
+                // ConvertIndices and primitive expansion while no write was noted
+                // in its source; the cached output is already post-expansion.
                 auto& converted = indexScratch;
                 if (!info.indexed) converted.clear();
                 bool useIndices = false;
@@ -11155,18 +11382,21 @@ void main()
                 const uint8_t* indexSrc = nullptr;
                 size_t indexSrcBytes = 0;
                 geometry_prepare::IndexKey indexKey{};
+                geometry_prepare::SourceStamp indexStamp;
+                bool indexCacheable = false;
                 if (info.indexed)
                 {
                     indexSrcCount = std::min<uint32_t>(info.indexCount, info.indexBufferWords);
                     indexSrc = Phys(info.indexBase);
                     indexSrcBytes = size_t(indexSrcCount) * (info.index32 ? 4 : 2);
-                    if (indexSrcCount >= geometry_prepare::IndexCache::kMinCount)
+                    indexCacheable = indexSrcCount >= geometry_prepare::IndexCache::kMinCount &&
+                        !gpu::guest_writes::InCommandBuffer(info.indexBase & 0x1FFFFFFFu, uint32_t(indexSrcBytes));
+                    if (indexCacheable)
                     {
                         indexKey = { info.indexBase, indexSrcCount, info.primitiveType,
                             uint8_t(info.index32 ? 1 : 0), uint8_t(info.indexEndian & 3) };
                         auto it = indexCache.find(indexKey);
-                        if (it != indexCache.end() && SourceMatches(it->second.validatedEpoch,
-                            [&] { return it->second.content.Matches(indexSrc, indexSrcBytes); }, info.indexBase))
+                        if (it != indexCache.end() && geometry_prepare::Unchanged(it->second.stamp, info.indexBase, indexSrcBytes))
                         {
                             cachedIndexEntry = &it->second;
                             it->second.lastFrame = frame;
@@ -11176,7 +11406,9 @@ void main()
                         }
                         else
                         {
+                            if (it != indexCache.end()) ++sourceRetakes;
                             // Convert below, then replace the cached result.
+                            indexStamp = geometry_prepare::TakeStamp(info.indexBase, indexSrcBytes);
                             converted.resize(indexSrcCount);
                             geometry_prepare::ConvertIndices(indexSrc, converted.data(), indexSrcCount, info.index32, info.indexEndian);
                             useIndices = true;
@@ -11226,16 +11458,15 @@ void main()
                 }
                 // Expanded rect lists fold VGT_INDX_OFFSET into the indices, which
                 // the cache key does not cover.
-                if (info.indexed && !indexCached && indexSrcCount >= geometry_prepare::IndexCache::kMinCount &&
+                if (info.indexed && !indexCached && indexCacheable &&
                     !(info.primitiveType == 8 && rectListExpansion))
                 {
                     // Store the post-expansion result against the exact source
                     // bytes; a later identical draw copies it verbatim.
                     geometry_prepare::IndexEntry entry;
                     entry.data = converted;
-                    entry.content.Capture(indexSrc, indexSrcBytes);
+                    entry.stamp = indexStamp;
                     entry.lastFrame = frame;
-                    entry.validatedEpoch = g_commandProcessor.SyncEpoch();
                     indexCache.emplace(indexKey, std::move(entry));
                     if (cpuTimingEnabled) ++indexCacheMisses;
                 }
@@ -12751,9 +12982,19 @@ void main()
                             uint32_t(rasterViewport.width), uint32_t(rasterViewport.height),
                             {rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height,
                              rasterViewport.minDepth, rasterViewport.maxDepth}, true};
+                        // The scene camera is the frame's first anchor (this draw's own
+                        // anchor when it is the first); HistoryOwner reprojects with it.
+                        const temporal::SceneAnchor* sceneCamera = temporalScene.Draws() ? &temporalScene.Anchor() :
+                            temporalDrawAnchor ? &*temporalDrawAnchor : nullptr;
+                        temporal::MotionCameraEvidence motionCamera{temporalSlot,
+                            sceneCamera && motionOriginalVP == sceneCamera->vpBits &&
+                            sceneCamera->depthAllocation == depth->allocationSerial &&
+                            double(shared.ndcScale[1]) == sceneCamera->viewport.ndcYSign &&
+                            double(shared.halfPixel[0]) == sceneCamera->viewport.halfPixelNdcX &&
+                            double(shared.halfPixel[1]) == sceneCamera->viewport.halfPixelNdcY};
                         auto match = drawTemporalTracker.Collect(mk, vsConstants, &shared, vs->info.usesRelativeConstants,
                             drawJitter.applied ? temporalSlot : -1, motionOriginalVP.data(), &motionRaster,
-                            motionReplay ? motionReplay->ConstantUsage(key.vs) : nullptr);
+                            motionReplay ? motionReplay->ConstantUsage(key.vs) : nullptr, motionCamera);
                         if (taaLiveDirectory && match.previous && !match.exactStationary && frame % 120 == 0 &&
                             (key.vs == 0x702c643defe73320ull || key.vs == 0xb030ab4e17a20783ull)) {
                             static uint64_t lastProofFrame[2]{};
@@ -12778,17 +13019,54 @@ void main()
                         }
                         mvTimer.AddTo(mvTrackCpuMs);
                         recordProbe.Enter(record_timing::Phase::MvPrepare);
+                        // Restore the guest binding contract after BeginScene framebuffer/layout changes.
+                        const auto restoreDrawBindings = [&] {
+                            commandList->setFramebuffer(framebuffer); commandList->setViewports(&rasterViewport, 1);
+                            commandList->setScissors(&scissor, 1); commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                            commandList->setPipeline(pipeline);
+                            if (vulkan) BindDrawConstants();
+                            else { SetConstantBuffer(vsOffset,0); SetConstantBuffer(sharedOffset,1); SetConstantBuffer(psOffset,2); }
+                            commandList->setGraphicsDescriptorSet(set0,0); commandList->setGraphicsDescriptorSet(set1,1);
+                            commandList->setGraphicsDescriptorSet(set2,2); commandList->setGraphicsDescriptorSet(set3,3);
+                            if (vulkan) commandList->setGraphicsDescriptorSet(set4,4);
+                        };
                         if (motionReplay && motionReplay->UsableThisFrame()) {
                             const auto w = uint32_t(rasterViewport.width), h = uint32_t(rasterViewport.height);
+                            const float jx = drawJitter.applied ? float(drawJitter.sample.pixelX) : 0;
+                            const float jy = drawJitter.applied ? float(drawJitter.sample.pixelY) : 0;
+                            const bool cameraFrame = CameraStaticAllowed(sceneCamera);
+                            // One raster jitter serves every skipped draw in Finish.
+                            if (cameraFrame && match.cameraStatic &&
+                                (!cameraStatic.skipped || (cameraStatic.jx == jx && cameraStatic.jy == jy))) {
+                                const bool cleared = motionReplay->ClearedThisFrame();
+                                const bool sceneReady = motionReplay->BeginScene(commandList, depth->allocationSerial, depth->texture.get(), w, h);
+                                if (!sceneReady) {
+                                    logFirstMotionFailure("replay_scene_failed", 3);
+                                    motionReplay->AbortFrame();
+                                } else {
+                                    cameraStatic.jx = jx; cameraStatic.jy = jy; ++cameraStatic.skipped;
+                                    if (!match.replayWarm && motionReplay->Prewarm(key, DescribePipeline(key, vs, ps, false),
+                                            vsWords, vsCount, ps ? psWords : nullptr, ps ? psCount : 0) ==
+                                        temporal::MotionReplayGPU::PipelinePrepareStatus::Ready)
+                                        drawTemporalTracker.MarkReplayWarm(match.tag);
+                                }
+                                recordProbe.Enter(record_timing::Phase::MvDraw);
+                                if (!cleared) restoreDrawBindings();
+                            } else {
                             // Cold start: allocate/clear real MV targets without previous or pipeline.
                             const auto prepared = motionReplay->PrepareSceneDraw(commandList, depth->allocationSerial, depth->texture.get(), w, h,
                                 key, DescribePipeline(key, vs, ps, false),
                                 vsWords, vsCount, ps ? psWords : nullptr, ps ? psCount : 0);
                             recordProbe.Enter(record_timing::Phase::MvDraw);
+                            if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready)
+                                drawTemporalTracker.MarkReplayWarm(match.tag);
                             if (!prepared.sceneReady || prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Failed) {
                                 logFirstMotionFailure(prepared.sceneReady ? "replay_pipeline_failed" : "replay_scene_failed", 3);
                                 motionReplay->AbortFrame();
-                            } else if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready && match.previous) {
+                            } else if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready && (match.previous || cameraFrame)) {
+                                // Without a previous draw this is an invalid marker: in a
+                                // camera-static frame it keeps its pixels reactive.
+                                cameraStatic.markers += !match.previous;
                                 const uint64_t aligned = (Gpu().uploadOffset + 255) & ~uint64_t(255);
                                 // Never trigger a mid-draw Flush: it would invalidate bound
                                 // index/texture state and the original constant references.
@@ -12796,9 +13074,7 @@ void main()
                                     logFirstMotionFailure("replay_upload_ring_full", 4);
                                     motionReplay->AbortFrame("MV upload ring full");
                                 } else {
-                                    const auto c = temporal::MakeMotionReplayConstants(match, w, h,
-                                        drawJitter.applied ? float(drawJitter.sample.pixelX) : 0,
-                                        drawJitter.applied ? float(drawJitter.sample.pixelY) : 0);
+                                    const auto c = temporal::MakeMotionReplayConstants(match, w, h, jx, jy);
                                     const uint64_t mvOffset = Upload(&c, sizeof(c));
                                     const RenderBufferReference cb[4] = {{uploadRing, vsOffset}, {uploadRing, sharedOffset},
                                         {uploadRing, psOffset}, {uploadRing, mvOffset}};
@@ -12812,15 +13088,8 @@ void main()
                                     }
                                 }
                             }
-                            // Restore the guest binding contract after BeginScene framebuffer/layout changes.
-                            commandList->setFramebuffer(framebuffer); commandList->setViewports(&rasterViewport, 1);
-                            commandList->setScissors(&scissor, 1); commandList->setGraphicsPipelineLayout(pipelineLayout.get());
-                            commandList->setPipeline(pipeline);
-                            if (vulkan) BindDrawConstants();
-                            else { SetConstantBuffer(vsOffset,0); SetConstantBuffer(sharedOffset,1); SetConstantBuffer(psOffset,2); }
-                            commandList->setGraphicsDescriptorSet(set0,0); commandList->setGraphicsDescriptorSet(set1,1);
-                            commandList->setGraphicsDescriptorSet(set2,2); commandList->setGraphicsDescriptorSet(set3,3);
-                            if (vulkan) commandList->setGraphicsDescriptorSet(set4,4);
+                            restoreDrawBindings();
+                            }
                         }
                     }
                 }
@@ -13223,7 +13492,8 @@ void main()
                         commandList->setFramebuffer(framebuffer);
                     }
 
-                    std::vector<RenderTargetKey> others;
+                    auto& others = clearViewScratch;
+                    others.clear();
                     for (auto& [k, tex] : renderTargets)
                     {
                         if (!tex || k.pitch == pitch) continue;
@@ -13238,14 +13508,16 @@ void main()
                         {
                             const DepthClearRect sourceRect{int32_t(std::ceil(minX)), int32_t(std::ceil(minY)),
                                 int32_t(std::ceil(maxX)), int32_t(std::ceil(maxY))};
-                            std::vector<pending_clear::Rect> clearRects = MappedDepthClear({pitch, (surfaceInfo >> 16) & 3,
+                            const auto& mapped = MappedDepthClear({pitch, (surfaceInfo >> 16) & 3,
                                 k.pitch, target->guestHeight, target->depthMsaa, target->resolutionSize.width,
                                 target->resolutionSize.height, vulkan, sourceRect}, *target);
-                            const size_t regions = clearRects.size();
+                            const size_t regions = mapped.size();
                             // An empty rectangle list would mean the whole texture,
                             // so an empty mapping is skipped.
-                            if (!clearRects.empty())
+                            if (!mapped.empty())
                             {
+                                auto clearRects = target->pendingClear.SpareRects();
+                                clearRects.assign(mapped.begin(), mapped.end());
                                 FlushMotionReplayQueue();
                                 QueueClear(*target, pending_clear::DepthOp(true, false, rectZ, 0, std::move(clearRects)));
                             }
@@ -14313,6 +14585,166 @@ void main()
                 color->sdrProducerFrame = ~0ull;
                 color->sdrLoss.Lost(frame, SdrLossTrace::Clear, 4);
             }
+
+#if !defined(LO_RENDERER_P2_EMBEDDED_TEST)
+            std::unique_ptr<RenderShader> movieYuvPs;
+            bool movieYuvCompiled = false;
+            std::map<uint32_t, std::unique_ptr<RenderPipeline>> movieYuvPipelines;
+            uint32_t movieLoggedSession = 0;
+
+            RenderPipeline* GetMovieYuvPipeline(RenderFormat format)
+            {
+                if (!movieYuvCompiled) {
+                    movieYuvCompiled = true;
+                    auto ps = xenos::CompileCachedHlsl(gpu::movie_yuv::PixelShader, "main", "ps_6_0", binaryFormat);
+                    if (ps.ok) movieYuvPs = device->createShader(ps.bytecode.data(), ps.bytecode.size(), "main", renderFormat);
+                    else LOG_WARNING("renderer: movie replacement shader compilation failed: {}", ps.errors);
+                }
+                if (!movieYuvPs || !blitVs) return nullptr;
+                if (const auto found = movieYuvPipelines.find(uint32_t(format)); found != movieYuvPipelines.end())
+                    return found->second.get();
+                RenderGraphicsPipelineDesc desc;
+                desc.pipelineLayout = pipelineLayout.get(); desc.vertexShader = blitVs.get(); desc.pixelShader = movieYuvPs.get();
+                desc.depthEnabled = false; desc.depthWriteEnabled = false; desc.depthFunction = RenderComparisonFunction::ALWAYS;
+                desc.depthTargetFormat = RenderFormat::UNKNOWN; desc.renderTargetFormat[0] = format;
+                desc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+                desc.renderTargetBlend[0].renderTargetWriteMask = 0x7; // the guest quad's alpha stays
+                desc.renderTargetCount = 1; desc.cullMode = RenderCullMode::NONE; desc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
+                auto pipeline = device->createGraphicsPipeline(desc);
+                if (!pipeline) return nullptr;
+                auto* result = pipeline.get();
+                movieYuvPipelines.emplace(uint32_t(format), std::move(pipeline));
+                return result;
+            }
+
+            // A plane of this slot; a size change retires the old one with the slot.
+            bool EnsureMoviePlane(std::unique_ptr<HostTexture>& tex, uint32_t width, uint32_t height, RenderFormat format)
+            {
+                if (tex && tex->texture && tex->width == width && tex->height == height) return true;
+                auto& slot = Gpu();
+                if (tex) slot.retiredTextures.push_back(std::move(tex));
+                slot.movieSerial = 0;
+                auto created = std::make_unique<HostTexture>();
+                created->texture = device->createTexture(RenderTextureDesc::Texture2D(width, height, 1, format));
+                if (!created->texture) return false;
+                created->format = format;
+                created->width = created->guestWidth = created->bindingWidth = width;
+                created->height = created->guestHeight = created->bindingHeight = height;
+                tex = std::move(created);
+                return true;
+            }
+
+            bool UploadMoviePlane(HostTexture& tex, const uint8_t* data, uint32_t sourcePitch, uint32_t rowBytes, uint32_t texelBytes)
+            {
+                // Placed footprints need 256-byte rows (1920-wide luma is not).
+                const uint32_t pitch = (rowBytes + 255) & ~255u;
+                const uint64_t offset = Upload(nullptr, size_t(pitch) * tex.height, 512);
+                if (offset == UINT64_MAX) return false;
+                for (uint32_t row = 0; row < tex.height; ++row)
+                    memcpy(uploadMapped + offset + size_t(row) * pitch, data + size_t(row) * sourcePitch, rowBytes);
+                Transition(tex, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
+                commandList->copyTextureRegion(RenderTextureCopyLocation::Subresource(tex.texture.get()),
+                    RenderTextureCopyLocation::PlacedFootprint(uploadRing, tex.format, tex.width, tex.height, 1, pitch / texelBytes, offset));
+                Transition(tex, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                return true;
+            }
+
+            void DrawMovieReplacement(uint32_t surfaceInfo, uint32_t colorInfo, float x, float y, float width, float height,
+                                      uint32_t session, int64_t timeUs)
+            {
+                if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(width) || !std::isfinite(height) ||
+                    width <= 0.0f || height <= 0.0f)
+                    return;
+                const uint32_t pitch = surfaceInfo & 0x3FFF;
+                if (!pitch) return;
+                movie::DrawFrame picture;
+                if (!movie::FrameForDraw(session, timeUs, picture) || !picture.frame) return;
+                const movie::Nv12Frame& video = *picture.frame;
+                const uint32_t chromaWidth = (video.width + 1) / 2, chromaHeight = (video.height + 1) / 2;
+                if (!video.width || !video.height || video.lumaPitch < video.width || video.chromaPitch < chromaWidth * 2 ||
+                    video.luma.size() < size_t(video.lumaPitch) * video.height ||
+                    video.chroma.size() < size_t(video.chromaPitch) * chromaHeight)
+                    return;
+                if (!ApplyInternalResolution()) return;
+                if (!Begin()) return;
+                // Room for both planes now, so their uploads cannot rewind the
+                // ring onto the other slot after this slot's planes are chosen.
+                const size_t planeBytes = size_t((video.width + 255) & ~255u) * video.height +
+                    size_t((chromaWidth * 2 + 255) & ~255u) * chromaHeight + 2048;
+                if (((Gpu().uploadOffset + 511) & ~uint64_t(511)) + planeBytes + kUploadHeadroom > kUploadRingSize)
+                    if (!Flush() || !Begin()) return;
+                FlushMotionReplayQueue();
+                const uint32_t bottomEdge = uint32_t(std::clamp(std::lround(y + height), 0l, 0x3FFFl));
+                const uint32_t rtHeight = GuessTargetHeight(pitch, bottomEdge);
+                HostTexture* color = AcquireColorTarget(colorInfo & 0xFFF, (colorInfo >> 16) & 0xF, pitch, rtHeight);
+                if (!color || !color->texture || !color->guestWidth || !color->guestHeight) return;
+                RenderPipeline* pipeline = GetMovieYuvPipeline(color->format);
+                if (!pipeline) return;
+
+                const float scaleX = float(color->width) / color->guestWidth, scaleY = float(color->height) / color->guestHeight;
+                const float left = std::clamp(x * scaleX, 0.0f, float(color->width));
+                const float top = std::clamp(y * scaleY, 0.0f, float(color->height));
+                const float right = std::clamp((x + width) * scaleX, left, float(color->width));
+                const float bottom = std::clamp((y + height) * scaleY, top, float(color->height));
+                // The same pixel edges as the movie bars around it.
+                const RenderRect scissor{
+                    int32_t(std::min(gpu::movie_clear::ScaleBoundary(x, color->width, color->guestWidth), color->width)),
+                    int32_t(std::min(gpu::movie_clear::ScaleBoundary(y, color->height, color->guestHeight), color->height)),
+                    int32_t(std::min(gpu::movie_clear::ScaleBoundary(x + width, color->width, color->guestWidth), color->width)),
+                    int32_t(std::min(gpu::movie_clear::ScaleBoundary(y + height, color->height, color->guestHeight), color->height))};
+                if (right - left < 1.0f || bottom - top < 1.0f || scissor.right <= scissor.left || scissor.bottom <= scissor.top) return;
+
+                auto& slot = Gpu();
+                if (!EnsureMoviePlane(slot.movieLuma, video.width, video.height, RenderFormat::R8_UNORM) ||
+                    !EnsureMoviePlane(slot.movieChroma, chromaWidth, chromaHeight, RenderFormat::R8G8_UNORM))
+                    return;
+                if (slot.movieSerial != picture.serial) {
+                    slot.movieSerial = 0;
+                    if (!UploadMoviePlane(*slot.movieLuma, video.luma.data(), video.lumaPitch, video.width, 1) ||
+                        !UploadMoviePlane(*slot.movieChroma, video.chroma.data(), video.chromaPitch, chromaWidth * 2, 2))
+                        return;
+                    slot.movieSerial = picture.serial;
+                }
+                SharedConstants constants{};
+                constants.transfer[0] = std::bit_cast<uint32_t>(left);
+                constants.transfer[1] = std::bit_cast<uint32_t>(top);
+                constants.transfer[2] = std::bit_cast<uint32_t>(right - left);
+                constants.transfer[3] = std::bit_cast<uint32_t>(bottom - top);
+                const uint64_t offset = Upload(&constants, sizeof(constants));
+                if (offset == UINT64_MAX) return;
+                if (std::exchange(movieLoggedSession, session) != session)
+                    LOG_INFO("renderer: movie replacement session={} video={}x{} target={}x{} format={} rect=({:.1f},{:.1f} {:.1f}x{:.1f})",
+                        session, video.width, video.height, color->width, color->height, uint32_t(color->format), left, top, right - left, bottom - top);
+
+                consecutiveResolveCopies.Invalidate();
+                Transition(*color, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                RenderDescriptorSet* set1 = AcquireSet(1);
+                set1->setTexture(0, slot.movieLuma->texture.get(), RenderTextureLayout::SHADER_READ);
+                set1->setTexture(1, slot.movieChroma->texture.get(), RenderTextureLayout::SHADER_READ);
+                BindTargets(color, nullptr);
+                const RenderViewport viewport(left, top, right - left, bottom - top);
+                commandList->setViewports(&viewport, 1);
+                commandList->setScissors(&scissor, 1);
+                commandList->setPipeline(pipeline);
+                commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                SetConstantBuffer(offset, 0);
+                SetConstantBuffer(offset, 1);
+                SetConstantBuffer(offset, 2);
+                commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                commandList->setGraphicsDescriptorSet(set1, 1);
+                commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                if (vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(), 4);
+                commandList->drawInstanced(3, 1, 0, 0);
+                color->hdrValid = false;
+#if defined(LO_GPU_PLUME)
+                HandleFsrAlphaRgbWriter(*color, "movie_replacement");
+#endif
+                color->aaProvenance.Invalidate(frame, color->allocationSerial, false);
+                color->sdrProducerFrame = ~0ull;
+                color->sdrLoss.Lost(frame, SdrLossTrace::Draw, 6);
+            }
+#endif
         };
 
         Renderer* g_renderer = nullptr;
@@ -14806,17 +15238,11 @@ void main()
                     r.indexCache.AllocatedBytes(), r.indexCache.PeakBytes(), r.indexCache.Evictions());
                 r.indexCacheHits = r.indexCacheMisses = 0;
             }
-            {
-                static const bool verify = [] { const char* v = getenv("LO_REVALIDATE_VERIFY"); return v && strcmp(v, "0") != 0; }();
+            if (render_timing::Enabled()) {
                 auto& r = *g_renderer;
-                const uint64_t epoch = g_commandProcessor.SyncEpoch();
-                if (render_timing::Enabled() || (verify && r.frame % 60 == 0))
-                    LOG_INFO("source revalidation frame={} sync_epochs={} compared={} skipped={} verify_mismatches={} scope=since_previous_line",
-                        r.frame, epoch - r.revalidationEpoch, r.revalidationChecks, r.revalidationSkips, r.revalidationMismatches);
-                if (render_timing::Enabled() || r.frame % 60 == 0) {
-                    r.revalidationEpoch = epoch;
-                    r.revalidationChecks = r.revalidationSkips = r.revalidationMismatches = 0;
-                }
+                LOG_INFO("source writes frame={} published={} retaken={} direct={} scope=since_previous_line",
+                    r.frame, gpu::guest_writes::Published(), r.sourceRetakes, r.sourceDirect);
+                r.sourceRetakes = r.sourceDirect = 0;
             }
             if (render_timing::Enabled()) {
                 Renderer& r = *g_renderer;
@@ -15437,6 +15863,17 @@ void main()
 #else
         (void)surfaceInfo; (void)colorInfo; (void)x; (void)y;
         (void)width; (void)height; (void)safeLeft; (void)safeRight; (void)safeTop; (void)safeBottom;
+#endif
+    }
+
+    void DrawMovieReplacement(uint32_t surfaceInfo, uint32_t colorInfo,
+                              float x, float y, float width, float height, uint32_t session, int64_t timeUs)
+    {
+#ifdef LO_GPU_PLUME
+        if (g_renderer)
+            g_renderer->DrawMovieReplacement(surfaceInfo, colorInfo, x, y, width, height, session, timeUs);
+#else
+        (void)surfaceInfo; (void)colorInfo; (void)x; (void)y; (void)width; (void)height; (void)session; (void)timeUs;
 #endif
     }
 #endif // !LO_RENDERER_P2_EMBEDDED_TEST

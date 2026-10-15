@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include <cpu/render_fence.h>
 #include "gpu/frame_plan.h"
+#include "gpu/guest_writes.h"
 #include "gpu/dlss_status_log.h"
 #include "gpu/video.h"
 #include <string_view>
@@ -131,8 +132,18 @@ namespace gpu::frame_plan
         const auto identity = StatusIdentityOf(cpuPlan);
         const bool planChanged = identity != loggedStatusPlan;
         loggedStatusPlan = identity;
-        if (planChanged)
+        if (planChanged) {
             NoteDlssRuntime(CurrentDlssEffect());
+            // The status line above describes DLSS only. Say once per device when
+            // the chosen upscaler cannot run at all, e.g. a build without D3D12 FSR.
+            static std::pair<upscaling::Upscaler, uint64_t> warned{upscaling::Upscaler::Off, 0};
+            if (config.upscaler != upscaling::Upscaler::Off && device.deviceReady && !device.gpuWorkStopped &&
+                !device.Available(config.upscaler) && warned != std::pair{config.upscaler, device.deviceEpoch}) {
+                warned = {config.upscaler, device.deviceEpoch};
+                LOG_WARNING("upscaler: {} is unavailable on {} with this device and build; rendering without it",
+                    UpscalerName(config.upscaler), backend::Name(device.backend));
+            }
+        }
     }
     FramePlan CpuPlan() { return cpuPlan; }
     bool NarrowTallView() { return narrowTallView.load(std::memory_order_relaxed); }
@@ -170,7 +181,7 @@ namespace gpu::frame_plan
             observed.plan.deviceEpoch != device.deviceEpoch ||
             observed.execution->plan.requestSignature != observed.plan.requestSignature ||
             observed.execution->plan.geometryEpoch != observed.plan.geometryEpoch) return {};
-        return observed.execution;
+        return StatusExecution(observed);
     }
     void ReportUpscalerExecution(const UpscalerExecutionObservation& observation)
     {
@@ -323,6 +334,7 @@ PPC_FUNC(sub_827B6E48)
     const uint32_t device = ctx.r3.u32, parameter = ctx.r4.u32;
     gpu::frame_plan::DeviceStreamDestroyed();
     __imp__sub_827B6E48(ctx, base);
+    gpu::guest_writes::CommandBufferSetUp(device, base);
     if (parameter) gpu::frame_plan::DeviceStreamReadyFromContext(device, ctx);
 }
 PPC_FUNC(sub_827BA640)

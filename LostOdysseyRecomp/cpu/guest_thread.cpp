@@ -5,6 +5,7 @@
 #include <kernel/function.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
+#include <os/host_scheduling.h>
 #include <host_ui/host_ui.h>
 #include <cstdio>
 #if LO_PLATFORM_SWITCH
@@ -74,6 +75,8 @@ static void GuestThreadFunc(std::shared_ptr<GuestThreadHandle::Control> state)
     state->hostHandle.store(os::switch_platform::CurrentThreadHandle(), std::memory_order_seq_cst);
     if (const int core = state->idealCore.load(std::memory_order_seq_cst); core >= 0)
         os::switch_platform::SetThreadIdealCore(0, core);
+#else
+    os::scheduling::PreferPerformanceCores();
 #endif
     state->suspended.wait(true);
     GuestThread::Start(state->params);

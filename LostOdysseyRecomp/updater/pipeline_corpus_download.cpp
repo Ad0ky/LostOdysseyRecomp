@@ -124,7 +124,7 @@ std::string Check(bool automaticUpdates, bool forced)
 }
 } // namespace
 
-void StartCorpusDownload(bool automaticUpdates)
+void StartCorpusDownload(bool automaticUpdates, bool redownload)
 {
     const char *mode = std::getenv("LO_SHADER_PACK_DOWNLOAD");
     const std::string_view choice = mode ? mode : "";
@@ -140,8 +140,9 @@ void StartCorpusDownload(bool automaticUpdates)
         LOG_INFO("pipeline corpus: {}", skipped);
         return;
     }
-    // LO_SHADER_PACK_DOWNLOAD=1 checks now even when the corpus was checked recently.
-    os::DetachThread(std::thread([automaticUpdates, forced = choice == "1"] {
+    // LO_SHADER_PACK_DOWNLOAD=1 and a requested redownload check now, even when
+    // the corpus was checked recently or automatic updates are off.
+    os::DetachThread(std::thread([automaticUpdates, forced = choice == "1" || redownload] {
         try
         {
             LOG_INFO("pipeline corpus: {}", Check(automaticUpdates, forced));

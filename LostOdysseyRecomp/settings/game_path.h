@@ -150,9 +150,18 @@ namespace settings::game_path
             const auto configuredPath = AbsoluteFrom(PathFromUtf8(configured), exeDirectory);
             if (const auto root = Recognize(configuredPath))
                 return { *root, Source::ConfiguredFile, true, false };
-            // A non-empty configured path is an explicit user choice. Keep it
-            // for the loader's existing error/installer flow rather than
-            // accidentally selecting an older installation elsewhere.
+            // The game folder was moved or copied with its imported discs, and
+            // game-path.txt still names the old place (older importers wrote
+            // absolute paths): use the package default beside this
+            // executable. Anything else stays the user's explicit choice, kept
+            // for the loader's error/installer flow rather than accidentally
+            // selecting another installation elsewhere.
+            const auto packageDefault = DefaultGameRoot(exeDirectory);
+            for (const auto& candidate : { packageDefault / "disc1", packageDefault })
+            {
+                if (const auto root = RecognizeDefaultDirectory(candidate))
+                    return { *root, Source::DefaultSearch, true, true };
+            }
             return { configuredPath, Source::ConfiguredFile, false, true };
         }
 

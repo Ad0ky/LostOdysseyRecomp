@@ -9,7 +9,7 @@ if(CMAKE_OSX_DEPLOYMENT_TARGET VERSION_LESS LO_MINIMUM_MACOS)
     message(STATUS "Raising CMAKE_OSX_DEPLOYMENT_TARGET from ${CMAKE_OSX_DEPLOYMENT_TARGET} to ${LO_MINIMUM_MACOS}")
     set(CMAKE_OSX_DEPLOYMENT_TARGET "${LO_MINIMUM_MACOS}" CACHE STRING "Minimum macOS deployment target" FORCE)
 endif()
-project(LostOdysseyRecomp VERSION 0.9.22 LANGUAGES C CXX)
+project(LostOdysseyRecomp VERSION 0.9.57 LANGUAGES C CXX)
 include(GNUInstallDirs)
 # Source version, not a release/commit or clean-checkout assertion.
 # Capture before nested projects can replace PROJECT_VERSION in their scope.
@@ -65,7 +65,7 @@ option(LO_BUILD_TOOLS "Build XenonRecomp / XenosRecomp (use tools/build_tools.ba
 option(LO_BUILD_RECOMP_LIB "Build the recompiled game code library from LostOdysseyRecompLib/ppc" ON)
 option(LO_BUILD_RUNTIME "Build the LostOdysseyRecomp runtime executable" ON)
 option(LO_BUILD_GPU "Build the plume-based GPU backend" ON)
-option(LO_BUILD_ANDROID_RUNTIME "Enable the experimental Android game runtime shared library" OFF)
+option(LO_BUILD_ANDROID_RUNTIME "Enable the Android game runtime shared library" OFF)
 
 if(LO_TARGET_PLATFORM STREQUAL "switch")
     if(LO_BUILD_TOOLS)
@@ -82,7 +82,7 @@ if(ANDROID)
         message(FATAL_ERROR "Android builds use host-generated PPC sources; build XenonRecomp/XenosRecomp separately for the host")
     endif()
     if(LO_BUILD_RUNTIME AND NOT LO_BUILD_ANDROID_RUNTIME)
-        message(FATAL_ERROR "The Android game runtime is experimental; explicitly set -DLO_BUILD_ANDROID_RUNTIME=ON, or use -DLO_BUILD_ANDROID_PROBE=ON for diagnostics")
+        message(FATAL_ERROR "The Android game runtime needs an explicit opt-in; set -DLO_BUILD_ANDROID_RUNTIME=ON, or use -DLO_BUILD_ANDROID_PROBE=ON for diagnostics")
     endif()
     # These archives will be linked into the Android runtime shared library.
     set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -154,12 +154,43 @@ if(LO_BUILD_MOD_TESTS)
         target_compile_options(LoModApiTest PRIVATE -UNDEBUG)
     endif()
     add_test(NAME LoModApiTest COMMAND LoModApiTest)
+    add_executable(LoFpiOverflowTest tools/tests/fpi_overflow_test.cpp)
+    target_include_directories(LoFpiOverflowTest PRIVATE LostOdysseyRecomp)
+    target_compile_features(LoFpiOverflowTest PRIVATE cxx_std_20)
+    if(MSVC)
+        target_compile_options(LoFpiOverflowTest PRIVATE /UNDEBUG)
+    else()
+        target_compile_options(LoFpiOverflowTest PRIVATE -UNDEBUG)
+    endif()
+    add_test(NAME LoFpiOverflowTest COMMAND LoFpiOverflowTest)
+    if(WIN32)
+        # MP4 demuxer + Media Foundation H.264 decoder; also the speed bench for replacement CG movies.
+        add_executable(LoMovieDecodeTest
+            tools/tests/movie_decode_test.cpp
+            LostOdysseyRecomp/movie/byte_source.cpp
+            LostOdysseyRecomp/movie/movie_decoder.cpp
+            LostOdysseyRecomp/movie/movie_decoder_mf.cpp
+            LostOdysseyRecomp/movie/mp4_demux.cpp
+            LostOdysseyRecomp/modding/mod_api.cpp)
+        target_include_directories(LoMovieDecodeTest PRIVATE LostOdysseyRecomp)
+        target_compile_features(LoMovieDecodeTest PRIVATE cxx_std_20)
+        target_link_libraries(LoMovieDecodeTest PRIVATE Threads::Threads)
+        add_test(NAME LoMovieDecodeTest COMMAND LoMovieDecodeTest
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/data/testsrc-64x64-bframes.mp4 --rewind-check)
+        add_test(NAME LoMovieDecodeTestSoftware COMMAND LoMovieDecodeTest
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/data/testsrc-64x64-bframes.mp4 --software --rewind-check)
+        add_test(NAME LoMovieDecodeTestFragmented COMMAND LoMovieDecodeTest
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/data/testsrc-64x64-bframes-frag.mp4 --software --rewind-check)
+    endif()
     # The runtime's --export-assets mode without game code, GPU or SDL.
     if(EXISTS "${LO_MINIZ_DIR}/miniz.c")
         add_executable(LoAssetExport
             tools/tests/asset_export_cli.cpp
             LostOdysseyRecomp/modding/asset_export.cpp
+            LostOdysseyRecomp/modding/font_patch.cpp
+            LostOdysseyRecomp/modding/gltf_writer.cpp
             LostOdysseyRecomp/modding/mod_api.cpp
+            LostOdysseyRecomp/modding/model_preview.cpp
             LostOdysseyRecomp/modding/text_format.cpp
             LostOdysseyRecomp/modding/text_menu.cpp
             thirdparty/lzokay/lzokay.cpp

@@ -33,6 +33,7 @@ using gpu::frame_plan::NoteDlssRuntime;
 using gpu::frame_plan::PlannerInput;
 using gpu::frame_plan::PlannerState;
 using gpu::frame_plan::ResetDlssStatusLog;
+using gpu::frame_plan::StatusExecution;
 using gpu::upscaling::BackendDeviceSnapshot;
 using gpu::upscaling::DlssQuality;
 using gpu::upscaling::OutputSizing;
@@ -237,6 +238,9 @@ void CheckRuntime(LogFile& log, std::vector<std::string>& examples)
     Require(planner.ReportExecution(fallback), "fallback stored");
     auto fallen = DescribeDlssRuntime(device, planner.Observe(), &sizing);
     Require(fallen.phase == DlssEffectPhase::TemporaryFallback && fallen.reason == DlssEffectReason::NoEligibleScene, "fallback classification");
+    const auto menuView = planner.Observe();
+    Require(menuView.eligible && StatusExecution(menuView)->outcome == DlssExecutionOutcome::Submitted &&
+        StatusExecution(menuView)->renderFrame == 41, "the menu keeps the last submitted frame; the log still gets the fallback");
     NoteDlssRuntime(fallen);
     NoteDlssRuntime(fallen);
     auto recovered = Submitted(quality, 44, 12);

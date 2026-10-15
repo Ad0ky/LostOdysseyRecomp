@@ -31,6 +31,7 @@
 #include <os/shader_log.h>
 #include <os/user_paths.h>
 #include <host_ui/host_ui.h>
+#include <achievements/achievements.h>
 #include <csetjmp>
 
 // Kernel HLE for xboxkrnl.exe / xam.xex imports. Reference behaviour: Xenia
@@ -58,8 +59,8 @@ struct ThreadWaitState
 static Mutex g_waitStatesMutex;
 static std::vector<ThreadWaitState*> g_waitStates;
 
-// Clears the live-context pointer when the host thread exits so the watchdog
-// never dereferences a dead guest context.
+// Remove a thread's diagnostic record when it exits; the watchdog holds the
+// same lock while reading the records.
 struct ThreadWaitStateGuard
 {
     ThreadWaitState* state = nullptr;
@@ -68,8 +69,8 @@ struct ThreadWaitStateGuard
         if (state)
         {
             std::lock_guard lock(g_waitStatesMutex);
-            state->ctx = nullptr;
-            state->what = "exited";
+            std::erase(g_waitStates, state);
+            delete state;
         }
     }
 };
@@ -197,8 +198,6 @@ void DumpGuestThreadStates()
     LOG_WARNING("guest thread states ({} threads):", g_waitStates.size());
     for (auto* st : g_waitStates)
     {
-        if (st->what[0] == 'e') // exited
-            continue;
         bool running = st->what[0] == 'r';
         uint32_t liveLr = st->ctx ? uint32_t(st->ctx->lr) : 0;
         uint32_t liveR1 = st->ctx ? st->ctx->r1.u32 : 0;
@@ -281,6 +280,7 @@ struct Semaphore final : KernelObject, HostObject<XKSEMAPHORE>
     Semaphore(uint32_t count, uint32_t maximum) : state(count, maximum) {}
     kernel::wait::Target* WaitTarget() override { return &state; }
     bool Release(uint32_t amount, uint32_t* previous) { return state.Release(amount, previous); }
+    void Reset(uint32_t count, uint32_t limit) { state.Reset(count, limit); }
 };
 struct Mutant final : KernelObject, HostObject<XDISPATCHER_HEADER>
 {
@@ -468,7 +468,7 @@ static void KeInitializeSemaphore(XKSEMAPHORE* semaphore, uint32_t count, uint32
     semaphore->Header.Type = 5;
     semaphore->Header.SignalState = count;
     semaphore->Limit = limit;
-    QueryKernelObject<Semaphore>(semaphore->Header);
+    QueryKernelObject<Semaphore>(semaphore->Header)->Reset(count, limit);
 }
 
 static uint32_t KeReleaseSemaphore(XKSEMAPHORE* semaphore, uint32_t increment, uint32_t adjustment, uint32_t wait)
@@ -1895,6 +1895,17 @@ static uint32_t XamUserCreateAchievementEnumerator(uint32_t titleId, uint32_t us
 static uint32_t XMsgStartIORequest(uint32_t App, uint32_t Message, XXOVERLAPPED* overlapped, void* Buffer, uint32_t szBuffer)
 {
     LOG_KERNEL("app={:#x} msg={:#x}", App, Message);
+    // XGI (0xFB) XGIUserWriteAchievements: {count, X_XUSER_ACHIEVEMENT* {user, id}}.
+    if (App == 0xFB && Message == 0xB0008 && Buffer && szBuffer >= 8)
+    {
+        const auto* args = static_cast<const be<uint32_t>*>(Buffer);
+        const uint32_t count = args[0], list = args[1];
+        for (uint32_t i = 0; i < std::min(count, 64u) && list; ++i)
+        {
+            const auto* entry = static_cast<const be<uint32_t>*>(g_memory.Translate(list + i * 8));
+            achievements::Unlock(uint16_t(entry[1]));
+        }
+    }
     if (overlapped)
     {
         overlapped->Error = 0;
@@ -1908,8 +1919,13 @@ static uint32_t XMsgStartIORequestEx(uint32_t App, uint32_t Message, XXOVERLAPPE
 {
     return XMsgStartIORequest(App, Message, overlapped, Buffer, szBuffer);
 }
-// XAM in-process app messages. App 0xFA is XMP (music player); the game polls
-// its state every frame. Semantics per Xenia kernel/xam/apps/xmp_app.cc.
+// XAM in-process app messages. App 0xFA is XMP (music player). Semantics per
+// Xenia kernel/xam/apps/xmp_app.cc, without its sleeps: Xenia sleeps 1 ms in
+// XMPGetStatus and 10 ms in XMPGetPlaybackController for a title that polls
+// them in a tight loop. Here the sound worker (sub_82B632C0) calls both on each
+// pass, and each pass takes one queued sound command per ring. With the sleeps
+// it ran 82 passes a second instead of about 950, so a burst of sound commands
+// could fill the 192-command queue (#497).
 static uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t>* param1, uint32_t param2)
 {
     if (app == 0xFA)
@@ -1920,7 +1936,6 @@ static uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t>* 
         {
             if (param1 && param1[1])
                 *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(param1[1])) = 0; // kIdle
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
             return 0;
         }
         case 0x0007001B: // XMPGetPlaybackController(xmp_client, controller_ptr, locked_ptr)
@@ -1930,7 +1945,6 @@ static uint32_t XMsgInProcessCall(uint32_t app, uint32_t message, be<uint32_t>* 
                 if (param1[1]) *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(param1[1])) = 0;
                 if (param1[2]) *reinterpret_cast<be<uint32_t>*>(g_memory.Translate(param1[2])) = 0;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             return 0;
         }
         case 0x0007000B: // XMPGetVolume(xmp_client, volume_ptr)

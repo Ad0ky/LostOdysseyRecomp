@@ -40,8 +40,14 @@ Config Validate(Config value)
     value.displayName = TextValue(std::move(value.displayName));
     value.gameLanguagePack = PackId(std::move(value.gameLanguagePack));
     if (value.displayName.empty() || value.displayIndex > 63) value.displayIndex = 0;
-    // 540 is the Switch handheld scene height (see below); elsewhere it is not offered.
-    const bool switch540 = LO_PLATFORM_SWITCH && value.internalResolution == 540;
+#if LO_PLATFORM_SWITCH
+    // 540 is the Switch handheld scene height (see below).
+    const bool switch540 = value.internalResolution == 540;
+#else
+    // 540 was a render resolution in development builds; it now means the original 720.
+    if (value.internalResolution == 540) value.internalResolution = 720;
+    constexpr bool switch540 = false;
+#endif
     if (value.internalResolution != 0 && value.internalResolution != InternalResolutionNative && !switch540 &&
         value.internalResolution != 720 && value.internalResolution != 1080 &&
         value.internalResolution != 1440 && value.internalResolution != 2160)
@@ -59,6 +65,9 @@ Config Validate(Config value)
     value.audioMatrixRear = std::clamp((value.audioMatrixRear + 5) / 10 * 10, 90u, 150u);
     value.voiceVolume = std::min(value.voiceVolume, 100u);
     if (value.buttonPrompts > 2) value.buttonPrompts = 0;
+    if (value.performanceOverlay > 2) value.performanceOverlay = 0;
+    value.controllerMap = hid::input_map::ValidController(value.controllerMap);
+    value.keyboardMap = hid::input_map::ValidKeyboard(value.keyboardMap);
     value.hdrPaperWhiteNits = std::clamp(value.hdrPaperWhiteNits, 80u, 400u);
     value.hdrPeakNits = std::clamp(value.hdrPeakNits, 80u, 10000u);
     value.hdrPeakNits = std::max(value.hdrPeakNits, value.hdrPaperWhiteNits);
@@ -110,11 +119,7 @@ Config Validate(Config value)
     if (value.audioOutput > AudioOutputMatrix)
         value.audioOutput = AudioOutputStereo;
     if (!gpu::backend::Known(value.graphicsBackend))
-#ifdef _WIN32
-        value.graphicsBackend = GraphicsBackend::D3D12;
-#else
         value.graphicsBackend = GraphicsBackend::Vulkan;
-#endif
 #if LO_PLATFORM_MACOS
     value.graphicsBackend = GraphicsBackend::Metal; // The only macOS backend.
 #elif !defined(_WIN32)
@@ -188,6 +193,15 @@ Config Read()
         {
             (name == "gpu_device" ? value.gpuDevice : name == "display_name" ? value.displayName : value.gameLanguagePack) =
                 TextValue(digits);
+            continue;
+        }
+        if (name == "controller_map" || name == "keyboard_map")
+        {
+            // "input:value" pairs; an invalid pair keeps that input's default.
+            std::string_view text = digits;
+            while (!text.empty() && (text.back() == '\r' || text.back() == '\n')) text.remove_suffix(1);
+            if (name == "controller_map") value.controllerMap = hid::input_map::ParseController(text);
+            else value.keyboardMap = hid::input_map::ParseKeyboard(text);
             continue;
         }
         if (name == "display_brightness" || name == "dlss_nr_skin")
@@ -314,6 +328,12 @@ Config Read()
             value.fxaa = number == 1;
         else if (key == "skip_shader_prebuild")
             value.skipShaderPrebuild = number == 1;
+        else if (key == "achievement_notifications" && number <= 1)
+            value.achievementNotifications = number == 1;
+        else if (key == "achievement_sound" && number <= 1)
+            value.achievementSound = number == 1;
+        else if (key == "performance_overlay")
+            value.performanceOverlay = number;
         else if (key == "save_anywhere" && number <= 1)
             value.saveAnywhere = number == 1;
         else if (key == "no_random_encounters" && number <= 1)
@@ -456,6 +476,8 @@ static bool WriteConfig(const Config &value)
            << "\nculling=" << value.cullingPercent
            << "\nvibration=" << value.vibrationPercent
            << "\nbutton_prompts=" << value.buttonPrompts
+           << "\ncontroller_map=" << hid::input_map::FormatController(value.controllerMap)
+           << "\nkeyboard_map=" << hid::input_map::FormatKeyboard(value.keyboardMap)
             << "\nupscaler=" << uint32_t(value.upscaler) << "\ndlss_quality=" << uint32_t(value.dlssQuality)
            << "\ndlss_model=" << value.dlssModel
            << "\nfsr_quality=" << uint32_t(value.fsrQuality)
@@ -482,6 +504,9 @@ static bool WriteConfig(const Config &value)
            << "\naudio_matrix_rear=" << value.audioMatrixRear
            << "\nvoice_volume=" << value.voiceVolume
            << "\nskip_shader_prebuild=" << (value.skipShaderPrebuild ? 1 : 0)
+           << "\nachievement_notifications=" << (value.achievementNotifications ? 1 : 0)
+           << "\nachievement_sound=" << (value.achievementSound ? 1 : 0)
+           << "\nperformance_overlay=" << value.performanceOverlay
            << "\nsave_anywhere=" << (value.saveAnywhere ? 1 : 0)
            << "\nno_random_encounters=" << (value.noRandomEncounters ? 1 : 0)
            << "\nfast_forward=" << (value.fastForward ? 1 : 0)
@@ -540,6 +565,17 @@ bool SaveDisplayChoice(const std::string &name, uint32_t index)
     if (!WriteConfig(persisted)) return false;
     Current().displayName = persisted.displayName;
     Current().displayIndex = persisted.displayIndex;
+    return true;
+}
+bool SaveGraphicsBackend(GraphicsBackend backend)
+{
+    std::lock_guard lock(mutex);
+    // Merge with the persisted settings, not a pending graphics preview.
+    auto persisted = Read();
+    persisted.graphicsBackend = backend;
+    persisted = Validate(persisted);
+    if (!WriteConfig(persisted)) return false;
+    Current().graphicsBackend = persisted.graphicsBackend;
     return true;
 }
 bool SaveDebugLanguage(uint32_t language)
