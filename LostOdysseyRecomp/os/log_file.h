@@ -26,6 +26,11 @@ namespace os::logger
     // the report. Missing sinks are harmless; pending CRT bytes are not flushed.
     void EmergencyWrite(const char* data, size_t size) noexcept;
 
+    // Switch: writes the lines the log writer thread has not written yet. For
+    // crash and exit paths: gives up rather than wait on a lock a crashed
+    // thread may hold. Elsewhere a no-op (lines are written as they come).
+    void DrainForExit() noexcept;
+
     // Flush and copy the complete active log while holding the logger mutex.
     // Returns an error if the sink is absent, flushing fails or copying fails.
     // Logging stays open after the snapshot, including on failure.
