@@ -5,6 +5,8 @@
 
 extern "C" PPC_FUNC(__imp__sub_822ED938);
 extern "C" PPC_FUNC(__imp__sub_8234B9B8);
+extern "C" PPC_FUNC(__imp__sub_8285FD88);
+extern "C" PPC_FUNC(__imp__sub_8285FDA8);
 
 namespace
 {
@@ -19,14 +21,32 @@ constexpr uint32_t TimerOffset = 96;
 constexpr uint32_t HoldStages[] = {22, 38, 51, 63};
 constexpr float ExpiredTimer = 4.0f;
 
-// After Continue on the title, state 27 of the title tick waits for the first
-// save scan to finish and then until 1.0 s (0x82000F28) has passed since the
-// start time it stored at +164 (float seconds) before it starts the second
-// scan. Later states read +164 too, so move the start back only for the call.
+// Title tick states that wait until a time has passed since the start time
+// at +164 (float seconds), with nothing else to wait for:
+// 27: after Continue, once the first save scan is done, 1.0 s (0x82000F28)
+//     before the second scan.
+// 85: after START, state 84 shows the profile check message, stores the
+//     start time and holds 0.5 s (0x82000F70) before 86 requests the profile
+//     data (achievements and DLC, on the XDK thread) and 87 waits for it.
+// 83: after that request, holds until 1.0 s (0x82000F28) since state 84, then
+//     hides the message and opens the title menu.
+// Later states read +164 too, so the start moves back only for the call. A
+// minute back clears every hold, also at the float's coarse resolution after
+// a long uptime.
 constexpr uint32_t TitleStateOffset = 20;
-constexpr uint32_t TitleScanState = 27;
-constexpr uint32_t TitleScanStartOffset = 164;
-constexpr float TitleScanWait = 1.0f;
+constexpr uint32_t TitleHoldStates[] = {27, 83, 85};
+constexpr uint32_t TitleStartOffset = 164;
+constexpr float TitleHoldSkip = 60.0f;
+
+// Message 6 of 8285FD88 is the profile check ("Updating gamer profile...",
+// text 12139). Without the holds it would only flash while 87 waits, so it
+// is not shown, and 83 does not hide it.
+constexpr uint32_t ProfileCheckMessage = 6;
+constexpr uint32_t ShowProfileCheckState = 85;
+constexpr uint32_t HideProfileCheckState = 83;
+// Set on the title thread while the title tick runs.
+thread_local uint32_t tickingTitle = 0;
+bool profileMessageSkipped = false;
 }
 
 PPC_FUNC(sub_822ED938)
@@ -42,19 +62,43 @@ PPC_FUNC(sub_822ED938)
     __imp__sub_822ED938(ctx, base);
 }
 
+PPC_FUNC(sub_8285FD88)
+{
+    if (tickingTitle)
+    {
+        profileMessageSkipped = ctx.r4.u32 == ProfileCheckMessage &&
+                                PPC_LOAD_U32(tickingTitle + TitleStateOffset) == ShowProfileCheckState;
+        if (profileMessageSkipped)
+            return;
+    }
+    __imp__sub_8285FD88(ctx, base);
+}
+
+PPC_FUNC(sub_8285FDA8)
+{
+    if (tickingTitle && profileMessageSkipped && PPC_LOAD_U32(tickingTitle + TitleStateOffset) == HideProfileCheckState)
+    {
+        profileMessageSkipped = false;
+        return;
+    }
+    __imp__sub_8285FDA8(ctx, base);
+}
+
 void save_menu_holds::TitleTick(PPCContext& ctx, uint8_t* base)
 {
     const uint32_t title = ctx.r3.u32;
-    if (PPC_LOAD_U32(title + TitleStateOffset) != TitleScanState)
-    {
-        __imp__sub_8234B9B8(ctx, base);
-        return;
-    }
+    const uint32_t state = PPC_LOAD_U32(title + TitleStateOffset);
+    const bool hold = std::find(std::begin(TitleHoldStates), std::end(TitleHoldStates), state) != std::end(TitleHoldStates);
     PPCRegister start{}, earlier{};
-    start.u32 = PPC_LOAD_U32(title + TitleScanStartOffset);
-    earlier.f32 = start.f32 - TitleScanWait;
-    PPC_STORE_U32(title + TitleScanStartOffset, earlier.u32);
+    if (hold)
+    {
+        start.u32 = PPC_LOAD_U32(title + TitleStartOffset);
+        earlier.f32 = start.f32 - TitleHoldSkip;
+        PPC_STORE_U32(title + TitleStartOffset, earlier.u32);
+    }
+    tickingTitle = title;
     __imp__sub_8234B9B8(ctx, base);
-    if (PPC_LOAD_U32(title + TitleScanStartOffset) == earlier.u32)
-        PPC_STORE_U32(title + TitleScanStartOffset, start.u32);
+    tickingTitle = 0;
+    if (hold && PPC_LOAD_U32(title + TitleStartOffset) == earlier.u32)
+        PPC_STORE_U32(title + TitleStartOffset, start.u32);
 }
