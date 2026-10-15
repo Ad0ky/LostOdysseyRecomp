@@ -18,20 +18,23 @@ class CollectionWorker {
 public:
     class Control {
     public:
-        bool Stopped() const { return stopped_.load(std::memory_order_relaxed); }
-        bool Wait(std::chrono::milliseconds duration) {
+        bool Stopped() const { return stopped_.load(); }
+        // Sleeps until Notify or Stop, with no periodic wake-up. A semaphore
+        // retains a notification sent before the wait starts; only the consumed
+        // token clears signaled_, so a release can never overflow it.
+        bool Wait() {
             if (Stopped()) return true;
-            // A semaphore retains notifications sent before the wait starts.
-            // Only a consumed token clears signaled_; clearing it on timeout
-            // could race a release and overflow the binary semaphore.
-            if (wake_.try_acquire_for(duration)) signaled_.store(false);
+            wake_.acquire();
+            signaled_.store(false);
             return Stopped();
         }
         void Notify() noexcept {
             if (!signaled_.exchange(true)) wake_.release();
         }
+        // Sequentially consistent: a Stop whose notify finds a token just
+        // taken by Wait is still seen by Wait's final Stopped().
         void Stop() noexcept {
-            stopped_.store(true, std::memory_order_relaxed);
+            stopped_.store(true);
             Notify();
         }
     private:

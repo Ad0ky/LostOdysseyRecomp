@@ -5391,7 +5391,9 @@ void main()
             void QueueClear(HostTexture& tex, pending_clear::Op op)
             {
                 // A depth fill leaves a surface no replay draws; the clear value 0 is "nothing".
-                if (motionOptions.staticSkip && IsDepthTarget(tex) && (op.aspects & pending_clear::Depth) && op.depth != 0.0f) {
+                // Only a frame with a motion consumer tracks it.
+                if (motionOptions.staticSkip && (temporalExperiment || temporalInputProbe || dlssSrRequested || nativeFgInputs) &&
+                    IsDepthTarget(tex) && (op.aspects & pending_clear::Depth) && op.depth != 0.0f) {
                     const bool sceneCameraKnown = temporalScene.Frame() == frame && temporalScene.Draws() != 0;
                     cameraStatic.NoteUntrackedDepth(frame, tex.allocationSerial, sceneCameraKnown,
                         sceneCameraKnown ? temporalScene.Anchor().depthAllocation : 0);
@@ -7528,6 +7530,11 @@ void main()
                     activePlan = committedPlan;
                     activePlanFailed = activePlan.geometryEpoch != 0 && failedPlanEpochs.contains(activePlan.geometryEpoch);
                     activePlanGeneration = framePlanGeneration.load(std::memory_order_relaxed);
+#if defined(LO_GPU_PLUME)
+                    // Only FSR publishes or reads FSR alpha; leaving it drops what it left.
+                    if (fsrAlphaBridge && activePlan.requestedUpscaler != upscaling::Upscaler::Fsr)
+                        fsrAlphaBridge->Invalidate();
+#endif
                 }
                 if (activePlanFailed)
                     return false;
@@ -9344,10 +9351,6 @@ void main()
                 if (modeControl != 6) consecutiveResolveCopies.Invalidate();
                 if (!ApplyInternalResolution())
                     return;
-#if defined(LO_GPU_PLUME)
-                if (fsrAlphaBridge && activePlan.requestedUpscaler != upscaling::Upscaler::Fsr)
-                    fsrAlphaBridge->Invalidate();
-#endif
                 // LO_DRAW_LIMIT=<n>: only record the first n draws of each frame,
                 // to bisect which pass ruins the image.
                 static const uint32_t drawLimit = getenv("LO_DRAW_LIMIT") ? strtoul(getenv("LO_DRAW_LIMIT"), nullptr, 10) : 0;
