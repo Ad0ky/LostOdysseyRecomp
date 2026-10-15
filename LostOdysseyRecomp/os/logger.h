@@ -3,9 +3,11 @@
 #include <fmt/core.h>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <os/netlog.h>
 #ifdef __ANDROID__
@@ -75,6 +77,53 @@ namespace os::logger
         return "";
     }
 
+#if defined(__SWITCH__)
+    // SD card writes take tens of milliseconds (60-110 ms seen for a 64 KiB
+    // buffer). Taken by whichever thread logged the line that filled the
+    // buffer or crossed the one-second flush, that was usually the GPU command
+    // processor, which logs every frame with LO_RENDER_TIMING: a hitch once a
+    // second. Lines are now appended to memory under g_mutex and a writer
+    // thread puts them on the card; warnings and errors still go out at once.
+    inline std::string g_pending;              // under g_mutex
+    inline std::mutex g_writeMutex;            // file writes, in order; taken before g_mutex
+    inline std::condition_variable g_writerWake;
+    inline bool g_writerStarted = false;       // under g_mutex
+    inline constexpr size_t kWriterWakeBytes = 128 * 1024;
+
+    // Writes everything queued so far. Lock order: g_writeMutex, then g_mutex.
+    inline void DrainPending()
+    {
+        std::lock_guard write(g_writeMutex);
+        std::string out;
+        {
+            std::lock_guard lock(g_mutex);
+            out.swap(g_pending);
+        }
+        if (!out.empty() && g_file)
+        {
+            fwrite(out.data(), 1, out.size(), g_file);
+            fflush(g_file);
+        }
+    }
+
+    inline void StartWriter() // caller holds g_mutex
+    {
+        g_writerStarted = true;
+        // Never joined or detached: libnx has no pthread_detach.
+        (void)new std::thread([] {
+            for (;;)
+            {
+                {
+                    std::unique_lock lock(g_mutex);
+                    g_writerWake.wait_for(lock, std::chrono::milliseconds(500),
+                        [] { return g_pending.size() >= kWriterWakeBytes; });
+                }
+                DrainPending();
+            }
+        });
+    }
+#endif
+
     template<typename... Args>
     inline void Log(LogType type, const char* func, fmt::format_string<Args...> format, Args&&... args)
     {
@@ -85,28 +134,29 @@ namespace os::logger
         if (type == LogType::Verbose && !g_verbose)
             return;
 
-        std::lock_guard lock(g_mutex);
+        std::unique_lock lock(g_mutex);
         std::string msg = fmt::format(format, std::forward<Args>(args)...);
         const auto line = func
             ? fmt::format("[{:9.3f} t{:04x}] {} {}: {}\n", ElapsedSeconds(), ThreadTag(), Prefix(type), func, msg)
             : fmt::format("[{:9.3f} t{:04x}] {} {}\n", ElapsedSeconds(), ThreadTag(), Prefix(type), msg);
 #if defined(__SWITCH__)
-        // Each flush is an SD card write taken under g_mutex, which every
-        // logging thread waits on: buffer, flush warnings and errors at once and
-        // the rest at least every second. The crash handlers flush on exit.
-        // No stderr copy once the runtime log is open (stderr.log keeps the
-        // driver's, profiler's and crash output).
+        // Queued for the writer thread (see DrainPending); warnings and errors
+        // are written before returning. Crash and exit paths drain the queue
+        // (os::logger::DrainForExit). No stderr copy once the runtime log is
+        // open (stderr.log keeps the driver's, profiler's and crash output).
         os::netlog::Write(line.data(), line.size());
         if (g_file)
         {
-            fwrite(line.data(), 1, line.size(), g_file);
-            static auto lastFlush = std::chrono::steady_clock::now();
-            const auto now = std::chrono::steady_clock::now();
-            if (type == LogType::Error || type == LogType::Warning || now - lastFlush >= std::chrono::seconds(1))
+            g_pending += line;
+            if (!g_writerStarted)
+                StartWriter();
+            if (type == LogType::Error || type == LogType::Warning)
             {
-                fflush(g_file);
-                lastFlush = now;
+                lock.unlock();
+                DrainPending();
             }
+            else if (g_pending.size() >= kWriterWakeBytes)
+                g_writerWake.notify_one();
             return;
         }
 #else

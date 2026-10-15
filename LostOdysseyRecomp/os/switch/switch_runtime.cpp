@@ -31,6 +31,9 @@ extern "C"
     u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
 }
 
+// os/log_file.h (not included: this file sees libnx headers, not the PCH).
+namespace os::logger { void DrainForExit() noexcept; }
+
 namespace
 {
 // stderr (fd 2) goes through this device: the file plus the network log.
@@ -81,6 +84,7 @@ void WriteAddress(FILE* file, const char* name, uint64_t value)
 
 [[noreturn]] void ExitWithLog()
 {
+    os::logger::DrainForExit(); // lines still queued for the log writer
     std::fflush(nullptr);
     svcExitProcess();
     __builtin_unreachable();

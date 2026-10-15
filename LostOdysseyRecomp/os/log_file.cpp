@@ -3,6 +3,9 @@
 #include <os/shader_log.h>
 
 #include <cerrno>
+#include <chrono>
+#include <cstdlib>
+#include <thread>
 #include <atomic>
 #include <algorithm>
 #include <map>
@@ -170,6 +173,11 @@ namespace os::logger
         g_filePath = std::move(absolutePath);
         g_emergencyFile.store(emergency, std::memory_order_release);
         g_file = file;
+#if defined(__SWITCH__)
+        // Lines queued for the writer thread reach the card on a normal exit too.
+        static const bool drainAtExit = std::atexit([] { DrainForExit(); }) == 0;
+        (void)drainAtExit;
+#endif
         const auto runtimePath = g_filePath;
         lock.unlock();
         try { shaderlog::OpenForRuntime(runtimePath); }
@@ -229,6 +237,33 @@ namespace os::logger
         }
     }
 
+    void DrainForExit() noexcept
+    {
+#if defined(__SWITCH__)
+        for (int attempt = 0; attempt < 100; ++attempt)
+        {
+            if (g_writeMutex.try_lock())
+            {
+                if (g_mutex.try_lock())
+                {
+                    if (!g_pending.empty() && g_file)
+                    {
+                        fwrite(g_pending.data(), 1, g_pending.size(), g_file);
+                        g_pending.clear();
+                    }
+                    if (g_file)
+                        fflush(g_file);
+                    g_mutex.unlock();
+                    g_writeMutex.unlock();
+                    return;
+                }
+                g_writeMutex.unlock();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+#endif
+    }
+
     void EmergencyWrite(const char* data, size_t size) noexcept
     {
         if (!data || !size)
@@ -278,6 +313,9 @@ namespace os::logger
 
     std::error_code SnapshotFile(const std::filesystem::path& destination)
     {
+#if defined(__SWITCH__)
+        DrainPending(); // the copy includes the lines still queued for the writer
+#endif
         std::lock_guard lock(g_mutex);
         if (!g_file || g_filePath.empty())
             return std::make_error_code(std::errc::bad_file_descriptor);
