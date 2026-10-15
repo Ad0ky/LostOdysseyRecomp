@@ -7,11 +7,15 @@ namespace gpu::temporal {
 // temporal rendering; LO_MV_ENABLE=0 remains an exact comparison switch.
 struct MotionOptions {
     bool enabled = false, replay = false, consume = false, debug = false, log = false, timing = false;
+    // Skip the replay of draws that only the scene camera moved; their pixels
+    // take the camera's motion. LO_MV_STATIC_SKIP=0 replays every draw.
+    bool staticSkip = false;
     static MotionOptions Environment() {
         auto on = [](const char* n) { const auto* p = std::getenv(n); return p && std::string_view(p) == "1"; };
         auto notOff = [](const char* n) { const auto* p = std::getenv(n); return !p || std::string_view(p) != "0"; };
         MotionOptions out; out.enabled = notOff("LO_MV_ENABLE");
         out.replay = out.enabled && notOff("LO_MV_REPLAY");
+        out.staticSkip = out.replay && notOff("LO_MV_STATIC_SKIP");
         out.consume = out.replay && notOff("LO_MV_CONSUME");
         out.debug = out.consume && on("LO_MV_DEBUG"); out.log = on("LO_MV_LOG");
         out.timing = on("LO_MV_TIMING"); // TAA baseline A can be measured with MV disabled.

@@ -139,6 +139,10 @@ inline std::string Pixel(const TranslatedShader* ps) {
     wrapper += R"HLSL(
     MvOutput o = (MvOutput)0;
     o.depths.x = p.z;
+    // A replayed draw always claims its visible pixels. Without valid previous
+    // motion it leaves the invalid marker, never tag 0: that is the camera-static
+    // class when static replays are skipped (motion_replay_gpu.h).
+    o.tag = 0xFFFFFFFFu;
     uint4 meta = XeMvMeta();
     if (meta.x == 0 || !all(isfinite(previousClip)) || !all(isfinite(currentClip)) ||
         previousClip.w <= 1e-6 || currentClip.w <= 1e-6) return o;
@@ -150,7 +154,7 @@ inline std::string Pixel(const TranslatedShader* ps) {
     o.velocity = previousPixel - currentPixel + asfloat(meta.yz);
     o.depths.y = previousClip.z / previousClip.w; // host reverse depth, already converted by original epilogue
     if (!all(isfinite(o.velocity)) || !isfinite(o.depths.y) || o.depths.y <= 0 || o.depths.y > 1) {
-        o.velocity = 0; o.depths.y = 0; return o;
+        o.velocity = 0; o.depths.y = 0; return o; // marker tag
     }
     // Identical unjittered inputs prove zero geometric displacement. Avoid the
     // rounding residue of interpolated clip subtraction plus jitter cancellation.

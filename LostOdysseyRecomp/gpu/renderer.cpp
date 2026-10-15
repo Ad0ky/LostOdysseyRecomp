@@ -1084,6 +1084,53 @@ namespace gpu::renderer
             temporal::SuspectTracker suspectTracker;
             temporal::JitterMissLog jitterMissLog;
             double mvTrackCpuMs = 0;
+            // Camera-static replay skipping (MotionReplayGPU kCameraHlsl): a frame may
+            // skip the replay of draws that only the scene camera moved when every
+            // other depth writer into the scene depth replays.
+            struct CameraStaticState {
+                uint64_t frame = ~0ull;
+                // Depth writers outside motion tracking: before the scene camera
+                // (allocations) and into its allocation after it.
+                std::array<uint64_t, 4> preAnchorDepth{};
+                uint32_t preAnchorCount = 0, untrackedDepth = 0;
+                bool preAnchorOverflow = false;
+                int8_t allowed = -1; // decided at the first tracked draw
+                bool unsafe = false;
+                // Skipping waits this long after a frame that could not give the
+                // skipped draws camera motion, and stops for good if the camera
+                // passes cannot be built on this device.
+                uint64_t holdUntil = 0;
+                bool disabled = false;
+                uint32_t skipped = 0, markers = 0;
+                float jx = 0, jy = 0;
+                // The last frame whose scene camera HistoryOwner keeps as the next
+                // frame's previous camera, and that camera's VP bits.
+                uint64_t keptFrame = ~0ull, keptEpoch = 0;
+                std::array<uint32_t, 16> keptVp{};
+                temporal::Viewport keptViewport{};
+                uint64_t camerasApplied = 0, camerasDropped = 0;
+                void Hold(uint64_t f) { holdUntil = std::max(holdUntil, f + 60); }
+                void Begin(uint64_t f) {
+                    if (frame == f) return;
+                    if (unsafe) Hold(frame);
+                    frame = f; preAnchorCount = untrackedDepth = skipped = markers = 0;
+                    preAnchorOverflow = unsafe = false; allowed = -1; jx = jy = 0;
+                }
+                bool PreAnchorWrote(uint64_t allocation) const {
+                    return preAnchorOverflow || std::find(preAnchorDepth.begin(), preAnchorDepth.begin() + preAnchorCount, allocation) !=
+                        preAnchorDepth.begin() + preAnchorCount;
+                }
+                // Depth written outside motion tracking (a draw, clear or fill).
+                void NoteUntrackedDepth(uint64_t f, uint64_t allocation, bool sceneCameraKnown, uint64_t sceneAllocation) {
+                    Begin(f);
+                    if (sceneCameraKnown) {
+                        if (allocation == sceneAllocation) { ++untrackedDepth; unsafe = true; }
+                    } else if (!PreAnchorWrote(allocation)) {
+                        if (preAnchorCount < preAnchorDepth.size()) preAnchorDepth[preAnchorCount++] = allocation;
+                        else preAnchorOverflow = true;
+                    }
+                }
+            } cameraStatic;
             uint64_t mvScratchBytes = 0;
             const temporal::MotionOptions motionOptions = temporal::MotionOptions::Environment();
             std::unique_ptr<temporal::MotionReplayGPU> motionReplay;
@@ -1337,6 +1384,56 @@ namespace gpu::renderer
                 dlssFrame.publishedPlan = observation.plan;
                 dlssFrame.publishedSubmitted = observation.outcome == frame_plan::DlssExecutionOutcome::Submitted;
             }
+            // Tracked draws in this frame may skip a camera-static replay: the frame
+            // continues the previous one, whose scene camera HistoryOwner kept, and
+            // no depth writer outside motion tracking has touched the scene depth.
+            bool CameraStaticAllowed(const temporal::SceneAnchor* sceneCamera) {
+                auto& s = cameraStatic;
+                s.Begin(frame);
+                // Metal (queued replay draws) has not been checked against a full
+                // replay yet; it keeps replaying every draw.
+                if (s.allowed < 0)
+                    s.allowed = motionOptions.staticSkip && !video::IsMetal() && !s.disabled && frame >= s.holdUntil && sceneCamera &&
+                        s.keptFrame + 1 == frame && s.keptEpoch == temporalEpoch &&
+                        !s.PreAnchorWrote(sceneCamera->depthAllocation) && CameraContinuous(*sceneCamera);
+                return s.allowed > 0 && !s.unsafe;
+            }
+            // A camera cut resets temporal history anyway; near the old camera's
+            // plane its reprojection is also too unstable to stand in for a replay.
+            bool CameraContinuous(const temporal::SceneAnchor& sceneCamera) const {
+                temporal::Matrix current{}, previous{};
+                for (unsigned i = 0; i < 16; ++i) {
+                    current[i] = std::bit_cast<float>(sceneCamera.vpBits[i]);
+                    previous[i] = std::bit_cast<float>(cameraStatic.keptVp[i]);
+                }
+                const auto c = temporal::Camera::Create(current, sceneCamera.viewport);
+                const auto p = temporal::Camera::Create(previous, cameraStatic.keptViewport);
+                return c && p && temporal::ContinuousHistoryCamera(*c, *p);
+            }
+            // The camera reprojection the skipped draws were classified against:
+            // HistoryOwner's current and previous cameras are exactly the scene
+            // anchors of this and the previous frame.
+            std::optional<temporal::SrHybridConstants> CameraStaticConstants(temporal::HistoryOwner* history) const {
+                const auto& s = cameraStatic;
+                if (s.frame != frame || !s.skipped || s.unsafe || !temporalScene.Draws()) return {};
+                const auto current = history->CurrentCameraForCapture(), previous = history->PreviousCameraForCapture();
+                if (!current || !previous) return {};
+                const auto& anchor = temporalScene.Anchor().vpBits;
+                bool unchanged = true;
+                for (unsigned i = 0; i < 16; ++i) {
+                    const uint32_t c = std::bit_cast<uint32_t>(float(current->VP()[i]));
+                    const uint32_t p = std::bit_cast<uint32_t>(float(previous->VP()[i]));
+                    if (c != anchor[i] || p != s.keptVp[i]) return {};
+                    unchanged = unchanged && c == p;
+                }
+                auto constants = temporal::MakeSrHybridConstants(*current, &*previous, history->InputWidth(), history->InputHeight(),
+                    s.jx, s.jy, false);
+                if (!constants) return {};
+                const auto& cr = current->Raster(); const auto& pr = previous->Raster();
+                constants->options[1] = unchanged && cr.width == pr.width && cr.height == pr.height && cr.ndcYSign == pr.ndcYSign &&
+                    cr.halfPixelNdcX == pr.halfPixelNdcX && cr.halfPixelNdcY == pr.halfPixelNdcY ? 1u : 0u;
+                return constants;
+            }
             void FinishMotion(temporal::HistoryOwner* history) {
                 if (!motionOptions.enabled || !history || motionFinalizedFrame == frame) return;
                 motionFinalizedFrame = frame;
@@ -1344,8 +1441,27 @@ namespace gpu::renderer
                 const auto& flags = drawTemporalTracker.FinalizeFrame();
                 timer.AddTo(mvTrackCpuMs);
                 if (motionReplay && !drawTemporalTracker.Failed()) {
-                    motionView = motionReplay->Finish(commandList, history->CurrentDepth(), flags, history->ResetInitializationRequired());
+                    std::optional<temporal::SrHybridConstants> camera;
+                    if (cameraStatic.frame == frame && cameraStatic.skipped) {
+                        camera = CameraStaticConstants(history);
+                        ++(camera ? cameraStatic.camerasApplied : cameraStatic.camerasDropped);
+                    }
+                    motionView = motionReplay->Finish(commandList, history->CurrentDepth(), flags, history->ResetInitializationRequired(),
+                        camera ? &*camera : nullptr);
                     if (motionView.ready) history->RecordExternalRead();
+                    if (cameraStatic.frame == frame && cameraStatic.skipped && motionView.ready && !motionReplay->CameraFrameThisFrame()) {
+                        cameraStatic.Hold(frame);
+                        if (motionReplay->CameraUnavailable() && !cameraStatic.disabled) {
+                            cameraStatic.disabled = true;
+                            LOG_WARNING("mv: camera motion passes unavailable; every draw replays: {}", motionReplay->LastError());
+                        }
+                    }
+                }
+                // This frame's scene camera is the next frame's previous camera.
+                if (history->CurrentCameraForCapture() && temporalScene.Draws()) {
+                    cameraStatic.keptFrame = frame; cameraStatic.keptEpoch = temporalEpoch;
+                    cameraStatic.keptVp = temporalScene.Anchor().vpBits;
+                    cameraStatic.keptViewport = temporalScene.Anchor().viewport;
                 }
                 if (motionOptions.log) {
                     const auto& st = drawTemporalTracker.Stats();
@@ -1368,9 +1484,13 @@ namespace gpu::renderer
                     const bool firstState = !seen && motionFinishDistinct < motionFinishStates.size();
                     if (firstState) motionFinishStates[motionFinishDistinct++] = state;
                     if (firstState || frame % 120 == 0) {
-                        LOG_INFO("mv: frame={} epoch={} tracker_failed={} tracker_finalized={} tracked={} matched={} unmatched={} overflow={} late={} replay_draws={} replay_failed={} replay_cleared={} replay_finalized={} aborted={} resource_failed={} pending_pipeline={} pending_batches={} ready={} empty_reason={} replay_error={} suppressed_draw={} suppressed_finish={}",
+                        LOG_INFO("mv: frame={} epoch={} tracker_failed={} tracker_finalized={} tracked={} matched={} unmatched={} camera_static={} not_scene_camera={} relative={} constants={} shared={} raster={} static_skips={} marker_draws={} static_allowed={} static_unsafe={} untracked_scene_depth={} pre_anchor_scene_depth={} camera_fill={} cameras_applied={} cameras_dropped={} overflow={} late={} replay_draws={} replay_failed={} replay_cleared={} replay_finalized={} aborted={} resource_failed={} pending_pipeline={} pending_batches={} ready={} empty_reason={} replay_error={} suppressed_draw={} suppressed_finish={}",
                             frame, temporalEpoch, trackerFailed, drawTemporalTracker.Finalized(),
                             st.trackedCurrentDraws, st.matchedPreviousDraws, st.unmatchedDraws,
+                            st.cameraStaticDraws, st.staticNotSceneCamera, st.staticRelative, st.staticConstants,
+                            st.staticShared, st.staticRaster, cameraStatic.skipped, cameraStatic.markers, int(cameraStatic.allowed),
+                            cameraStatic.unsafe, cameraStatic.untrackedDepth, cameraStatic.PreAnchorWrote(temporalScene.Anchor().depthAllocation),
+                            motionReplay && motionReplay->CameraFrameThisFrame(), cameraStatic.camerasApplied, cameraStatic.camerasDropped,
                             st.overflowDraws, st.lateDraws, motionReplay ? motionReplay->DrawCount() : 0,
                             motionReplay ? motionReplay->FailedDraws() : 0, cleared, replayFinalized, aborted,
                             motionReplay && motionReplay->ResourceFailedThisFrame(), pending,
@@ -5270,6 +5390,12 @@ void main()
 
             void QueueClear(HostTexture& tex, pending_clear::Op op)
             {
+                // A depth fill leaves a surface no replay draws; the clear value 0 is "nothing".
+                if (motionOptions.staticSkip && IsDepthTarget(tex) && (op.aspects & pending_clear::Depth) && op.depth != 0.0f) {
+                    const bool sceneCameraKnown = temporalScene.Frame() == frame && temporalScene.Draws() != 0;
+                    cameraStatic.NoteUntrackedDepth(frame, tex.allocationSerial, sceneCameraKnown,
+                        sceneCameraKnown ? temporalScene.Anchor().depthAllocation : 0);
+                }
                 MarkFgWritable(tex, "edram_clear");
                 if (tex.pendingClear.Size() >= pending_clear::Queue::kMaxOps) RunPendingClears(tex);
                 tex.pendingClear.Record(std::move(op), tex.width, tex.height);
@@ -9696,6 +9822,7 @@ void main()
                         render_batch::CpuTimer<> mvTimer(motionOptions.timing);
                         drawTemporalTracker.BeginFrame(frame, temporalEpoch);
                         mvTimer.AddTo(mvTrackCpuMs);
+                        cameraStatic.Begin(frame);
                         if (motionView.frame != frame || motionView.epoch != temporalEpoch) motionView = {};
                         if (motionOptions.replay && !motionReplay && !motionInitFailed) {
                             motionReplay = std::make_unique<temporal::MotionReplayGPU>();
@@ -9879,6 +10006,13 @@ void main()
                 // rejects any underlying replay sample in the validity-mask pass.
                 const bool motionLocallyMaskedClipWriter = motionDepthWrite &&
                     key.vs == 0x8bbd4da701845d16ull && temporalSlot < 0 && info.indexCount == 6;
+                // A depth writer that does not replay must not leave the scene depth
+                // to the camera-static class: block skipping before the scene camera,
+                // or invalidate this frame's skipped pixels after it.
+                if (motionOptions.staticSkip && temporalActive && depth && (depthControl & 6) == 6 &&
+                    (!motionDepthWrite || motionLocallyMaskedClipWriter))
+                    cameraStatic.NoteUntrackedDepth(frame, depth->allocationSerial, temporalScene.Draws() != 0,
+                        temporalScene.Draws() ? temporalScene.Anchor().depthAllocation : 0);
                 // Save only the words jitter can change. Collect copies the FULL
                 // VS bank once and restores this proven matrix window in its arena.
                 std::array<uint32_t, 16> motionOriginalVP;
@@ -12629,9 +12763,19 @@ void main()
                             uint32_t(rasterViewport.width), uint32_t(rasterViewport.height),
                             {rasterViewport.x, rasterViewport.y, rasterViewport.width, rasterViewport.height,
                              rasterViewport.minDepth, rasterViewport.maxDepth}, true};
+                        // The scene camera is the frame's first anchor (this draw's own
+                        // anchor when it is the first); HistoryOwner reprojects with it.
+                        const temporal::SceneAnchor* sceneCamera = temporalScene.Draws() ? &temporalScene.Anchor() :
+                            temporalDrawAnchor ? &*temporalDrawAnchor : nullptr;
+                        temporal::MotionCameraEvidence motionCamera{temporalSlot,
+                            sceneCamera && motionOriginalVP == sceneCamera->vpBits &&
+                            sceneCamera->depthAllocation == depth->allocationSerial &&
+                            double(shared.ndcScale[1]) == sceneCamera->viewport.ndcYSign &&
+                            double(shared.halfPixel[0]) == sceneCamera->viewport.halfPixelNdcX &&
+                            double(shared.halfPixel[1]) == sceneCamera->viewport.halfPixelNdcY};
                         auto match = drawTemporalTracker.Collect(mk, vsConstants, &shared, vs->info.usesRelativeConstants,
                             drawJitter.applied ? temporalSlot : -1, motionOriginalVP.data(), &motionRaster,
-                            motionReplay ? motionReplay->ConstantUsage(key.vs) : nullptr);
+                            motionReplay ? motionReplay->ConstantUsage(key.vs) : nullptr, motionCamera);
                         if (taaLiveDirectory && match.previous && !match.exactStationary && frame % 120 == 0 &&
                             (key.vs == 0x702c643defe73320ull || key.vs == 0xb030ab4e17a20783ull)) {
                             static uint64_t lastProofFrame[2]{};
@@ -12656,17 +12800,54 @@ void main()
                         }
                         mvTimer.AddTo(mvTrackCpuMs);
                         recordProbe.Enter(record_timing::Phase::MvPrepare);
+                        // Restore the guest binding contract after BeginScene framebuffer/layout changes.
+                        const auto restoreDrawBindings = [&] {
+                            commandList->setFramebuffer(framebuffer); commandList->setViewports(&rasterViewport, 1);
+                            commandList->setScissors(&scissor, 1); commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                            commandList->setPipeline(pipeline);
+                            if (vulkan) BindDrawConstants();
+                            else { SetConstantBuffer(vsOffset,0); SetConstantBuffer(sharedOffset,1); SetConstantBuffer(psOffset,2); }
+                            commandList->setGraphicsDescriptorSet(set0,0); commandList->setGraphicsDescriptorSet(set1,1);
+                            commandList->setGraphicsDescriptorSet(set2,2); commandList->setGraphicsDescriptorSet(set3,3);
+                            if (vulkan) commandList->setGraphicsDescriptorSet(set4,4);
+                        };
                         if (motionReplay && motionReplay->UsableThisFrame()) {
                             const auto w = uint32_t(rasterViewport.width), h = uint32_t(rasterViewport.height);
+                            const float jx = drawJitter.applied ? float(drawJitter.sample.pixelX) : 0;
+                            const float jy = drawJitter.applied ? float(drawJitter.sample.pixelY) : 0;
+                            const bool cameraFrame = CameraStaticAllowed(sceneCamera);
+                            // One raster jitter serves every skipped draw in Finish.
+                            if (cameraFrame && match.cameraStatic &&
+                                (!cameraStatic.skipped || (cameraStatic.jx == jx && cameraStatic.jy == jy))) {
+                                const bool cleared = motionReplay->ClearedThisFrame();
+                                const bool sceneReady = motionReplay->BeginScene(commandList, depth->allocationSerial, depth->texture.get(), w, h);
+                                if (!sceneReady) {
+                                    logFirstMotionFailure("replay_scene_failed", 3);
+                                    motionReplay->AbortFrame();
+                                } else {
+                                    cameraStatic.jx = jx; cameraStatic.jy = jy; ++cameraStatic.skipped;
+                                    if (!match.replayWarm && motionReplay->Prewarm(key, DescribePipeline(key, vs, ps, false),
+                                            vsWords, vsCount, ps ? psWords : nullptr, ps ? psCount : 0) ==
+                                        temporal::MotionReplayGPU::PipelinePrepareStatus::Ready)
+                                        drawTemporalTracker.MarkReplayWarm(match.tag);
+                                }
+                                recordProbe.Enter(record_timing::Phase::MvDraw);
+                                if (!cleared) restoreDrawBindings();
+                            } else {
                             // Cold start: allocate/clear real MV targets without previous or pipeline.
                             const auto prepared = motionReplay->PrepareSceneDraw(commandList, depth->allocationSerial, depth->texture.get(), w, h,
                                 key, DescribePipeline(key, vs, ps, false),
                                 vsWords, vsCount, ps ? psWords : nullptr, ps ? psCount : 0);
                             recordProbe.Enter(record_timing::Phase::MvDraw);
+                            if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready)
+                                drawTemporalTracker.MarkReplayWarm(match.tag);
                             if (!prepared.sceneReady || prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Failed) {
                                 logFirstMotionFailure(prepared.sceneReady ? "replay_pipeline_failed" : "replay_scene_failed", 3);
                                 motionReplay->AbortFrame();
-                            } else if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready && match.previous) {
+                            } else if (prepared.status == temporal::MotionReplayGPU::PipelinePrepareStatus::Ready && (match.previous || cameraFrame)) {
+                                // Without a previous draw this is an invalid marker: in a
+                                // camera-static frame it keeps its pixels reactive.
+                                cameraStatic.markers += !match.previous;
                                 const uint64_t aligned = (Gpu().uploadOffset + 255) & ~uint64_t(255);
                                 // Never trigger a mid-draw Flush: it would invalidate bound
                                 // index/texture state and the original constant references.
@@ -12674,9 +12855,7 @@ void main()
                                     logFirstMotionFailure("replay_upload_ring_full", 4);
                                     motionReplay->AbortFrame("MV upload ring full");
                                 } else {
-                                    const auto c = temporal::MakeMotionReplayConstants(match, w, h,
-                                        drawJitter.applied ? float(drawJitter.sample.pixelX) : 0,
-                                        drawJitter.applied ? float(drawJitter.sample.pixelY) : 0);
+                                    const auto c = temporal::MakeMotionReplayConstants(match, w, h, jx, jy);
                                     const uint64_t mvOffset = Upload(&c, sizeof(c));
                                     const RenderBufferReference cb[4] = {{uploadRing, vsOffset}, {uploadRing, sharedOffset},
                                         {uploadRing, psOffset}, {uploadRing, mvOffset}};
@@ -12690,15 +12869,8 @@ void main()
                                     }
                                 }
                             }
-                            // Restore the guest binding contract after BeginScene framebuffer/layout changes.
-                            commandList->setFramebuffer(framebuffer); commandList->setViewports(&rasterViewport, 1);
-                            commandList->setScissors(&scissor, 1); commandList->setGraphicsPipelineLayout(pipelineLayout.get());
-                            commandList->setPipeline(pipeline);
-                            if (vulkan) BindDrawConstants();
-                            else { SetConstantBuffer(vsOffset,0); SetConstantBuffer(sharedOffset,1); SetConstantBuffer(psOffset,2); }
-                            commandList->setGraphicsDescriptorSet(set0,0); commandList->setGraphicsDescriptorSet(set1,1);
-                            commandList->setGraphicsDescriptorSet(set2,2); commandList->setGraphicsDescriptorSet(set3,3);
-                            if (vulkan) commandList->setGraphicsDescriptorSet(set4,4);
+                            restoreDrawBindings();
+                            }
                         }
                     }
                 }

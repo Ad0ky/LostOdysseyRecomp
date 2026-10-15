@@ -3,6 +3,7 @@
 #include "temporal_gpu_timing.h"
 #include "motion_vector.h"
 #include "motion_frame.h"
+#include "sr_hybrid_motion.h"
 #include "pipeline_cache.h"
 #include "shader/motion_replay_hlsl.h"
 #include "shader/dxc_compiler.h"
@@ -53,7 +54,8 @@ class MotionReplayGPU {
     struct Image {
         std::unique_ptr<plume::RenderTexture> texture;
         plume::RenderTextureLayout layout = plume::RenderTextureLayout::UNKNOWN;
-    } velocity_, depths_, tags_, reactive_;
+    } velocity_, depths_, tags_, reactive_,
+      cameraMask_; // R8: 1 where a skipped camera-static draw owns the visible surface
     struct Module {
         enum class Failure : uint8_t { None, Unsupported, Translation, GpuAllocation };
         std::unique_ptr<plume::RenderShader> shader;
@@ -75,6 +77,11 @@ class MotionReplayGPU {
     std::unique_ptr<plume::RenderPipelineLayout> layout_, maskLayout_;
     std::unique_ptr<plume::RenderShader> maskVS_, maskPS_;
     std::unique_ptr<plume::RenderPipeline> maskPipeline_;
+    // Camera-static frames: a mask variant and a fill pass, built on first use.
+    std::unique_ptr<plume::RenderPipelineLayout> cameraMaskLayout_, cameraFillLayout_;
+    std::unique_ptr<plume::RenderShader> cameraMaskVS_, cameraMaskPS_, cameraFillVS_, cameraFillPS_;
+    std::unique_ptr<plume::RenderPipeline> cameraMaskPipeline_, cameraFillPipeline_;
+    bool cameraInitAttempted_ = false, cameraFrame_ = false;
     std::unique_ptr<plume::RenderFramebuffer> clearFramebuffer_, drawFramebuffer_;
     struct Retired {
         uint64_t serial = 0;
@@ -89,6 +96,10 @@ class MotionReplayGPU {
         std::unique_ptr<plume::RenderBuffer> flags, constants;
         std::unique_ptr<plume::RenderDescriptorSet> set;
         std::unique_ptr<plume::RenderFramebuffer> framebuffer;
+        // Camera-static frames only, created on first use.
+        std::unique_ptr<plume::RenderBuffer> cameraConstants;
+        std::unique_ptr<plume::RenderDescriptorSet> cameraMaskSet, cameraFillSet;
+        std::unique_ptr<plume::RenderFramebuffer> cameraMaskFramebuffer, cameraFillFramebuffer;
     };
     std::vector<std::unique_ptr<MaskBatch>> pending_, free_;
     static constexpr size_t kMaxBatches = 16;
@@ -167,6 +178,169 @@ float pixel(float4 p : SV_Position) : SV_Target {
     return abs(d.x-visible) <= max(2e-7, abs(visible)*2e-5) ? 0 : 1;
 }
 )HLSL";
+    // Camera-static frames skip the replay of draws whose only changed position
+    // input is the scene camera (DrawTemporalTracker::Match::cameraStatic). The
+    // mask variant gives their visible pixels the camera's motion as valid; the
+    // fill pass writes that motion where a replay would have. Constants are
+    // SrHybridConstants with options.x = validity entries, options.y = 1 when the
+    // scene camera did not move.
+    static constexpr const char* kCameraHlsl = R"HLSL(
+    row_major float4x4 inverseCurrent;
+    row_major float4x4 previous;
+    float4 currentNdc, previousRaster, jitterExtent;
+    uint4 options;
+};
+float4 vertex(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2,-2) + float2(-1,1), 0, 1);
+}
+bool validW(float4 p) {
+    float m = max(max(abs(p.x),abs(p.y)),max(abs(p.z),abs(p.w)));
+    return all(isfinite(p)) && m > 0 && p.w > 1e-6 * m;
+}
+// The replay's motion for a camera-static surface, from its visible depth:
+// unjittered pixels and previous reverse depth. The sr_hybrid_motion.h camera
+// path without its screen-edge rejection, which a replay does not have either.
+bool cameraMotion(float2 position, float depth, out float2 motion, out float previousDepth) {
+    motion = 0; previousDepth = depth;
+    if (options.y != 0) return true;
+    float2 currentPixel = position - jitterExtent.xy;
+    float2 ndc = currentPixel * currentNdc.xy + currentNdc.zw;
+    float4 world = mul(float4(ndc,1-depth,1),inverseCurrent);
+    if (!validW(world)) return false;
+    float4 clip = mul(world / world.w,previous);
+    if (!validW(clip)) return false;
+    previousDepth = 1 - clip.z / clip.w;
+    motion = clip.xy / clip.w * previousRaster.xy + previousRaster.zw - currentPixel;
+    return isfinite(previousDepth) && previousDepth > 0 && previousDepth <= 1 &&
+        all(isfinite(motion)) && all(abs(motion) <= 65504);
+}
+)HLSL";
+    static constexpr const char* kCameraMaskShader = R"HLSL(
+Texture2D<float2> motionDepth : register(t0);
+Texture2D<uint> motionTag : register(t1);
+Texture2D<float> sceneDepth : register(t2);
+ByteAddressBuffer matchFlags : register(t3);
+#ifdef __spirv__
+[[vk::binding(4,0)]]
+#endif
+cbuffer CameraStatic : register(b4) {
+)HLSL";
+    static constexpr const char* kCameraMaskBody = R"HLSL(
+struct MaskOutput { float reactive : SV_Target0; float camera : SV_Target1; };
+MaskOutput pixel(float4 p : SV_Position) {
+    MaskOutput o; o.reactive = 1; o.camera = 0;
+    int3 at = int3(p.xy,0);
+    float visible = sceneDepth.Load(at);
+    if (!isfinite(visible) || visible <= 0 || visible > 1) return o;
+    uint tag = motionTag.Load(at);
+    float2 d = motionDepth.Load(at);
+    if (tag != 0 && all(isfinite(d)) && d.x > 0 && d.x <= 1 && abs(d.x-visible) <= max(2e-7, abs(visible)*2e-5)) {
+        // A replayed draw owns the visible surface; its invalid marker stays reactive.
+        if (tag < options.x && matchFlags.Load(tag * 4) != 0 && d.y > 0 && d.y <= 1) o.reactive = 0;
+        return o;
+    }
+    // Every other scene depth writer of the frame replayed: a skipped
+    // camera-static draw owns this surface.
+    float2 motion; float previousDepth;
+    if (cameraMotion(p.xy, visible, motion, previousDepth)) { o.reactive = 0; o.camera = 1; }
+    return o;
+}
+)HLSL";
+    static constexpr const char* kCameraFillShader = R"HLSL(
+Texture2D<float> cameraMask : register(t0);
+Texture2D<float> sceneDepth : register(t1);
+#ifdef __spirv__
+[[vk::binding(2,0)]]
+#endif
+cbuffer CameraStatic : register(b2) {
+)HLSL";
+    static constexpr const char* kCameraFillBody = R"HLSL(
+struct FillOutput { float2 velocity : SV_Target0; float2 depths : SV_Target1; };
+FillOutput pixel(float4 p : SV_Position) {
+    int3 at = int3(p.xy,0);
+    if (cameraMask.Load(at) < .5) discard;
+    FillOutput o; float visible = sceneDepth.Load(at), previousDepth;
+    cameraMotion(p.xy, visible, o.velocity, previousDepth);
+    o.depths = float2(visible, previousDepth);
+    return o;
+}
+)HLSL";
+    bool PrepareCamera(MaskBatch& batch, const SrHybridConstants& camera, plume::RenderTexture* currentDepth, uint32_t entries) {
+        if (!InitCamera()) return false;
+        if (!cameraMask_.texture && !Allocate(cameraMask_, plume::RenderFormat::R8_UNORM)) return false;
+        if (!batch.cameraConstants) {
+            batch.cameraConstants = device_->createBuffer(plume::RenderBufferDesc::UploadBuffer(sizeof(SrHybridConstants), plume::RenderBufferFlag::CONSTANT));
+            plume::RenderDescriptorSetBuilder mask; CameraMaskSet(mask); batch.cameraMaskSet = mask.create(device_);
+            plume::RenderDescriptorSetBuilder fill; CameraFillSet(fill); batch.cameraFillSet = fill.create(device_);
+        }
+        if (!batch.cameraConstants || !batch.cameraMaskSet || !batch.cameraFillSet) return false;
+        if (!batch.cameraMaskFramebuffer) {
+            const plume::RenderTexture* attachments[] = {reactive_.texture.get(), cameraMask_.texture.get()};
+            batch.cameraMaskFramebuffer = device_->createFramebuffer(plume::RenderFramebufferDesc(attachments, 2));
+        }
+        if (!batch.cameraFillFramebuffer) {
+            const plume::RenderTexture* attachments[] = {velocity_.texture.get(), depths_.texture.get()};
+            batch.cameraFillFramebuffer = device_->createFramebuffer(plume::RenderFramebufferDesc(attachments, 2));
+        }
+        if (!batch.cameraMaskFramebuffer || !batch.cameraFillFramebuffer) return false;
+        SrHybridConstants constants = camera;
+        constants.options[0] = entries;
+        void* mapped = batch.cameraConstants->map();
+        if (!mapped) return false;
+        std::memcpy(mapped, &constants, sizeof(constants)); batch.cameraConstants->unmap();
+        batch.cameraMaskSet->setTexture(0, depths_.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+        batch.cameraMaskSet->setTexture(1, tags_.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+        batch.cameraMaskSet->setTexture(2, currentDepth, plume::RenderTextureLayout::SHADER_READ);
+        batch.cameraMaskSet->setBuffer(3, batch.flags.get(), uint64_t(entries) * 4);
+        batch.cameraMaskSet->setBuffer(4, batch.cameraConstants.get(), sizeof(constants));
+        batch.cameraFillSet->setTexture(0, cameraMask_.texture.get(), plume::RenderTextureLayout::SHADER_READ);
+        batch.cameraFillSet->setTexture(1, currentDepth, plume::RenderTextureLayout::SHADER_READ);
+        batch.cameraFillSet->setBuffer(2, batch.cameraConstants.get(), sizeof(constants));
+        return true;
+    }
+    static void CameraMaskSet(plume::RenderDescriptorSetBuilder& b) {
+        b.begin(); b.addTexture(0); b.addTexture(1); b.addTexture(2); b.addByteAddressBuffer(3); b.addConstantBuffer(4); b.end();
+    }
+    static void CameraFillSet(plume::RenderDescriptorSetBuilder& b) {
+        b.begin(); b.addTexture(0); b.addTexture(1); b.addConstantBuffer(2); b.end();
+    }
+    bool InitCamera() {
+        if (cameraInitAttempted_) return bool(cameraMaskPipeline_ && cameraFillPipeline_);
+        cameraInitAttempted_ = true;
+        const auto binary = vulkan_ ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
+        const auto format = vulkan_ ? plume::RenderShaderFormat::SPIRV : plume::RenderShaderFormat::DXIL;
+        plume::RenderPipelineLayoutBuilder b;
+        plume::RenderDescriptorSetBuilder maskSet; CameraMaskSet(maskSet);
+        b.begin(false, false); b.addDescriptorSet(maskSet); b.end(); cameraMaskLayout_ = b.create(device_);
+        plume::RenderDescriptorSetBuilder fillSet; CameraFillSet(fillSet);
+        b.begin(false, false); b.addDescriptorSet(fillSet); b.end(); cameraFillLayout_ = b.create(device_);
+        const std::string mask = std::string(kCameraMaskShader) + kCameraHlsl + kCameraMaskBody;
+        const std::string fill = std::string(kCameraFillShader) + kCameraHlsl + kCameraFillBody;
+        const auto mv = xenos::CompileCachedHlsl(mask, "vertex", "vs_6_0", binary);
+        const auto mp = xenos::CompileCachedHlsl(mask, "pixel", "ps_6_0", binary);
+        const auto fv = xenos::CompileCachedHlsl(fill, "vertex", "vs_6_0", binary);
+        const auto fp = xenos::CompileCachedHlsl(fill, "pixel", "ps_6_0", binary);
+        if (!mv.ok || !mp.ok || !fv.ok || !fp.ok || !cameraMaskLayout_ || !cameraFillLayout_) {
+            error_ = mv.errors + mp.errors + fv.errors + fp.errors; return false;
+        }
+        cameraMaskVS_ = device_->createShader(mv.bytecode.data(), mv.bytecode.size(), "vertex", format);
+        cameraMaskPS_ = device_->createShader(mp.bytecode.data(), mp.bytecode.size(), "pixel", format);
+        cameraFillVS_ = device_->createShader(fv.bytecode.data(), fv.bytecode.size(), "vertex", format);
+        cameraFillPS_ = device_->createShader(fp.bytecode.data(), fp.bytecode.size(), "pixel", format);
+        if (!cameraMaskVS_ || !cameraMaskPS_ || !cameraFillVS_ || !cameraFillPS_) return false;
+        plume::RenderGraphicsPipelineDesc d{};
+        d.pipelineLayout = cameraMaskLayout_.get(); d.vertexShader = cameraMaskVS_.get(); d.pixelShader = cameraMaskPS_.get();
+        d.renderTargetCount = 2;
+        d.renderTargetFormat[0] = d.renderTargetFormat[1] = plume::RenderFormat::R8_UNORM;
+        d.renderTargetBlend[0] = d.renderTargetBlend[1] = plume::RenderBlendDesc::Copy();
+        cameraMaskPipeline_ = device_->createGraphicsPipeline(d);
+        d.pipelineLayout = cameraFillLayout_.get(); d.vertexShader = cameraFillVS_.get(); d.pixelShader = cameraFillPS_.get();
+        d.renderTargetFormat[0] = plume::RenderFormat::R16G16_FLOAT;
+        d.renderTargetFormat[1] = plume::RenderFormat::R32G32_FLOAT;
+        cameraFillPipeline_ = device_->createGraphicsPipeline(d);
+        return bool(cameraMaskPipeline_ && cameraFillPipeline_);
+    }
     static void Transition(plume::RenderCommandList* commands, Image& image, plume::RenderTextureLayout to) {
         if (image.layout != to) {
             commands->barriers(plume::RenderBarrierStage::ALL, plume::RenderTextureBarrier(image.texture.get(), to));
@@ -206,7 +380,11 @@ float pixel(float4 p : SV_Position) : SV_Target {
             } else if (!pixel) {
                 m.error = "Missing vertex microcode"; m.failure = Module::Failure::Unsupported; return m;
             }
-            if(!pixel && translated.errors.empty()) m.constantUsage = ParseMotionConstantUsage(translated.hlsl,translated.usesRelativeConstants);
+            if(!pixel && translated.errors.empty()) {
+                m.constantUsage = ParseMotionConstantUsage(translated.hlsl,translated.usesRelativeConstants);
+                m.constantUsage.positionSlots = translated.positionConstantSlots;
+                m.constantUsage.positionKnown = translated.positionConstantsKnown && !translated.usesRelativeConstants;
+            }
             m.source = pixel ? xenos::motion_replay::Pixel(count ? &translated : nullptr) : xenos::motion_replay::Vertex(translated);
             if (m.source.empty()) {
                 m.error = "Unsupported replay program: " + translated.errors;
@@ -306,6 +484,10 @@ public:
     bool FinalizedThisFrame() const { return finalized_; }
     bool SceneReadyThisFrame() const { return cleared_ && !aborted_; }
     bool AbortedThisFrame() const { return aborted_; }
+    // Finish gave skipped camera-static draws the camera's motion this frame.
+    bool CameraFrameThisFrame() const { return cameraFrame_; }
+    // The camera passes could not be built on this device.
+    bool CameraUnavailable() const { return cameraInitAttempted_ && !(cameraMaskPipeline_ && cameraFillPipeline_); }
     bool ResourceFailedThisFrame() const { return resourceFailedThisFrame_; }
     const std::string& LastError() const { return error_; }
     enum class PipelinePrepareStatus : uint8_t { Ready, Pending, Failed };
@@ -321,7 +503,7 @@ public:
     void InjectNextModuleAllocationFailureForTest() { testFailNextModuleAllocation_ = true; }
     void BeginFrame(uint64_t frame, uint64_t epoch) {
         if (frame_ == frame && epoch_ == epoch) return;
-        frame_ = frame; epoch_ = epoch; cleared_ = finalized_ = aborted_ = pendingThisFrame_ = resourceFailedThisFrame_ = false;
+        frame_ = frame; epoch_ = epoch; cleared_ = finalized_ = aborted_ = pendingThisFrame_ = resourceFailedThisFrame_ = cameraFrame_ = false;
         error_.clear();
         injectPreparePending_ = false;
         drawCount_ = failedDraws_ = 0;
@@ -370,6 +552,10 @@ public:
             ++targetGeneration_;
             free_.clear(); // release cached framebuffers before retiring their attachments
             Retire(drawFramebuffer_, boundDepth_); Retire(clearFramebuffer_);
+            if (cameraMask_.texture) { // reallocated by the next camera-static Finish
+                retired_.push_back({serial_, nullptr, {}, std::move(cameraMask_.texture)});
+                cameraMask_.layout = plume::RenderTextureLayout::UNKNOWN;
+            }
             width_ = width; height_ = height;
             if (!Allocate(velocity_, plume::RenderFormat::R16G16_FLOAT) || !Allocate(depths_, plume::RenderFormat::R32G32_FLOAT) ||
                 !Allocate(tags_, plume::RenderFormat::R32_UINT) || !Allocate(reactive_, plume::RenderFormat::R8_UNORM)) {
@@ -486,6 +672,19 @@ public:
         setStatus(PipelinePrepareStatus::Ready);
         return result;
     }
+    // A skipped camera-static draw keeps its replay pipeline built without tying
+    // this frame to it, so the draw replays at once when it starts moving.
+    PipelinePrepareStatus Prewarm(const Key& key, const plume::RenderGraphicsPipelineDesc& desc,
+        const uint32_t* vsWords, uint32_t vsCount, const uint32_t* psWords, uint32_t psCount) {
+        const bool pending = pendingThisFrame_, resourceFailed = resourceFailedThisFrame_;
+        const uint32_t failed = failedDraws_, pendingDraws = work_.pendingDraws;
+        std::string error = error_;
+        PipelinePrepareStatus status = PipelinePrepareStatus::Failed;
+        PreparePipeline(key, desc, vsWords, vsCount, psWords, psCount, false, &status);
+        pendingThisFrame_ = pending; resourceFailedThisFrame_ = resourceFailed;
+        failedDraws_ = failed; work_.pendingDraws = pendingDraws; error_ = std::move(error);
+        return status;
+    }
     SceneDrawPrepare PrepareSceneDraw(plume::RenderCommandList* commands, uint64_t allocation, plume::RenderTexture* depth,
         uint32_t width, uint32_t height, const Key& key, plume::RenderGraphicsPipelineDesc desc,
         const uint32_t* vsWords, uint32_t vsCount, const uint32_t* psWords, uint32_t psCount, bool wait = false) {
@@ -530,8 +729,11 @@ public:
         if (timed) drawTimer_.End(commands, serial_);
         return true;
     }
+    // camera: non-null in a camera-static frame, whose skipped draws need the
+    // camera's motion (see kCameraHlsl). Unavailable passes leave those pixels
+    // reactive, as unreplayed pixels always were.
     MotionFrameView Finish(plume::RenderCommandList* commands, plume::RenderTexture* currentDepth,
-        const std::vector<uint32_t>& validity, bool resetInitialization = false) {
+        const std::vector<uint32_t>& validity, bool resetInitialization = false, const SrHybridConstants* camera = nullptr) {
         MotionFrameView result;
         FlushQueued(commands);
         if (!cleared_ || aborted_ || finalized_ || !currentDepth || !commands || validity.empty() || validity.size() > DrawTemporalTracker::kMaxDraws + 1) return result;
@@ -549,7 +751,9 @@ public:
         if (!batch->flags || !batch->set || (vulkan_ && !batch->constants)) {
             aborted_ = resourceFailedThisFrame_ = true; error_ = "MV validity batch allocation failed"; return result;
         }
-        if (batch->generation != targetGeneration_) batch->framebuffer.reset();
+        if (batch->generation != targetGeneration_) {
+            batch->framebuffer.reset(); batch->cameraMaskFramebuffer.reset(); batch->cameraFillFramebuffer.reset();
+        }
         batch->generation = targetGeneration_;
         if (!batch->framebuffer) {
             const plume::RenderTexture* attachments[] = {reactive_.texture.get()};
@@ -562,6 +766,35 @@ public:
             aborted_ = resourceFailedThisFrame_ = true; error_ = "MV validity flags mapping failed"; return result;
         }
         std::memcpy(mapped, validity.data(), validity.size() * 4); batch->flags->unmap();
+        cameraFrame_ = camera && PrepareCamera(*batch, *camera, currentDepth, uint32_t(validity.size()));
+        if (cameraFrame_) {
+            const bool timed = maskTimer_.Begin(device_, commands);
+            Transition(commands, velocity_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, depths_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, tags_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, reactive_, plume::RenderTextureLayout::COLOR_WRITE);
+            Transition(commands, cameraMask_, plume::RenderTextureLayout::COLOR_WRITE);
+            plume::RenderViewport vp(0,0,float(width_),float(height_)); plume::RenderRect sc(0,0,width_,height_);
+            commands->setFramebuffer(batch->cameraMaskFramebuffer.get());
+            commands->setViewports(&vp,1); commands->setScissors(&sc,1);
+            commands->setGraphicsPipelineLayout(cameraMaskLayout_.get()); commands->setPipeline(cameraMaskPipeline_.get());
+            commands->setGraphicsDescriptorSet(batch->cameraMaskSet.get(),0); commands->drawInstanced(3,1,0,0);
+            Transition(commands, reactive_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, cameraMask_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, velocity_, plume::RenderTextureLayout::COLOR_WRITE);
+            Transition(commands, depths_, plume::RenderTextureLayout::COLOR_WRITE);
+            commands->setFramebuffer(batch->cameraFillFramebuffer.get());
+            commands->setViewports(&vp,1); commands->setScissors(&sc,1);
+            commands->setGraphicsPipelineLayout(cameraFillLayout_.get()); commands->setPipeline(cameraFillPipeline_.get());
+            commands->setGraphicsDescriptorSet(batch->cameraFillSet.get(),0); commands->drawInstanced(3,1,0,0);
+            Transition(commands, velocity_, plume::RenderTextureLayout::SHADER_READ);
+            Transition(commands, depths_, plume::RenderTextureLayout::SHADER_READ);
+            batch->serial = ++serial_;
+            if (timed) maskTimer_.End(commands, serial_);
+            pending_.push_back(std::move(batch));
+            return {velocity_.texture.get(), depths_.texture.get(), reactive_.texture.get(), frame_, epoch_, allocation_, width_, height_, true,
+                resetInitialization ? MotionState::ResetInitialization : MotionState::Tracked};
+        }
         uint32_t c[4] = {uint32_t(validity.size()),0,0,0};
         if (vulkan_) {
             mapped = batch->constants->map(); if (!mapped) {
@@ -641,7 +874,9 @@ public:
         drawTimer_.ReleaseCompletedThrough(completed);maskTimer_.ReleaseCompletedThrough(completed);
         for (auto it = pending_.begin(); it != pending_.end();) {
             if ((*it)->serial <= completed) {
-                if ((*it)->generation != targetGeneration_) (*it)->framebuffer.reset();
+                if ((*it)->generation != targetGeneration_) {
+                    (*it)->framebuffer.reset(); (*it)->cameraMaskFramebuffer.reset(); (*it)->cameraFillFramebuffer.reset();
+                }
                 free_.push_back(std::move(*it)); it = pending_.erase(it); }
             else ++it;
         }
