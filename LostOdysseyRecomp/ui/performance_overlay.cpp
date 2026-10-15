@@ -46,6 +46,8 @@ uint64_t ProcessCpuNs() {
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     const auto ns = [](FILETIME t) { return (uint64_t(t.dwHighDateTime) << 32 | t.dwLowDateTime) * 100; };
     return ns(kernel) + ns(user);
+#elif LO_PLATFORM_SWITCH
+    return 0; // newlib on the Switch has no getrusage; the CPU share is not shown
 #else
     // getrusage covers the whole process on Linux, Android and macOS alike
     // (the same totals as /proc/self/stat and task_info, without parsing).

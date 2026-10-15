@@ -3403,6 +3403,7 @@ namespace gpu::video
             const auto unit=PreparationUnit(progress>>60);
             g_preparationShown.store(progress);
             std::string title = lo_version::WindowTitle;
+#if !LO_PLATFORM_SWITCH // no window title there, and SDL's iconv has no libc iconv to call
             if (total) {
                 const std::wstring status = std::wstring(PreparationTitle(stage)) + L" " + std::to_wstring(done) + L"/" +
                     std::to_wstring(total) + PreparationSuffix(unit);
@@ -3411,6 +3412,7 @@ namespace gpu::video
                     SDL_free(utf8);
                 }
             }
+#endif
             SDL_SetWindowTitle(g_window, title.c_str());
 #ifdef _WIN32
             // The window thread owns the preparation overlay and stays responsive
