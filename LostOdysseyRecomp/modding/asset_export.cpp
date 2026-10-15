@@ -1,4 +1,5 @@
 #include "asset_export.h"
+#include "font_patch.h"
 #include "fpi_index.h"
 #include "gltf_writer.h"
 #include "mod_api.h"
@@ -872,7 +873,7 @@ struct Stats
     std::vector<ModelRow> models;
     std::map<std::string, uint64_t> formats, skipped, examples;
     std::vector<std::string> notes;
-    uint64_t textureBytes = 0, movies = 0, movieBytes = 0, modelBytes = 0, packages = 0, notPackages = 0;
+    uint64_t textureBytes = 0, movies = 0, movieBytes = 0, modelBytes = 0, packages = 0, notPackages = 0, fonts = 0;
     void Skipped(const std::string &reason, const std::string &detail)
     {
         ++skipped[reason];
@@ -889,7 +890,7 @@ struct Stats
         for (auto &note : other.notes)
             if (examples[note.substr(0, note.find(':'))]++ < 5) notes.push_back(std::move(note));
         textureBytes += other.textureBytes; movies += other.movies; movieBytes += other.movieBytes; modelBytes += other.modelBytes;
-        packages += other.packages; notPackages += other.notPackages;
+        packages += other.packages; notPackages += other.notPackages; fonts += other.fonts;
     }
     uint64_t SkippedTotal() const
     {
@@ -1051,7 +1052,7 @@ std::vector<Skeleton> ReadSkeletons(const std::vector<Disc> &discs, std::string_
 struct Context
 {
     const Request &request;
-    fs::path textures, models, animations;
+    fs::path textures, models, animations, fonts;
     const std::set<std::string> *select = nullptr; // list.csv names, or null for everything
     const std::vector<Disc> *discs = nullptr;
     // Every skeleton, read on first use (the whole set of *_m packages).
@@ -1180,6 +1181,44 @@ void ExportAnimSet(const Job &job, const Package &package, size_t index, const s
 }
 
 // list: the texture's headers only, no decode, fingerprint or PNG.
+// One font's metrics and glyph table (modding/font_patch.h FontInfo) as
+// fonts/<package path>/<font>.json, for tools that draw glyphs a language pack adds.
+void ExportFont(const Job &job, const Package &package, std::span<const uint8_t> bytes, size_t index, const Context &context, Stats &stats)
+{
+    const auto &e = package.exports[index];
+    try
+    {
+        const font_patch::FontInfo *font = nullptr;
+        const auto fonts = font_patch::ReadFonts(bytes);
+        for (const auto &f : fonts) if (f.exportIndex == index) font = &f;
+        if (!font) throw std::runtime_error("not read");
+        std::string json = "{\n  \"package\": \"" + job.path + "\",\n  \"font\": \"" + font->name + "\",\n  \"export_index\": " +
+                           std::to_string(index) + ",\n  \"kerning\": " + std::to_string(font->kerning) + ",\n  \"pages\": [";
+        for (size_t p = 0; p < font->pages.size(); ++p)
+        {
+            const auto &page = font->pages[p];
+            json += std::string(p ? "," : "") + "\n    {\"export_index\": " + std::to_string(page.exportIndex) + ", \"name\": \"" + page.name +
+                    "\", \"width\": " + std::to_string(page.width) + ", \"height\": " + std::to_string(page.height) +
+                    ", \"format\": " + std::to_string(page.format) + ", \"png\": \"" + job.path + "/" + FileStem(page.name) + "." +
+                    std::to_string(page.exportIndex) + ".png\"}";
+        }
+        json += "\n  ],\n  \"glyphs\": [";
+        for (size_t g = 0; g < font->glyphs.size(); ++g)
+        {
+            const auto &glyph = font->glyphs[g];
+            json += std::string(g ? "," : "") + "\n    [" + std::to_string(glyph.codepoint) + ", " + std::to_string(glyph.x) + ", " +
+                    std::to_string(glyph.y) + ", " + std::to_string(glyph.width) + ", " + std::to_string(glyph.height) + ", " +
+                    std::to_string(glyph.page) + "]";
+        }
+        json += "\n  ]\n}\n";
+        const auto directory = context.fonts / FromUtf8(job.path);
+        CreateDirectories(directory);
+        WriteFile(directory / FromUtf8(FileStem(e.name) + ".json"), json.data(), json.size());
+        ++stats.fonts;
+    }
+    catch (const std::exception &error) { stats.Skipped("font_unreadable", job.path + "#" + std::to_string(index) + ":" + e.name + ": " + error.what()); }
+}
+
 void ExportPackage(const Job &job, const Context &context, Stats &stats)
 {
     const auto &request = context.request;
@@ -1204,6 +1243,11 @@ void ExportPackage(const Job &job, const Context &context, Stats &stats)
         const auto &e = package->exports[index];
         if (e.name.starts_with("Default__")) continue;
         const auto className = package->ClassName(e);
+        if (request.fonts && className == "Font" && !list && !e.name.starts_with("Default__"))
+        {
+            ExportFont(job, *package, bytes, index, context, stats);
+            continue;
+        }
         const auto kind = request.textures ? Classify(className) : TextureClass::None;
         const auto mesh = request.models ? ClassifyMesh(className) : MeshClass::None;
         const bool animation = request.animations && className == "AnimSet";
@@ -1681,7 +1725,7 @@ std::optional<Request> ParseArguments(int argc, char **argv)
         }
         else
         {
-            parsed.textures = parsed.movies = parsed.pngs = parsed.text = parsed.models = parsed.animations = false;
+            parsed.textures = parsed.movies = parsed.pngs = parsed.text = parsed.models = parsed.animations = parsed.fonts = false;
             size_t begin = 0;
             while (begin <= value.size())
             {
@@ -1693,7 +1737,8 @@ std::optional<Request> ParseArguments(int argc, char **argv)
                 else if (kind == "text") parsed.text = true;
                 else if (kind == "models") parsed.models = true;
                 else if (kind == "animations") parsed.animations = true;
-                else parsed.error = "unknown export kind '" + kind + "' (expected textures,fingerprints,movies,text,models,animations)";
+                else if (kind == "fonts") parsed.fonts = true;
+                else parsed.error = "unknown export kind '" + kind + "' (expected textures,fingerprints,movies,text,models,animations,fonts)";
                 begin = end + 1;
             }
         }
@@ -1702,7 +1747,7 @@ std::optional<Request> ParseArguments(int argc, char **argv)
     if (parsed.output.empty() && parsed.error.empty()) parsed.error = "--export-assets <output folder> is required";
     if (!parsed.languagePack.empty())
     {
-        parsed.textures = parsed.movies = parsed.pngs = parsed.models = parsed.animations = false;
+        parsed.textures = parsed.movies = parsed.pngs = parsed.models = parsed.animations = parsed.fonts = false;
         parsed.text = true;
         if (parsed.language.empty()) parsed.language = "int";
     }
@@ -1793,7 +1838,7 @@ int Run(const Request &request, const fs::path &gameRoot)
         if (select.empty()) return Fail(Utf8(request.select) + " names nothing to export");
     }
     const auto textures = output / "textures", movies = output / "movies";
-    const auto models = output / "models", animations = output / "animations";
+    const auto models = output / "models", animations = output / "animations", fonts = output / "fonts";
     const auto pack = request.languagePack.empty() ? fs::path{} : output / FromUtf8(request.languagePack);
     const auto texts = pack.empty() ? output / "text" : pack / "text";
     // The untranslated copy that language-clean compares the pack with.
@@ -1808,10 +1853,11 @@ int Run(const Request &request, const fs::path &gameRoot)
             if (request.text) CreateDirectories(texts);
             if (request.models) CreateDirectories(models);
             if (request.animations) CreateDirectories(animations);
+            if (request.fonts) CreateDirectories(fonts);
         }
     }
     catch (const std::exception &failure) { return Fail(failure.what()); }
-    const bool packages = request.textures || request.models || request.animations;
+    const bool packages = request.textures || request.models || request.animations || request.fonts;
 
     // One job per FPI path; a path repeated on later discs is the same file
     // when its size matches (the four-disc census found no content variants).
@@ -1912,7 +1958,7 @@ int Run(const Request &request, const fs::path &gameRoot)
         std::call_once(skeletonsRead, [&] { skeletons = ReadSkeletons(discs); });
         return skeletons;
     };
-    const Context context{request, textures, models, animations, select.empty() ? nullptr : &select, &discs, allSkeletons};
+    const Context context{request, textures, models, animations, fonts, select.empty() ? nullptr : &select, &discs, allSkeletons};
 
     std::mutex mutex;
     std::atomic<size_t> next{0};
@@ -2070,7 +2116,7 @@ int Run(const Request &request, const fs::path &gameRoot)
             for (const auto &name : dlcNames) summary += " " + name;
         }
         summary += std::string("\nkinds:") + (request.textures ? " textures" : "") + (request.movies ? " movies" : "") +
-                   (request.text ? " text" : "") + (request.models ? " models" : "") + (request.animations ? " animations" : "") +
+                   (request.text ? " text" : "") + (request.models ? " models" : "") + (request.animations ? " animations" : "") + (request.fonts ? " fonts" : "") +
                    (request.modelTextures ? " (with model textures)" : "");
         summary += "\nfilter: " + (request.filter.empty() ? std::string("(none)") : request.filter);
         if (!select.empty()) summary += "\nselection: " + std::to_string(select.size()) + " names from " + Utf8(request.select);
@@ -2084,6 +2130,7 @@ int Run(const Request &request, const fs::path &gameRoot)
         for (const auto &format : kFormats)
             summary += "  " + std::string(format.name) + ": " + std::to_string(total.formats[format.name]) + "\n";
         summary += "movies: " + std::to_string(total.movies) + " (" + std::to_string(total.movieBytes) + " bytes)\n";
+        if (request.fonts) summary += "fonts: " + std::to_string(total.fonts) + "\n";
         summary += "models: " + std::to_string(modelCount) + ", animation sets: " + std::to_string(animationCount) + " (" +
                    std::to_string(total.modelBytes) + " glTF bytes)\n";
         summary += "packages read: " + std::to_string(total.packages) + " (" + std::to_string(total.notPackages) +

@@ -392,6 +392,7 @@ target_link_libraries(LoLogCaptureTest PRIVATE fmt::fmt)
 # overlay, without guest/GPU work.
 add_executable(LoModelImport EXCLUDE_FROM_ALL
     ${CMAKE_SOURCE_DIR}/tools/tests/model_import_cli.cpp
+    ${LO_RUNTIME_ROOT}/modding/font_patch.cpp
     ${LO_RUNTIME_ROOT}/modding/gltf_reader.cpp
     ${LO_RUNTIME_ROOT}/modding/model_import.cpp
     ${LO_RUNTIME_ROOT}/modding/mod_api.cpp
@@ -401,8 +402,21 @@ add_executable(LoModelImport EXCLUDE_FROM_ALL
 target_include_directories(LoModelImport PRIVATE ${LO_RUNTIME_ROOT})
 target_compile_features(LoModelImport PRIVATE cxx_std_20)
 target_compile_definitions(LoModelImport PRIVATE NOMINMAX)
-target_link_libraries(LoModelImport PRIVATE fmt::fmt Threads::Threads)
+target_link_libraries(LoModelImport PRIVATE fmt::fmt lo_menu_lzo Threads::Threads)
 set_target_properties(LoModelImport PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
+
+# Language-pack glyphs (modding/font_patch.h) on a font package from a disc,
+# checked with the settings menu's reader, without guest/GPU work.
+add_executable(LoFontPatch EXCLUDE_FROM_ALL
+    ${CMAKE_SOURCE_DIR}/tools/tests/font_patch_cli.cpp
+    ${LO_RUNTIME_ROOT}/modding/font_patch.cpp
+    ${LO_RUNTIME_ROOT}/modding/mod_api.cpp
+    ${LO_RUNTIME_ROOT}/settings/menu_assets.cpp)
+target_include_directories(LoFontPatch PRIVATE ${LO_RUNTIME_ROOT})
+target_compile_features(LoFontPatch PRIVATE cxx_std_20)
+target_compile_definitions(LoFontPatch PRIVATE NOMINMAX)
+target_link_libraries(LoFontPatch PRIVATE lo_menu_lzo Threads::Threads)
+set_target_properties(LoFontPatch PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
 
 # Background archive publication and failure recovery, without guest/GPU work.
 if(WIN32)

@@ -1,5 +1,6 @@
 #include "text_overlay.h"
 #include "cpx_pack.h"
+#include "font_patch.h"
 #include "fpi_index.h"
 #include "fpi_overflow.h"
 #include "mod_api.h"
@@ -124,8 +125,9 @@ struct ModSet
 {
     std::map<std::string, ResolvedAsset> texts;               // member path -> translation file or archive entry
     std::map<std::string, std::vector<ResolvedAsset>> models; // package member path -> its model replacements
+    std::map<std::string, std::vector<ResolvedAsset>> fonts;  // package member path -> glyphs the selected language pack adds
     uint64_t key = 0;                                          // what the rebuilt bytes depend on (Build adds the folder)
-    bool Empty() const { return texts.empty() && models.empty(); }
+    bool Empty() const { return texts.empty() && models.empty() && fonts.empty(); }
 };
 
 std::mutex gMutex;
@@ -168,7 +170,7 @@ const text::Replacements *Translation(const ResolvedAsset &file)
 
 struct Counts
 {
-    size_t files = 0, texts = 0, unknownKeys = 0, failed = 0, models = 0;
+    size_t files = 0, texts = 0, unknownKeys = 0, failed = 0, models = 0, fonts = 0;
 };
 
 // Thrown when a background build is stopped; not a std::exception, so the
@@ -258,6 +260,39 @@ std::vector<uint8_t> RebuildModels(const ModSet &set, const std::string &path, c
     return std::move(result.package);
 }
 
+// The package with the language pack's glyphs added to its fonts, or empty to keep it.
+std::vector<uint8_t> RebuildFonts(const ModSet &set, const std::string &path, const std::vector<uint8_t> &package, Counts &counts)
+{
+    std::vector<font_patch::Addition> additions;
+    for (const auto &asset : set.fonts.at(path))
+    {
+        // Key: <package>#<font>.
+        font_patch::Addition addition{asset.id.key.substr(asset.id.key.rfind('#') + 1), {}, DescribeAsset(asset)};
+        try
+        {
+            std::ifstream input;
+            uint64_t length = 0;
+            if (!OpenAsset(asset, input, length) || length > 128 * 1024 * 1024) throw std::runtime_error("cannot read it or larger than 128 MiB");
+            std::vector<uint8_t> bytes(static_cast<size_t>(length));
+            if (!input.read(reinterpret_cast<char *>(bytes.data()), std::streamsize(bytes.size()))) throw std::runtime_error("truncated");
+            addition.glyphs = font_patch::Parse(bytes);
+        }
+        catch (const std::exception &error)
+        {
+            LOG_WARNING("[mods] font {} skipped: {}", addition.source, error.what());
+            continue;
+        }
+        additions.push_back(std::move(addition));
+    }
+    if (additions.empty()) return {};
+    auto result = font_patch::RebuildPackage(package, additions);
+    for (const auto &note : result.notes)
+        if (result.patched) LOG_NOTICE("[mods] font {}: {}", path, note);
+        else LOG_WARNING("[mods] font {}: {}", path, note);
+    counts.fonts += result.patched;
+    return std::move(result.package);
+}
+
 // Rebuilds the translated files and model packages one index points to, a
 // member folder at a time: its files, then the packages that place its
 // replaced static meshes (their baked lighting follows the new vertices),
@@ -274,6 +309,7 @@ void PatchIndex(const ModSet &set, const fs::path &folder, const std::map<std::s
 {
     const auto &texts = set.texts;
     const auto &models = set.models;
+    const auto &fonts = set.fonts;
     const auto parsed = fpi::Read(index);
     // In archive order, so the reads run forward through each file (slow disks).
     auto byOffset = [](const fpi::File *a, const fpi::File *b) { return std::tie(a->archive, a->offset) < std::tie(b->archive, b->offset); };
@@ -284,7 +320,7 @@ void PatchIndex(const ModSet &set, const fs::path &folder, const std::map<std::s
     struct Group { std::vector<const fpi::File *> members, placers; bool shared = false; };
     std::map<std::string, Group> groups;
     for (const auto &file : parsed.files)
-        if ((texts.count(file.path) && text::Detect(file.path) != text::Format::None) || models.count(file.path))
+        if ((texts.count(file.path) && text::Detect(file.path) != text::Format::None) || models.count(file.path) || fonts.count(file.path))
             groups[FolderOf(file.path)].members.push_back(&file);
     for (const auto &[meshes, placer] : model_import::kPlacedElsewhere)
     {
@@ -411,7 +447,9 @@ void PatchIndex(const ModSet &set, const fs::path &folder, const std::map<std::s
             } count{options.progress};
             const auto &file = *member;
             const auto text = texts.find(file.path);
-            const bool model = models.count(file.path) != 0;
+            const bool font = fonts.count(file.path) != 0;
+            // Packages: model replacements, glyphs or both; anything else is text.
+            const bool model = models.count(file.path) != 0 || font;
             try
             {
                 const text::Replacements *translation = nullptr;
@@ -425,10 +463,16 @@ void PatchIndex(const ModSet &set, const fs::path &folder, const std::map<std::s
                 std::vector<uint8_t> bytes;
                 if (model)
                 {
-                    model_import::VertexMaps own;
-                    bytes = RebuildModels(set, file.path, loaded.bytes, counts, own, options.cancel);
-                    if (group.shared) shared.insert(own.begin(), own.end());
-                    maps.merge(own);
+                    if (models.count(file.path))
+                    {
+                        model_import::VertexMaps own;
+                        bytes = RebuildModels(set, file.path, loaded.bytes, counts, own, options.cancel);
+                        if (group.shared) shared.insert(own.begin(), own.end());
+                        maps.merge(own);
+                    }
+                    if (font)
+                        if (auto patched = RebuildFonts(set, file.path, bytes.empty() ? loaded.bytes : bytes, counts); !patched.empty())
+                            bytes = std::move(patched);
                 }
                 else
                 {
@@ -532,7 +576,7 @@ void PatchIndex(const ModSet &set, const fs::path &folder, const std::map<std::s
     for (const auto &c : partial)
     {
         counts.files += c.files; counts.texts += c.texts; counts.unknownKeys += c.unknownKeys;
-        counts.failed += c.failed; counts.models += c.models;
+        counts.failed += c.failed; counts.models += c.models; counts.fonts += c.fonts;
     }
     if (options.Cancelled()) throw Cancelled{};
 
@@ -823,8 +867,8 @@ Folder Build(const fs::path &folder, const ModSet &set, const BuildOptions &opti
     if (counts.files || counts.failed)
         // Keys a copy lacks are normal: a pack made from the DLC copy of a file
         // also applies to the disc copy, which has fewer entries.
-        LOG_NOTICE("[mods] {} translated and {} model packages rebuilt in {} ({} failed; {} translation keys this copy does not have)",
-                   counts.texts, counts.files - counts.texts, Utf8(folder), counts.failed, counts.unknownKeys);
+        LOG_NOTICE("[mods] {} translated and {} model or font packages rebuilt in {} ({} fonts given glyphs; {} failed; {} translation keys this copy does not have)",
+                   counts.texts, counts.files - counts.texts, Utf8(folder), counts.fonts, counts.failed, counts.unknownKeys);
 
     bool cached = false;
     if (!building.empty())
@@ -907,6 +951,16 @@ std::shared_ptr<const ModSet> MakeSet(const std::string &languagePack)
     if (!texts.empty())
         LOG_NOTICE("[mods] text: {} translation files ({} from language pack {})", texts.size(), packFiles,
                    languagePack.empty() ? "none" : languagePack);
+    size_t fonts = 0;
+    for (const auto &pack : LanguagePacks())
+        if (pack.id == languagePack)
+            for (auto &asset : ListFonts(pack))
+            {
+                const auto package = asset.id.key.substr(0, asset.id.key.rfind('#'));
+                set->fonts[package].push_back(std::move(asset));
+                ++fonts;
+            }
+    if (fonts) LOG_NOTICE("[mods] font: {} glyph files in {} packages from language pack {}", fonts, set->fonts.size(), languagePack);
     size_t models = 0;
     for (auto &asset : ListModels())
     {
@@ -939,6 +993,8 @@ std::shared_ptr<const ModSet> MakeSet(const std::string &languagePack)
     };
     for (const auto &[member, asset] : texts) add(asset);
     for (const auto &[member, assets] : set->models)
+        for (const auto &asset : assets) add(asset);
+    for (const auto &[member, assets] : set->fonts)
         for (const auto &asset : assets) add(asset);
     set->key = key;
     return set;
@@ -1155,8 +1211,8 @@ void CommitReload(const fs::path &folder)
         gPrebuild.claimed.clear();
         gPrebuild.started = false;
     }
-    LOG_NOTICE("[mods] live reload: {} now reads the files for the new mods ({} text, {} model packages)", Utf8(folder),
-               gSet->texts.size(), gSet->models.size());
+    LOG_NOTICE("[mods] live reload: {} now reads the files for the new mods ({} text, {} model and {} font packages)", Utf8(folder),
+               gSet->texts.size(), gSet->models.size(), gSet->fonts.size());
 }
 } // namespace
 

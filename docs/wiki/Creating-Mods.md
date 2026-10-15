@@ -36,7 +36,7 @@ The game finds the files under `overlay/` by name, so `mod.ini` needs no file li
 
 Zip it with `mods/` at the top of the archive: `mods/<id>/mod.ini`, `mods/<id>/overlay/...`. Players extract the archive into the game folder; Mod Organizer 2 installs it as it is. Mod folders never conflict with each other. When two of them replace the same file, the in-game mod order decides, then `priority` in `mod.ini` (see [Modding API](Modding-API.md#order-and-mod-listini)). Changes take effect after a restart.
 
-Players manage installed mods in Settings → System → Mods. The page lists each mod with its `name`, `version` and `author`. The confirm button (A, or B if the game's confirm and cancel buttons are swapped) switches the selected mod On or Off, LB / RB move it up or down, and **Save mod list** (or Start) saves the order and applies it while the game runs: texture mods change at once, model mods from the next area you enter. Until then the help line says so. Party members' models are loaded once at startup, so a change to them needs a restart; an area the game still holds in memory, such as one you just left, can show the old models until it is loaded again. The selected mod's `description` and folder appear in the help line. A mod with a broken `mod.ini` shows an error there with its first problem. Language packs are listed below the mods; choose one in Settings → System → Game language.
+Players manage installed mods in Settings → System → Mods. The page lists each mod with its `name`, `version` and `author`. The confirm button (A, or B if the game's confirm and cancel buttons are swapped) switches the selected mod On or Off, LB / RB move it up or down, and **Save mod list** (or Start) saves the order and applies it while the game runs: texture mods change at once, model mods from the next area you enter. Until then the help line says so. Party members' models, and the letters a language pack adds to the fonts, are loaded once at startup, so a change to them needs a restart; an area the game still holds in memory, such as one you just left, can show the old models until it is loaded again. The selected mod's `description` and folder appear in the help line. A mod with a broken `mod.ini` shows an error there with its first problem. Language packs are listed below the mods; choose one in Settings → System → Game language.
 
 To turn a top-level `overlay/` folder (an overlay pack) into a mod folder without packing it again:
 
@@ -95,7 +95,7 @@ LostOdysseyRecomp.exe --export-assets my-export --export-kinds textures,movies -
 
 The output folder must not exist or must be empty, and it must be outside the game data. Optional arguments:
 
-- `--export-kinds`: `textures`, `movies`, `text`, `models`, `animations`, or `fingerprints` (the texture index without PNG files). The default is textures, movies and text; models and animations are not in the default because of their size.
+- `--export-kinds`: `textures`, `movies`, `text`, `models`, `animations`, `fonts` (each font's size, pages and letters as JSON, for [adding letters](#add-letters-the-fonts-lack)), or `fingerprints` (the texture index without PNG files). The default is textures, movies and text; models and animations are not in the default because of their size.
 - `--export-filter`: only names containing this text.
 - `--export-language`: the text of one language only: `int`, `jpn`, `deu`, `fra`, `spa`, `ita`, `kor`, `chi` or `sch`.
 - `--export-language-pack <id>`: only text, written as a language pack to translate (see [make a language pack](#make-a-language-pack-a-new-language)).
@@ -115,6 +115,7 @@ my-export/models/<package path>/<object>.<export index>.glb   3D models (glTF)
 my-export/models/index.csv          key,file,class,vertices,triangles,bones
 my-export/animations/<package path>/<set>.<index>.glb         animation sets (glTF)
 my-export/animations/index.csv      key,file,sequences,tracks,frames,model
+my-export/fonts/<package path>/<font>.json                   font size, kerning, pages and letters
 my-export/export-summary.txt
 ```
 
@@ -324,6 +325,26 @@ The log shows `mods: language pack pt-br (Português (Brasil), base int)` at sta
 
 The game runs as the base language underneath: voices, artwork with words in it and everything you have not translated stay in that language (English for `int`). While the pack is selected, its files replace the same files from other text mods. Players who pick another language do not see the pack.
 
+### Add letters the fonts lack
+
+The game draws text with bitmap fonts: each letter is a small picture on a texture page, white with a dark outline, at one fixed size. A language that needs letters those fonts do not have, such as Polish, Russian or Arabic, can add them to a language pack: `lo_mod.py font-glyphs` draws every letter the pack's text uses and the fonts lack from a TrueType or OpenType font, at each game font's size and in its style, and the game adds them to its fonts while the pack is selected.
+
+1. Export the fonts and their pages: `LostOdysseyRecomp.exe --export-assets my-fonts --export-kinds textures,fonts --export-filter rpfonts`. Besides the page PNGs in `textures/`, `my-fonts/fonts/<package path>/<font>.json` has each font's size, kerning, pages and letters.
+2. Translate the pack's text first: the letters drawn are the ones it uses. `--chars` adds more.
+3. Install what the command needs: `python -m pip install Pillow fonttools freetype-py uharfbuzz`.
+4. Draw the letters with a font whose licence lets you share it, such as an OFL font:
+
+   ```sh
+   python tools/modding/lo_mod.py font-glyphs my-export/pt-br --export my-fonts --ttf MyFont-Regular.ttf
+   ```
+
+   For each font of the pack's base language (`rpfontscommon_int.xxx`, `rpfontsdream_int.xxx`, `rpfontstitle_int.xxx` for `int`) it writes `my-export/pt-br/fonts/<package path>/<font>.lofont` and prints how many letters it drew and at which size. The size matches the TTF's `H` to the game's `H`, then shrinks until every new letter fits the font's line height; `--scale` makes them larger or smaller, `--fonts Maru23,Meiyo18` limits the fonts. A heavier weight of the TTF reads better at the small sizes. Fonts without letters, such as `Icon`, are skipped.
+5. Start the game with the pack selected. The log shows `[mods] font: N glyph files in M packages from language pack pt-br` and one `[mods] font <package>: <font>: … glyphs` line per font; the first start after a change rebuilds the font packages with the other mod files. The game reads its fonts once, at startup, so changed glyph files need a restart; saving the Mods page does not apply them.
+
+`language-clean` copies the pack's `fonts/` folder with the text. A letter the game's font already has keeps the game's own glyph unless `fonts/` draws it again.
+
+The game draws every line from left to right and does not join letters. Arabic, Persian and other right-to-left scripts work when the text in the pack is already shaped and in display order: each letter as its presentation form (U+FB50–U+FEFF, which `font-glyphs` draws by shaping the letter with its neighbours) and each line reversed, with codes such as `{E001}` kept in place. Lines the game wraps on its own, such as long subtitles, wrap from the wrong end; break them by hand.
+
 ### Change a language the game already has
 
 1. Export the text: `LostOdysseyRecomp.exe --export-assets my-export --export-kinds text --export-language int` (or tick Text in the MO2 tool). Without `--export-language` you get every language on your discs.
@@ -333,7 +354,7 @@ The game runs as the base language underneath: voices, artwork with words in it 
 
 ### For both
 
-Translated text can be longer than the original. Menus and message boxes do not grow, so long lines may need a manual break. Use only characters the game's font has (see [Modding API](Modding-API.md#text-language-packs)); languages that need other letters, such as Polish or Russian, are not possible yet. The Thousand Years of Dreams stories and the place names in `name_data.xmb` are not exported yet.
+Translated text can be longer than the original. Menus and message boxes do not grow, so long lines may need a manual break. Use only characters the game's font has (see [Modding API](Modding-API.md#text-language-packs)); a language pack can [add the letters it lacks](#add-letters-the-fonts-lack). The Thousand Years of Dreams stories and the place names in `name_data.xmb` are not exported yet.
 
 ## Settings-menu artwork
 

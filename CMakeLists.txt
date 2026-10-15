@@ -178,6 +178,7 @@ if(LO_BUILD_MOD_TESTS)
         add_executable(LoAssetExport
             tools/tests/asset_export_cli.cpp
             LostOdysseyRecomp/modding/asset_export.cpp
+            LostOdysseyRecomp/modding/font_patch.cpp
             LostOdysseyRecomp/modding/gltf_writer.cpp
             LostOdysseyRecomp/modding/mod_api.cpp
             LostOdysseyRecomp/modding/model_preview.cpp

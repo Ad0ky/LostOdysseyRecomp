@@ -2,6 +2,7 @@
 //   LoModelImport --package <decoded .xxx> --export <index> --object <name> --glb <file> --out <file>
 //     rebuilds one package with one replacement (modding/model_import.h).
 //   LoModelImport --disc <disc folder> --mods <mods folder> --member <archive path> --out <file>
+//     [--language-pack <id>]
 //     takes the runtime path: mod listing, archive overlay (modding/text_overlay.h),
 //     then reads the member back through the patched index, archive tail or overflow
 //     archive and writes it decoded. --prebuild 1 then prepares the other discs
@@ -88,6 +89,8 @@ int Run(std::map<std::string, std::string> &args)
     }
     const fs::path disc = args.at("--disc");
     modding::Initialize(args.at("--mods"));
+    // The pack the player selected in Settings: its text and font glyphs apply.
+    if (args.count("--language-pack")) modding::text_overlay::SelectLanguagePack(args.at("--language-pack"));
     if (args.count("--prebuild")) modding::text_overlay::EnablePrebuild(std::chrono::seconds(0));
     std::printf("models listed: %zu\n", modding::ListModels().size());
     const auto header = Read(disc / "LO.fpi", 0, 64);
