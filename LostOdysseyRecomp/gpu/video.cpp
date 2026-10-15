@@ -42,6 +42,7 @@
 #include "frame_plan.h"
 #include "pipeline_prepare_progress.h"
 #include <modding/rebuild_progress.h>
+#include <modding/text_overlay.h>
 #include <settings/config.h>
 #include "frame_generation_settings.h"
 #include <settings/menu.h>
@@ -3027,6 +3028,7 @@ namespace gpu::video
     void RequestExit() {
         if (!g_exitRequested.exchange(true, std::memory_order_acq_rel))
             LOG_INFO("video: exit requested; GPU owner cleanup pending");
+        modding::text_overlay::StopPrebuild();
         g_commandProcessor.RequestStopForExit();
         RequestSkipShaderPreparation();
     }
@@ -3254,7 +3256,12 @@ namespace gpu::video
     {
         const uint64_t mods = modding::rebuild_progress::g_progress.load(std::memory_order_relaxed);
         const uint32_t total = modding::rebuild_progress::Total(mods);
-        if (!total) return 0;
+        // Logged when it appears and goes (a disc switch shows it mid-game too).
+        static bool shown = false;
+        if (!total) {
+            if (std::exchange(shown, false)) LOG_INFO("video: mods progress closed");
+            return 0;
+        }
         static uint64_t seenFrames = 0;
         static auto lastFrame = std::chrono::steady_clock::time_point{};
         if (const uint64_t frames = g_guestFrames.load(std::memory_order_relaxed); frames != seenFrames) {
@@ -3262,6 +3269,8 @@ namespace gpu::video
             lastFrame = now;
         }
         if (IsHostOverlayActive() || now - lastFrame < std::chrono::milliseconds(500)) return 0;
+        if (!std::exchange(shown, true))
+            LOG_INFO("video: mods progress shown ({} of {} game files)", modding::rebuild_progress::Done(mods), total);
         return PackPreparation(std::min(modding::rebuild_progress::Done(mods), total), total,
             PreparationStage::Mods, PreparationUnit::GameFiles);
     }

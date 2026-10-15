@@ -1292,7 +1292,8 @@ std::string MeshKey(const Package &package, int32_t ref, const std::string &stem
 }
 }
 
-Result RebuildPackage(std::span<const uint8_t> bytes, const std::string &stem, const std::vector<Replacement> &replacements)
+Result RebuildPackage(std::span<const uint8_t> bytes, const std::string &stem, const std::vector<Replacement> &replacements,
+                      const std::atomic<bool> *stop)
 {
     Result result;
     std::unique_ptr<Package> package;
@@ -1301,6 +1302,7 @@ Result RebuildPackage(std::span<const uint8_t> bytes, const std::string &stem, c
     std::vector<uint8_t> out(bytes.begin(), bytes.end());
     for (const auto &replacement : replacements)
     {
+        if (stop && stop->load(std::memory_order_relaxed)) return {};
         try
         {
             Require(replacement.exportIndex < package->exports.size(), "export " + std::to_string(replacement.exportIndex) + " does not exist");
@@ -1367,7 +1369,7 @@ bool PlacesStaticMeshes(std::span<const uint8_t> bytes)
     return false;
 }
 
-Result RemapLighting(std::span<const uint8_t> bytes, const std::string &stem, const VertexMaps &maps)
+Result RemapLighting(std::span<const uint8_t> bytes, const std::string &stem, const VertexMaps &maps, const std::atomic<bool> *stop)
 {
     Result result;
     std::unique_ptr<Package> package;
@@ -1395,6 +1397,7 @@ Result RemapLighting(std::span<const uint8_t> bytes, const std::string &stem, co
     size_t lightMaps = 0, skipped = 0;
     for (const auto &e : package->exports)
     {
+        if (stop && stop->load(std::memory_order_relaxed)) return {};
         if (package->ClassName(e) != "StaticMeshComponent") continue;
         try
         {

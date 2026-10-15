@@ -4,7 +4,9 @@
 //   LoModelImport --disc <disc folder> --mods <mods folder> --member <archive path> --out <file>
 //     takes the runtime path: mod listing, archive overlay (modding/text_overlay.h),
 //     then reads the member back through the patched index, archive tail or overflow
-//     archive and writes it decoded.
+//     archive and writes it decoded. --prebuild 1 then prepares the other discs
+//     in the background as the runtime does (no delay); --switch <disc> after
+//     --switch-after <seconds> opens that disc's index meanwhile, as a disc switch.
 #include <gpu/shader/cpx_decode.h>
 #include <modding/fpi_index.h>
 #include <modding/mod_api.h>
@@ -17,6 +19,7 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -83,10 +86,26 @@ int Run(std::map<std::string, std::string> &args)
     }
     const fs::path disc = args.at("--disc");
     modding::Initialize(args.at("--mods"));
+    if (args.count("--prebuild")) modding::text_overlay::EnablePrebuild(std::chrono::seconds(0));
     std::printf("models listed: %zu\n", modding::ListModels().size());
     const auto header = Read(disc / "LO.fpi", 0, 64);
     const auto index = Read(disc / "LO.fpi", 0, modding::fpi::IndexSize(header));
     const auto parsed = modding::fpi::Read(index);
+    if (args.count("--prebuild"))
+    {
+        const auto began = std::chrono::steady_clock::now();
+        auto seconds = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count(); };
+        if (args.count("--switch"))
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(int(std::stod(args.at("--switch-after")) * 1000)));
+            const auto other = disc.parent_path() / ("disc" + args.at("--switch"));
+            std::printf("switch to %s at %.1f s\n", other.string().c_str(), seconds());
+            Read(other / "LO.fpi", 0, 64);
+            std::printf("switch done at %.1f s\n", seconds());
+        }
+        modding::text_overlay::WaitForPrebuild();
+        std::printf("background preparation idle at %.1f s\n", seconds());
+    }
     // The record the game opens: an overflow archive's copy comes first.
     const auto *file = modding::fpi::Find(parsed, args.at("--member"));
     if (!file)

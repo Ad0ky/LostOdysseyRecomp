@@ -19,6 +19,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -27,6 +29,16 @@
 #include <set>
 #include <thread>
 #include <tuple>
+
+#ifdef _WIN32
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#elif defined(__linux__)
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 
 namespace modding::text_overlay
 {
@@ -107,6 +119,7 @@ struct Tail
 };
 
 std::mutex gMutex;
+std::mutex gFilesMutex; // gFiles: a foreground and a background build may both translate
 bool gListed = false;
 std::string gLanguagePack;
 std::map<std::string, ResolvedAsset> gTexts; // member path -> translation file or archive entry
@@ -150,6 +163,47 @@ struct Counts
     size_t files = 0, texts = 0, unknownKeys = 0, failed = 0, models = 0;
 };
 
+// Thrown when a background build is stopped; not a std::exception, so the
+// per-file and per-index handlers let it through.
+struct Cancelled {};
+
+struct BuildOptions
+{
+    std::atomic<uint64_t> *progress = &rebuild_progress::g_progress;
+    size_t threads = 0;                        // 0: up to kMaxThreads
+    bool background = false;                   // workers at low priority
+    const std::atomic<bool> *cancel = nullptr; // stops the build between files
+    bool Cancelled() const { return cancel && cancel->load(std::memory_order_relaxed); }
+};
+
+// A background build rests after each file as long as the file took: half the
+// time idle keeps it from taking the power a handheld's GPU shares with the CPU.
+struct Rest
+{
+    const BuildOptions &options;
+    std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+    ~Rest()
+    {
+        if (!options.background) return;
+        const auto until = std::chrono::steady_clock::now() + std::min<std::chrono::steady_clock::duration>(
+                                                                  std::chrono::steady_clock::now() - began, std::chrono::seconds(5));
+        while (!options.Cancelled() && std::chrono::steady_clock::now() < until)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+};
+
+// CPU (and on Windows I/O) priority below the game's threads.
+void LowerThreadPriority()
+{
+#ifdef _WIN32
+    SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+#elif defined(__APPLE__)
+    pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+#elif defined(__linux__)
+    setpriority(PRIO_PROCESS, id_t(syscall(SYS_gettid)), 19);
+#endif
+}
+
 // A member path's folder and file name without extension.
 std::string FolderOf(const std::string &path) { return path.substr(0, path.rfind('/') + 1); }
 std::string StemOf(const std::string &path)
@@ -161,7 +215,7 @@ std::string StemOf(const std::string &path)
 // The package with its model replacements, or empty to keep it. Replaced static
 // meshes add their vertex maps to maps.
 std::vector<uint8_t> RebuildModels(const std::string &path, const std::vector<uint8_t> &package, Counts &counts,
-                                   model_import::VertexMaps &maps)
+                                   model_import::VertexMaps &maps, const std::atomic<bool> *stop)
 {
     std::vector<model_import::Replacement> replacements;
     for (const auto &asset : gModels.at(path))
@@ -187,7 +241,7 @@ std::vector<uint8_t> RebuildModels(const std::string &path, const std::vector<ui
         }
         replacements.push_back(std::move(r));
     }
-    auto result = model_import::RebuildPackage(package, StemOf(path), replacements);
+    auto result = model_import::RebuildPackage(package, StemOf(path), replacements, stop);
     for (const auto &note : result.notes)
         if (result.replaced) LOG_NOTICE("[mods] model {}: {}", path, note);
         else LOG_WARNING("[mods] model {}: {}", path, note);
@@ -207,7 +261,8 @@ std::vector<uint8_t> RebuildModels(const std::string &path, const std::vector<ui
 // index: the file's first IndexSize() bytes, patched in place; tails: per
 // archive file name; overflows: the folder's overflow archives by name.
 void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &names, std::vector<uint8_t> &index,
-                std::map<std::string, Tail> &tails, std::map<std::string, Tail> &overflows, const fs::path &cache, Counts &counts)
+                std::map<std::string, Tail> &tails, std::map<std::string, Tail> &overflows, const fs::path &cache, Counts &counts,
+                const BuildOptions &options)
 {
     const auto parsed = fpi::Read(index);
     // In archive order, so the reads run forward through each file (slow disks).
@@ -236,7 +291,7 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         order.push_back(&group);
         members += group.second.members.size();
     }
-    rebuild_progress::AddTotal(uint32_t(members));
+    rebuild_progress::AddTotal(*options.progress, uint32_t(members));
     std::stable_sort(order.begin(), order.end(), [&](const auto *a, const auto *b) {
         if (a->second.shared != b->second.shared) return a->second.shared;
         if (a->second.members.empty() || b->second.members.empty()) return !a->second.members.empty() && b->second.members.empty();
@@ -315,7 +370,6 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
     };
 
     model_import::VertexMaps shared; // of the shared mesh packages, kept for the folders that place them
-    std::mutex translating;          // gFiles
     auto work = [&](const std::pair<const std::string, Group> &entry, Counts &counts) {
         const auto &[memberFolder, group] = entry;
         // Packages that may place a replaced static mesh wait for the second
@@ -336,8 +390,15 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         const auto before = maps.size();
         for (const auto *member : group.members)
         {
+            if (options.Cancelled()) return;
+            const Rest rest{options};
             // Counted when done with; members that place static meshes once stored below.
-            struct Count { bool later = false; ~Count() { if (!later) rebuild_progress::Advance(); } } count;
+            struct Count
+            {
+                std::atomic<uint64_t> *progress;
+                bool later = false;
+                ~Count() { if (!later) rebuild_progress::Advance(*progress); }
+            } count{options.progress};
             const auto &file = *member;
             const auto text = gTexts.find(file.path);
             const bool model = gModels.count(file.path) != 0;
@@ -346,7 +407,7 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
                 const text::Replacements *translation = nullptr;
                 if (!model)
                 {
-                    std::lock_guard lock(translating);
+                    std::lock_guard lock(gFilesMutex);
                     translation = Translation(text->second);
                 }
                 if (!model && !translation) continue;
@@ -355,7 +416,7 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
                 if (model)
                 {
                     model_import::VertexMaps own;
-                    bytes = RebuildModels(file.path, loaded.bytes, counts, own);
+                    bytes = RebuildModels(file.path, loaded.bytes, counts, own, options.cancel);
                     if (group.shared) shared.insert(own.begin(), own.end());
                     maps.merge(own);
                 }
@@ -391,6 +452,8 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         if (maps.empty()) placers.clear();
         for (const auto *placer : placers)
         {
+            if (options.Cancelled()) return;
+            const Rest rest{options};
             const auto &file = *placer;
             if (stored.count(placer)) continue; // places no static mesh
             try
@@ -398,7 +461,8 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
                 auto it = rebuilt.find(placer);
                 Member loaded;
                 if (it == rebuilt.end()) loaded = load(file);
-                auto result = model_import::RemapLighting(it != rebuilt.end() ? it->second.bytes : loaded.bytes, StemOf(file.path), maps);
+                auto result = model_import::RemapLighting(it != rebuilt.end() ? it->second.bytes : loaded.bytes, StemOf(file.path), maps,
+                                                          options.cancel);
                 for (const auto &note : result.notes) LOG_NOTICE("[mods] model lighting {}: {}", file.path, note);
                 if (it == rebuilt.end())
                 {
@@ -410,7 +474,7 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
                 if (!result.package.empty()) it->second.bytes = std::move(result.package);
                 put(file, it->second);
                 rebuilt.erase(it);
-                rebuild_progress::Advance();
+                rebuild_progress::Advance(*options.progress);
             }
             catch (const std::exception &error)
             {
@@ -421,27 +485,30 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         // Members that place static meshes but had none of theirs replaced.
         for (auto &[file, item] : rebuilt)
         {
+            if (options.Cancelled()) return;
             put(*file, item);
-            rebuild_progress::Advance();
+            rebuild_progress::Advance(*options.progress);
         }
     };
 
     // Shared mesh folders (sorted first) one by one, as the others need their
     // vertex maps; the rest on worker threads.
     size_t next = 0;
-    for (; next < order.size() && order[next]->second.shared; ++next) work(*order[next], counts);
+    for (; next < order.size() && order[next]->second.shared && !options.Cancelled(); ++next) work(*order[next], counts);
 #ifdef __ANDROID__
     constexpr size_t kMaxThreads = 2; // each holds a few packages; phones share their memory with the game
 #else
     constexpr size_t kMaxThreads = 8;
 #endif
-    const size_t threads = std::min<size_t>(std::clamp<size_t>(std::thread::hardware_concurrency(), 1, kMaxThreads), order.size() - next);
+    const size_t threads = std::min<size_t>(std::clamp<size_t>(std::thread::hardware_concurrency(), 1, options.threads ? options.threads : kMaxThreads),
+                                            order.size() - next);
     std::atomic<size_t> claimed = next;
     std::vector<Counts> partial(threads);
     std::vector<std::thread> pool;
     for (size_t t = 0; t < threads; ++t)
         pool.emplace_back([&, t] {
-            for (size_t i; (i = claimed++) < order.size();)
+            if (options.background) LowerThreadPriority();
+            for (size_t i; !options.Cancelled() && (i = claimed++) < order.size();)
             {
                 try { work(*order[i], partial[t]); }
                 catch (const std::exception &error)
@@ -457,6 +524,7 @@ void PatchIndex(const fs::path &folder, const std::map<std::string, fs::path> &n
         counts.files += c.files; counts.texts += c.texts; counts.unknownKeys += c.unknownKeys;
         counts.failed += c.failed; counts.models += c.models;
     }
+    if (options.Cancelled()) throw Cancelled{};
 
     if (overflowFiles.empty()) return;
     try
@@ -576,7 +644,7 @@ bool LoadCache(const fs::path &cache, uint64_t key, Folder &result)
     return true;
 }
 
-Folder Build(const fs::path &folder)
+Folder Build(const fs::path &folder, const BuildOptions &options = {})
 {
     Folder result;
     // File names are matched case-insensitively, as the game does.
@@ -622,8 +690,13 @@ Folder Build(const fs::path &folder)
                                        : "the cached files are incomplete");
     }
 
+    if (options.Cancelled()) throw Cancelled{};
     // PatchIndex counts the packages for the window until the files are in place.
-    struct Finished { ~Finished() { rebuild_progress::Finish(); } } finished;
+    struct Finished
+    {
+        std::atomic<uint64_t> *progress;
+        ~Finished() { rebuild_progress::Finish(*progress); }
+    } finished{options.progress};
 
     // Build into <cache>.new, then put it in place of the old one.
     fs::path building = cache.empty() ? fs::path() : fs::path(cache).concat(".new");
@@ -640,18 +713,29 @@ Folder Build(const fs::path &folder)
     std::map<std::string, Tail> tails, overflows;
     std::vector<std::string> patched;
     Counts counts;
-    for (auto &[name, index] : indexes)
+    try
     {
-        try
+        for (auto &[name, index] : indexes)
         {
-            const auto before = counts.files;
-            PatchIndex(folder, names, index, tails, overflows, building, counts);
-            if (counts.files != before) patched.push_back(name);
+            try
+            {
+                const auto before = counts.files;
+                PatchIndex(folder, names, index, tails, overflows, building, counts, options);
+                if (counts.files != before) patched.push_back(name);
+            }
+            catch (const std::exception &error)
+            {
+                LOG_WARNING("[mods] cannot patch index {}: {}", Utf8(names.at(name)), error.what());
+            }
         }
-        catch (const std::exception &error)
-        {
-            LOG_WARNING("[mods] cannot patch index {}: {}", Utf8(names.at(name)), error.what());
-        }
+    }
+    catch (const Cancelled &)
+    {
+        // Nothing half done stays: the folder has no manifest and goes.
+        for (auto &[name, tail] : tails) tail.file.close();
+        for (auto &[name, overflow] : overflows) overflow.file.close();
+        if (!building.empty()) fs::remove_all(building, ec);
+        throw;
     }
     for (auto &[name, tail] : tails) tail.file.close();
     for (auto &[name, overflow] : overflows) overflow.file.close();
@@ -774,6 +858,155 @@ void List()
         for (const auto &asset : assets) add(asset);
     gModsKey = key;
 }
+
+// ---- Background preparation of the other discs ------------------------------
+// A mod that rebuilds many files makes the first switch to another disc wait
+// for that disc's rebuild (a minute or two). After the start, the other discs
+// of the game folder are rebuilt into the cache on a few low-priority threads,
+// so a later switch only reads the cache. A build the game waits for stops the
+// background one (it starts again after) and runs on its own as before.
+struct Prebuild
+{
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool allowed = false, started = false, stopping = false;
+    std::chrono::seconds delay{30}; // after the first disc: the DLC folders, the first map's shaders
+    int foreground = 0;            // builds the game waits for: the background one waits
+    std::vector<fs::path> pending; // disc folders still to prepare
+    std::set<fs::path> claimed;    // built in the foreground
+    fs::path current;              // being prepared
+    std::atomic<bool> cancel{false};
+    std::atomic<uint64_t> progress{0};
+};
+Prebuild gPrebuild;
+
+// One thread by default: four made the field drop from 27 to 24 FPS on a Strix
+// Halo handheld (p95 frame time 34 -> 98 ms). LO_MODS_PREBUILD_THREADS overrides.
+size_t PrebuildThreads()
+{
+    const char *setting = std::getenv("LO_MODS_PREBUILD_THREADS");
+    return std::clamp<size_t>(setting ? size_t(std::atoi(setting)) : 1, 1, 8);
+}
+
+void PrebuildThread()
+{
+    LowerThreadPriority();
+    {
+        // Let the start finish first.
+        std::unique_lock lock(gPrebuild.mutex);
+        gPrebuild.changed.wait_for(lock, gPrebuild.delay, [] { return gPrebuild.stopping; });
+    }
+    for (;;)
+    {
+        fs::path folder;
+        {
+            std::unique_lock lock(gPrebuild.mutex);
+            gPrebuild.changed.wait(lock, [] { return gPrebuild.stopping || !gPrebuild.foreground; });
+            if (gPrebuild.stopping) break;
+            if (gPrebuild.pending.empty())
+            {
+                LOG_NOTICE("[mods] background preparation finished");
+                break;
+            }
+            folder = gPrebuild.pending.front();
+            gPrebuild.pending.erase(gPrebuild.pending.begin());
+            gPrebuild.current = folder;
+            gPrebuild.cancel = false;
+            gPrebuild.progress = 0;
+        }
+        bool again = false;
+        const auto began = std::chrono::steady_clock::now();
+        try
+        {
+            LOG_NOTICE("[mods] preparing the rebuilt files for {} in the background ({} threads)", Utf8(folder), PrebuildThreads());
+            BuildOptions options;
+            options.progress = &gPrebuild.progress;
+            options.threads = PrebuildThreads();
+            options.background = true;
+            options.cancel = &gPrebuild.cancel;
+            Build(folder, options);
+            LOG_NOTICE("[mods] background preparation of {} done in {:.0f} s", Utf8(folder),
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count());
+        }
+        catch (const Cancelled &)
+        {
+            again = true;
+            LOG_NOTICE("[mods] background preparation of {} stopped", Utf8(folder));
+        }
+        catch (const std::exception &error)
+        {
+            LOG_WARNING("[mods] background preparation of {} failed: {}", Utf8(folder), error.what());
+        }
+        {
+            std::lock_guard lock(gPrebuild.mutex);
+            gPrebuild.current.clear();
+            gPrebuild.progress = 0;
+            if (again && !gPrebuild.stopping && !gPrebuild.claimed.count(folder))
+                gPrebuild.pending.insert(gPrebuild.pending.begin(), folder);
+        }
+        gPrebuild.changed.notify_all();
+    }
+}
+
+// After the first disc folder is in place: the other disc folders beside it.
+// Caller holds gMutex.
+void StartPrebuild(const fs::path &folder)
+{
+    std::lock_guard lock(gPrebuild.mutex);
+    if (!gPrebuild.allowed || gPrebuild.started || gPrebuild.stopping || CacheRoot().empty()) return; // nothing to keep without a cache
+    const auto name = Lower(Utf8(folder.filename()));
+    if (name.size() != 5 || !name.starts_with("disc") || name[4] < '1' || name[4] > '4') return;
+    gPrebuild.started = true;
+    std::error_code ec;
+    // The next discs first, as the story goes; then the earlier ones.
+    std::vector<char> order;
+    for (char disc = char(name[4] + 1); disc <= '4'; ++disc) order.push_back(disc);
+    for (char disc = char(name[4] - 1); disc >= '1'; --disc) order.push_back(disc);
+    for (const char disc : order)
+    {
+        const auto other = (folder.parent_path() / (std::string("disc") + disc)).lexically_normal();
+        if (other == folder || gPrebuild.claimed.count(other) || gFolders.count(other)) continue;
+        bool index = false;
+        for (const auto &item : fs::directory_iterator(other, ec))
+            index = index || Lower(Utf8(item.path().filename())) == "lo.fpi";
+        if (index) gPrebuild.pending.push_back(other);
+    }
+    if (gPrebuild.pending.empty()) return;
+    LOG_NOTICE("[mods] {} other discs will be prepared in the background", gPrebuild.pending.size());
+    std::thread(PrebuildThread).detach();
+}
+
+// A build the game waits for: the background one stops (and waits for the
+// foreground to end); for the same folder it stops first, as both would write
+// its cache. While waiting, the window shows the stopped build's count.
+struct ForegroundBuild
+{
+    explicit ForegroundBuild(const fs::path &folder)
+    {
+        std::unique_lock lock(gPrebuild.mutex);
+        ++gPrebuild.foreground;
+        gPrebuild.claimed.insert(folder);
+        std::erase(gPrebuild.pending, folder);
+        if (gPrebuild.current.empty()) return;
+        gPrebuild.cancel = true;
+        if (gPrebuild.current != folder) return;
+        LOG_NOTICE("[mods] stopping the background preparation of {}: the game needs it now", Utf8(folder));
+        while (!gPrebuild.current.empty())
+        {
+            rebuild_progress::g_progress.store(gPrebuild.progress.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gPrebuild.changed.wait_for(lock, std::chrono::milliseconds(100));
+        }
+        rebuild_progress::Finish();
+    }
+    ~ForegroundBuild()
+    {
+        {
+            std::lock_guard lock(gPrebuild.mutex);
+            --gPrebuild.foreground;
+        }
+        gPrebuild.changed.notify_all();
+    }
+};
 } // namespace
 
 std::vector<Range> RangesFor(const fs::path &file)
@@ -806,7 +1039,12 @@ std::vector<Range> RangesFor(const fs::path &file)
     }
     const auto folder = file.parent_path().lexically_normal();
     auto it = gFolders.find(folder);
-    if (it == gFolders.end()) it = gFolders.emplace(folder, Build(folder)).first;
+    if (it == gFolders.end())
+    {
+        ForegroundBuild foreground(folder);
+        it = gFolders.emplace(folder, Build(folder)).first;
+    }
+    StartPrebuild(folder);
     const auto ranges = it->second.ranges.find(name);
     return ranges == it->second.ranges.end() ? std::vector<Range>{} : ranges->second;
 }
@@ -848,8 +1086,39 @@ bool Translates(const std::string &memberPath, const std::string &key)
     List();
     const auto text = gTexts.find(memberPath);
     if (text == gTexts.end()) return false;
+    std::lock_guard files(gFilesMutex);
     const auto *translation = Translation(text->second);
     return translation && translation->count(key);
+}
+
+void EnablePrebuild(std::chrono::seconds delay)
+{
+    const char *setting = std::getenv("LO_MODS_PREBUILD");
+#ifdef __ANDROID__
+    // Phones share memory and heat with the game: only when asked for.
+    const bool allowed = setting && std::string_view(setting) == "1";
+#else
+    const bool allowed = !setting || std::string_view(setting) != "0";
+#endif
+    std::lock_guard lock(gPrebuild.mutex);
+    gPrebuild.allowed = allowed;
+    gPrebuild.delay = delay;
+}
+
+void WaitForPrebuild()
+{
+    std::unique_lock lock(gPrebuild.mutex);
+    gPrebuild.changed.wait(lock, [] { return !gPrebuild.started || gPrebuild.stopping || (gPrebuild.pending.empty() && gPrebuild.current.empty()); });
+}
+
+void StopPrebuild()
+{
+    {
+        std::lock_guard lock(gPrebuild.mutex);
+        gPrebuild.stopping = true;
+        gPrebuild.cancel = true;
+    }
+    gPrebuild.changed.notify_all();
 }
 
 void SelectLanguagePack(const std::string &id)

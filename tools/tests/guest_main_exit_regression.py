@@ -54,6 +54,7 @@ static std::atomic<bool> idleExitChecked{false};
 static void Record(const char* event) { std::puts(event); }
 namespace os::shaderlog { void CloseForExit() { Record("shader_log_closed"); } }
 namespace host_ui { void RequestStop() { Record("pause_released"); } }
+namespace modding::text_overlay { void StopPrebuild() { Record("mods_prebuild_stopped"); } }
 struct Memory {
     uint32_t registers[0x3000]{};
     void* Translate(uint32_t address) { return &registers[(address - 0x7FC80000u) / 4]; }

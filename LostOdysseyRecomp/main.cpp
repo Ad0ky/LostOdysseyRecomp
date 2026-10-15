@@ -577,6 +577,7 @@ int main(int argc, char* argv[])
                    c.frameGenerationMultiplier, c.hdr, c.ambientOcclusion, c.shadowResolution, c.debugLog);
         const auto pack = settings::GameLanguagePack();
         modding::text_overlay::SelectLanguagePack(pack);
+        modding::text_overlay::EnablePrebuild();
         if (!pack.empty())
             LOG_NOTICE("settings: game language {} with language pack {}", settings::GameLanguage(), pack);
         else if (!c.gameLanguagePack.empty())

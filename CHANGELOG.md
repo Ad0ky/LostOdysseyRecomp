@@ -31,6 +31,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - When a sound frame cannot be decoded, the log now says why (#524).
 - Windows, Direct3D 12: with Settings → System → Debug log on, the log records what the graphics card was doing when it stops responding. It takes effect at the next launch and costs a few percent of GPU time (#524).
 - TAA and the upscalers (DLSS, FSR, XeSS) take less CPU and GPU time; in Uhra the frame rate is about 8% higher.
+- Model mods: while you play, the game prepares the other discs' mod files in the background, so a later disc switch takes seconds instead of a minute or two.
 
 ### 简体中文
 
@@ -57,6 +58,7 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - 声音帧无法解码时，日志会写明原因（#524）。
 - Windows Direct3D 12：打开“设置 → 系统 → 调试日志”后，显卡停止响应时日志会记下它当时在做什么。下次启动时生效，会多占几个百分点的 GPU 时间（#524）。
 - TAA 和超分（DLSS、FSR、XeSS）占用的 CPU 和 GPU 时间更少；在乌拉，帧率约提高 8%。
+- 模型 Mod：游戏运行时会在后台准备其他光盘的 Mod 文件，之后切换光盘只要几秒，不再等一两分钟。
 
 ## [v0.9.52](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.52) — 2026-10-14
 

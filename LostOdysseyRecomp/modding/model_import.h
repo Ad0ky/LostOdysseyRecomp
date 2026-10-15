@@ -1,5 +1,6 @@
 #pragma once
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <span>
@@ -49,7 +50,9 @@ struct Result
     VertexMaps vertexMaps;          // the static meshes replaced
 };
 // package: the decoded package bytes (no CPX); stem: its file name without extension.
-Result RebuildPackage(std::span<const uint8_t> package, const std::string &stem, const std::vector<Replacement> &replacements);
+// stop: when set, returns an empty result between replacements.
+Result RebuildPackage(std::span<const uint8_t> package, const std::string &stem, const std::vector<Replacement> &replacements,
+                      const std::atomic<bool> *stop = nullptr);
 
 // Whether a package has StaticMeshComponents, which may place a replaced mesh.
 bool PlacesStaticMeshes(std::span<const uint8_t> package);
@@ -58,5 +61,6 @@ bool PlacesStaticMeshes(std::span<const uint8_t> package);
 // per-vertex light maps and ShadowMap1D buffers rebuilt for the new vertices,
 // interpolated at each one's surface point. result.replaced counts the light
 // maps and buffers changed; the package is empty when none was.
-Result RemapLighting(std::span<const uint8_t> package, const std::string &stem, const VertexMaps &maps);
+Result RemapLighting(std::span<const uint8_t> package, const std::string &stem, const VertexMaps &maps,
+                     const std::atomic<bool> *stop = nullptr);
 }

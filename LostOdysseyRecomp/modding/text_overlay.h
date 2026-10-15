@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -46,6 +47,16 @@ std::filesystem::path OverflowArchive(const std::filesystem::path &file);
 // Whether a language pack has a translation for this key of this member
 // (for host text that replaces game text, such as the Quit to Desktop row).
 bool Translates(const std::string &memberPath, const std::string &key);
+
+// The runtime prepares the rebuilt files of the other discs in the background
+// after the first disc's (not on Android unless LO_MODS_PREBUILD=1;
+// LO_MODS_PREBUILD=0 turns it off). Call before the game opens its archives.
+void EnablePrebuild(std::chrono::seconds delay = std::chrono::seconds(30));
+// Until the background preparation has nothing left (tools and tests).
+void WaitForPrebuild();
+// Stops the background preparation (at exit). What it has not finished stays
+// out of the cache: a cache folder counts once its manifest is written.
+void StopPrebuild();
 
 // The selected language pack (mod_api.h LanguagePack id; empty for none). Its
 // files replace other mods' translations of the same files. Set before the
