@@ -31,6 +31,12 @@
 #include <string>
 #include <vector>
 
+// libnx's default native window (the one the swapchain was made for);
+// <switch.h> is not included here (its Mutex/Event typedefs collide).
+struct NWindow;
+extern "C" NWindow* nwindowGetDefault(void);
+extern "C" uint32_t nwindowSetSwapInterval(NWindow* window, uint32_t swapInterval);
+
 namespace
 {
 VkImageMemoryBarrier ImageBarrier(VkImage image, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess,
@@ -69,6 +75,27 @@ float EnvFloat(const char* name, float fallback)
 {
     const char* value = std::getenv(name);
     return value && *value ? std::strtof(value, nullptr) : fallback;
+}
+
+// LO_FRAMEGEN_LOCK=1: show every presented image for two refreshes. Each game
+// frame is then a generated + real pair over four refreshes: the game is held
+// to 15 fps and the screen gets an evenly paced 30 fps. Mesa's Switch WSI
+// queues buffers with the NWindow's swap interval, which it sets to 1 only
+// when a swapchain is created.
+bool LockRequested()
+{
+    static const bool requested = [] {
+        const char* value = std::getenv("LO_FRAMEGEN_LOCK");
+        return value && value[0] == '1';
+    }();
+    return requested;
+}
+
+void SetSwapInterval(uint32_t interval)
+{
+    NWindow* window = nwindowGetDefault();
+    const uint32_t result = window ? nwindowSetSwapInterval(window, interval) : 1;
+    if (result != 0) LOG_WARNING("framegen: setting swap interval {} failed ({:#x})", interval, result);
 }
 
 std::filesystem::path DataRoot()
@@ -131,10 +158,17 @@ public:
         for (size_t i = 0; i < slotCount; ++i) slots_.emplace_back(*vulkan_);
         LOG_NOTICE("framegen: LSFG ready {}x{} ({} swapchain images, flow scale {}, {} mode)", extent_.width,
                    extent_.height, images_.size(), flowScale, performance ? "performance" : "quality");
+        if (LockRequested())
+        {
+            SetSwapInterval(2);
+            locked_ = true;
+            LOG_NOTICE("framegen: locked to 15 game fps, 30 fps shown (swap interval 2)");
+        }
     }
 
     ~Runtime()
     {
+        if (locked_) SetSwapInterval(1);
         if (vulkan_ && vulkan_->df().DeviceWaitIdle) (void)vulkan_->df().DeviceWaitIdle(vulkan_->dev());
     }
 
@@ -269,6 +303,7 @@ private:
     std::array<bool, 2> sourceInitialized_{false, false};
     uint64_t realFrame_{};
     size_t slotCursor_{};
+    bool locked_{};
 };
 
 std::unique_ptr<Runtime> g_runtime;
