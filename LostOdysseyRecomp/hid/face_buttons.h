@@ -1,5 +1,8 @@
 #pragma once
 #include <SDL3/SDL.h>
+#include <cstdlib>
+#include <cstring>
+#include <os/platform.h>
 
 namespace hid::face_buttons
 {
@@ -7,8 +10,37 @@ namespace hid::face_buttons
 // SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS default); SDL3 reports position.
 // Keep the letter: the button labelled A confirms on every A/B/X/Y pad.
 // PlayStation shapes and non-face buttons keep their position.
+#if LO_PLATFORM_SWITCH
+// The console's own controllers (Joy-Con, Pro Controller, handheld) are not
+// reported as a Nintendo type by the libnx SDL backend, so their buttons kept
+// the Xbox position: the B button confirmed. Use the printed letters there too
+// (A right, B bottom, X top, Y left). LO_SWITCH_BUTTONS=position keeps the
+// positional layout.
+inline bool SwitchLetterLayout()
+{
+    static const bool letters = [] {
+        const char* value = std::getenv("LO_SWITCH_BUTTONS");
+        return !value || std::strcmp(value, "position") != 0;
+    }();
+    return letters;
+}
+#endif
+
 inline SDL_GamepadButton ByLabel(SDL_GamepadType type, SDL_GamepadButton button)
 {
+#if LO_PLATFORM_SWITCH
+    if (SwitchLetterLayout())
+    {
+        switch (button)
+        {
+        case SDL_GAMEPAD_BUTTON_EAST: return SDL_GAMEPAD_BUTTON_SOUTH;  // A
+        case SDL_GAMEPAD_BUTTON_SOUTH: return SDL_GAMEPAD_BUTTON_EAST;  // B
+        case SDL_GAMEPAD_BUTTON_NORTH: return SDL_GAMEPAD_BUTTON_WEST;  // X
+        case SDL_GAMEPAD_BUTTON_WEST: return SDL_GAMEPAD_BUTTON_NORTH;  // Y
+        default: return button;
+        }
+    }
+#endif
     switch (SDL_GetGamepadButtonLabelForType(type, button))
     {
     case SDL_GAMEPAD_BUTTON_LABEL_A: return SDL_GAMEPAD_BUTTON_SOUTH;

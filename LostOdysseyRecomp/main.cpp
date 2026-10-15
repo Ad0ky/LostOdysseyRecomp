@@ -15,6 +15,7 @@
 #include <apu/audio.h>
 #include <apu/xma.h>
 #include <hid/hid.h>
+#include <debug/map_info.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
 #include <os/detach_thread.h>
@@ -158,6 +159,9 @@ static settings::game_path::Resolution FindGameRoot(
 }
 
 void InstallPhysicalWatchpoint();
+void DumpGuestThreadStates();
+bool GuestWaitProfileEnabled();
+std::string TakeGuestWaitProfile(size_t top);
 
 static int RunGuest(uint32_t entry)
 {
@@ -188,6 +192,43 @@ static int RunGuest(uint32_t entry)
     }
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
+    // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
+    // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
+    // LO_LOAD_PROFILE=1 adds thread dumps at 8, 20, 45 and 90 s of a load.
+    if (FileSystem::ReadProfileEnabled() || GuestWaitProfileEnabled() || debug_menu::LoadProfileEnabled())
+    os::DetachThread(std::thread([] {
+        os::SetCurrentThreadName("IO Monitor");
+        uint64_t watchedLoad = 0;
+        int dumpsDone = 0;
+        static constexpr int kDumpAfterSeconds[] = { 8, 20, 45, 90 };
+        for (unsigned tick = 1;; ++tick)
+        {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            std::string what;
+            uint64_t startMs = 0;
+            if (debug_menu::LoadProfileEnabled() && debug_menu::CurrentLoad(what, startMs))
+            {
+                if (startMs != watchedLoad) { watchedLoad = startMs; dumpsDone = 0; }
+                const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+                const uint64_t seconds = nowMs > startMs ? (nowMs - startMs) / 1000 : 0;
+                if (dumpsDone < int(std::size(kDumpAfterSeconds)) && seconds >= uint64_t(kDumpAfterSeconds[dumpsDone]))
+                {
+                    ++dumpsDone;
+                    LOG_WARNING("slow load: {} still loading after {} s", what, seconds);
+                    DumpGuestThreadStates();
+                }
+            }
+            if (tick % 10)
+                continue;
+            if (FileSystem::ReadProfileEnabled())
+                if (const std::string reads = FileSystem::TakeReadStatistics(); !reads.empty())
+                    LOG_INFO("switch io: {}", reads);
+            if (GuestWaitProfileEnabled())
+                if (const std::string waits = TakeGuestWaitProfile(12); !waits.empty())
+                    LOG_INFO("guest waits (10 s, longest first):{}", waits);
+        }
+    }));
     // Memory over time: the console has no swap, and the GPU shares this RAM.
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("Memory Monitor");
@@ -390,7 +431,13 @@ int main(int argc, char* argv[])
     }
 #if LO_PLATFORM_SWITCH
     // One SD card line per guest file read and allocation: opt in (env.txt).
-    os::logger::g_kernelTrace = getenv("LO_KERNEL_TRACE") != nullptr;
+    // Quiet rather than just off, so the Debug log setting (SetDebugLog, also
+    // applied when settings load or save) keeps it off as well.
+    if (!getenv("LO_KERNEL_TRACE"))
+    {
+        os::logger::g_quietKernel = true;
+        os::logger::g_kernelTrace = false;
+    }
 #endif
 
     {

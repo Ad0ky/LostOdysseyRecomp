@@ -82,6 +82,7 @@ def harvest_program():
     locals_ = {
         "presentation": extract_expression(GPU / "presentation.cpp", None, r"const char \*source\s*=\s*"),
         "presentationUi": extract_expression(GPU / "presentation.cpp", None, r"const char \*uiSource\s*=\s*"),
+        "presentationOverlay": extract_expression(GPU / "presentation.cpp", None, r"const char \*overlaySource\s*=\s*"),
         "transferPs": extract_expression(GPU / "renderer.cpp", "void CompileTransferShader()", r"const char\* psSrc\s*=\s*"),
         "blitVs": extract_expression(GPU / "renderer.cpp", "void CompileBlitShaders()", r"const char\* vsSrc\s*=\s*"),
         "blitPs": extract_expression(GPU / "renderer.cpp", "void CompileBlitShaders()", r"const char\* psSrc\s*=\s*"),
@@ -121,6 +122,8 @@ def harvest_program():
         '    Emit(presentation, "gainPixel", "ps_6_0");',
         '    Emit(presentationUi, "vertexUi", "vs_6_0");',
         '    Emit(presentationUi, "pixelUi", "ps_6_0");',
+        '    Emit(presentationOverlay, "vertexOverlay", "vs_6_0");',
+        '    Emit(presentationOverlay, "pixelOverlay", "ps_6_0");',
         '    Emit(transferPs, "main", "ps_6_0");',
         '    Emit(blitVs, "main", "vs_6_0");',
         '    Emit(blitPs, "main", "ps_6_0");',

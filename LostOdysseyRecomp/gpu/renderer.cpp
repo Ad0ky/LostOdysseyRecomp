@@ -2074,9 +2074,15 @@ namespace gpu::renderer
                 for (auto& target : resolveTraceTargets)
                 {
                     if (target.address != address || ++target.seen != target.occurrence) continue;
+#if LO_PLATFORM_SWITCH
+                    const bool compactFloat = format == RenderFormat::R11G11B10_FLOAT;
+#else
+                    const bool compactFloat = false;
+#endif
                     const uint32_t bpp = format == RenderFormat::R8G8B8A8_UNORM ? 4 :
                         (format == RenderFormat::R16G16B16A16_FLOAT || format == RenderFormat::R32G32_FLOAT) ? 8 :
-                        (format == RenderFormat::R32_FLOAT || format == RenderFormat::R16G16_FLOAT) ? 4 :
+                        (format == RenderFormat::R32_FLOAT || format == RenderFormat::R16G16_FLOAT ||
+                         format == RenderFormat::R10G10B10A2_UNORM || compactFloat) ? 4 :
                         format == RenderFormat::R8_UNORM ? 1 : 0;
                     if (!bpp) continue;
                     const uint32_t pitch = (width * bpp + 255) & ~255u;
@@ -5414,9 +5420,15 @@ void main()
                 // Only host formats emitted by GetRenderTarget are accepted.
                 const auto color = static_cast<RenderFormat>(key.rtFormat);
                 const auto depth = static_cast<RenderFormat>(key.depthFormat);
+#if LO_PLATFORM_SWITCH
+                const bool compactFloat = color == RenderFormat::R11G11B10_FLOAT;
+#else
+                const bool compactFloat = false;
+#endif
                 const bool colorValid = color == RenderFormat::UNKNOWN || color == RenderFormat::R8G8B8A8_UNORM ||
                     color == RenderFormat::R16G16_FLOAT || color == RenderFormat::R16G16B16A16_FLOAT ||
-                    color == RenderFormat::R32_FLOAT || color == RenderFormat::R32G32_FLOAT;
+                    color == RenderFormat::R32_FLOAT || color == RenderFormat::R32G32_FLOAT ||
+                    color == RenderFormat::R10G10B10A2_UNORM || compactFloat;
                 return key.vs != 0 && key.prim <= 32 && colorValid &&
                     (depth == RenderFormat::UNKNOWN || depth == RenderFormat::D32_FLOAT_S8_UINT);
             }
@@ -7118,6 +7130,19 @@ void main()
                 }
                 if (it != cache.end() && !it->second.valid && !it->second.retry.Ready()) return nullptr;
                 if (it != cache.end() && it->second.valid) {
+                    // LO_SHADER_HLSL_DIR also covers shaders that came from the portable
+                    // pack (no HLSL was generated for them): translate once to write it.
+                    if (static const char* hlslDir = getenv("LO_SHADER_HLSL_DIR"); hlslDir && it->second.info.hlsl.empty()) {
+                        static std::unordered_set<uint64_t> written[2];
+                        static const bool directory = [] { std::error_code ec; std::filesystem::create_directories(getenv("LO_SHADER_HLSL_DIR"), ec); return true; }();
+                        (void)directory;
+                        if (written[pixel ? 1 : 0].insert(hash).second) {
+                            std::vector<uint32_t> swapped(count);
+                            for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
+                            std::ofstream(fmt::format("{}/{}_{:016x}.hlsl", hlslDir, pixel ? "ps" : "vs", hash))
+                                << xenos::TranslateShader(swapped.data(), count, pixel, uboConstants).hlsl;
+                        }
+                    }
                     if (!debugCaptureDir.empty() && it->second.valid && it->second.info.hlsl.empty()) {
                         std::vector<uint32_t> swapped(count);
                         for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
@@ -7372,11 +7397,30 @@ void main()
                 }
             }
 
-            // All classes live in FP16 host textures: an 8-bit or 10-bit unorm value is
-            // exact in half precision, and keeping one host format keeps resolves and
-            // framebuffers simple. Only the interpretation differs between classes.
+            // By default the 10-bit classes live in FP16 host textures: an 8-bit or
+            // 10-bit unorm value is exact in half precision, and one host format
+            // keeps resolves and framebuffers simple.
+            // LO_RT32=1 opts into 32-bit host formats for the two 10-bit classes, which
+            // halves their render target bandwidth (and blends at full rate on GPUs
+            // whose FP16x4 blending is half rate, such as the Switch's Maxwell).
+            // 2_10_10_10 stays exact in R10G10B10A2. On Switch, 7e3 goes to R11G11B10_FLOAT:
+            // the same [0, 31.875] range fits, with 6/6/5 mantissa bits instead of
+            // 7, and its 2-bit alpha is dropped (reads as 1).
+            static bool Rt32Enabled()
+            {
+                static const bool enabled = [] {
+                    const char* value = getenv("LO_RT32");
+                    return value && value[0] == '1' && value[1] == '\0';
+                }();
+                return enabled;
+            }
+
             static RenderFormat ClassHostFormat(uint32_t colorClass)
             {
+#if LO_PLATFORM_SWITCH
+                if (Rt32Enabled() && colorClass == kClass7e3) return RenderFormat::R11G11B10_FLOAT;
+#endif
+                if (Rt32Enabled() && colorClass == kClass2101010) return RenderFormat::R10G10B10A2_UNORM;
                 switch (colorClass)
                 {
                 case kClass16F2: return RenderFormat::R16G16_FLOAT;
@@ -8365,6 +8409,24 @@ void main()
                 for (uint32_t by = 0; by < levelBlocksY; by++)
                 {
                     uint8_t* dstRow = out + (size_t(f) * levelBlocksY + by) * outPitch;
+                    // Linear rows that need no format conversion are one copy plus an
+                    // in-place byte swap. The movie decoder rewrites its linear planes
+                    // every frame, so this is the per-frame cutscene upload path; the
+                    // block loop below cost ~35 ms per 720p frame on the Switch.
+                    if (!tiled && !fi.convertToRgba8)
+                    {
+                        const uint8_t* srcRow = levelSrc + size_t(f) * faceStride +
+                            (size_t(by + origin.y) * levelPitchBlocks + origin.x) * fi.bytesPerBlock;
+                        const size_t bytes = size_t(levelBlocksX) * fi.bytesPerBlock;
+                        memcpy(dstRow, srcRow, bytes);
+                        if (fi.bytesPerBlock >= 2 && (endian == 1 || (endian == 2 && fi.bytesPerBlock == 2)))
+                            for (size_t i = 0; i + 1 < bytes; i += 2) std::swap(dstRow[i], dstRow[i + 1]);
+                        else if (fi.bytesPerBlock >= 4 && endian == 2)
+                            for (size_t i = 0; i + 3 < bytes; i += 4) { std::swap(dstRow[i], dstRow[i + 3]); std::swap(dstRow[i + 1], dstRow[i + 2]); }
+                        else if (fi.bytesPerBlock >= 4 && endian == 3)
+                            for (size_t i = 0; i + 3 < bytes; i += 4) { std::swap(dstRow[i], dstRow[i + 2]); std::swap(dstRow[i + 1], dstRow[i + 3]); }
+                        continue;
+                    }
                     for (uint32_t bx = 0; bx < levelBlocksX; bx++)
                     {
                         const uint32_t sx = bx + origin.x, sy = by + origin.y;

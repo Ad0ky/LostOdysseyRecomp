@@ -36,6 +36,14 @@ namespace
 // stderr (fd 2) goes through this device: the file plus the network log.
 FILE* g_stderrFile = nullptr;
 devoptab_t g_stderrDevice{};
+AppletHookCookie g_operationModeHook{};
+std::atomic<bool> g_operationModeChanged{false};
+
+void OnAppletEvent(AppletHookType hook, void*)
+{
+    if (hook == AppletHookType_OnOperationMode)
+        g_operationModeChanged.store(true, std::memory_order_release);
+}
 
 ssize_t StderrWrite(struct _reent*, void*, const char* data, size_t size)
 {
@@ -318,6 +326,7 @@ void Initialize(const std::filesystem::path& dataRoot)
     appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
     appletSetAutoSleepDisabled(true);
     appletLockExit();
+    appletHook(&g_operationModeHook, OnAppletEvent, nullptr);
 }
 
 void AllowExit()
@@ -336,6 +345,11 @@ void ShowError(const std::string& summary, const std::string& details)
 bool IsDocked()
 {
     return appletGetOperationMode() == AppletOperationMode_Console;
+}
+
+bool TakeOperationModeChanged()
+{
+    return g_operationModeChanged.exchange(false, std::memory_order_acq_rel);
 }
 
 std::string MemorySummary()
@@ -364,9 +378,30 @@ std::string MemorySummary()
     return text;
 }
 
+uint32_t CurrentThreadHandle()
+{
+    return threadGetCurHandle();
+}
+
+uint32_t SetThreadIdealCore(uint32_t handle, int core)
+{
+    return svcSetThreadCoreMask(handle ? Handle(handle) : CUR_THREAD_HANDLE, core, 0x7);
+}
+
 void SetCurrentThreadPriority(int priority)
 {
-    svcSetThreadPriority(CUR_THREAD_HANDLE, u32(priority));
+    SetThreadPriority(0, priority);
+}
+
+int CurrentThreadPriority()
+{
+    s32 priority = -1;
+    return R_SUCCEEDED(svcGetThreadPriority(&priority, CUR_THREAD_HANDLE)) ? priority : -1;
+}
+
+uint32_t SetThreadPriority(uint32_t handle, int priority)
+{
+    return svcSetThreadPriority(handle ? Handle(handle) : CUR_THREAD_HANDLE, u32(priority));
 }
 
 void SetLoadingBoost(bool enabled)
