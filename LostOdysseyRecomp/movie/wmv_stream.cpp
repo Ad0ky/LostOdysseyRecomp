@@ -1,6 +1,7 @@
 // Built only with the WMV3 decoder (Switch; see thirdparty/ffmpeg.cmake).
 #if LO_HAS_WMV3_DECODER
 #include "wmv_stream.h"
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 
@@ -100,8 +101,10 @@ void WmvStream::Run()
                 std::memcpy(context->extradata, video.extradata.data(), video.extradata.size());
                 context->extradata_size = int(video.extradata.size());
             }
+            else
+                fail("out of memory");
         }
-        if (avcodec_open2(context, &ff_wmv3_decoder, nullptr) < 0)
+        if (LastError().empty() && avcodec_open2(context, &ff_wmv3_decoder, nullptr) < 0)
             fail("cannot open the WMV3 decoder");
     }
 
@@ -120,7 +123,20 @@ void WmvStream::Run()
         }
         if (!out) out = std::make_unique<VideoFrame>();
         const uint32_t w = uint32_t(frame->width), h = uint32_t(frame->height);
-        if (frame->format != AV_PIX_FMT_YUV420P || w != width_ || h != height_) return true; // skip odd frames
+        if (frame->format != AV_PIX_FMT_YUV420P || w != width_ || h != height_)
+        {
+            fail("unsupported decoded video format or size");
+            return false;
+        }
+        for (unsigned plane = 0; plane < 3; ++plane)
+        {
+            const int columns = int(plane == 0 ? w : w / 2);
+            if (!frame->data[plane] || (frame->linesize[plane] > -columns && frame->linesize[plane] < columns))
+            {
+                fail("invalid decoded video plane");
+                return false;
+            }
+        }
         out->width = w;
         out->height = h;
         const int64_t pts = frame->best_effort_timestamp != AV_NOPTS_VALUE ? frame->best_effort_timestamp : frame->pts;
@@ -129,11 +145,11 @@ void WmvStream::Run()
         out->u.resize(size_t(w / 2) * (h / 2));
         out->v.resize(size_t(w / 2) * (h / 2));
         for (uint32_t row = 0; row < h; ++row)
-            std::memcpy(out->y.data() + size_t(row) * w, frame->data[0] + size_t(row) * frame->linesize[0], w);
+            std::memcpy(out->y.data() + size_t(row) * w, frame->data[0] + ptrdiff_t(row) * frame->linesize[0], w);
         for (uint32_t row = 0; row < h / 2; ++row)
         {
-            std::memcpy(out->u.data() + size_t(row) * (w / 2), frame->data[1] + size_t(row) * frame->linesize[1], w / 2);
-            std::memcpy(out->v.data() + size_t(row) * (w / 2), frame->data[2] + size_t(row) * frame->linesize[2], w / 2);
+            std::memcpy(out->u.data() + size_t(row) * (w / 2), frame->data[1] + ptrdiff_t(row) * frame->linesize[1], w / 2);
+            std::memcpy(out->v.data() + size_t(row) * (w / 2), frame->data[2] + ptrdiff_t(row) * frame->linesize[2], w / 2);
         }
         {
             std::lock_guard lock(mutex_);
@@ -151,6 +167,11 @@ void WmvStream::Run()
             if (stop_) break;
         }
         const bool more = demux_.Next(input);
+        if (!more && !demux_.Error().empty())
+        {
+            fail(demux_.Error().c_str());
+            break;
+        }
         const auto start = std::chrono::steady_clock::now();
         int sent;
         if (more)
@@ -164,11 +185,21 @@ void WmvStream::Run()
         }
         else
             sent = avcodec_send_packet(context, nullptr); // drain
-        (void)sent; // a corrupt frame is skipped, like the console player does
+        if (sent < 0)
+        {
+            fail("cannot submit WMV3 packet");
+            break;
+        }
         for (;;)
         {
             const int received = avcodec_receive_frame(context, frame);
-            if (received < 0) break;
+            if (received == AVERROR(EAGAIN) || received == AVERROR_EOF) break;
+            if (received < 0)
+            {
+                fail("cannot decode WMV3 frame");
+                ok = false;
+                break;
+            }
             decodeNs_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
             ++decoded_;
             const bool kept = deliver();

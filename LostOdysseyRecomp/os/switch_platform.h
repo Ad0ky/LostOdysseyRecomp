@@ -24,6 +24,10 @@ namespace os::switch_platform
     // Docked (true) or handheld (false).
     bool IsDocked();
 
+    // The libnx operation-mode hook only records a notification. Consume it
+    // from the SDL event pump after appletMainLoop has processed the message.
+    bool TakeOperationModeChanged();
+
     // Process memory and thread usage, for failure logs ("used/total MiB ...").
     std::string MemorySummary();
 
@@ -36,6 +40,8 @@ namespace os::switch_platform
     // Horizon thread priority of the calling thread (0x2C is above the 0x3B
     // every pthread gets; lower numbers run first).
     void SetCurrentThreadPriority(int priority);
+    int CurrentThreadPriority(); // -1 if the priority cannot be read
+    uint32_t SetThreadPriority(uint32_t handle, int priority);
 
     // Kernel handle of the calling thread, and its ideal core (0-2; allowed
     // cores stay 0-2). handle 0 means the calling thread.

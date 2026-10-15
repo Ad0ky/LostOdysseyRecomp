@@ -192,27 +192,10 @@ static int RunGuest(uint32_t entry)
     }
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
-    // Docking changes the scene resolution (settings::Validate picks 540 in
-    // handheld mode, 720 docked): re-apply the settings when the mode changes.
-    os::DetachThread(std::thread([] {
-        os::SetCurrentThreadName("Dock Watch");
-        bool docked = os::switch_platform::IsDocked();
-        for (;;)
-        {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool now = os::switch_platform::IsDocked();
-            if (now == docked)
-                continue;
-            docked = now;
-            settings::PreviewConfig(settings::GetConfig());
-            LOG_NOTICE("switch: {} mode, scene at {}p", docked ? "docked" : "handheld",
-                       settings::GetConfig().internalResolution);
-        }
-    }));
-    // Game file reads every 10 s (only intervals with reads), to tell slow SD
-    // reads from other waits during loading screens. With LO_WAIT_PROFILE=1,
-    // also the guest's longest waits of each 10 s. A map or battle load still
-    // unfinished after 8, 20, 45 and 90 s prints what every guest thread waits on.
+    // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
+    // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
+    // LO_LOAD_PROFILE=1 adds thread dumps at 8, 20, 45 and 90 s of a load.
+    if (FileSystem::ReadProfileEnabled() || GuestWaitProfileEnabled() || debug_menu::LoadProfileEnabled())
     os::DetachThread(std::thread([] {
         os::SetCurrentThreadName("IO Monitor");
         uint64_t watchedLoad = 0;
@@ -223,7 +206,7 @@ static int RunGuest(uint32_t entry)
             std::this_thread::sleep_for(std::chrono::seconds(1));
             std::string what;
             uint64_t startMs = 0;
-            if (debug_menu::CurrentLoad(what, startMs))
+            if (debug_menu::LoadProfileEnabled() && debug_menu::CurrentLoad(what, startMs))
             {
                 if (startMs != watchedLoad) { watchedLoad = startMs; dumpsDone = 0; }
                 const uint64_t nowMs = uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -238,8 +221,9 @@ static int RunGuest(uint32_t entry)
             }
             if (tick % 10)
                 continue;
-            if (const std::string reads = FileSystem::TakeReadStatistics(); !reads.empty())
-                LOG_INFO("switch io: {}", reads);
+            if (FileSystem::ReadProfileEnabled())
+                if (const std::string reads = FileSystem::TakeReadStatistics(); !reads.empty())
+                    LOG_INFO("switch io: {}", reads);
             if (GuestWaitProfileEnabled())
                 if (const std::string waits = TakeGuestWaitProfile(12); !waits.empty())
                     LOG_INFO("guest waits (10 s, longest first):{}", waits);

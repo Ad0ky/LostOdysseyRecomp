@@ -13,10 +13,12 @@ Switch layer follows the Sonic Unleashed Switch ports
 > limit, and battles stay well below 30 fps. Expect crashes and missing
 > features.
 
-The Switch build keeps the Xbox 360 image: the game's 720p scene and its own
-effects (bloom, depth of field, motion blur, shadows). The PC additions are off
-and hidden in the Graphics menu: anti-aliasing, ambient occlusion, anisotropic
-filtering, render and shadow resolution, upscalers, frame generation and HDR.
+The Switch build keeps the Xbox 360 image and its own effects (bloom, depth of
+field, motion blur, shadows). The scene defaults to 540p in handheld mode and
+720p when docked; `LO_SWITCH_RENDER_HEIGHT` can force either mode. The PC
+additions are off and hidden in the Graphics menu: anti-aliasing, ambient
+occlusion, anisotropic filtering, render and shadow resolution, upscalers,
+frame generation and HDR.
 
 ## What you need
 
@@ -174,6 +176,22 @@ timestamps), `LO_GPU_DRAW_TIMING_EVERY=300` (GPU time of every group of four
 draws, every 300th frame), `LO_KERNEL_TRACE=1` (guest kernel calls such as file
 reads; off by default on the console).
 
+Switch-specific options and diagnostics:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `LO_SWITCH_RENDER_HEIGHT` | automatic | `540` or `720` forces the scene height; otherwise handheld uses 540 and docked uses 720 |
+| `LO_TRIM_VARYINGS` | `1` | Keeps only vertex outputs used by the paired fragment shader; set to `0` to disable the Switch Vulkan optimisation |
+| `LO_RT32` | off | Set to `1` to use 32-bit formats for the two 10-bit render-target classes; on Switch the 7e3 class uses `R11G11B10_FLOAT`, so its 2-bit alpha is read as 1 |
+| `LO_GUEST_AFFINITY` | off | Set to `1` to map Xbox guest thread affinity onto the Switch's three cores |
+| `LO_SWITCH_BUTTONS` | letter layout | Set to `position` to use the physical positional A/B/X/Y layout |
+| `LO_XAUDIO_WORKER_PRIORITY` | `0x2D` | Hex priority for Switch XAudio workers; `0` keeps the default `0x3B` |
+| `LO_NATIVE_MOVIES` | off | Set to `1` to opt into the experimental host WMV decoder; failures fall back to the guest decoder |
+| `LO_MOVIE_GUEST_VIDEO_PRIORITY` | `0x3F` | Hex priority for the guest video thread while native movies are active; `0` keeps the game's priority |
+| `LO_IO_PROFILE` | off | Set to `1` to log periodic game-file read statistics |
+| `LO_LOAD_PROFILE` | off | Set to `1` to log thread dumps during long scene or battle loads |
+| `LO_WAIT_PROFILE` | off | Set to `1` to log guest waits of at least 1 ms every 10 seconds |
+
 The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
 written at least once a second; warnings and errors are written at once.
 
@@ -212,15 +230,15 @@ Delete the file to turn sampling off. Per-thread CPU shares are logged every
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
 | Window, input, audio | devkitPro's SDL 3.4 fork (`thirdparty/SDL-switch`), built without EGL (`tools/patches/sdl-switch-no-egl.patch`) |
 | XMA audio | Xenia's FFmpeg fork with `thirdparty/ffmpeg-config/switch-aarch64` |
-| Graphics settings | `settings::Validate()` pins a 720p scene, 1x shadow maps and no AA, AO, anisotropic filtering, upscaling, frame generation or HDR; `GraphicsRowHidden()` hides those rows |
+| Graphics settings | `settings::Validate()` selects 540p handheld or 720p docked (override with `LO_SWITCH_RENDER_HEIGHT`), 1x shadow maps and no AA, AO, anisotropic filtering, upscaling, frame generation or HDR; `GraphicsRowHidden()` hides those rows |
 | Not on Switch | Updater, network downloads, importer, D3D12, DLSS/FSR/XeSS, frame generation, HDR |
 
 ## Known gaps
 
-- Slow: about 4 FPS in the opening battle in handheld mode, with 150 ms of GPU
-  time per frame. Candidates are vertex fetch through buffer device
-  addresses (the depth-only passes now cost the most), the occlusion queries,
-  and render pass breaks.
+- Slow: the opening battle remains well below 30 FPS in handheld mode. The
+  540p handheld default and Switch Vulkan shader optimisations are intended to
+  reduce GPU cost, but no complete hardware playthrough or performance
+  acceptance has been recorded yet.
 - No on-console importer: discs are copied from a PC.
 - Shaders missing from both the pack and the PC cache cannot be compiled on the
   console.

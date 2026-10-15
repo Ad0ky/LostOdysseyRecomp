@@ -2,6 +2,9 @@
 
 #include <kernel/xdm.h>
 #include <os/guest_code_thread.h>
+#if LO_PLATFORM_SWITCH
+#include <mutex>
+#endif
 
 #define CURRENT_THREAD_HANDLE uint32_t(-2)
 
@@ -32,10 +35,13 @@ struct GuestThreadHandle : KernelObject
         GuestThreadParams params;
         std::atomic<bool> suspended;
         kernel::wait::Event completion{true, false};
-        // Switch: the host thread's kernel handle (0 until it starts) and the
-        // ideal core asked for by KeSetAffinityThread before it started (-1: none).
-        std::atomic<uint32_t> hostHandle{0};
-        std::atomic<int> idealCore{-1};
+#if LO_PLATFORM_SWITCH
+        // Serialize publication of the host handle with affinity requests so
+        // one side always applies the most recent ideal core.
+        std::mutex affinityMutex;
+        uint32_t hostHandle = 0; // 0 until the host thread starts
+        int idealCore = -1; // -1 until KeSetAffinityThread requests one
+#endif
         explicit Control(const GuestThreadParams& p) : params(p), suspended((p.flags & 1) != 0) {}
     };
     std::shared_ptr<Control> control;

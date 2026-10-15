@@ -3075,6 +3075,13 @@ namespace gpu::video
             SDL_FlushEvents(SDL_EVENT_FIRST, SDL_EVENT_LAST);
             return;
         }
+#if LO_PLATFORM_SWITCH
+        if (os::switch_platform::TakeOperationModeChanged()) {
+            settings::PreviewConfig(settings::GetConfig());
+            LOG_NOTICE("switch: {} mode, scene at {}p", os::switch_platform::IsDocked() ? "docked" : "handheld",
+                       settings::GetConfig().internalResolution);
+        }
+#endif
         // Service close even during an outstanding FG window handshake. The
         // regular event loop below cannot run while that handshake is pending.
         PollDisplayRefresh();
