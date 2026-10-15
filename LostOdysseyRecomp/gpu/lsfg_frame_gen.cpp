@@ -95,6 +95,19 @@ public:
 
         float flowScale = EnvFloat("LO_FRAMEGEN_FLOW", 0.25f);
         if (!std::isfinite(flowScale) || flowScale < 0.125f || flowScale > 0.5f) flowScale = 0.25f;
+        // The flow chain halves the flow image twice and then builds five more
+        // levels from that (Beta1), so each flow dimension must be at least 125
+        // pixels or the smallest level is 0 pixels and image creation fails
+        // (NVK panics instead of returning an error). 720p handheld needs a flow
+        // scale of at least ~0.18; use 128 px for margin against rounding.
+        const float minFlowScale = 128.0f / static_cast<float>(std::min(extent_.width, extent_.height));
+        if (minFlowScale > 1.0f) throw std::runtime_error("swapchain too small for frame generation");
+        if (flowScale < minFlowScale)
+        {
+            LOG_WARNING("framegen: flow scale {} is too small for {}x{}; using {:.3f}", flowScale, extent_.width,
+                        extent_.height, minFlowScale);
+            flowScale = minFlowScale;
+        }
         const char* perfValue = std::getenv("LO_FRAMEGEN_PERF");
         const bool performance = !(perfValue && perfValue[0] == '0');
 

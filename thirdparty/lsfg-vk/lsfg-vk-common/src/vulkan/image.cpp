@@ -19,6 +19,10 @@ namespace {
             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
             bool external, const std::vector<uint32_t>& queueFamilyIndices) {
         VkImage handle{};
+        // A 0-pixel image is invalid; some drivers (NVK) panic on its view
+        // instead of failing, so reject it here where it can be handled.
+        if (extent.width == 0 || extent.height == 0)
+            throw ls::vulkan_error("image extent is 0 (flow scale too small for this resolution)");
         const bool concurrent = queueFamilyIndices.size() > 1;
 
         const VkExternalMemoryImageCreateInfo externalInfo{
