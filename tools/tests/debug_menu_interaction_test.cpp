@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -39,11 +40,15 @@ struct MockServices
     bool saveAnywhere = false;
     int partySwitchRequests = 0;
     settings::EncounterRate encounterRate = settings::EncounterRate::Normal;
+    int encounterRateSaveCalls = 0;
     bool battleExpDouble = false;
     bool everyStep = false;
     bool allowVictory = true;
     bool victoryRequested = false;
     bool victoryCancelled = false;
+    bool allowSoftReset = true;
+    int softResetRequests = 0;
+    const wchar_t* softResetRefusal = nullptr;
 
     bool allowTeleport = true;
     bool allowSavePos = true;
@@ -110,7 +115,12 @@ bool SaveAnywhereEnabled() { return g_mock.saveAnywhere; }
 void SetSaveAnywhereEnabled(bool enabled) { g_mock.saveAnywhere = enabled; }
 void RequestPartySwitch() { ++g_mock.partySwitchRequests; }
 settings::EncounterRate GetEncounterRate() { return g_mock.encounterRate; }
-void SetEncounterRate(settings::EncounterRate rate) { g_mock.encounterRate = rate; }
+void SetEncounterRate(settings::EncounterRate rate)
+{
+    g_mock.encounterRate = rate;
+    g_mock.everyStep = false;
+    ++g_mock.encounterRateSaveCalls;
+}
 bool BattleExpDoubleEnabled() { return g_mock.battleExpDouble; }
 void SetBattleExpDoubleEnabled(bool enabled) { g_mock.battleExpDouble = enabled; }
 bool EncounterEveryStepEnabled() { return g_mock.everyStep; }
@@ -164,6 +174,18 @@ bool RequestPoiTeleport(uint64_t)
     return true;
 }
 const wchar_t* RequestMapJump(const char*) { return nullptr; }
+
+namespace soft_reset
+{
+bool Request() { ++g_mock.softResetRequests; return g_mock.allowSoftReset; }
+const wchar_t* Status() { return L"Please wait for loading to finish"; }
+const wchar_t* TakeRefusal()
+{
+    const wchar_t* refusal = g_mock.softResetRefusal;
+    g_mock.softResetRefusal = nullptr;
+    return refusal;
+}
+}
 }
 
 int main()
@@ -210,13 +232,51 @@ int main()
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
     Require(g_mock.partySwitchRequests == 1, "Party switch was not requested");
 
-    // Row 4: Encounter Every Step toggles both ways
+    // Row 4: Return to title requires an explicit Yes; nested inputs stay modal.
     debug_menu::HandleInput(debug_menu::InputAction::Down);
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
-    Require(g_mock.everyStep, "Encounter every step was not enabled");
+    debug_menu::HandleInput(debug_menu::InputAction::NextTab);
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
-    Require(!g_mock.everyStep, "Encounter every step was not disabled");
+    Require(g_mock.softResetRequests == 0 && debug_menu::IsOverlayVisible(),
+        "Return to title must default to No and keep confirmation modal");
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    debug_menu::HandleInput(debug_menu::InputAction::Cancel);
+    Require(g_mock.softResetRequests == 0 && debug_menu::IsOverlayVisible() && host_ui::IsGamePaused(),
+        "Cancelling Return to title must retain the menu without submitting a reset");
+    g_mock.allowSoftReset = false;
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    Require(g_mock.softResetRequests == 1 && debug_menu::IsOverlayVisible() && host_ui::IsGamePaused(),
+        "Refused Return to title must retain the menu and pause");
+    g_mock.allowSoftReset = true;
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    Require(g_mock.softResetRequests == 2 && !debug_menu::IsOverlayVisible() && !host_ui::IsGamePaused(),
+        "Accepted Return to title must close the menu and resume guest execution");
+    debug_menu::PollResetNotice();
+    Require(!debug_menu::IsOverlayVisible() && !host_ui::IsGamePaused(),
+        "An empty reset notice must not reopen the menu");
+    g_mock.softResetRefusal = L"Please wait for saving to finish";
+    debug_menu::PollResetNotice();
+    Require(debug_menu::IsOverlayVisible() && host_ui::IsGamePaused() && !g_mock.softResetRefusal,
+        "A guest-thread refusal must be consumed and reopen the menu with the game paused");
+    debug_menu::PollResetNotice();
+    Require(debug_menu::IsOverlayVisible() && host_ui::IsGamePaused() && g_mock.softResetRequests == 2,
+        "Polling a consumed refusal must retain the menu without another reset request");
+    debug_menu::HandleInput(debug_menu::InputAction::NextTab);
+    debug_menu::HandleInput(debug_menu::InputAction::NextTab); // Cheats
+    g_mock.softResetRefusal = L"Please wait for loading to finish";
+    debug_menu::PollResetNotice();
+    Require(debug_menu::IsOverlayVisible() && host_ui::IsGamePaused() && !g_mock.softResetRefusal,
+        "A late refusal on Cheats must retain the paused menu and consume the notice");
+    Require(!g_mock.everyStep && g_mock.encounterRate == settings::EncounterRate::Normal && g_mock.saveAnywhere,
+        "Return to title changed the player's cheat options");
 
+    // Late refusal returns to Overview row 4, including from an already-open Cheats page.
     // Row 5: Win Battle (Success and Rejection)
     debug_menu::HandleInput(debug_menu::InputAction::Down);
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
@@ -353,9 +413,31 @@ int main()
     Require(std::wstring(debug_menu::translations::Poi(L"存档点 1", false)) == L"Save point 1", "POI translation to English");
     Require(std::wstring(debug_menu::translations::Poi(L"Save Point 1", true)) == L"存档点 1", "POI translation to Chinese");
 
+    for (const auto& notice : {
+        std::pair{L"Return to title unavailable", L"当前无法返回标题"},
+        std::pair{L"Not available during battle", L"战斗期间不可用"},
+        std::pair{L"Please wait for loading to finish", L"请等待读取完成"},
+        std::pair{L"Please wait for saving to finish", L"请等待保存完成"},
+        std::pair{L"Close the save/load screen first", L"先关闭存档/读档画面"},
+        std::pair{L"Already at the title screen", L"当前已在标题画面"},
+        std::pair{L"Returning to title", L"正在返回标题"}})
+    {
+        Require(std::wstring(debug_menu::translations::Text(notice.first, true)) == notice.second,
+            "Return to title notice lacks its Chinese translation");
+        for (bool zh : {false, true})
+            Require(rasterizer.MeasureWString(debug_menu::translations::Text(notice.first, zh)) <= 700,
+                "Return to title notice exceeds the Overview text width");
+    }
+
     // Live quick-tool options must fit their production text columns.
     for (bool zh : {false, true})
     {
+        for (const auto* key : {L"Return to title", L"Unsaved progress will be lost"})
+            Require(rasterizer.MeasureWString(debug_menu::translations::Text(key, zh)) <= 520,
+                "Return to title confirmation text exceeds the dialog width");
+        Require(rasterizer.MeasureWString(debug_menu::translations::Text(
+            L"Return to title after confirmation; unavailable in battle.", zh)) <= 700,
+            "Return to title help exceeds the Overview text width");
         for (const auto* label : {debug_menu::cheat_overlay::FastForwardAudioLabel[zh],
                                  debug_menu::cheat_overlay::EncounterRateLabel[zh],
                                  debug_menu::cheat_overlay::BattleExpLabel[zh],
@@ -408,9 +490,17 @@ int main()
     debug_menu::HandleInput(debug_menu::InputAction::Right);
     Require(g_mock.encounterRate==settings::EncounterRate::None, "Encounter rate did not select None");
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
-    Require(g_mock.encounterRate==settings::EncounterRate::Normal, "Encounter rate did not wrap to Normal");
+    Require(g_mock.everyStep && g_mock.encounterRate==settings::EncounterRate::None && g_mock.encounterRateSaveCalls==2,
+        "Every step must enable the session flag and preserve the saved None choice");
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    Require(!g_mock.everyStep && g_mock.encounterRate==settings::EncounterRate::Normal,
+        "Encounter rate did not wrap from Every step to Normal and disable Every step");
     debug_menu::HandleInput(debug_menu::InputAction::Left);
-    Require(g_mock.encounterRate==settings::EncounterRate::None, "Encounter rate did not wrap backwards");
+    Require(g_mock.everyStep && g_mock.encounterRate==settings::EncounterRate::Normal && g_mock.encounterRateSaveCalls==3,
+        "Backward wrap to Every step must preserve the saved Normal choice");
+    debug_menu::HandleInput(debug_menu::InputAction::Left);
+    Require(!g_mock.everyStep && g_mock.encounterRate==settings::EncounterRate::None,
+        "Left from Every step must select None and disable Every step");
     debug_menu::HandleInput(debug_menu::InputAction::Down);
     debug_menu::HandleInput(debug_menu::InputAction::Confirm);
     Require(g_mock.battleExpDouble && g_mock.encounterRate==settings::EncounterRate::None,
