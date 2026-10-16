@@ -34,9 +34,13 @@ PPC_FUNC(sub_822EBAA0)
 
 // The storage page also has a separate engine task; I/O and input keep the
 // original f1, with only its visual calls inside the scope accelerated.
-PPC_FUNC(sub_822ED938)
+// patches/save_menu_holds.cpp owns the sub_822ED938 hook and calls this.
+namespace debug_menu::menu_animations
 {
-    CampChildTick(ctx, base, debug_menu::menu_animations::SaveLoadMenu, __imp__sub_822ED938);
+void TickSaveLoadMenu(PPCContext& ctx, uint8_t* base)
+{
+    CampChildTick(ctx, base, SaveLoadMenu, __imp__sub_822ED938);
+}
 }
 
 // Only opening/closing the Dreams selector; interactive selection and the
