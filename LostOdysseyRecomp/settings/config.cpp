@@ -1,5 +1,6 @@
 #include "config.h"
 #include <debug/fast_forward.h>
+#include <atomic>
 #include <gpu/frame_rate.h>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@ namespace settings
 namespace
 {
 std::mutex mutex;
+std::atomic<uint32_t> menuAnimationRate{1};
 // One settings.ini line: no line breaks, bounded like the adapter/display names it stores.
 std::string TextValue(std::string text)
 {
@@ -99,6 +101,8 @@ Config Validate(Config value)
     namespace ff = debug_menu::fast_forward;
     if (std::find(std::begin(ff::Rates), std::end(ff::Rates), value.fastForwardRate) == std::end(ff::Rates))
         value.fastForwardRate = 2;
+    if (std::find(std::begin(MenuAnimationRates), std::end(MenuAnimationRates), value.menuAnimationRate) == std::end(MenuAnimationRates))
+        value.menuAnimationRate = 1;
     if (value.uiLanguage > 4)
         value.uiLanguage = 0;
     if (GameLanguageIds[GameLanguageIndex(value.gameLanguage)] != value.gameLanguage)
@@ -315,6 +319,8 @@ Config Read()
             value.fastForwardMode = number;
         else if (key == "fast_forward_rate")
             value.fastForwardRate = number;
+        else if (key == "menu_animation_rate")
+            value.menuAnimationRate = number;
         else if (key == "audio_output")
             value.audioOutput = number;
         else if (key == "audio_matrix_rear")
@@ -345,7 +351,11 @@ Config Read()
 }
 Config &Current()
 {
-    static Config config = Read();
+    static Config config = [] {
+        auto value = Read();
+        menuAnimationRate.store(value.menuAnimationRate, std::memory_order_relaxed);
+        return value;
+    }();
     return config;
 }
 // Debug-menu choices are saved on their own, never through a graphics save.
@@ -403,6 +413,7 @@ void PreviewConfig(const Config &value)
     merged.encounterRate = Current().encounterRate;
     merged.battleExpDouble = Current().battleExpDouble;
     CopyFastForward(merged, Current());
+    merged.menuAnimationRate = Current().menuAnimationRate;
     merged.audioOutput = Current().audioOutput;
     Current() = merged;
 }
@@ -488,7 +499,8 @@ static bool WriteConfig(const Config &value)
            << "\nbattle_exp_double=" << (value.battleExpDouble ? 1 : 0)
            << "\nfast_forward=" << (value.fastForward ? 1 : 0)
            << "\nfast_forward_mode=" << value.fastForwardMode
-           << "\nfast_forward_rate=" << value.fastForwardRate << '\n';
+           << "\nfast_forward_rate=" << value.fastForwardRate
+           << "\nmenu_animation_rate=" << value.menuAnimationRate << '\n';
     output.flush();
     if (!output)
         return false;
@@ -516,6 +528,7 @@ bool SaveConfig(const Config &requested)
     value.encounterRate = Current().encounterRate;
     value.battleExpDouble = Current().battleExpDouble;
     CopyFastForward(value, Current());
+    value.menuAnimationRate = Current().menuAnimationRate;
     value.audioOutput = Current().audioOutput;
     if (!WriteConfig(value)) return false;
     Current() = value;
@@ -605,5 +618,22 @@ bool SaveFastForward(bool enabled, uint32_t mode, uint32_t rate)
     if (!WriteConfig(persisted)) return false;
     CopyFastForward(Current(), persisted);
     return true;
+}
+bool SaveMenuAnimationRate(uint32_t rate)
+{
+    std::lock_guard lock(mutex);
+    // Keep unconfirmed graphics previews out of this debug-only save.
+    auto persisted = Read();
+    persisted.menuAnimationRate = rate;
+    persisted = Validate(persisted);
+    if (!WriteConfig(persisted)) return false;
+    Current().menuAnimationRate = persisted.menuAnimationRate;
+    menuAnimationRate.store(persisted.menuAnimationRate, std::memory_order_relaxed);
+    return true;
+}
+uint32_t MenuAnimationRate()
+{
+    Current(); // Initialize the persisted choice once before reading its atomic mirror.
+    return menuAnimationRate.load(std::memory_order_relaxed);
 }
 } // namespace settings

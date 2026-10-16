@@ -12,6 +12,7 @@
 #include "encounter_rate.h"
 namespace settings
 {
+inline constexpr uint32_t MenuAnimationRates[] = {1, 2, 4};
 // Persisted 2 (the removed exclusive fullscreen) loads as Borderless.
 enum class WindowMode : uint32_t
 {
@@ -185,6 +186,7 @@ struct Config
     bool fastForward = false;
     uint32_t fastForwardMode = 0;
     uint32_t fastForwardRate = 2;
+    uint32_t menuAnimationRate = 1; // Debug-only camp-menu transitions: 1 Normal, 2 Fast, 4 Faster.
     bool operator==(const Config &) const = default;
 };
 Config GetConfig();
@@ -196,6 +198,9 @@ bool SaveSaveAnywhere(bool enabled);
 bool SaveEncounterRate(EncounterRate rate);
 bool SaveBattleExpDouble(bool enabled);
 bool SaveFastForward(bool enabled, uint32_t mode, uint32_t rate);
+bool SaveMenuAnimationRate(uint32_t rate);
+// Cheap, thread-safe read for the camp-menu tween hook.
+uint32_t MenuAnimationRate();
 bool SaveAudioOutput(uint32_t output);
 // The player moved the window to another display (Win+Shift+arrow, dragging):
 // saves only the display choice, merged with the persisted settings.

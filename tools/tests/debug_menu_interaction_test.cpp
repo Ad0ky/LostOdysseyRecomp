@@ -29,6 +29,9 @@ struct MockServices
 {
     uint32_t selectedLanguage = 1;
     bool saveLanguageSuccess = true;
+    uint32_t menuAnimationRate = 1;
+    bool saveMenuAnimationSuccess = true;
+    int menuAnimationSaveCalls = 0;
     bool captureRequested = false;
     bool saveAnywhere = false;
     int partySwitchRequests = 0;
@@ -62,6 +65,7 @@ Config GetConfig()
 {
     Config c;
     c.debugLanguage = g_mock.selectedLanguage;
+    c.menuAnimationRate = g_mock.menuAnimationRate;
     return c;
 }
 bool SaveDebugLanguage(uint32_t language)
@@ -71,6 +75,13 @@ bool SaveDebugLanguage(uint32_t language)
     return true;
 }
 bool SaveFastForward(bool, uint32_t, uint32_t) { return true; }
+bool SaveMenuAnimationRate(uint32_t rate)
+{
+    ++g_mock.menuAnimationSaveCalls;
+    if (!g_mock.saveMenuAnimationSuccess) return false;
+    g_mock.menuAnimationRate = rate;
+    return true;
+}
 }
 
 namespace gpu::renderer
@@ -332,6 +343,32 @@ int main()
     Require(std::wstring(debug_menu::translations::Poi(L"存档点 1", false)) == L"Save point 1", "POI translation to English");
     Require(std::wstring(debug_menu::translations::Poi(L"Save Point 1", true)) == L"存档点 1", "POI translation to Chinese");
 
+    // All three live quick-tool options must fit their production text columns.
+    for (bool zh : {false, true})
+    {
+        for (const auto* label : {debug_menu::cheat_overlay::EncounterRateLabel[zh],
+                                 debug_menu::cheat_overlay::BattleExpLabel[zh],
+                                 debug_menu::cheat_overlay::MenuAnimationLabel[zh]})
+            Require(rasterizer.MeasureWString(label) <= 170,
+                "Quick-tool label exceeds the Cheats label column");
+        for (const auto& rate : debug_menu::cheat_overlay::EncounterRateValues)
+            Require(rasterizer.MeasureWString(rate[zh]) <= 350,
+                "Encounter rate value exceeds the Cheats value column");
+        for (const auto* value : {L"ON", L"OFF"})
+            Require(rasterizer.MeasureWString(value) <= 350,
+                "Battle EXP value exceeds the Cheats value column");
+        const std::wstring help = debug_menu::cheat_overlay::MenuAnimationHelp[zh];
+        Require(help.find(L'\n') == std::wstring::npos && rasterizer.MeasureWString(help) <= 700,
+            "Menu animations help must fit one complete line");
+        for (const auto rate : settings::MenuAnimationRates)
+            Require(rasterizer.MeasureWString(debug_menu::cheat_overlay::MenuAnimationValue(rate, zh)) <= 350,
+                "Menu animations value exceeds the Cheats value column");
+    }
+    const debug_menu::cheat_overlay::Model quickTools;
+    Require(quickTools.Rows() == 11 &&
+            (int(quickTools.Rows()) - 1) * debug_menu::cheat_overlay::QuickToolRowHeight + 24 <= 296,
+        "Quick-tool rows overlap the help area");
+
     // Cheats -> Quick tools: the independent live options need no memory-edit
     // confirmation and remain usable before a playable field has loaded.
     Require(!debug_menu::cheats::session.Get().enabled, "Memory edits unexpectedly enabled");
@@ -355,9 +392,36 @@ int main()
     Require(!debug_menu::cheats::session.Get().enabled, "Quick options enabled memory edits");
     debug_menu::RenderOverlay(rasterizer);
 
+    // Cheats / Quick tools / Menu animations: forward/backward cycling persists each choice.
+    debug_menu::HandleInput(debug_menu::InputAction::Down); // Row 6: Menu animations
+    Require(g_mock.menuAnimationRate == 1, "Menu animation speed should initially be Normal");
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    Require(g_mock.menuAnimationRate == 2, "Confirm should select and save Fast");
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    Require(g_mock.menuAnimationRate == 4, "Right should select and save Faster");
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    Require(g_mock.menuAnimationRate == 1, "Right should wrap back to Normal");
+    debug_menu::HandleInput(debug_menu::InputAction::Left);
+    Require(g_mock.menuAnimationRate == 4 && g_mock.menuAnimationSaveCalls == 4,
+        "Left should wrap to Faster and persist once per change");
+    debug_menu::HandleInput(debug_menu::InputAction::Cancel);
+    debug_menu::ToggleOverlay();
+    debug_menu::HandleInput(debug_menu::InputAction::Confirm);
+    Require(g_mock.menuAnimationRate == 1, "Reopening the debug menu must restore its persisted animation speed");
+    g_mock.saveMenuAnimationSuccess = false;
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    Require(g_mock.menuAnimationRate == 1, "Failed animation save must preserve the persisted choice");
+    g_mock.saveMenuAnimationSuccess = true;
+    debug_menu::HandleInput(debug_menu::InputAction::Right);
+    Require(g_mock.menuAnimationRate == 2, "Failed animation save must restore the row's previous choice");
+    Require(g_mock.encounterRate == settings::EncounterRate::None && !g_mock.battleExpDouble &&
+            !debug_menu::cheats::session.Get().enabled,
+        "Menu animation changes affected another quick-tool option or enabled memory edits");
+    debug_menu::RenderOverlay(rasterizer);
+
     // Both debug-menu languages must show the complete two-line help at the
     // production 700px content width, without an ellipsis or discarded text.
-    for(bool zh : {false,true}) for(unsigned row : {4u,5u}) {
+    for(bool zh : {false,true}) for(unsigned row : {4u,5u,6u}) {
         std::wstring remaining=debug_menu::cheat_overlay::QuickToolHelp(row,zh);
         Require(!remaining.empty(), "Quick-tool help is missing a language");
         for(int line=0;!remaining.empty() && line<2;++line) {
