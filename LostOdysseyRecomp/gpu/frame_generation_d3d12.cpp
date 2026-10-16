@@ -1,5 +1,6 @@
 #include "frame_generation_d3d12.h"
 #if defined(_WIN32) && defined(LO_ENABLE_D3D12_FG)
+#include "d3d12_dred.h"
 #include <os/logger.h>
 #include <cstdlib>
 #include <cstdio>
@@ -23,7 +24,11 @@ D3D12Bridge::~D3D12Bridge() { Shutdown(); }
 void D3D12Bridge::Require(bool success, const std::string& reason) {
     if (success) return;
     LOG_ERROR("D3D12 FG: {}; terminating without releasing uncertain GPU ownership", reason);
-    std::fflush(nullptr); std::_Exit(EXIT_FAILURE);
+    gpu::dred::LogRemovedDevice(device_ ? device_->d3d : nullptr);
+    std::fflush(nullptr);
+    // Not ExitProcess: DLL detach in the driver and Streamline can hang after a device loss.
+    TerminateProcess(GetCurrentProcess(), EXIT_FAILURE);
+    std::_Exit(EXIT_FAILURE);
 }
 bool D3D12Bridge::Initialize(plume::D3D12Device& device, const framegen::Config& config,
     const std::filesystem::path& runtime, std::string& reason) {
@@ -66,8 +71,8 @@ void D3D12Bridge::PrepareAfterHostDrain(const CompositeHandoff& handoff,
     std::string reason;
     Require(!recording_, "prepare overlaps previous command recording");
     const bool drained = session_->Drain(reason); Require(drained, reason);
-    // video already waited the ordinary present fence; Drain additionally
-    // establishes completion of SDK-owned asynchronous input reads.
+    // video already waited the ordinary present fence; Drain checks the FG
+    // fence signaled after the previous accepted present.
     depth_->ReleaseAfterInputDrain();
     const auto reject = [&] {
         const bool off = session_->Disable(reason); Require(off, reason);

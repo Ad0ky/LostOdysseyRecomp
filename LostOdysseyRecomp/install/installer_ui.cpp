@@ -208,8 +208,9 @@ struct UIState : InstallerSessionState
 } // namespace
 
 InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory,
-                                const std::filesystem::path& initialSource,
-                                const std::filesystem::path& initialDest)
+                                const std::vector<std::filesystem::path>& sources,
+                                const std::filesystem::path& initialDest,
+                                const std::string& notice)
 {
     InstallerResult result;
 
@@ -367,7 +368,8 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
     }
 #endif
 
-    std::filesystem::path startSource = initialSource;
+    // Back from the review of picked sources browses their folder.
+    std::filesystem::path startSource = sources.empty() ? std::filesystem::path() : sources.front().parent_path();
     if (startSource.empty() || !std::filesystem::exists(startSource))
     {
         startSource = ui::DefaultSourceDirectory();
@@ -395,21 +397,22 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
 
     std::thread workerThread;
 
-    auto startScan = [&](const std::filesystem::path& srcPath) {
-        if (state.isScanning.load()) return;
+    auto startScan = [&](const std::vector<std::filesystem::path>& srcPaths) {
+        if (state.isScanning.load() || srcPaths.empty()) return;
         state.isScanning = true;
         state.cancelRequested = false;
-        state.selectedSource = srcPath;
+        // Several picked disc images share a folder; the review names that.
+        state.selectedSource = srcPaths.size() == 1 ? srcPaths.front() : srcPaths.front().parent_path();
         state.BeginScan();
 
         if (workerThread.joinable()) workerThread.join();
 
-        workerThread = std::thread([&state, srcPath]() {
+        workerThread = std::thread([&state, srcPaths]() {
             UIState::WorkerEvent event;
             try
             {
                 event.type = UIState::WorkerEvent::Type::ScanFinished;
-                event.scan = ScanContent(srcPath, [&state] { return state.cancelRequested.load(); });
+                event.scan = ScanContent(srcPaths, [&state] { return state.cancelRequested.load(); });
             }
             catch (const Error& err)
             {
@@ -691,6 +694,21 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
         }
     };
 
+    auto handleSelectCurrent = [&]() {
+        if (state.isScanning.load() || state.isImporting.load()) return;
+        if (state.screen == ScreenState::BrowseSource)
+        {
+            startScan({state.currentSourceBrowse});
+            state.screen = ScreenState::ReviewDiscs;
+            state.reviewSelectedIndex = ReviewActionStart(state.scanResult);
+        }
+        else if (state.screen == ScreenState::BrowseDest)
+        {
+            state.selectedDest = state.currentDestBrowse;
+            state.screen = ScreenState::ReviewDiscs;
+        }
+    };
+
     auto handleAction = [&]() {
         if (state.isScanning.load() || state.isImporting.load()) return;
         if (state.screen == ScreenState::BrowseSource)
@@ -715,6 +733,11 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
                         auto can = std::filesystem::canonical(item.path, ec);
                         state.currentSourceBrowse = ec ? item.path : can;
                         refreshSourceList();
+                    }
+                    else
+                    {
+                        // Opening a disc image selects the folder that holds it, with the other discs.
+                        handleSelectCurrent();
                     }
                 }
             }
@@ -775,21 +798,6 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
         }
     };
 
-    auto handleSelectCurrent = [&]() {
-        if (state.isScanning.load() || state.isImporting.load()) return;
-        if (state.screen == ScreenState::BrowseSource)
-        {
-            startScan(state.currentSourceBrowse);
-            state.screen = ScreenState::ReviewDiscs;
-            state.reviewSelectedIndex = ReviewActionStart(state.scanResult);
-        }
-        else if (state.screen == ScreenState::BrowseDest)
-        {
-            state.selectedDest = state.currentDestBrowse;
-            state.screen = ScreenState::ReviewDiscs;
-        }
-    };
-
     auto handleCancel = [&]() {
         if (state.isScanning.load())
         {
@@ -820,6 +828,13 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
             state.quit = true;
         }
     };
+
+    if (!sources.empty())
+    {
+        startScan(sources);
+        state.screen = ScreenState::ReviewDiscs;
+        state.reviewSelectedIndex = ReviewActionStart(state.scanResult);
+    }
 
     ui::StickNavigation stickNavigation;
 #if defined(__ANDROID__)
@@ -1228,7 +1243,10 @@ InstallerResult ShowInstallerUI(const std::filesystem::path& executableDirectory
             // Header: Lost Odyssey Steel Bar
             DrawBevelPanel(renderer, 0, 0, w, 70, COLOR_STEEL_PANEL);
             ui::DrawString(renderer, 28, 16, "LOST ODYSSEY RECOMP", COLOR_ACCENT_GOLD.r, COLOR_ACCENT_GOLD.g, COLOR_ACCENT_GOLD.b, 255, 1.25f);
-            ui::DrawString(renderer, 28, 42, "Content Importer - Disc & Extracted Folder Setup", COLOR_GOLD_MUTED.r, COLOR_GOLD_MUTED.g, COLOR_GOLD_MUTED.b, 255, 0.9f);
+            if (notice.empty())
+                ui::DrawString(renderer, 28, 42, "Content Importer - Disc & Extracted Folder Setup", COLOR_GOLD_MUTED.r, COLOR_GOLD_MUTED.g, COLOR_GOLD_MUTED.b, 255, 0.9f);
+            else
+                ui::DrawString(renderer, 28, 42, ui::TruncateTextWidth(notice, w - 56, 0.9f), COLOR_RED.r, COLOR_RED.g, COLOR_RED.b, 255, 0.9f);
 
         // Footer / Controller & Keyboard Prompts Bar
         int footerH = 68;

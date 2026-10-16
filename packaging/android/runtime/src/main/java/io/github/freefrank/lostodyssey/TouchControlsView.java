@@ -426,7 +426,7 @@ final class TouchControlsView extends View {
         ctrlAutoHide.setChecked(ctrl.enabled());
         content.addView(ctrlAutoHide);
 
-        // Qualcomm devices: open the GPU driver page (download / switch Turnip).
+        // Qualcomm and Mali devices: open the GPU driver page (download / switch Turnip or PanVK).
         Button driverButton = null;
         if (GpuDriverStore.supported()) {
             driverButton = new Button(activity);
@@ -437,7 +437,7 @@ final class TouchControlsView extends View {
             content.addView(driverButton);
         }
         Button savesButton = new Button(activity);
-        savesButton.setText("Saves: export / import …");
+        savesButton.setText("Saves and logs: export / import …");
         savesButton.setAllCaps(false);
         content.addView(savesButton);
         Button folderButton = new Button(activity);

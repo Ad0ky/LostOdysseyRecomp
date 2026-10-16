@@ -71,7 +71,9 @@ int main()
     Require(!settings::restart::Required(before, after), "unchanged config requires restart");
     after.width = 1920;
     Require(!settings::restart::Required(before, after), "live display change requires restart");
-    after.graphicsBackend = settings::GraphicsBackend::Vulkan;
+    // The default backend is Vulkan; switch to the other one.
+    after.graphicsBackend = before.graphicsBackend == settings::GraphicsBackend::Vulkan ?
+        settings::GraphicsBackend::D3D12 : settings::GraphicsBackend::Vulkan;
     Require(settings::restart::Required(before, after), "backend change did not require restart");
     after = before;
     after.gameLanguage = 2;
@@ -111,6 +113,12 @@ int main()
     after.hdrPeakAutomatic = false;
     Require(!settings::restart::Required(before, after), "HDR peak mode changes live");
     before = after;
+    before.frameGenerationProvider = after.frameGenerationProvider = framegen::Provider::Dlss;
+    before.frameGenerationMultiplier = 2;
+    after.frameGenerationMultiplier = 3;
+    Require(!settings::restart::Required(before, after), "FG multiplier change with active HDR applies live");
+    before = after;
+    before.frameGenerationProvider = framegen::Provider::Off;
     after.frameGenerationProvider = framegen::Provider::Fsr;
     Require(settings::restart::Required(before, after), "FG change with active HDR requires restart");
     settings::restart::RequestInstall();

@@ -82,6 +82,35 @@ inline uint32_t RenderResolutionChoice(const Config& config)
         if (RenderResolutions[i] == config.internalResolution) return i;
     return 0;
 }
+// Graphics preset: a shortcut for the rows it sets, shown as the preset those
+// rows match (Custom otherwise). Nothing of its own is saved. Both render the
+// original 720p at 30 FPS; Low-end also turns off the game's costliest effects
+// for weak hardware, Original keeps their retail state.
+enum class Preset : uint32_t { Original, LowEnd, Custom };
+inline constexpr uint32_t PresetChoiceCount = 2; // Custom is shown, never chosen
+inline void ApplyPreset(Config& config, Preset preset)
+{
+    const bool low = preset == Preset::LowEnd;
+#if !LO_PLATFORM_SWITCH // the Switch picks its scene height (settings::Validate)
+    config.internalResolution = 720;
+#endif
+    config.frameRate = 30;
+    config.dynamicShadows = !low;
+    config.motionBlur = !low;
+    config.depthOfFieldPercent = low ? 0 : 100;
+    config.bloom = !low;
+    config.scalingQuality = low ? 0 : 1; // Standard (bilinear) or High (bicubic)
+}
+inline Preset PresetOf(const Config& config)
+{
+    for (const Preset preset : {Preset::Original, Preset::LowEnd})
+    {
+        Config applied = config;
+        ApplyPreset(applied, preset);
+        if (applied == config) return preset;
+    }
+    return Preset::Custom;
+}
 inline constexpr uint32_t ShadowResolutions[] = {1, 2, 4};
 inline uint32_t ShadowResolutionChoice(const Config& config)
 {
@@ -91,21 +120,31 @@ inline uint32_t ShadowResolutionChoice(const Config& config)
 }
 inline bool IsAction(int tab, int row)
 {
-    return (tab == 0 && (row == GameRestoreRow || row == GameMainMenuRow)) ||
-           (tab == 2 && (row == int(GraphicsRow::Brightness) || row == int(GraphicsRow::Save))) ||
-           (tab == 3 && (row == SystemModsRow || row == SystemImportRow || row == SystemSaveRow));
+    return (tab == 0 && (row == GameControlsRow || row == GameRestoreRow || row == GameMainMenuRow)) ||
+           (tab == 2 && (row == int(GraphicsRow::NeuralRenderingTuning) || row == int(GraphicsRow::HdrCalibration) ||
+                         row == int(GraphicsRow::Brightness) || row == int(GraphicsRow::Save))) ||
+           (tab == 3 && (row == SystemAchievementsRow || row == SystemModsRow || row == SystemImportRow || row == SystemShaderBundleRow ||
+                         row == SystemSaveRow));
 }
 static_assert(int(GraphicsRow::DlssQuality) + 1 == int(GraphicsRow::DlssModel));
 static_assert(int(GraphicsRow::DlssModel) + 1 == int(GraphicsRow::FsrSharpness));
+// The preset opens the rendering group, after the display rows.
+static_assert(int(GraphicsRow::OutputResolution) + 1 == int(GraphicsRow::Preset));
+static_assert(int(GraphicsRow::Preset) + 1 == int(GraphicsRow::RenderResolution));
 static_assert(int(GraphicsRow::RenderResolution) + 1 == int(GraphicsRow::ShadowResolution));
 static_assert(int(GraphicsRow::ShadowResolution) + 1 == int(GraphicsRow::DynamicShadows));
 // Upscaling, neural rendering and frame generation stay one group.
 static_assert(int(GraphicsRow::AntiAliasing) + 1 == int(GraphicsRow::DlssQuality));
 static_assert(int(GraphicsRow::FsrSharpness) + 1 == int(GraphicsRow::DlssNeuralRendering));
-static_assert(int(GraphicsRow::DlssNeuralRendering) + 1 == int(GraphicsRow::FrameGeneration));
+static_assert(int(GraphicsRow::DlssNeuralRendering) + 1 == int(GraphicsRow::NeuralRenderingTuning));
+static_assert(int(GraphicsRow::NeuralRenderingTuning) + 1 == int(GraphicsRow::FrameGeneration));
 static_assert(int(GraphicsRow::FrameGeneration) + 1 == int(GraphicsRow::FrameGenerationMultiplier));
 static_assert(int(GraphicsRow::FrameGenerationMultiplier) + 1 == int(GraphicsRow::AmbientOcclusion));
 static_assert(int(GraphicsRow::AmbientOcclusion) + 1 == int(GraphicsRow::AnisotropicFiltering));
 static_assert(int(GraphicsRow::FrameRate) + 1 == int(GraphicsRow::VariableRefreshRate));
+static_assert(int(GraphicsRow::VariableRefreshRate) + 1 == int(GraphicsRow::PerformanceOverlay));
+// Each sub-page entry sits right under its setting.
+static_assert(int(GraphicsRow::HdrPeak) + 1 == int(GraphicsRow::HdrCalibration));
+static_assert(int(GraphicsRow::HdrCalibration) + 1 == int(GraphicsRow::Brightness));
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
 }

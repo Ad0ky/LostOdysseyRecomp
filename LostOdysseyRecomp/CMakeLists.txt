@@ -142,6 +142,9 @@ if(ANDROID)
     add_library(LostOdysseyRecomp SHARED ${LO_RUNTIME_SOURCES} ${LO_IMPORT_STUBS})
     set_target_properties(LostOdysseyRecomp PROPERTIES OUTPUT_NAME main)
     target_link_options(LostOdysseyRecomp PRIVATE "-Wl,-z,max-page-size=16384")
+    # Calls between the library's own functions (the translated guest code
+    # calls itself constantly) bind directly instead of going through the PLT.
+    target_link_options(LostOdysseyRecomp PRIVATE "-Wl,-Bsymbolic-functions")
     # libadrenotools: optional custom Vulkan driver (Mesa Turnip) loading on
     # Qualcomm devices, selected at runtime with LO_VK_CUSTOM_DRIVER.
     if(EXISTS "${CMAKE_SOURCE_DIR}/thirdparty/libadrenotools/CMakeLists.txt")
@@ -197,6 +200,24 @@ add_custom_target(LoBuildRevision
     BYPRODUCTS "${LO_BUILD_REVISION_HEADER}" VERBATIM)
 add_dependencies(LostOdysseyRecomp LoBuildRevision)
 target_include_directories(LostOdysseyRecomp PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+# The game files rebuilt for model and text mods are cached under a key that
+# includes a hash of the code building them (modding/ and the readers it uses):
+# a release that leaves that code alone keeps the cache, any change rebuilds it.
+set(LO_MODS_BUILDER_SOURCES ${LO_RUNTIME_SOURCES})
+list(FILTER LO_MODS_BUILDER_SOURCES INCLUDE REGEX "/modding/")
+# The asset exporter (--export-assets, the MO2 tool) rebuilds nothing.
+list(FILTER LO_MODS_BUILDER_SOURCES EXCLUDE REGEX "/modding/(asset_export|gltf_writer|model_preview)\\.")
+list(APPEND LO_MODS_BUILDER_SOURCES "${LO_RUNTIME_ROOT}/gpu/shader/cpx_decode.h" "${LO_RUNTIME_ROOT}/os/json.h")
+set(LO_MODS_BUILDER_LIST "${CMAKE_CURRENT_BINARY_DIR}/lo_mods_builder_sources.txt")
+list(JOIN LO_MODS_BUILDER_SOURCES "\n" LO_MODS_BUILDER_LINES)
+file(CONFIGURE OUTPUT "${LO_MODS_BUILDER_LIST}" CONTENT "${LO_MODS_BUILDER_LINES}\n" @ONLY)
+set(LO_MODS_BUILDER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/lo_mods_builder.h")
+add_custom_command(OUTPUT "${LO_MODS_BUILDER_HEADER}"
+    COMMAND ${CMAKE_COMMAND} "-DSOURCE_ROOT=${CMAKE_SOURCE_DIR}" "-DSOURCES=${LO_MODS_BUILDER_LIST}"
+        "-DOUTPUT=${LO_MODS_BUILDER_HEADER}" -P "${CMAKE_SOURCE_DIR}/tools/write_mods_builder_hash.cmake"
+    DEPENDS ${LO_MODS_BUILDER_SOURCES} "${LO_MODS_BUILDER_LIST}" "${CMAKE_SOURCE_DIR}/tools/write_mods_builder_hash.cmake"
+    COMMENT "Hashing the mods rebuild code" VERBATIM)
+target_sources(LostOdysseyRecomp PRIVATE "${LO_MODS_BUILDER_HEADER}")
 # Publish source identity only after the corresponding runtime links successfully.
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/source-version.build.txt" CONTENT "${LO_SOURCE_VERSION}\n")
 add_custom_command(TARGET LostOdysseyRecomp POST_BUILD
@@ -262,8 +283,12 @@ if(LO_BUILD_GPU)
     if(WIN32)
         # Vulkan runs never load the D3D12 runtime; video.cpp probes both DLLs
         # before the D3D12 attempt so a missing one falls back instead of faulting.
+        # d3d11/mfplat serve only replacement cutscene movies. A static d3d11
+        # import pulls in dxgi.dll at process start, before main.cpp can keep a
+        # ReShade dxgi.dll out of Vulkan runs (#506).
         target_link_libraries(LostOdysseyRecomp PRIVATE d3d12 dxgi delayimp)
-        target_link_options(LostOdysseyRecomp PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll)
+        target_link_options(LostOdysseyRecomp PRIVATE /DELAYLOAD:d3d12.dll /DELAYLOAD:dxgi.dll
+            /DELAYLOAD:d3d11.dll /DELAYLOAD:mfplat.dll)
     endif()
     lo_enable_dlss(LostOdysseyRecomp)
     lo_enable_streamline_fg(LostOdysseyRecomp)
@@ -401,6 +426,36 @@ add_executable(LoLogCaptureTest EXCLUDE_FROM_ALL
 target_include_directories(LoLogCaptureTest PRIVATE ${LO_RUNTIME_ROOT})
 target_compile_features(LoLogCaptureTest PRIVATE cxx_std_20)
 target_link_libraries(LoLogCaptureTest PRIVATE fmt::fmt)
+
+# Model replacements (modding/model_import.h) on a package or through the archive
+# overlay, without guest/GPU work.
+add_executable(LoModelImport EXCLUDE_FROM_ALL
+    ${CMAKE_SOURCE_DIR}/tools/tests/model_import_cli.cpp
+    ${LO_RUNTIME_ROOT}/modding/font_patch.cpp
+    ${LO_RUNTIME_ROOT}/modding/gltf_reader.cpp
+    ${LO_RUNTIME_ROOT}/modding/model_import.cpp
+    ${LO_RUNTIME_ROOT}/modding/mod_api.cpp
+    ${LO_RUNTIME_ROOT}/modding/text_format.cpp
+    ${LO_RUNTIME_ROOT}/modding/text_menu.cpp
+    ${LO_RUNTIME_ROOT}/modding/text_overlay.cpp)
+target_include_directories(LoModelImport PRIVATE ${LO_RUNTIME_ROOT})
+target_compile_features(LoModelImport PRIVATE cxx_std_20)
+target_compile_definitions(LoModelImport PRIVATE NOMINMAX)
+target_link_libraries(LoModelImport PRIVATE fmt::fmt lo_menu_lzo Threads::Threads)
+set_target_properties(LoModelImport PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
+
+# Language-pack glyphs (modding/font_patch.h) on a font package from a disc,
+# checked with the settings menu's reader, without guest/GPU work.
+add_executable(LoFontPatch EXCLUDE_FROM_ALL
+    ${CMAKE_SOURCE_DIR}/tools/tests/font_patch_cli.cpp
+    ${LO_RUNTIME_ROOT}/modding/font_patch.cpp
+    ${LO_RUNTIME_ROOT}/modding/mod_api.cpp
+    ${LO_RUNTIME_ROOT}/settings/menu_assets.cpp)
+target_include_directories(LoFontPatch PRIVATE ${LO_RUNTIME_ROOT})
+target_compile_features(LoFontPatch PRIVATE cxx_std_20)
+target_compile_definitions(LoFontPatch PRIVATE NOMINMAX)
+target_link_libraries(LoFontPatch PRIVATE lo_menu_lzo Threads::Threads)
+set_target_properties(LoFontPatch PROPERTIES DISABLE_PRECOMPILE_HEADERS ON)
 
 # Background archive publication and failure recovery, without guest/GPU work.
 if(WIN32)

@@ -62,11 +62,58 @@ static void ConstantUsage() {
     c[0]++;Require(!next(nullptr),"unknown current usage falls back to full bank");
     c[0]++;Require(!next(&usage),"unknown previous usage falls back to full bank");
 }
+static void CameraStatic() {
+    DrawTemporalTracker t;DrawHistoryKey key{};key.geometrySignature=1;
+    std::array<uint32_t,1024> c{};std::array<uint32_t,52> shared{};
+    MotionRasterContract raster{64,64,{0,0,64,64,0,1},true};uint64_t frame=0;
+    const MotionCameraEvidence scene{7,true};
+    auto next=[&](MotionCameraEvidence e,bool relative=false,const MotionConstantUsage* u=nullptr,bool warm=false){
+        t.BeginFrame(++frame);auto m=t.Collect(key,c.data(),shared.data(),relative,-1,nullptr,&raster,u,e);
+        if(warm)t.MarkReplayWarm(m.tag);t.FinalizeFrame();return m;};
+    Require(!next(scene).cameraStatic,"first frame has no previous camera");
+    c[28]^=1;auto m=next(scene);
+    Require(m.cameraStatic&&!m.exactStationary,"a change inside the scene camera window alone is camera-static");
+    Require(next(scene).cameraStatic,"an unmoved camera is camera-static too");
+    c[16]^=1;Require(!next(scene).cameraStatic,"one bit of a world constant outside the window moves the draw");
+    Require(next(scene).cameraStatic,"camera-static again once the world constant stops changing");
+    c[43]^=1;c[44]^=1;Require(!next(scene).cameraStatic,"the slot right after the window is outside it");
+    next(scene);
+    Require(!next({7,false}).cameraStatic,"a window off the scene camera replays");
+    Require(!next(scene).cameraStatic,"a previous window off the scene camera replays");
+    Require(next(scene).cameraStatic,"scene camera in both frames");
+    Require(!next({8,true}).cameraStatic,"the window slot must match the previous frame");
+    next(scene);Require(!next(scene,true).cameraStatic,"relative constant addressing never skips");
+    Require(!next(scene).cameraStatic,"previous relative addressing never skips");
+    next(scene);shared[40]^=1;Require(!next(scene).cameraStatic,"a changed viewport transform replays");
+    next(scene);raster.width=128;raster.viewport[2]=128;Require(!next(scene).cameraStatic,"a resized target replays");
+    next(scene);key.geometrySignature++;Require(!next(scene).cameraStatic,"new geometry has no previous draw");
+    Require(next(scene).cameraStatic,"matched geometry again");
+    const auto usage=ParseMotionConstantUsage("void main(\n) {r0=XeConst(4);r1=XeConst(7);r2=XeConst(8);r3=XeConst(9);r4=XeConst(10);}",false);
+    next(scene,false,&usage);c[100]^=1;c[28]^=1;
+    Require(next(scene,false,&usage).cameraStatic,"an unread slot does not block a camera-static draw");
+    c[16]^=1;Require(!next(scene,false,&usage).cameraStatic,"a read slot outside the window moves the draw");
+    c[29]^=1;Require(next(scene,false,&usage).cameraStatic,"read window slots alone changed");
+    auto position=ParseMotionConstantUsage("void main(\n) {r0=XeConst(4);r1=XeConst(7);r2=XeConst(8);r3=XeConst(9);r4=XeConst(10);r5=XeConst(12);}",false);
+    position.positionSlots={(uint64_t(1)<<7)|(uint64_t(1)<<8)|(uint64_t(1)<<9)|(uint64_t(1)<<10)|(uint64_t(1)<<12),0,0,0};
+    position.positionKnown=true;
+    next(scene,false,&position);c[16]^=1;c[28]^=1;
+    Require(next(scene,false,&position).cameraStatic,"a read constant that does not reach the position does not block");
+    c[48]^=1;Require(!next(scene,false,&position).cameraStatic,"a position constant outside the window moves the draw");
+    Require(next(scene,false,&position).cameraStatic,"camera-static again");
+    c[16]^=1;Require(!next(scene,false,&position).exactStationary,"exact stationary still compares every read constant");
+    c[16]^=1;c[28]^=1;Require(!next(scene,false,&usage).cameraStatic,"different position knowledge falls back to every read constant");
+    m=next(scene,false,nullptr,true);Require(!m.replayWarm,"no pipeline before it was ready");
+    Require(next(scene).replayWarm,"a ready replay pipeline carries to the matched draw");
+    Require(next(scene).replayWarm,"and stays carried while the draw matches");
+    key.geometrySignature++;Require(!next(scene).replayWarm,"an unmatched draw is not warm");
+}
 int main(int argc,char** argv) {try {
     if(argc>1&&std::strcmp(argv[1],"--constant-usage-only")==0){ConstantUsage();printf("PASS: %u constant usage checks\n",checks);return 0;}
+    if(argc>1&&std::strcmp(argv[1],"--camera-static-only")==0){CameraStatic();printf("PASS: %u camera-static checks\n",checks);return 0;}
     if(argc>1&&std::strcmp(argv[1],"--exact-stationary-only")==0){ExactStationary();printf("PASS: %u exact stationary checks\n",checks);return 0;}
     ConstantUsage();
     ExactStationary();
+    CameraStatic();
     const auto hash = MotionHashWord(0xcbf29ce484222325ULL, 7);
     Require(hash != MotionHashWord(0xcbf29ce484222325ULL, 8), "stream data changes geometry identity");
     std::vector<uint32_t> indices{0, 1, 2, 2, 3, 0};

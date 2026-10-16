@@ -67,7 +67,8 @@ inline std::atomic<State> state{State::Idle};
 inline bool Required(const Config &before, const Config &after)
 {
     // HDR replaces the swap chain live, except with frame generation, whose
-    // SDKs own or hook the swap chain.
+    // SDKs own or hook the swap chain. The multiplier of a running session
+    // changes in place and keeps the swap chain.
     return before.gameLanguage != after.gameLanguage || before.gameLanguagePack != after.gameLanguagePack ||
            before.graphicsBackend != after.graphicsBackend ||
            before.gpuDevice != after.gpuDevice ||
@@ -77,7 +78,6 @@ inline bool Required(const Config &before, const Config &after)
            ((before.hdr || after.hdr) &&
             (before.frameGenerationProvider != after.frameGenerationProvider ||
              before.frameGenerationMode != after.frameGenerationMode ||
-             before.frameGenerationMultiplier != after.frameGenerationMultiplier ||
              before.frameGenerationTargetFps != after.frameGenerationTargetFps)) ||
            // Streamline stays loaded for DLSS SR, so another FG provider needs a restart.
            (before.graphicsBackend == GraphicsBackend::D3D12 &&

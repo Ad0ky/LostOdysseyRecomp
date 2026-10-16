@@ -62,6 +62,7 @@ bool WaitForGpuFence(plume::RenderCommandFence* fence) {
 }
 bool WaitForPresentGpu() { return true; } // No swapchain in this fixture.
 bool FrameGenerationInputCaptureEnabled() { return false; } // No frame generation session either.
+bool IsHostOverlayActive() { return false; } // No Settings menu or debug overlay.
 bool SubmitRendererBatch(const plume::RenderCommandList* const* lists, uint32_t count,
     plume::RenderCommandFence* fence, uint64_t& serial, int32_t& result, bool* executionMayBeInFlight) {
     if (executionMayBeInFlight) *executionMayBeInFlight = false;

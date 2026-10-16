@@ -4,6 +4,7 @@
 #include "matrix_surround.h"
 #include "test_signal.h"
 #include <cpu/guest_thread.h>
+#include <debug/fast_forward.h>
 #include <kernel/memory.h>
 #include <os/guest_code_thread.h>
 #include <os/host_scheduling.h>
@@ -40,6 +41,35 @@ namespace apu
         std::atomic<std::chrono::steady_clock::rep> g_testSignalUntil{ 0 };
         std::atomic<float> g_testPosition{ -1.0f };
         std::atomic<uint32_t> g_outputChannels{ 0 };
+        // Frames kept queued ahead of the device. A phone's thermally capped
+        // CPU can run the driver thread tens of milliseconds late, so Android
+        // keeps ~43 ms instead of ~21 ms; a late wakeup within that catches up.
+#if LO_PLATFORM_ANDROID
+        constexpr uint32_t kQueuedFrames = 8;
+#else
+        constexpr uint32_t kQueuedFrames = 4;
+#endif
+        // Times a frame found the queue empty (the device ran dry) and times
+        // the driver gave up catching up after a stall; logged with the frames.
+        std::atomic<uint32_t> g_starved{ 0 };
+        std::atomic<uint32_t> g_clockResets{ 0 };
+        // Guest frames per output frame in this period: 1, or under
+        // fast-forward up to its rate. The driver runs the guest callback this
+        // many times per period and SubmitFrame averages each run of this many
+        // samples into one, so the game's sound keeps pace with its boosted
+        // clock and plays higher, like a tape.
+        std::atomic<uint32_t> g_guestFramesPerOutput{ 1 };
+        // Driver thread: the most guest frames a fast-forward period may run.
+        constexpr uint32_t kMaxBoostFrames = 8;
+        uint32_t g_boostFrames = kMaxBoostFrames;
+#if LO_PLATFORM_ANDROID
+        // steady_clock time the app last returned to the foreground, until the
+        // driver has seen the device drain since then; 0 otherwise. After a
+        // long pause AAudio can fail to restart the stream without an error
+        // callback, and SDL then never takes audio again (#491).
+        std::atomic<std::chrono::steady_clock::rep> g_resumedAt{ 0 };
+        constexpr auto kResumeDrainTimeout = std::chrono::milliseconds(300);
+#endif
 
         uint32_t FrameBytes() { return XAUDIO_NUM_SAMPLES * g_channels * sizeof(float); }
 
@@ -120,6 +150,41 @@ namespace apu
             return g_stream ? std::max(0, SDL_GetAudioStreamQueued(g_stream)) / FrameBytes() : 0;
         }
 
+#if LO_PLATFORM_ANDROID
+        // SDL hands the app lifecycle events only to event watchers, on the
+        // thread that handles the pause or resume, before the app blocks in the
+        // background; they never reach the event queue.
+        bool SDLCALL WatchLifecycle(void*, SDL_Event* event)
+        {
+            if (event->type == SDL_EVENT_DID_ENTER_FOREGROUND)
+                g_resumedAt = std::chrono::steady_clock::now().time_since_epoch().count();
+            else if (event->type == SDL_EVENT_WILL_ENTER_BACKGROUND)
+                g_resumedAt = 0;
+            return true;
+        }
+
+        // Driver thread, while the device queue stays full: a device that has
+        // not drained since the app came back to the foreground is opened again.
+        void ReopenIfStalledAfterResume()
+        {
+            auto resumed = g_resumedAt.load(std::memory_order_relaxed);
+            if (!resumed) return;
+            const auto now = std::chrono::steady_clock::now().time_since_epoch();
+            const auto stalled = now - std::chrono::steady_clock::duration(resumed);
+            if (stalled < kResumeDrainTimeout) return;
+            std::lock_guard lock(g_deviceMutex);
+            if (!g_stream) return;
+            // A paused device keeps its queue; the wait starts over when it plays.
+            if (g_paused) { g_resumedAt.compare_exchange_strong(resumed, now.count()); return; }
+            // Lost to a pause that began meanwhile, or to a newer resume.
+            if (!g_resumedAt.compare_exchange_strong(resumed, 0)) return;
+            const uint32_t queued = std::max(0, SDL_GetAudioStreamQueued(g_stream)) / FrameBytes();
+            LOG_WARNING("audio: device not draining {} ms after resume (queued {}), reopened",
+                std::chrono::duration_cast<std::chrono::milliseconds>(stalled).count(), queued);
+            OpenDevice(g_surroundOpen);
+        }
+#endif
+
         void CaptureRequested(const float* stereo, uint32_t frame)
         {
             static const char* requestPath = getenv("LO_AUDIO_CAPTURE_REQUEST");
@@ -174,22 +239,29 @@ namespace apu
             // (0x2A): the guest callback has to run every 5.3 ms even while
             // movie decoding keeps all three cores busy.
             os::switch_platform::SetCurrentThreadPriority(0x2C);
+#else
+            os::scheduling::RaiseAudioThreadPriority();
 #endif
             GuestThreadContext ctx(3);
             constexpr auto framePeriod = std::chrono::microseconds(1000000ull * XAUDIO_NUM_SAMPLES / XAUDIO_SAMPLES_HZ);
             auto next = std::chrono::steady_clock::now();
+#if LO_PLATFORM_SWITCH
             uint64_t ticks = 0, dispatches = 0, stalls = 0;
             double waitedMs = 0;
             auto lastReport = next;
             auto nextReport = next + std::chrono::seconds(10);
+#endif
             while (g_running)
             {
                 next += framePeriod;
                 // Precise wakeups: a late one drains the few frames SDL has queued.
                 os::scheduling::PreciseSleepUntil(next);
                 // Avoid a burst of catch-up callbacks after a host stall.
-                if (std::chrono::steady_clock::now() - next > framePeriod * 4)
+                if (std::chrono::steady_clock::now() - next > framePeriod * kQueuedFrames)
+                {
                     next = std::chrono::steady_clock::now();
+                    g_clockResets.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (const bool surround = g_surroundRequested; g_audioReady && surround != g_surroundOpen)
                 {
                     std::lock_guard lock(g_deviceMutex);
@@ -198,14 +270,18 @@ namespace apu
                 }
                 else if (!g_outputChannels && g_device) // a request withdrawn before it was applied
                     g_outputChannels = g_channels;
+#if LO_PLATFORM_ANDROID
+                auto resumed = g_resumedAt.load(std::memory_order_relaxed);
+                bool waited = false;
+#endif
+#if LO_PLATFORM_SWITCH
                 // Wait for the device to drain, but not forever: an output
                 // that stops pulling (seen on Switch: no sound, one frame ever
                 // reported) must not also stop the guest's audio callbacks.
                 const auto waitStart = std::chrono::steady_clock::now();
-#if LO_PLATFORM_SWITCH
                 auto stallStart = waitStart;
 #endif
-                while (QueuedFrames() >= 4)
+                while (QueuedFrames() >= kQueuedFrames)
                 {
 #if LO_PLATFORM_SWITCH
                     if (std::chrono::steady_clock::now() - stallStart > std::chrono::milliseconds(250))
@@ -224,16 +300,53 @@ namespace apu
                     }
 #endif
                     os::scheduling::PreciseSleepFor(std::chrono::milliseconds(1));
+#if LO_PLATFORM_ANDROID
+                    waited = true;
+                    ReopenIfStalledAfterResume();
+#endif
                 }
+#if LO_PLATFORM_ANDROID
+                // A full queue went below the limit: the device takes audio again.
+                if (resumed && waited) g_resumedAt.compare_exchange_strong(resumed, 0);
+#endif
+#if LO_PLATFORM_SWITCH
                 waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+#endif
 
-                const bool dispatched = g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                const auto dispatch = [&](uint32_t frames)
                 {
-                    ctx.ppcContext.r3.u64 = param;
-                    g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
-                });
+                    g_guestFramesPerOutput.store(frames, std::memory_order_relaxed);
+                    for (uint32_t i = 0; i < frames; ++i)
+                    {
+                        const bool dispatched = g_client.Dispatch([&](uint32_t callback, uint32_t param)
+                        {
+                            ctx.ppcContext.r3.u64 = param;
+                            g_memory.FindFunction(callback)(ctx.ppcContext, g_memory.base);
+                        });
+#if LO_PLATFORM_SWITCH
+                        if (dispatched) ++dispatches;
+#else
+                        (void)dispatched;
+#endif
+                    }
+                };
+                if (const uint32_t rate = debug_menu::fast_forward::AudioRate(); rate > 1)
+                {
+                    // Up to `rate` guest frames per period, as many as fit in
+                    // three quarters of it, so the output never runs dry.
+                    const uint32_t frames = std::min(rate, g_boostFrames);
+                    const auto start = std::chrono::steady_clock::now();
+                    dispatch(frames);
+                    const auto spent = std::chrono::steady_clock::now() - start;
+                    if (spent > framePeriod * 3 / 4)
+                        g_boostFrames = std::max(2u, frames - 1);
+                    else if (spent < framePeriod / 2 && frames == g_boostFrames)
+                        g_boostFrames = std::min(g_boostFrames + 1, kMaxBoostFrames);
+                }
+                else
+                    dispatch(1);
+#if LO_PLATFORM_SWITCH
                 ++ticks;
-                if (dispatched) ++dispatches;
                 if (std::chrono::steady_clock::now() >= nextReport)
                 {
                     const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - lastReport).count();
@@ -244,6 +357,7 @@ namespace apu
                     lastReport = std::chrono::steady_clock::now();
                     nextReport = lastReport + std::chrono::seconds(10);
                 }
+#endif
             }
         }
     }
@@ -261,6 +375,9 @@ namespace apu
             if (g_audioReady) OpenDevice(surround);
             else LOG_WARNING("audio device unavailable: {}", SDL_GetError());
         }
+#if LO_PLATFORM_ANDROID
+        if (g_audioReady) SDL_AddEventWatch(WatchLifecycle, nullptr);
+#endif
         g_running = true;
         g_thread = os::GuestCodeThread(DriverMain);
         g_thread.detach();
@@ -301,6 +418,17 @@ namespace apu
         g_testSignalUntil = on ? until.time_since_epoch().count() : 0;
     }
 
+    std::mutex g_uiSoundMutex;
+    std::shared_ptr<const std::vector<float>> g_uiSound;
+    size_t g_uiSoundPosition = 0;
+
+    void PlayUiSound(std::shared_ptr<const std::vector<float>> samples)
+    {
+        std::lock_guard lock(g_uiSoundMutex);
+        g_uiSound = std::move(samples);
+        g_uiSoundPosition = 0;
+    }
+
     float TestSignalPosition()
     {
         return g_testPosition;
@@ -318,10 +446,59 @@ namespace apu
         if (g_stream) SDL_ClearAudioStream(g_stream);
     }
 
+    static void EmitFrame(const uint32_t* words);
+
+    // Averages runs of `rate` guest samples (big-endian float planes of
+    // XAUDIO_NUM_SAMPLES) into whole output frames. Frames arrive one at a
+    // time while the driver waits in Dispatch.
+    static void DecimateFrame(const uint32_t* words, uint32_t rate, bool restart)
+    {
+        static std::array<uint32_t, XAUDIO_NUM_SAMPLES * XAUDIO_NUM_CHANNELS> output;
+        static std::array<float, XAUDIO_NUM_CHANNELS> sum{};
+        static uint32_t summed = 0, written = 0;
+        if (restart)
+        {
+            summed = written = 0;
+            sum.fill(0);
+        }
+        for (uint32_t i = 0; i < XAUDIO_NUM_SAMPLES; ++i)
+        {
+            for (uint32_t c = 0; c < XAUDIO_NUM_CHANNELS; ++c)
+            {
+                const float value = std::bit_cast<float>(ByteSwap(words[c * XAUDIO_NUM_SAMPLES + i]));
+                sum[c] += std::isfinite(value) ? value : 0;
+            }
+            if (++summed < rate) continue;
+            for (uint32_t c = 0; c < XAUDIO_NUM_CHANNELS; ++c)
+                output[c * XAUDIO_NUM_SAMPLES + written] = ByteSwap(std::bit_cast<uint32_t>(sum[c] / float(rate)));
+            sum.fill(0);
+            summed = 0;
+            if (++written == XAUDIO_NUM_SAMPLES)
+            {
+                written = 0;
+                EmitFrame(output.data());
+            }
+        }
+    }
+
     void SubmitFrame(const void* samples)
     {
         if (!samples) return;
         const auto* words = static_cast<const uint32_t*>(samples);
+        // A rate change starts a new run; a partial output frame is dropped.
+        static uint32_t decimating = 0;
+        if (const uint32_t rate = g_guestFramesPerOutput.load(std::memory_order_relaxed); rate > 1)
+        {
+            DecimateFrame(words, rate, rate != decimating);
+            decimating = rate;
+            return;
+        }
+        decimating = 0;
+        EmitFrame(words);
+    }
+
+    static void EmitFrame(const uint32_t* words)
+    {
         std::array<float, XAUDIO_NUM_SAMPLES * 2> stereo{};
         // Guest planes FL, FR, FC, LFE, BL, BR match SDL's 6-channel order
         // FL, FR, FC, LFE, SL/BL, SR/BR, so 5.1 interleaves them unchanged.
@@ -346,6 +523,17 @@ namespace apu
         const bool test = std::chrono::steady_clock::now().time_since_epoch().count() < g_testSignalUntil;
         if (test && !testOn) pan.Reset(); // each test starts at front left
         testOn = test;
+        std::shared_ptr<const std::vector<float>> ui;
+        size_t uiPosition = 0;
+        {
+            std::lock_guard lock(g_uiSoundMutex);
+            if (g_uiSound && g_uiSoundPosition < g_uiSound->size())
+            {
+                ui = g_uiSound;
+                uiPosition = g_uiSoundPosition;
+                g_uiSoundPosition += XAUDIO_NUM_SAMPLES;
+            }
+        }
         float peak = 0;
         for (uint32_t i = 0; i < XAUDIO_NUM_SAMPLES; ++i)
         {
@@ -356,6 +544,11 @@ namespace apu
                 channel[c] = std::isfinite(value) ? value : 0;
             }
             if (testOn) pan.Next(channel);
+            if (ui && uiPosition + i < ui->size())
+            {
+                channel[0] += (*ui)[uiPosition + i];
+                channel[1] += (*ui)[uiPosition + i];
+            }
             for (uint32_t c = 0; c < 6; ++c)
                 surround[i * 6 + c] = std::clamp(channel[c], -1.0f, 1.0f);
             float left, right;
@@ -403,7 +596,9 @@ namespace apu
             if (g_stream)
             {
                 const float* data = g_channels == 6 ? surround.data() : stereo.data();
-                if (SDL_GetAudioStreamQueued(g_stream) < int(FrameBytes() * 16))
+                const int before = SDL_GetAudioStreamQueued(g_stream);
+                if (before == 0 && n > 1) g_starved.fetch_add(1, std::memory_order_relaxed);
+                if (before < int(FrameBytes() * 16))
                 {
                     if (!SDL_PutAudioStreamData(g_stream, data, int(FrameBytes()))) ++queueErrors;
                 }
@@ -412,8 +607,9 @@ namespace apu
             }
         }
         if (report)
-            LOG_INFO("audio frames submitted: {} peak={} queued={} mute={} queue_drops={} queue_errors={}", n, peak,
-                queued, mute, queueDrops, queueErrors);
+            LOG_INFO("audio frames submitted: {} peak={} queued={} mute={} queue_drops={} queue_errors={} starved={} clock_resets={}",
+                n, peak, queued, mute, queueDrops, queueErrors, g_starved.load(std::memory_order_relaxed),
+                g_clockResets.load(std::memory_order_relaxed));
     }
 
     void SetPaused(bool paused)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -33,6 +34,10 @@ namespace xenos
         // Relative ALU constant addressing (c[N + a0/aL]). Used by bone-matrix
         // indexing, but not sufficient on its own to identify a character mesh.
         bool usesRelativeConstants = false;
+        // Vertex shaders: the ALU constant slots that can reach oPos, over every
+        // path and register reuse. Unknown when relative addressing reaches it.
+        std::array<uint64_t, 4> positionConstantSlots{};
+        bool positionConstantsKnown = false;
     };
 
     // dwords: microcode in *host* byte order (already swapped from big-endian).

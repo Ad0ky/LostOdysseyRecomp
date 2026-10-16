@@ -103,3 +103,19 @@ Build the full game normally from this revision and confirm the executable's sou
 - **Async shader compilation**: throttled to at most 2 concurrent background worker jobs to eliminate scene transition loading hangs and black screens.
 - **Ordered duplicate matching**: matches repeated `DrawHistoryKey` instances by stable occurrence order across adjacent frames, improving automated Bell debug tracking from ~533/955 to stable 955/955 matched draws (`ready=true consume=true`) and eliminating reactive mask gaps.
 - **Status & limits**: Windows runtime BUILD OK; `motion_vector_test` 40 checks passed; `motion_replay_gpu_test --compile-only` 11 checks passed; automated Vulkan execution is stable. User confirmed MV is actively consumed; Bell visible jitter remains under active TAA investigation and is NOT marked resolved or accepted. D3D12 replay PSO creation `E_INVALIDARG 0x80070057` remains tracked follow-up work.
+
+## Camera-static skipping (2026-10-14)
+
+Most replayed draws are scenery that only the camera moved. Their replay vector equals the camera reprojection of the visible depth, so they no longer replay (`LO_MV_STATIC_SKIP=0` replays every draw again).
+
+A draw skips only when all of these hold (`DrawTemporalTracker::Collect`, `Match::cameraStatic`):
+
+- it matched last frame's draw (shader pair, scene depth allocation, every vertex stream's upload and arena generation, index contents, range, primitive), so any vertex write since #447 replays it;
+- same raster contract and the same VS-relevant shared words (bool/loop constants, viewport transform, half pixel, vertex format, epilogue flags);
+- no relative constant addressing in either frame, so skinned meshes always replay;
+- its reviewed position VP window holds exactly the frame's scene camera in both frames (the first scene anchor, the camera HistoryOwner reprojects with, with the same Y sign and half-pixel offsets);
+- every VS constant that can reach `oPos` outside that window is bit-identical. The translator records those constants per register component in program order (`TranslatedShader::positionConstantSlots`, `tools/tests/position_flow_test.cpp`); predicated or conditional writes keep the old dependencies and add the condition's; loops, unstructured control flow, vertex texture fetch or relative addressing reaching `oPos` make it unknown, and then every read constant is compared.
+
+A frame skips only when it continues the frame whose scene camera HistoryOwner kept, and no depth reaches the scene depth outside motion tracking: an untracked depth-writing draw, the screen-copy clip writer or a non-clear depth fill blocks skipping before the scene camera and makes the frame unsafe after it. After an unsafe frame, or one whose camera passes did not run, skipping waits 60 frames; if the passes cannot be built, every draw replays for the session. Metal keeps full replay for now.
+
+In a camera-static frame every replayed draw claims its visible pixels: unmatched draws replay as invalid markers, and a replay without valid previous motion writes the marker (tag `0xFFFFFFFF`) instead of tag 0. The validity pass gives a visible pixel that no replay owns to the skipped draw that drew it, and a fill pass writes the camera's unjittered motion and previous depth there (`MotionReplayGPU::kCameraHlsl`). The motion view keeps its formats and meaning for TAA, the SR hybrid composer and frame generation.

@@ -45,11 +45,13 @@ bool IsOpen() { return false; }
 void PointerClick(float, float, bool) {}
 void PointerDrag(float, float, bool) {}
 bool CalibrationKey(uint32_t) { return false; }
+bool CaptureKey(uint32_t, bool) { return false; }
 void SetHdrDisplayInfo(HdrDisplayInfo) {}
 void SetHdrCalibrationSceneAvailable(bool) {}
 HdrCalibration GetHdrCalibration() { return {}; }
 BrightnessCalibration GetBrightnessCalibration() { return {}; }
 bool SaveDisplayChoice(const std::string&, uint32_t) { return false; }
+bool SaveGraphicsBackend(GraphicsBackend) { return false; }
 }
 namespace hid {
 void Init() {}
@@ -58,6 +60,7 @@ void PumpHostInput() {}
 void HandleControllerEvent(uint32_t, uint32_t) {}
 void HandleKeyboardEvent(int32_t, bool) {}
 void ClearKeyboardState() {}
+void RefreshKeyNames() {}
 }
 namespace debug_menu {
 bool IsOverlayVisible() { return false; }

@@ -8,7 +8,9 @@
 #include <gpu/dlss_nr_state.h>
 #include "restart.h"
 #include "translations.h"
+#include "achievements_page.h"
 #include "mods_page.h"
+#include <patches/mod_hot_reload.h>
 #include <gpu/video.h>
 #include <gpu/display_choice.h>
 #include <gpu/frame_plan.h>
@@ -18,6 +20,7 @@
 #include <stdafx.h>
 #include "language_trace.h"
 #include <apu/audio.h>
+#include <updater/shader_pack_download.h>
 #include <hid/hid.h>
 extern "C" PPC_FUNC(__imp__sub_822F19B0);
 extern "C" PPC_FUNC(__imp__sub_82481BE8);
@@ -114,6 +117,8 @@ bool mainMenuRequested = false;
 bool importPrompt = false;
 int importChoice = 1;
 bool importLaunchPending = false;
+bool shaderBundlePrompt = false;
+int shaderBundleChoice = 1;
 // Mods page (System → Mods). The mods are listed when it opens; the order and
 // switches stay unsaved until Save. modsSaved is the order saved in this run,
 // applied at the next start; reopening the page shows it.
@@ -125,6 +130,34 @@ int modsFocus = 0;
 bool modsDiscardPrompt = false;
 int modsDiscardChoice = 1;
 bool restartForMods = false;
+// Achievements page (System → Achievements). The list is read when it opens.
+// achievementSummary is the System row's value, read when the menu opens.
+std::atomic<bool> achievementsOpen{false};
+std::vector<achievements_page::Item> achievementItems;
+std::vector<std::shared_ptr<const menu_assets::Image>> achievementIcons;
+int achievementsFocus = 0;
+std::wstring achievementSummary;
+// Controls page (Gameplay → Controls). The layouts stay unsaved until Save;
+// Button prompts and Vibration save at once, as they did on the tab. The page
+// navigates with the default layouts (FilterInput), so a layout that leaves a
+// button out of reach can always be undone here.
+namespace input_map = hid::input_map;
+std::atomic<bool> controlsOpen{false};
+input_map::ControllerMap controlsController = input_map::DefaultController, controlsControllerStart = input_map::DefaultController;
+input_map::KeyboardMap controlsKeyboard = input_map::DefaultKeyboard, controlsKeyboardStart = input_map::DefaultKeyboard;
+int controlsFocus = ControlsPromptRow;
+bool controlsDiscardPrompt = false;
+int controlsDiscardChoice = 1;
+// A capture on a layout row (captureRow, -1 for none). A controller capture
+// arms once every button is up and takes the next press; a keyboard capture
+// takes the next key from CaptureKey on the video thread. Escape cancels
+// either; both give up after ControlsCaptureSeconds.
+int captureRow = -1;
+bool captureArmed = false;
+std::chrono::steady_clock::time_point captureDeadline;
+std::atomic<int> captureMode{0}; // 0 none, 1 controller, 2 keyboard
+std::atomic<int> capturedKey{-1};
+std::atomic<bool> captureEscape{false};
 Config restartAfter;
 int tab = 0, row = 0;
 bool bypass = false, sawModal = false;
@@ -188,6 +221,11 @@ NeuralRenderingTuning MakeNeuralRenderingTuning(const Config &config, bool open)
     NeuralRenderingTuning result;
     result.open = open;
     result.sceneAvailable = nrSceneAvailable.load(std::memory_order_relaxed);
+    using gpu::dlss::NeuralRenderingState;
+    const auto state = gpu::dlss::g_neuralRenderingState.load(std::memory_order_relaxed);
+    result.blocker = state == NeuralRenderingState::MissingRuntime ? NeuralRenderingTuning::Blocker::MissingRuntime :
+        state == NeuralRenderingState::Unsupported ? NeuralRenderingTuning::Blocker::Unsupported :
+        NeuralRenderingTuning::Blocker::None;
     result.passes = std::min(config.dlssNeuralRendering, DlssNeuralRenderingMaxPasses);
     result.preset = config.dlssNrPreset;
     result.style = config.dlssNrStyle;
@@ -395,6 +433,81 @@ void CloseModsPage()
     modsEntries.clear();
     status.clear();
 }
+// "12/36 · 240G": the System row's value.
+void RefreshAchievementSummary()
+{
+    const auto summary = achievements_page::Summarize(achievements_page::LoadAchievementItems(false));
+    achievementSummary = std::to_wstring(summary.earned) + L"/" + std::to_wstring(summary.total) + L" · " +
+                         std::to_wstring(summary.earnedScore) + L"G";
+}
+void OpenAchievementsPage()
+{
+    achievementItems = achievements_page::LoadAchievementItems(true);
+    achievements_page::Sort(achievementItems);
+    achievementIcons.clear();
+    for (const auto &item : achievementItems)
+        achievementIcons.push_back(item.Hidden() ? nullptr : achievements_page::MakeIcon(item.icon, item.Earned()));
+    achievementsFocus = AchievementsNotificationsRow;
+    status.clear();
+    achievementsOpen = true;
+    LOG_INFO("settings: achievements page opened ({} achievements)", achievementItems.size());
+}
+void CloseAchievementsPage()
+{
+    achievementsOpen = false;
+    achievementItems.clear();
+    achievementIcons.clear();
+    status.clear();
+    RefreshAchievementSummary();
+}
+// 0 On, 1 Silent (a notification without the sound), 2 Off. Off keeps the
+// sound value; On and Silent set both fields.
+uint32_t AchievementNotificationMode()
+{
+    return !edit.achievementNotifications ? 2 : edit.achievementSound ? 0 : 1;
+}
+// Like Vibration: applied and saved at once, without unsaved edits from the
+// other System rows. The game reads both fields every frame.
+void CycleAchievementNotifications(int delta)
+{
+    const uint32_t mode = uint32_t((int(AchievementNotificationMode()) + 3 + delta) % 3);
+    edit.achievementNotifications = mode != 2;
+    if (mode != 2) edit.achievementSound = mode == 0;
+    Config saved = GetConfig();
+    saved.achievementNotifications = edit.achievementNotifications;
+    saved.achievementSound = edit.achievementSound;
+    if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+}
+// An achievement entry: icon, name, one line of text, then gamerscore and, once
+// earned, the date. A locked secret shows neither its name, text nor icon.
+Row AchievementRow(const achievements_page::Item &item, std::shared_ptr<const menu_assets::Image> icon)
+{
+    const bool hidden = item.Hidden();
+    Row row;
+    row.name = hidden ? std::wstring(Tr(L"Secret achievement", L"隱藏成就")) : mods_page::Shorten(Widen(item.info.name), 26);
+    const std::wstring text = hidden ? std::wstring(Tr(L"Keep playing to unlock this secret achievement.",
+                                                       L"繼續遊戲以解鎖這個隱藏成就。"))
+                                     : Widen(item.Earned() ? item.info.unlockedText : item.info.lockedText);
+    row.detail = text.empty() ? L"—" : hidden ? text : mods_page::Shorten(text, 42);
+    row.value = std::to_wstring(item.info.score) + L"G";
+    if (item.Earned()) row.value += L"   " + achievements_page::FormatDate(item.earnedTime);
+    row.icon = std::move(icon);
+    if (!row.icon) row.iconGlyph = L"?";
+    return row;
+}
+// Help for the focused Achievements page row.
+std::wstring AchievementsHelp()
+{
+    if (achievementsFocus == AchievementsNotificationsRow)
+        return Tr(L"Shows an Xbox 360-style notification when you unlock an achievement. Silent shows it without the sound.",
+                  L"解鎖成就時顯示 Xbox 360 風格的通知。靜音則只顯示、不播放音效。");
+    const int index = achievementsFocus - AchievementsFirstRow;
+    if (index < 0 || index >= int(achievementItems.size())) return {};
+    const auto &item = achievementItems[size_t(index)];
+    if (item.Hidden())
+        return Tr(L"Keep playing to unlock this secret achievement.", L"繼續遊戲以解鎖這個隱藏成就。");
+    return mods_page::Shorten(Widen(item.info.name) + L": " + Widen(item.Earned() ? item.info.unlockedText : item.info.lockedText), 110);
+}
 // A mod row: name, then version and author (or a mark for a mod.ini problem),
 // then on / off. Rejected mods and mods off in mod.ini have one inert cell.
 Row ModRow(const mods_page::Entry &entry)
@@ -438,9 +551,17 @@ std::pair<std::wstring, std::wstring> ModsHelp(const mods_page::Rows &rows)
                 folder};
     if (modsFocus == rows.open)
         return {Tr(L"Opens the mods folder in File Explorer.", L"在檔案總管中開啟 mods 資料夾。"), folder};
+    // A saved list being applied (patches/mod_hot_reload.h): one line for every row.
+    // The party's models are loaded once at startup and stay, so they need a restart.
+    if (const auto reload = mod_hot_reload::GetStatus(); reload.Pending())
+        return {Tr(L"Models update in the next area; party members after a restart.", L"模型從下一個區域起更新，隊伍成員需重新啟動後更新。"),
+                reload.phase == mod_hot_reload::Phase::Preparing && reload.total
+                    ? std::wstring(Tr(L"Preparing mods", L"正在準備 Mod")) + L"  " + std::to_wstring(reload.done) + L" / " +
+                          std::to_wstring(reload.total)
+                    : std::wstring{}};
     if (modsFocus == rows.save)
-        return {Tr(L"Saves the order and the switches. They apply after the game restarts.",
-                   L"儲存順序與開關。重新啟動遊戲後生效。"),
+        return {Tr(L"Saves the order and switches. Textures change at once, models in the next area.",
+                   L"儲存順序與開關。貼圖立即生效，模型在下一個區域生效。"),
                 Tr(L"When two mods change the same file, the one higher in the list wins.",
                    L"兩個 Mod 修改同一個檔案時，清單中較上方的優先。")};
     const int index = rows.EntryAt(modsFocus, modsEntries.size());
@@ -451,11 +572,8 @@ std::pair<std::wstring, std::wstring> ModsHelp(const mods_page::Rows &rows)
     std::wstring help;
     if (!mods_page::IsMod(modsEntries[size_t(index)]))
         help = !problem.empty() ? Tr(L"Problem: ", L"問題：") + problem
-                                : Tr(L"A language pack. Choose it in System → Game language.",
+                                : Tr(L"This is a language pack. Choose it in System → Game language.",
                                      L"語言包。請在 系統 → 遊戲語言 中選擇。");
-    else if (modding::Mode() == modding::ResolutionMode::Overlay)
-        help = Tr(L"Mod folders are not used: the game was started with --mods-mode overlay.",
-                  L"遊戲以 --mods-mode overlay 啟動，不使用 Mod 資料夾。");
     else if (info.apiVersion == 0)
         help = Tr(L"Not loaded: ", L"未載入：") + problem;
     else if (!info.manifestEnabled)
@@ -471,6 +589,136 @@ std::pair<std::wstring, std::wstring> ModsHelp(const mods_page::Rows &rows)
     if (info.active && info.manifestEntries)
         where += L"     " + (Tr(L"mod.ini entries: ", L"mod.ini 項目：") + std::to_wstring(info.manifestEntries));
     return {help, where};
+}
+static_assert(ControlsControllerFirst == ControlsControllerTitle + 1 &&
+              ControlsKeyboardTitle == ControlsControllerFirst + input_map::ControllerInputCount &&
+              ControlsKeyboardFirst == ControlsKeyboardTitle + 1 &&
+              ControlsRestoreRow == ControlsKeyboardFirst + input_map::KeyboardInputCount &&
+              ControlsSaveRow == ControlsRestoreRow + 1 && ControlsRowCount == ControlsSaveRow + 1);
+bool ControlsTitle(int r) { return r == ControlsControllerTitle || r == ControlsKeyboardTitle; }
+// The Xbox 360 input of a layout row, or -1; keyboard tells which layout.
+int ControlsInput(int r, bool &keyboard)
+{
+    keyboard = r >= ControlsKeyboardFirst;
+    if (r >= ControlsControllerFirst && r < ControlsControllerFirst + input_map::ControllerInputCount)
+        return r - ControlsControllerFirst;
+    if (r >= ControlsKeyboardFirst && r < ControlsKeyboardFirst + input_map::KeyboardInputCount)
+        return r - ControlsKeyboardFirst;
+    return -1;
+}
+// The Xbox 360 name of an input. Letters and shoulder names become the
+// PlayStation glyphs with those prompts (menu_render.cpp).
+std::wstring InputLabel(int input)
+{
+    switch (input)
+    {
+    case input_map::A: return L"A";
+    case input_map::B: return L"B";
+    case input_map::X: return L"X";
+    case input_map::Y: return L"Y";
+    case input_map::LeftShoulder: return L"LB";
+    case input_map::RightShoulder: return L"RB";
+    case input_map::LeftTrigger: return L"LT";
+    case input_map::RightTrigger: return L"RT";
+    case input_map::Back: return L"Back";
+    case input_map::Start: return L"Start";
+    case input_map::LeftThumb: return Tr(L"Left stick click", L"左搖桿按下");
+    case input_map::RightThumb: return Tr(L"Right stick click", L"右搖桿按下");
+    case input_map::DpadUp: return Tr(L"D-pad up", L"方向鍵上");
+    case input_map::DpadDown: return Tr(L"D-pad down", L"方向鍵下");
+    case input_map::DpadLeft: return Tr(L"D-pad left", L"方向鍵左");
+    case input_map::DpadRight: return Tr(L"D-pad right", L"方向鍵右");
+    case input_map::StickUp: return Tr(L"Left stick up", L"左搖桿上");
+    case input_map::StickDown: return Tr(L"Left stick down", L"左搖桿下");
+    case input_map::StickLeft: return Tr(L"Left stick left", L"左搖桿左");
+    case input_map::StickRight: return Tr(L"Left stick right", L"左搖桿右");
+    }
+    return L"?";
+}
+// A controller source by the Xbox 360 name of its default input; the extra
+// buttons some controllers have by their own names.
+std::wstring SourceLabel(input_map::Source source)
+{
+    for (int i = 0; i < input_map::ControllerInputCount; ++i)
+        if (input_map::DefaultController[i] == source) return InputLabel(i);
+    if (source >= 16 && source <= 19) return Tr(L"Paddle", L"背鍵") + std::wstring(L" ") + std::to_wstring(source - 15);
+    if (source == 20) return Tr(L"Touchpad", L"觸控板");
+    if (source == 15) return Tr(L"Extra button", L"額外按鍵") + std::wstring(L" 1");
+    if (source >= 21 && source <= 25) return Tr(L"Extra button", L"額外按鍵") + std::wstring(L" ") + std::to_wstring(source - 19);
+    return L"Guide";
+}
+std::wstring KeyLabel(uint16_t scancode)
+{
+    return scancode == input_map::NoKey ? std::wstring(Tr(L"None", L"無")) : Widen(hid::KeyName(scancode));
+}
+void EndCapture()
+{
+    captureMode = 0;
+    captureRow = -1;
+    captureArmed = false;
+    capturedKey = -1;
+    captureEscape = false;
+}
+void BeginCapture(int r, bool keyboard)
+{
+    captureRow = r;
+    captureArmed = false;
+    capturedKey = -1;
+    captureEscape = false;
+    captureDeadline = MenuNow() + std::chrono::seconds(ControlsCaptureSeconds);
+    captureMode = keyboard ? 2 : 1;
+    status.clear();
+}
+void OpenControlsPage()
+{
+    const auto saved = GetConfig();
+    controlsController = controlsControllerStart = saved.controllerMap;
+    controlsKeyboard = controlsKeyboardStart = saved.keyboardMap;
+    controlsFocus = ControlsPromptRow;
+    controlsDiscardPrompt = false;
+    EndCapture();
+    status.clear();
+    controlsOpen = true;
+    LOG_INFO("settings: controls page opened");
+}
+void CloseControlsPage()
+{
+    EndCapture();
+    controlsOpen = false;
+    controlsDiscardPrompt = false;
+    status.clear();
+}
+// Help for the focused Controls page row (line 1); line 2 says the page keeps
+// the default layouts.
+std::pair<std::wstring, std::wstring> ControlsHelp()
+{
+    std::wstring page = Tr(L"This page always uses the default buttons and keys.", L"此頁面始終使用預設按鍵。");
+    bool keyboard = false;
+    const int input = ControlsInput(controlsFocus, keyboard);
+    if (captureRow >= 0)
+        return {captureMode.load() == 2 ? Tr(L"Press a key. Esc cancels.", L"按下鍵盤按鍵。按 Esc 取消。")
+                                        : Tr(L"Press a button on any controller. Esc on the keyboard cancels.",
+                                             L"在任一控制器上按下按鍵。按鍵盤 Esc 取消。"),
+                page};
+    if (controlsFocus == ControlsPromptRow)
+        return {Tr(L"Which button icons the game shows. Auto follows the controller you use.",
+                   L"遊戲顯示的按鍵圖示。自動會跟隨你使用的控制器。"),
+                page};
+    if (controlsFocus == ControlsVibrationRow)
+        return {Tr(L"Controller vibration strength. Min turns it off. Applies immediately.",
+                   L"控制器震動強度。調到最小即關閉。立即套用。"),
+                page};
+    if (controlsFocus == ControlsRestoreRow)
+        return {Tr(L"Puts every button and key back to the default. Save to keep it.", L"將所有按鍵恢復為預設。儲存後保留。"), page};
+    if (controlsFocus == ControlsSaveRow)
+        return {Tr(L"Saves the buttons and keys. They apply at once.", L"儲存按鍵配置，立即套用。"), page};
+    if (input >= 0)
+        return {keyboard ? Tr(L"Confirm, then press the key for this input. Any key already in use swaps places.",
+                              L"確認後，按下要用於此項的鍵盤按鍵。已使用的按鍵會互換。")
+                         : Tr(L"Confirm, then press the controller button for this input. Any button already in use swaps places.",
+                              L"確認後，按下要用於此項的控制器按鍵。已使用的按鍵會互換。"),
+                page};
+    return {{}, page};
 }
 // Menu choice 0 is Automatic; choice i names[i - 1]. A saved name that is not
 // listed stays as the last choice, so the row shows the saved value.
@@ -569,6 +817,15 @@ const wchar_t *VoiceName(uint8_t *base, uint32_t index)
     const auto language = VoiceLanguage(base, index);
     return language >= 1 && language < std::size(names) ? names[language] : L"Unknown";
 }
+// The status line is one line in a small box: a space after a Latin stop,
+// none after a full-width one.
+void AppendSentence(std::wstring &text, std::wstring_view sentence)
+{
+    while (!sentence.empty() && sentence.front() == L' ') sentence.remove_prefix(1);
+    if (sentence.empty()) return;
+    if (!text.empty() && !text.ends_with(L'。')) text += L' ';
+    text += sentence;
+}
 std::wstring ExecutionSizeSuffix(const gpu::frame_plan::FramePlan &plan)
 {
     if (!plan.width || !plan.height || !plan.output.width || !plan.output.height)
@@ -599,23 +856,21 @@ const wchar_t *ReasonSentence(gpu::frame_plan::DlssEffectReason reason)
     case DlssEffectReason::AwaitingGpuFrame:
         return Tr(L"Waiting for the first DLSS result.", L"正在等待第一次 DLSS 結果。");
     case DlssEffectReason::DeviceNotReady:
-        return Tr(L"DLSS is waiting for the graphics device. Normal rendering is used for now.",
-                  L"DLSS 正在等待圖形裝置。目前先使用常規渲染。");
+        return Tr(L"DLSS is waiting for the graphics device.",
+                  L"DLSS 正在等待圖形裝置。");
     case DlssEffectReason::NeedsVulkanRestart:
         return Tr(L"DLSS needs Vulkan and a restart.", L"DLSS 需要 Vulkan，並在重新啟動後才會使用。");
     case DlssEffectReason::CapabilityUnavailable:
         return Tr(L"DLSS is not available on this device.", L"這台裝置無法使用 DLSS。");
     case DlssEffectReason::SizingPending:
-        return Tr(L"DLSS is querying the render resolution. Normal rendering is used for now.",
-                  L"DLSS 正在查詢渲染解析度。目前先使用常規渲染。");
+        return Tr(L"DLSS is querying the render resolution.",
+                  L"DLSS 正在查詢渲染解析度。");
     case DlssEffectReason::SizingUnavailable:
         return Tr(L"Render resolution is unavailable.", L"渲染解析度無法使用。");
     case DlssEffectReason::SizingError:
         return Tr(L"Render resolution query failed.", L"渲染解析度查詢失敗。");
     case DlssEffectReason::InputProbeOnly:
         return Tr(L"Input capture only. DLSS is not run.", L"只採集輸入，不執行 DLSS。");
-    case DlssEffectReason::NoEligibleScene:
-        return Tr(L"No eligible scene this frame.", L"這一幀沒有合格場景。");
     case DlssEffectReason::MotionPipelinePending:
         return Tr(L"Motion data is still being prepared.", L"正在準備運動資料。");
     case DlssEffectReason::UnknownColorEncoding:
@@ -625,14 +880,21 @@ const wchar_t *ReasonSentence(gpu::frame_plan::DlssEffectReason reason)
     case DlssEffectReason::PromotionUnavailable:
         return Tr(L"DLSS output was not adopted.", L"未能採用 DLSS 輸出。");
     case DlssEffectReason::RequestFailure:
-        return Tr(L"DLSS request failed and fell back. No automatic retry.",
-                  L"DLSS 請求失敗並已回退，不會自動重試。");
+        return Tr(L"DLSS request failed; no automatic retry.",
+                  L"DLSS 請求失敗，不會自動重試。");
     case DlssEffectReason::GpuWorkStopped:
         return Tr(L"GPU work has stopped.", L"GPU 工作已停止。");
+    case DlssEffectReason::NoEligibleScene: // NotStartedSentence
     case DlssEffectReason::None:
         break;
     }
     return nullptr;
+}
+// No frame of the current request has drawn a scene yet: the title screen,
+// a fresh boot, or a change just saved from the in-game menu. Every upscaler.
+const wchar_t *NotStartedSentence()
+{
+    return Tr(L"Upscaling starts once the game scene is on screen.", L"進入遊戲場景後才會開始縮放。");
 }
 const wchar_t *PhaseSentence(gpu::frame_plan::DlssEffectPhase phase)
 {
@@ -651,32 +913,33 @@ const wchar_t *PhaseSentence(gpu::frame_plan::DlssEffectPhase phase)
     case DlssEffectPhase::DeviceUnavailable:
         return ReasonSentence(DlssEffectReason::CapabilityUnavailable);
     case DlssEffectPhase::TemporaryFallback:
-        return Tr(L"DLSS is not running. Normal rendering is used for now.",
-                  L"DLSS 沒有在執行。目前先使用常規渲染。");
+        return Tr(L"DLSS is not running for now.",
+                  L"DLSS 暫時沒有執行。");
     case DlssEffectPhase::Inactive:
     case DlssEffectPhase::Active:
         break;
     }
     return Tr(L"DLSS is not in use.", L"DLSS 目前未啟用。");
 }
-std::wstring SubmittedSentence(const gpu::frame_plan::DlssEffectSnapshot &running)
+std::wstring SubmittedSentence(const gpu::frame_plan::DlssExecutionObservation &execution)
 {
-    return std::wstring(SubmittedModeSentence(running.execution->plan.dlssQuality)) +
-           ExecutionSizeSuffix(running.execution->plan);
+    std::wstring text = SubmittedModeSentence(execution.plan.dlssQuality);
+    AppendSentence(text, ExecutionSizeSuffix(execution.plan));
+    return text;
 }
 const wchar_t *BackendPendingSentence(gpu::backend::Backend backend)
 {
     if (backend == gpu::backend::Backend::Vulkan)
-        return Tr(L"Still using Vulkan until restart. DLSS is checked after restart.",
-                  L"重新啟動前仍使用 Vulkan。DLSS 會在重新啟動後再確認。");
+        return Tr(L"Still on Vulkan until restart.",
+                  L"重新啟動前仍使用 Vulkan。");
     if (backend == gpu::backend::Backend::D3D11)
-        return Tr(L"Still using Direct3D 11 until restart. DLSS is checked after restart.",
-                  L"重新啟動前仍使用 Direct3D 11。DLSS 會在重新啟動後再確認。");
+        return Tr(L"Still on Direct3D 11 until restart.",
+                  L"重新啟動前仍使用 Direct3D 11。");
     if (backend == gpu::backend::Backend::D3D12)
-        return Tr(L"Still using Direct3D 12 until restart. DLSS is checked after restart.",
-                  L"重新啟動前仍使用 Direct3D 12。DLSS 會在重新啟動後再確認。");
-    return Tr(L"Graphics backend change is not applied. DLSS is checked after restart.",
-              L"圖形後端變更尚未套用。DLSS 會在重新啟動後再確認。");
+        return Tr(L"Still on Direct3D 12 until restart.",
+                  L"重新啟動前仍使用 Direct3D 12。");
+    return Tr(L"The backend change applies after restart.",
+              L"圖形後端變更會在重新啟動後套用。");
 }
 // XeSS shares the FSR status sentences and their translations; only the
 // provider name differs.
@@ -691,11 +954,10 @@ const wchar_t* FsrFallbackSentence(gpu::frame_plan::DlssEffectReason reason)
     using gpu::frame_plan::DlssEffectReason;
     switch (reason) {
     case DlssEffectReason::NoEligibleScene:
-        return Tr(L"FSR: no eligible scene in the latest frame. Menus and transitions may use normal rendering.",
-                  L"FSR：最近一幀沒有合格場景。選單和過場可能使用常規渲染。");
+        return NotStartedSentence();
     case DlssEffectReason::UnknownColorEncoding:
-        return Tr(L"FSR: scene color source is not verified. Normal rendering is used for this frame.",
-                  L"FSR：場景色彩來源尚未確認，這一幀使用常規渲染。");
+        return Tr(L"FSR: scene color unverified; normal rendering.",
+                  L"FSR：場景色彩未確認，使用常規渲染。");
     case DlssEffectReason::MotionPipelinePending:
         return Tr(L"FSR: motion data is still being prepared.", L"FSR：正在準備運動資料。");
     case DlssEffectReason::FeatureReconfigurePending:
@@ -703,20 +965,22 @@ const wchar_t* FsrFallbackSentence(gpu::frame_plan::DlssEffectReason reason)
     case DlssEffectReason::PromotionUnavailable:
         return Tr(L"FSR: output was not adopted this frame.", L"FSR：這一幀未能採用輸出。");
     case DlssEffectReason::RequestFailure:
-        return Tr(L"FSR request failed. Change the upscaler setting or restart to retry.",
-                  L"FSR 請求失敗。請變更縮放設定或重新啟動後重試。");
+        return Tr(L"FSR failed. Change the upscaler or restart to retry.",
+                  L"FSR 失敗。請變更縮放設定或重新啟動後重試。");
     case DlssEffectReason::GpuWorkStopped:
         return Tr(L"FSR: GPU work has stopped. Restart is required.", L"FSR：GPU 工作已停止，需要重新啟動。");
     default:
-        return Tr(L"FSR has not submitted output for the current request. Normal rendering is in use.",
-                  L"FSR 目前的請求尚無已提交輸出，正在使用常規渲染。");
+        return Tr(L"FSR has no output yet; normal rendering for now.",
+                  L"FSR 尚無輸出，目前使用常規渲染。");
     }
 }
 // The first sentence is the classified result. Active with an execution record
 // reads quality and size from that submitted frame, not from an unsaved edit or
 // the CPU plan. Submitted means that output was accepted for submission. It does
 // not mean the GPU finished, the image was presented, or the whole frame used DLSS.
-// Active without an execution record stays on the waiting sentence.
+// Active without an execution record stays on the waiting sentence. While the
+// newest frame has no scene, StatusExecution of the same request is described;
+// a failure classified from the snapshot still comes first.
 // An unsaved Off, quality, or backend edit is only a following note.
 std::wstring DlssNotice()
 {
@@ -734,18 +998,20 @@ std::wstring DlssNotice()
         else if (!running.device.metalFxAvailable)
             text = Tr(L"MetalFX Temporal is unavailable on this Mac.", L"這台 Mac 無法使用 MetalFX Temporal。");
         else if (running.hasPlan && running.failure)
-            text = Tr(L"MetalFX request failed. Change the upscaler setting or restart to retry.",
-                      L"MetalFX 請求失敗。請變更縮放設定或重新啟動後重試。");
+            text = Tr(L"MetalFX failed. Change the upscaler or restart to retry.",
+                      L"MetalFX 失敗。請變更縮放設定或重新啟動後重試。");
         else if (matchingExecution && execution->submissionSerial &&
             execution->outcome == gpu::frame_plan::DlssExecutionOutcome::Submitted) {
             const wchar_t* modes[] = {Tr(L"Quality", L"品質"), Tr(L"Balanced", L"平衡"), Tr(L"Performance", L"效能"), L"Native AA"};
             text = std::wstring(L"MetalFX ") + modes[uint32_t(gpu::upscaling::NormalizeFsrQuality(execution->plan.fsrQuality))] +
-                Tr(L" output submitted.", L" 輸出已提交。") + ExecutionSizeSuffix(execution->plan);
-        } else
-            text = Tr(L"MetalFX: no upscaled scene in the latest frame. Menus and transitions use normal rendering.",
-                      L"MetalFX：最近一幀沒有縮放場景。選單和過場使用常規渲染。");
+                Tr(L" output submitted.", L" 輸出已提交。");
+            AppendSentence(text, ExecutionSizeSuffix(execution->plan));
+        } else if (matchingExecution && gpu::frame_plan::SceneEligible(*execution))
+            text = WithProvider(FsrFallbackSentence(execution->reason), L"MetalFX");
+        else
+            text = NotStartedSentence();
         if (edit.upscaler != gpu::upscaling::Upscaler::MetalFx)
-            text += Tr(L" The selected upscaler is not applied yet.", L" 選取的縮放技術尚未套用。");
+            AppendSentence(text, Tr(L" The new upscaler is not applied yet.", L" 新的縮放技術尚未套用。"));
         return text;
     }
     for (const auto provider : {gpu::upscaling::Upscaler::Fsr, gpu::upscaling::Upscaler::Xess}) {
@@ -774,24 +1040,46 @@ std::wstring DlssNotice()
             execution->outcome == gpu::frame_plan::DlssExecutionOutcome::Submitted) {
             const wchar_t* modes[] = {Tr(L"Quality", L"品質"), Tr(L"Balanced", L"平衡"), Tr(L"Performance", L"效能"), L"Native AA"};
             fsrText = std::wstring(L"FSR ") + modes[uint32_t(gpu::upscaling::NormalizeFsrQuality(execution->plan.fsrQuality))] +
-                Tr(L" output submitted.", L" 輸出已提交。") + ExecutionSizeSuffix(execution->plan);
+                Tr(L" output submitted.", L" 輸出已提交。");
+            AppendSentence(fsrText, ExecutionSizeSuffix(execution->plan));
             if (edit.upscaler == provider && edit.fsrQuality != execution->plan.fsrQuality)
-                fsrText += Tr(L" The selected FSR quality is not applied yet.", L" 選取的 FSR 品質尚未套用。");
+                AppendSentence(fsrText, Tr(L" The new quality is not applied yet.", L" 新的品質尚未套用。"));
         } else {
             fsrText = FsrFallbackSentence(matchingExecution ? execution->reason :
                 gpu::frame_plan::DlssEffectReason::AwaitingGpuFrame);
         }
         if (edit.graphicsBackend != running.device.backend)
-            fsrText += Tr(L" The selected graphics backend applies after restart.", L" 選取的圖形後端會在重新啟動後套用。");
+            AppendSentence(fsrText, Tr(L" The backend change applies after restart.", L" 圖形後端變更會在重新啟動後套用。"));
         if (edit.upscaler != provider)
-            fsrText += Tr(L" The selected upscaler is not applied yet.", L" 選取的縮放技術尚未套用。");
+            AppendSentence(fsrText, Tr(L" The new upscaler is not applied yet.", L" 新的縮放技術尚未套用。"));
         return xess ? WithProvider(std::move(fsrText), name) : fsrText;
     }
+    // The menu itself covers the scene, so its frames report NoEligibleScene.
+    // Describe a submitted frame of this request instead, or the reason of its
+    // last frame with a scene when none was submitted.
+    const bool sceneless = running.phase == gpu::frame_plan::DlssEffectPhase::TemporaryFallback &&
+        running.reason == gpu::frame_plan::DlssEffectReason::NoEligibleScene;
+    const bool lastScene = sceneless && execution && gpu::frame_plan::SceneEligible(*execution) &&
+        execution->actualProvider == gpu::upscaling::Upscaler::Dlss &&
+        execution->plan.deviceEpoch == running.device.deviceEpoch &&
+        execution->plan.requestSignature == running.requestSignature &&
+        execution->plan.geometryEpoch == running.geometryEpoch;
+    const bool lastSubmitted = lastScene && execution->submissionSerial &&
+        execution->outcome == gpu::frame_plan::DlssExecutionOutcome::Submitted &&
+        execution->plan.consumer == gpu::upscaling::TemporalConsumer::DlssSr;
     std::wstring text;
     if (running.phase == gpu::frame_plan::DlssEffectPhase::Active && running.execution)
-        text = SubmittedSentence(running);
+        text = SubmittedSentence(*running.execution);
     else if (running.phase == gpu::frame_plan::DlssEffectPhase::Active)
         text = ReasonSentence(gpu::frame_plan::DlssEffectReason::AwaitingGpuFrame);
+    else if (lastSubmitted)
+        text = SubmittedSentence(*execution);
+    else if (const wchar_t *lastReason = lastScene ? ReasonSentence(execution->reason) : nullptr)
+        text = lastReason;
+    else if (lastScene)
+        text = PhaseSentence(gpu::frame_plan::DlssEffectPhase::TemporaryFallback);
+    else if (sceneless)
+        text = NotStartedSentence();
     else if (const wchar_t *classified = ReasonSentence(running.reason))
         text = classified;
     else
@@ -804,23 +1092,28 @@ std::wstring DlssNotice()
         if (running.execution)
             appliedQuality = gpu::upscaling::NormalizeDlssQuality(running.execution->plan.dlssQuality);
     }
+    else if (lastSubmitted)
+        appliedQuality = gpu::upscaling::NormalizeDlssQuality(execution->plan.dlssQuality);
     else if (runningDlss)
         appliedQuality = gpu::upscaling::NormalizeDlssQuality(running.plannedQuality);
     if (runningDlss && edit.upscaler != gpu::upscaling::Upscaler::Dlss)
-        text += std::wstring(L" ") + (edit.upscaler == gpu::upscaling::Upscaler::Fsr ? Tr(L"The FSR choice is not applied yet.", L"FSR 選項尚未套用。") :
+        AppendSentence(text, edit.upscaler == gpu::upscaling::Upscaler::Fsr ? Tr(L"The FSR choice is not applied yet.", L"FSR 選項尚未套用。") :
             edit.upscaler == gpu::upscaling::Upscaler::Xess ? WithProvider(Tr(L"The FSR choice is not applied yet.", L"FSR 選項尚未套用。"), L"XeSS") :
             Tr(L"The Off choice is not applied yet.", L"關閉選項尚未套用。"));
     else if (!runningDlss && edit.upscaler == gpu::upscaling::Upscaler::Dlss && !backendPending)
-        text += std::wstring(L" ") + Tr(L"The DLSS choice is not applied yet.", L"DLSS 選項尚未套用。");
+        AppendSentence(text, Tr(L"The DLSS choice is not applied yet.", L"DLSS 選項尚未套用。"));
     else if (runningDlss && edit.upscaler == gpu::upscaling::Upscaler::Dlss && appliedQuality &&
              gpu::upscaling::NormalizeDlssQuality(edit.dlssQuality) != *appliedQuality)
-        text += std::wstring(L" ") + Tr(L"The selected DLSS quality is not applied yet.", L"選取的 DLSS 品質尚未套用。");
+        AppendSentence(text, Tr(L"The new quality is not applied yet.", L"新的品質尚未套用。"));
     if (backendPending)
-        text += std::wstring(L" ") + BackendPendingSentence(running.device.backend);
+        AppendSentence(text, BackendPendingSentence(running.device.backend));
     return text;
 }
 bool GraphicsRowHidden(int r)
 {
+    // A page entry row shows with the setting it belongs to.
+    if (r == int(GraphicsRow::NeuralRenderingTuning)) r = int(GraphicsRow::DlssNeuralRendering);
+    if (r == int(GraphicsRow::HdrCalibration)) r = int(GraphicsRow::HdrPeak);
 #if LO_PLATFORM_SWITCH
     // The console owns the display and output size, and settings::Validate pins
     // the Xbox 360 image (720p scene, no host AA, AO, filtering, upscaling, HDR).
@@ -910,7 +1203,7 @@ std::wstring FgNotice()
         text = Tr(L"Frame generation is off.", L"影格生成已關閉。"); break;
     }
     if (running.environmentOverride)
-        text += Tr(L" A diagnostic override controls FG.", L" 影格生成由診斷覆寫控制。");
+        text += Tr(L" The diagnostic override controls FG.", L" 影格生成由診斷覆寫控制。");
     return text;
 }
 static_assert(int(GraphicsRow::Save) + 1 == int(GraphicsRow::Count));
@@ -943,7 +1236,7 @@ void Publish(uint8_t *base, uint32_t config)
     apu::SetTestSignal(speakerTest);
     Snapshot next;
     next.tab = tab;
-    next.row = modsOpen ? modsFocus : row;
+    next.row = modsOpen ? modsFocus : controlsOpen ? controlsFocus : achievementsOpen ? achievementsFocus : row;
     next.speakerLayout = speakerTest;
     next.speakerRear = int(edit.audioMatrixRear);
     next.language = edit.uiLanguage;
@@ -951,6 +1244,7 @@ void Publish(uint8_t *base, uint32_t config)
     next.brightness = MakeBrightnessCalibration(edit, brightnessOpen.load());
     next.neuralRendering = MakeNeuralRenderingTuning(edit, nrOpen.load());
     const uint32_t flags = PPC_LOAD_U32(config + 4);
+    next.confirmB = (flags & 0x02000000) != 0;
     auto makeChoices = [&](const wchar_t *en, const wchar_t *zh, std::vector<std::wstring> choices,
                            uint32_t selected, bool enabled = true) {
         selected = choices.empty() ? 0 : std::min(selected, uint32_t(choices.size() - 1));
@@ -1000,6 +1294,67 @@ void Publish(uint8_t *base, uint32_t config)
         next.reorder = focused >= 0 && mods_page::IsMod(modsEntries[size_t(focused)]) &&
                        modsEntries[size_t(focused)].info.apiVersion != 0 && mods_page::ModCount(modsEntries) > 1;
     }
+    else if (achievementsOpen)
+    {
+        next.pageTitle = Tr(L"Achievements", L"成就");
+        next.keyLegend = (flags & 0x02000000)
+            ? Tr(L"B / Left / Right: change     A: back", L"B / 左 / 右：變更     A：返回")
+            : Tr(L"A / Left / Right: change     B: back", L"A / 左 / 右：變更     B：返回");
+        next.rows.resize(size_t(AchievementsFirstRow) + achievementItems.size());
+        next.rows[AchievementsNotificationsRow] = makeChoices(L"Notifications", L"通知",
+            {Tr(L"On", L"開"), Tr(L"Silent", L"靜音"), Tr(L"Off", L"關")}, AchievementNotificationMode());
+        const auto summary = achievements_page::Summarize(achievementItems);
+        Row title;
+        title.header = true;
+        title.name = std::wstring(Tr(L"Earned", L"已獲得")) + L" " + std::to_wstring(summary.earned) + L" " +
+                     Tr(L"of", L"/") + L" " + std::to_wstring(summary.total);
+        title.detail = std::to_wstring(summary.earnedScore) + L" / " + std::to_wstring(summary.totalScore) + L"G";
+        next.rows[AchievementsSummaryRow] = std::move(title);
+        for (size_t i = 0; i < achievementItems.size(); ++i)
+            next.rows[size_t(AchievementsFirstRow) + i] = AchievementRow(achievementItems[i], achievementIcons[i]);
+    }
+    else if (controlsOpen)
+    {
+        next.pageTitle = Tr(L"Controls", L"按鍵設定");
+        next.keyLegend = (flags & 0x02000000)
+            ? Tr(L"B: change     Start: save     A: back", L"B：變更     Start：儲存     A：返回")
+            : Tr(L"A: change     Start: save     B: back", L"A：變更     Start：儲存     B：返回");
+        next.rows.resize(size_t(ControlsRowCount));
+        next.rows[ControlsPromptRow] = makeChoices(L"Button prompts", L"按鍵提示",
+            {Tr(L"Auto", L"自動"), L"Xbox", L"PlayStation"}, std::min(edit.buttonPrompts, 2u));
+        next.rows[ControlsVibrationRow] = {Tr(L"Vibration", L"震動"), std::to_wstring(edit.vibrationPercent) + L"%", true, {}, 0,
+                                           int(std::min(edit.vibrationPercent, 100u))};
+        auto title = [&](const wchar_t *en, const wchar_t *zh) {
+            Row header{Tr(en, zh), {}, false, {}, 0};
+            header.header = true;
+            return header;
+        };
+        next.rows[ControlsControllerTitle] = title(L"Controller", L"控制器");
+        next.rows[ControlsKeyboardTitle] = title(L"Keyboard", L"鍵盤");
+        // The row being captured counts down in place of its binding.
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(captureDeadline - MenuNow()).count();
+        const auto seconds = std::to_wstring(std::max<long long>(0, (left + 999) / 1000));
+        auto binding = [&](int r, std::wstring value, bool literal) {
+            bool keyboard = false;
+            const int input = ControlsInput(r, keyboard);
+            if (r == captureRow)
+            {
+                value = std::wstring(keyboard ? Tr(L"Press a key…", L"請按下鍵盤按鍵…") : Tr(L"Press a button…", L"請按下按鍵…")) +
+                        L" (" + seconds + L")";
+                literal = false;
+            }
+            Row mapping{InputLabel(input), value, true, {value}, 0};
+            mapping.literal = literal;
+            next.rows[size_t(r)] = std::move(mapping);
+        };
+        for (int i = 0; i < input_map::ControllerInputCount; ++i)
+            binding(ControlsControllerFirst + i, SourceLabel(controlsController[size_t(i)]), false);
+        for (int i = 0; i < input_map::KeyboardInputCount; ++i)
+            binding(ControlsKeyboardFirst + i, KeyLabel(controlsKeyboard[size_t(i)]),
+                    controlsKeyboard[size_t(i)] != input_map::NoKey);
+        next.rows[ControlsRestoreRow] = makeChoices(L"Restore default buttons", L"恢復預設按鍵", {Tr(L"Restore", L"恢復")}, 0);
+        next.rows[ControlsSaveRow] = makeChoices(L"Save controls", L"儲存按鍵設定", {Tr(L"Save", L"儲存")}, 0);
+    }
     else if (tab == 0)
     {
         addChoices(L"Text speed", L"文字速度", {Tr(L"Fast", L"快"), Tr(L"Normal", L"正常"),
@@ -1017,9 +1372,8 @@ void Publish(uint8_t *base, uint32_t config)
         addChoices(L"Confirmation button", L"確認按鍵", {L"A / B", L"B / A"},
                    (flags & 0x02000000) ? 1 : 0);
         next.rows.back().controllerButtons = true;
-        addChoices(L"Button prompts", L"按鍵提示", {Tr(L"Auto", L"自動"), L"Xbox", L"PlayStation"},
-                   std::min(edit.buttonPrompts, 2u));
-        addSlider(L"Vibration", L"震動", edit.vibrationPercent);
+        addAction(L"Controls", L"按鍵設定", Tr(L"Open", L"開啟"));
+        next.rows.back().pageEntry = true;
         addAction(L"Restore game defaults", L"恢復遊戲預設設定", Tr(L"Restore", L"恢復"));
         addAction(L"Quit to Main Menu", L"退出到主選單", Tr(L"Return", L"返回"));
         for (int i = 0; i < GameRowCount; ++i)
@@ -1096,6 +1450,9 @@ void Publish(uint8_t *base, uint32_t config)
             if (edit.width == resolutions[i][0] && edit.height == resolutions[i][1]) outputChoice = i;
         }
         placeGraphics(GraphicsRow::OutputResolution, makeChoices(L"Output resolution", L"輸出解析度", std::move(outputChoices), outputChoice));
+        placeGraphics(GraphicsRow::Preset, makeChoices(L"Graphics preset", L"畫質預設",
+                   {Tr(L"Original", L"原版"), Tr(L"Low-end", L"低配置"), Tr(L"Custom", L"自訂")},
+                   uint32_t(graphics_menu::PresetOf(edit))));
         std::vector<std::wstring> renderChoices;
         for (const int height : graphics_menu::RenderResolutions)
             renderChoices.push_back(height == 0 ? Tr(L"Follow output", L"跟隨輸出") :
@@ -1148,6 +1505,9 @@ void Publish(uint8_t *base, uint32_t config)
                    std::min(edit.dlssNeuralRendering, DlssNeuralRenderingMaxPasses));
         neuralRendering.hidden = GraphicsRowHidden(int(GraphicsRow::DlssNeuralRendering));
         placeGraphics(GraphicsRow::DlssNeuralRendering, std::move(neuralRendering));
+        auto nrTuning = makeChoices(L"NR tuning & preview", L"神經渲染調整與預覽", {Tr(L"Open", L"開啟")}, 0);
+        nrTuning.pageEntry = true;
+        placeGraphics(GraphicsRow::NeuralRenderingTuning, std::move(nrTuning));
         const uint32_t afChoice = edit.anisotropicFiltering == 16 ? 4 : edit.anisotropicFiltering == 8 ? 3 :
                                   edit.anisotropicFiltering == 4 ? 2 : edit.anisotropicFiltering == 2 ? 1 : 0;
         placeGraphics(GraphicsRow::AnisotropicFiltering, makeChoices(L"Anisotropic filtering", L"各向異性過濾",
@@ -1191,6 +1551,8 @@ void Publish(uint8_t *base, uint32_t config)
         vsync.singleValue = true;
         placeGraphics(GraphicsRow::VariableRefreshRate, std::move(vsync));
 #endif
+        placeGraphics(GraphicsRow::PerformanceOverlay, makeChoices(L"Performance overlay", L"效能資訊",
+            {Tr(L"Off", L"關"), L"FPS", Tr(L"Detailed", L"詳細")}, std::min(edit.performanceOverlay, 2u)));
         std::vector<std::wstring> providers;
         uint32_t selected = 0;
         for (auto provider : FgProviders()) {
@@ -1223,8 +1585,13 @@ void Publish(uint8_t *base, uint32_t config)
         placeGraphics(GraphicsRow::HdrPeak,
             Row{Tr(L"HDR peak brightness", L"HDR 最高亮度"), peakValue, hdrAvailable,
                 {L"◀", peakValue, L"▶"}, 1});
-        placeGraphics(GraphicsRow::Brightness, makeChoices(L"Brightness / Gamma", L"亮度 / Gamma",
-                   {BrightnessValue(edit.displayBrightness) + L" · " + GammaValue(edit.displayGamma)}, 0));
+        auto calibration = makeChoices(L"HDR calibration", L"HDR 校準", {Tr(L"Open", L"開啟")}, 0, hdrAvailable);
+        calibration.pageEntry = true;
+        placeGraphics(GraphicsRow::HdrCalibration, std::move(calibration));
+        auto brightness = makeChoices(L"Brightness / Gamma", L"亮度 / Gamma",
+                   {BrightnessValue(edit.displayBrightness) + L" · " + GammaValue(edit.displayGamma)}, 0);
+        brightness.pageEntry = true;
+        placeGraphics(GraphicsRow::Brightness, std::move(brightness));
         placeGraphics(GraphicsRow::Save, makeChoices(L"Save graphics settings", L"儲存圖形設定", {Tr(L"Save", L"儲存")}, 0));
     }
     else
@@ -1239,19 +1606,24 @@ void Publish(uint8_t *base, uint32_t config)
                    GameLanguageChoiceIndex(gameLanguageChoices, edit.gameLanguage, edit.gameLanguagePack));
         addChoices(L"Automatic updates", L"自動更新", onOff(), edit.automaticUpdates ? 0 : 1);
         addChoices(L"Debug log", L"除錯日誌", onOff(), edit.debugLog ? 0 : 1);
+        if (achievementSummary.empty()) RefreshAchievementSummary();
+        addAction(L"Achievements", L"成就", achievementSummary.c_str());
+        next.rows.back().pageEntry = true;
         const bool logUpload = os::log_collection::Supported();
         next.rows.push_back({os::log_collection::Label(edit.uiLanguage),
             !logUpload ? Tr(L"Windows only", L"僅限 Windows") : os::log_collection::Enabled() ? Tr(L"On", L"開") : Tr(L"Off", L"關"),
             logUpload, {}, 0});
         addAction(L"Mods", L"Mod", Tr(L"Open", L"開啟"));
+        next.rows.back().pageEntry = true;
         addAction(L"Import discs & DLC", L"匯入光碟與 DLC", Tr(L"Open", L"開啟"));
+        addAction(L"Shader bundle", L"著色器包", Tr(L"Download again", L"重新下載"));
         addAction(L"Save settings", L"儲存設定", Tr(L"Save", L"儲存"));
     }
     // Keep the focused row inside the visible window. Scroll persists per tab
     // so returning to a long list restores its position.
     if (tab >= 0 && tab < MenuTabCount)
     {
-        static int scrollByTab[MenuTabCount] = {}, modsScroll = 0;
+        static int scrollByTab[MenuTabCount] = {}, modsScroll = 0, controlsScroll = 0, achievementsScroll = 0;
         int visibleCount = 0, visibleFocus = 0;
         for (size_t i = 0; i < next.rows.size(); ++i)
         {
@@ -1259,7 +1631,7 @@ void Publish(uint8_t *base, uint32_t config)
             if (int(i) <= next.row) visibleFocus = visibleCount;
             ++visibleCount;
         }
-        int &scroll = modsOpen ? modsScroll : scrollByTab[tab];
+        int &scroll = modsOpen ? modsScroll : controlsOpen ? controlsScroll : achievementsOpen ? achievementsScroll : scrollByTab[tab];
         scroll = std::clamp(scroll, 0, std::max(0, visibleCount - kMenuVisibleRows));
         if (visibleFocus < scroll) scroll = visibleFocus;
         if (visibleFocus >= scroll + kMenuVisibleRows) scroll = visibleFocus - kMenuVisibleRows + 1;
@@ -1271,48 +1643,51 @@ void Publish(uint8_t *base, uint32_t config)
     if (status.empty() && (flags & 0x02000000))
         next.help = Tr(L"LB / RB: category     D-pad: select / change     B: confirm     A: back",
                        L"LB / RB：分類     方向鍵：選擇 / 調整     B：確認     A：返回");
-    if (tab == 0 && row == GameVibrationRow)
-        next.help = Tr(L"Controller vibration strength. Min turns it off. Applies immediately.",
-                       L"控制器震動強度。調到最小即關閉。立即套用。");
+    if (tab == 0 && row == GameControlsRow)
+        next.help = Tr(L"Button prompts, vibration, and the controller and keyboard buttons.",
+                       L"按鍵提示、震動，以及控制器與鍵盤的按鍵配置。");
     if (tab == 3 && row == SystemGameLanguageRow)
         next.help = !edit.gameLanguagePack.empty()
-            ? Tr(L"A language pack from the mods folder. Voices and the rest stay in the language it is based on. Takes effect after restarting.",
-                 L"來自 mods 資料夾的語言包。語音等其餘內容沿用它所基於的語言。重新啟動後生效。")
+            ? Tr(L"Language pack from the mods folder. Voices and the rest stay in its base language. Applies after restarting.",
+                 L"來自 mods 資料夾的語言包。語音等其餘內容沿用其基礎語言。重新啟動後生效。")
             : Tr(L"Game language takes effect after restarting. Requires matching language assets.",
                  L"遊戲語言重新啟動後生效，需要對應語言資源。中文遊戲文本需要亞洲版資源。");
-    if (tab == 0 && row == GamePromptRow)
-        next.help = Tr(L"Which button icons the game shows. Auto follows the controller you use.",
-                       L"遊戲顯示的按鍵圖示。自動會跟隨你使用的控制器。");
     if (tab == 3 && row == SystemDebugLogRow)
         next.help = Tr(L"Writes every message to the log in logs/. Turn it on when you report a problem. Applies when saved.",
                        L"把所有訊息寫入 logs/ 中的日誌。回報問題時請開啟。儲存後生效。");
+    if (tab == 3 && row == SystemAchievementsRow)
+        next.help = Tr(L"Your achievements, and whether a notification shows when you unlock one.",
+                       L"查看你的成就，並設定解鎖時是否顯示通知。");
     if (tab == 3 && row == SystemModsRow)
-        next.help = Tr(L"Turn installed mods on or off and change their order. Changes apply after a restart.",
-                       L"開關已安裝的 Mod 並調整順序。重新啟動後生效。");
+        next.help = Tr(L"Turn installed mods on or off and change their order, without a restart.",
+                       L"開關已安裝的 Mod 並調整順序，無需重新啟動。");
     if (tab == 3 && row == SystemImportRow)
         next.help = Tr(L"Close the game to import selected discs or DLC again. Other content and saves stay intact.",
                        L"關閉遊戲並重新匯入所選光碟或 DLC；其他內容與存檔保留。");
+    if (tab == 3 && row == SystemShaderBundleRow)
+        next.help = Tr(L"Downloads the shader bundle for your renderer again at the next start, even if one is installed.",
+                       L"下次啟動時重新下載目前渲染器的著色器包，即使已經安裝。");
     if (tab == 1 && row == AudioVoiceVolumeRow && status.empty())
-        next.help = Tr(L"Spoken dialogue in cutscenes, set apart from Sound effects. Voices in battle follow Sound effects. Applies from the next scene.",
-                       L"過場動畫中的對白音量，與音效音量分開。戰鬥中的語音仍跟隨音效音量。從下一個場景起套用。");
+        next.help = Tr(L"Cutscene dialogue volume. Voices in battle follow Sound effects. Applies from the next scene.",
+                       L"過場動畫中的對白音量。戰鬥中的語音跟隨音效音量。從下一個場景起套用。");
     if (tab == 1 && row == AudioOutputRow && status.empty())
         next.help = edit.audioOutput == AudioOutputMatrix
-            ? Tr(L"Encodes 5.1 into stereo for an AV receiver's Pro Logic II, Dolby Surround or Neural:X mode; plays as stereo elsewhere. Applies immediately.",
-                 L"把 5.1 編入立體聲，供 AV 擴大機的 Pro Logic II、Dolby Surround 或 Neural:X 模式還原；其他裝置照常播放立體聲。立即套用。")
+            ? Tr(L"Encodes 5.1 into stereo for Pro Logic II, Dolby Surround or Neural:X receivers. Applies at once.",
+                 L"5.1 編入立體聲，供 Pro Logic II、Dolby Surround 或 Neural:X 擴大機還原；其他為立體聲。立即套用。")
             : edit.audioOutput == AudioOutputSurround && apu::OutputChannels() == 2
 #ifdef _WIN32
             // The speaker layout is only in the classic Sound control panel.
-            ? Tr(L"Windows reports a stereo device. Open Control Panel → Sound → Playback, select the device, click Configure and choose 5.1 or 7.1 Surround, then select 5.1 again.",
-                 L"Windows 將此裝置視為立體聲。開啟 控制台 → 音效 → 播放，選取裝置，按「設定」並選擇 5.1 或 7.1 環繞，再重新選擇 5.1。")
+            ? Tr(L"Windows sees a stereo device. In Control Panel → Sound → Playback → Configure, pick 5.1 or 7.1, then 5.1 here.",
+                 L"Windows 視此裝置為立體聲。在 控制台 → 音效 → 播放 → 設定 選 5.1 或 7.1，再於此選 5.1。")
 #else
-            ? Tr(L"The output device is not set to 5.1, so the stereo mix is in use. Set the system speakers to 5.1 or 7.1 and select 5.1 again.",
-                 L"輸出裝置未設定為 5.1，正在使用立體聲混音。請將系統喇叭設定為 5.1 或 7.1 後重新選擇 5.1。")
+            ? Tr(L"The device is not set to 5.1, so stereo is used. Set the system speakers to 5.1 or 7.1, then select 5.1 again.",
+                 L"裝置未設定為 5.1，正在使用立體聲。請將系統喇叭設為 5.1 或 7.1，再重新選擇 5.1。")
 #endif
             : Tr(L"5.1 sends the game's surround mix to a 5.1 or 7.1 speaker setup. Applies immediately.",
                  L"5.1 會將遊戲的環繞聲混音輸出到 5.1 或 7.1 喇叭，立即套用。");
     if (tab == 1 && row == AudioRearAngleRow && status.empty())
         next.help = edit.audioOutput == AudioOutputMatrix
-            ? Tr(L"A test sound circles the speakers. Sets where the rear channels sound; 110° is the Pro Logic II standard.",
+            ? Tr(L"The test sound circles the speakers. Sets where the rear channels sound; 110° is the Pro Logic II standard.",
                  L"測試聲音會繞著喇叭轉圈。設定後方聲道的位置；110° 為 Pro Logic II 標準。")
             : Tr(L"Select Matrix surround in Audio output to adjust this.",
                  L"在音訊輸出選擇矩陣環繞聲後才能調整。");
@@ -1343,23 +1718,27 @@ void Publish(uint8_t *base, uint32_t config)
                            L"儲存後將遊戲視窗移到這台顯示器，全螢幕也會使用它。自動則讓視窗留在原處。");
             break;
         case GraphicsRow::AspectRatio:
-            next.help = Tr(L"Auto fills the window. 16:9, 21:9 and 4:3 keep that shape with black bars; frame generation is off while bars show. Applies immediately after saving.",
-                           L"自動會填滿視窗。16:9、21:9 與 4:3 保持該比例並加上黑邊；有黑邊時影格生成關閉。儲存後立即套用。");
+            next.help = Tr(L"Auto fills the window. 16:9, 21:9 and 4:3 add black bars, and frame generation is off while they show. Applies on saving.",
+                           L"自動會填滿視窗。16:9、21:9 與 4:3 會加上黑邊，有黑邊時影格生成關閉。儲存後套用。");
             break;
         case GraphicsRow::OutputResolution:
             next.help = Tr(L"Sets the output size. Fullscreen uses the desktop size.",
                            L"設定輸出尺寸；全螢幕使用桌面尺寸。");
             break;
+        case GraphicsRow::Preset:
+            next.help = Tr(L"Both use 720p at 30 FPS. Low-end turns off dynamic shadows, motion blur, depth of field and bloom and uses the standard scaling filter.",
+                           L"兩者皆為 720p、30 FPS。低配置會關閉動態陰影、動態模糊、景深與光暈，並使用標準縮放濾鏡。");
+            break;
         case GraphicsRow::RenderResolution:
 #if LO_PLATFORM_MACOS
-            next.help = Tr(L"Scene resolution before scaling. Follow output uses the window size in points; Native uses every Retina pixel (4x the work).",
-                           L"縮放前的場景解析度。跟隨輸出使用視窗的點尺寸；原生使用全部 Retina 像素（4 倍工作量）。");
+            next.help = Tr(L"Scene resolution before scaling. Follow output uses window points; Native, every Retina pixel (4x work).",
+                           L"縮放前的場景解析度。跟隨輸出使用視窗點尺寸；原生使用全部 Retina 像素（4 倍工作量）。");
 #else
-            next.help = Tr(L"Scene resolution before scaling to the output. Follow output matches the output size.",
-                           L"縮放至輸出前的場景解析度。跟隨輸出與輸出尺寸相同。");
+            next.help = Tr(L"Scene resolution before scaling. Follow output matches the output size.",
+                           L"縮放前的場景解析度。跟隨輸出與輸出尺寸相同。");
 #endif
-            next.help += Tr(L" With an upscaler, a value above the output supersamples: the upscaler outputs at it and the image is scaled down.",
-                            L" 開啟縮放器時，高於輸出的值會超取樣：縮放器以此解析度輸出，再縮小顯示。");
+            next.help += Tr(L" An upscaler supersamples above it.",
+                            L"開啟縮放器時，高於輸出即為超取樣。");
             break;
         case GraphicsRow::ShadowResolution:
             next.help = Tr(L"Shadow-map resolution multiplier. Higher values need more GPU memory and rendering time. Applies after saving.",
@@ -1405,8 +1784,8 @@ void Publish(uint8_t *base, uint32_t config)
                            L"效能、平衡、品質或 DLAA。狀態列顯示已提交的模式。");
             break;
         case GraphicsRow::DlssModel:
-            next.help = Tr(L"M: steadier and sharper than older DLSS models at a moderate cost. L: the steadiest image with the least ghosting, but slower, especially on RTX 20 and 30 series.",
-                           L"M：比舊版 DLSS 模型更穩定、更清晰，開銷適中。L：畫面最穩定、拖影最少，但較慢，在 RTX 20/30 系列顯示卡上尤其明顯。");
+            next.help = Tr(L"M: steadier and sharper than older models, moderate cost. L: steadiest, least ghosting, but slower, mainly on RTX 20 and 30.",
+                           L"M：比舊版模型更穩定、更清晰，開銷適中。L：最穩定、拖影最少，但較慢，RTX 20/30 系列尤其明顯。");
             break;
         case GraphicsRow::FsrSharpness:
             next.help = Tr(L"FSR sharpening: Off disables RCAS; 1-100% sets sharpening strength.",
@@ -1414,19 +1793,25 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         case GraphicsRow::DlssNeuralRendering:
         {
-            next.help = Tr(L"NVIDIA's DLSS 5 neural rendering on the DLSS image. 1×-4× runs it that many times: stronger, but each pass costs frame rate. Needs an RTX GPU and nvngx_dlssnr.dll next to the game (not included). Applies after saving.",
-                           L"在 DLSS 畫面上執行 NVIDIA 的 DLSS 5 神經渲染。1×-4× 為執行次數：次數越多效果越強，但每次都會降低影格率。需要 RTX 顯示卡，並將 nvngx_dlssnr.dll 放在遊戲旁（不隨附）。儲存後套用。");
-            next.help = next.help + L" " + Tr(L"Confirm opens the tuning page.", L"按確認開啟調整頁面。");
+            next.help = Tr(L"More passes: stronger but slower. Needs an RTX GPU and nvngx_dlssnr.dll (not included). Confirm: tuning page.",
+                           L"次數越多效果越強，但會降低影格率。需要 RTX 顯示卡與 nvngx_dlssnr.dll（不隨附）。確認：調整頁面。");
+            // The Graphics help shares its box with the upscaler status, so the
+            // line is small already; the NR status must fit on it as well.
             using gpu::dlss::NeuralRenderingState;
             const auto state = gpu::dlss::g_neuralRenderingState.load(std::memory_order_relaxed);
             const wchar_t *status =
                 state == NeuralRenderingState::Active ? Tr(L"Running.", L"執行中。") :
-                state == NeuralRenderingState::MissingRuntime ? Tr(L"nvngx_dlssnr.dll is missing or unusable.", L"找不到 nvngx_dlssnr.dll 或無法使用。") :
-                state == NeuralRenderingState::Unsupported ? Tr(L"This GPU or driver cannot run it.", L"此顯示卡或驅動程式無法執行。") :
-                state == NeuralRenderingState::Failed ? Tr(L"It stopped after an error; see the log.", L"發生錯誤後已停止，請查看記錄檔。") : nullptr;
-            if (status) next.help = next.help + L" " + status;
+                state == NeuralRenderingState::MissingRuntime ? Tr(L"DLL not found.", L"找不到 DLL。") :
+                state == NeuralRenderingState::Unsupported ? Tr(L"Not supported.", L"此顯示卡或驅動程式不支援。") :
+                state == NeuralRenderingState::Failed ? Tr(L"Stopped after an error.", L"發生錯誤後已停止。") : nullptr;
+            // A full-width stop needs no space before the next sentence.
+            if (status) next.help = next.help + (next.help.ends_with(L'。') ? L"" : L" ") + status;
             break;
         }
+        case GraphicsRow::NeuralRenderingTuning:
+            next.help = Tr(L"Tune the model and compare DLSS with DLSS + NR in a live preview.",
+                           L"調整模型，並在即時預覽中比較 DLSS 與 DLSS + NR。");
+            break;
         case GraphicsRow::AnisotropicFiltering:
             next.help = Tr(L"Improves texture clarity at oblique viewing angles. Changes apply immediately after saving.",
                            L"提升斜角觀看時的紋理清晰度。儲存後立即套用。");
@@ -1444,8 +1829,8 @@ void Publish(uint8_t *base, uint32_t config)
                            L"遊戲在鏡頭與角色快速移動時的模糊。關閉後移動畫面保持清晰。儲存後立即套用。");
             break;
         case GraphicsRow::Culling:
-            next.help = Tr(L"How soon the game stops drawing characters and objects at the screen edges. 100% is the original; lower keeps them until they are fully off screen but costs frame rate, higher hides them sooner. Applies immediately after saving.",
-                           L"遊戲在畫面邊緣停止繪製角色與物件的時機。100% 為原版；數值越低越晚隱藏，直到完全離開畫面，但會降低影格率；數值越高越早隱藏。儲存後立即套用。");
+            next.help = Tr(L"How soon characters and objects at screen edges stop being drawn. 100% is original; lower costs frame rate, higher hides them sooner.",
+                           L"畫面邊緣的角色與物件何時停止繪製。100% 為原版；越低越耗影格率，越高越早隱藏。");
             break;
         case GraphicsRow::ScalingQuality:
 #if LO_PLATFORM_MACOS
@@ -1469,12 +1854,16 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         case GraphicsRow::VariableRefreshRate:
 #if LO_PLATFORM_MACOS
-            next.help = Tr(L"Shows each frame for one game frame so ProMotion and adaptive-sync displays follow the game's frame rate. Display sync stays on.",
+            next.help = Tr(L"Shows each frame for one game frame, so ProMotion and adaptive-sync displays follow the game's frame rate. Display sync stays on.",
                            L"每個影格至少顯示一個遊戲影格的時間，讓 ProMotion 與自適應同步螢幕跟隨遊戲影格率；顯示同步保持開啟。");
 #else
-            next.help = Tr(L"Off: each frame shows as soon as it is ready, with the lowest latency, but the picture can tear. On: frames wait for the display to refresh, without tearing. FreeSync / G-SYNC Compatible: for adaptive-sync displays; turn it on in the display and driver too. Applies immediately after saving.",
-                           L"關：畫面完成即顯示，延遲最低，但可能出現畫面撕裂。開：等待螢幕刷新再顯示，不會撕裂。FreeSync / G-SYNC Compatible：適用於自適應同步螢幕，需同時在螢幕與驅動程式中啟用。儲存後立即套用。");
+            next.help = Tr(L"Off: lowest latency, may tear. On: no tearing. FreeSync / G-SYNC Compatible: adaptive sync; turn it on in the display and driver too.",
+                           L"關：延遲最低，但可能撕裂。開：不會撕裂。FreeSync / G-SYNC Compatible：自適應同步螢幕用，需在螢幕與驅動程式中啟用。");
 #endif
+            break;
+        case GraphicsRow::PerformanceOverlay:
+            next.help = Tr(L"FPS: the frame rate at the top left. Detailed: a top bar with the upscaler and its resolution, frame generation, and CPU and GPU load.",
+                           L"FPS：左上角顯示影格率。詳細：頂端資訊列，含縮放器與解析度、影格生成、CPU 與 GPU 負載。");
             break;
         case GraphicsRow::FrameGeneration:
         case GraphicsRow::FrameGenerationMultiplier:
@@ -1494,8 +1883,8 @@ void Publish(uint8_t *base, uint32_t config)
                          L"影格生成需要 Direct3D 12。請先變更圖形後端並重新啟動。")
                     : Tr(L"Frame generation is unavailable for this backend in this build.", L"此版本的目前圖形後端未包含影格生成功能。");
             else if (GraphicsRow(row) == GraphicsRow::FrameGenerationMultiplier)
-                next.help = Tr(L"Includes the rendered frame. Available multipliers depend on the GPU and driver.",
-                               L"倍數包含原始渲染影格。可用倍數取決於顯示卡與驅動程式。");
+                next.help = Tr(L"Includes the rendered frame. Available multipliers depend on the GPU and driver. Applies immediately after saving.",
+                               L"倍數包含原始渲染影格。可用倍數取決於顯示卡與驅動程式。儲存後立即套用。");
             else if (edit.graphicsBackend == GraphicsBackend::Metal)
                 next.help = Tr(L"MetalFX frame generation uses 2× on supported GPUs with macOS 26 or later.",
                                L"MetalFX 影格生成在 macOS 26 或更新版本及支援的 GPU 上使用 2×。");
@@ -1518,8 +1907,8 @@ void Publish(uint8_t *base, uint32_t config)
         }
         case GraphicsRow::Hdr:
             next.help = graphics_menu::HdrAvailable(edit.graphicsBackend)
-                ? Tr(L"Requires an HDR display. Applies after saving; with frame generation on, after a restart. Works with every AA mode, upscaler and scaling filter; frame generation stays SDR except DLSS on Vulkan.",
-                     L"需要 HDR 螢幕。儲存後套用；開啟影格生成時需重新啟動。可搭配任一抗鋸齒、超解析度與縮放濾鏡；影格生成僅 Vulkan 的 DLSS 可與 HDR 同時開啟。")
+                ? Tr(L"Requires an HDR display. Applies on saving; with frame generation on, after a restart. Frame generation stays SDR except DLSS on Vulkan.",
+                     L"需要 HDR 螢幕。儲存後套用；開啟影格生成時需重新啟動。影格生成僅 Vulkan 的 DLSS 可保持 HDR。")
                 : Tr(L"HDR output is unavailable for this graphics backend.",
                      L"目前圖形後端無法使用 HDR 輸出。");
             break;
@@ -1536,6 +1925,13 @@ void Publish(uint8_t *base, uint32_t config)
             next.help = Tr(L"Press A to calibrate peak brightness against an HDR comparison pattern. Auto follows the active display report.",
                            L"按 A 以 HDR 對比圖校準最高亮度；自動模式跟隨目前顯示器的回報值。");
             break;
+        case GraphicsRow::HdrCalibration:
+            next.help = graphics_menu::HdrAvailable(edit.graphicsBackend)
+                ? Tr(L"Set peak brightness against an HDR test pattern or the current scene.",
+                     L"以 HDR 測試圖案或目前場景校準最高亮度。")
+                : Tr(L"HDR output is unavailable for this graphics backend.",
+                     L"目前圖形後端無法使用 HDR 輸出。");
+            break;
         case GraphicsRow::Brightness:
             next.help = Tr(L"Adjusts the game image's brightness and gamma. Press A to compare against the current scene. Changes apply after saving.",
                            L"調整遊戲畫面的亮度與 Gamma。按 A 與目前畫面對照；儲存後套用。");
@@ -1546,12 +1942,15 @@ void Publish(uint8_t *base, uint32_t config)
             break;
         }
     }
-    std::pair<std::wstring, std::wstring> modsHelp;
-    if (modsOpen)
+    // A page's help: line 1 for the focused row, line 2 in place of the notice.
+    std::pair<std::wstring, std::wstring> pageHelp;
+    if (modsOpen || controlsOpen)
     {
-        modsHelp = ModsHelp(modsRows);
-        next.help = modsHelp.first;
+        pageHelp = modsOpen ? ModsHelp(modsRows) : ControlsHelp();
+        next.help = pageHelp.first;
     }
+    else if (achievementsOpen)
+        next.help = AchievementsHelp();
     if (!status.empty()) next.help = status;
     if (restartPrompt)
     {
@@ -1606,12 +2005,26 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogChoices = {Tr(L"Open importer", L"開啟匯入器"), Tr(L"Cancel", L"取消")};
         next.dialogSelection = importChoice;
     }
-    if (modsDiscardPrompt)
+    if (shaderBundlePrompt)
+    {
+        next.dialogTitle = Tr(L"Shader bundle", L"著色器包");
+#ifdef _WIN32
+        next.dialogMessage = Tr(L"Restart the game and download the shader bundle again? Unsaved progress will be lost.",
+                                L"重新啟動遊戲並重新下載著色器包嗎？尚未儲存的進度將會遺失。");
+#else
+        next.dialogMessage = Tr(L"Download the shader bundle again the next time the game starts?",
+                                L"下次啟動時重新下載著色器包嗎？");
+#endif
+        next.dialogChoices = {Tr(L"Download again", L"重新下載"), Tr(L"Cancel", L"取消")};
+        next.dialogSelection = shaderBundleChoice;
+    }
+    if (modsDiscardPrompt || controlsDiscardPrompt)
     {
         next.dialogTitle = Tr(L"Unsaved changes", L"尚未儲存的變更");
-        next.dialogMessage = Tr(L"Leave without saving the mod list?", L"不儲存 Mod 清單就離開嗎？");
+        next.dialogMessage = modsDiscardPrompt ? Tr(L"Leave without saving the mod list?", L"不儲存 Mod 清單就離開嗎？")
+                                               : Tr(L"Leave without saving the controls?", L"不儲存按鍵設定就離開嗎？");
         next.dialogChoices = {Tr(L"Discard changes", L"捨棄變更"), Tr(L"Cancel", L"取消")};
-        next.dialogSelection = modsDiscardChoice;
+        next.dialogSelection = modsDiscardPrompt ? modsDiscardChoice : controlsDiscardChoice;
     }
     if (displayConfirm)
     {
@@ -1643,7 +2056,7 @@ void Publish(uint8_t *base, uint32_t config)
         : tab == 2 ? (row == int(GraphicsRow::FrameGeneration) ||
         row == int(GraphicsRow::FrameGenerationMultiplier) ? FgNotice() : DlssNotice()) : std::wstring{};
 #endif
-    if (modsOpen) next.notice = std::move(modsHelp.second);
+    if (modsOpen || controlsOpen) next.notice = std::move(pageHelp.second);
     std::lock_guard lock(snapshotMutex);
     // Presentation may have published availability while this snapshot was built.
     next.calibration.sceneAvailable = calibrationSceneAvailable.load(std::memory_order_relaxed);
@@ -1656,7 +2069,7 @@ void Publish(uint8_t *base, uint32_t config)
         next.dialogMessage == snapshot.dialogMessage && next.dialogChoices == snapshot.dialogChoices &&
         next.dialogSelection == snapshot.dialogSelection && next.speakerLayout == snapshot.speakerLayout &&
         next.speakerRear == snapshot.speakerRear && next.pageTitle == snapshot.pageTitle &&
-        next.keyLegend == snapshot.keyLegend && next.reorder == snapshot.reorder)
+        next.keyLegend == snapshot.keyLegend && next.reorder == snapshot.reorder && next.confirmB == snapshot.confirmB)
         return;
     next.revision = snapshot.revision + 1;
     snapshot = std::move(next);
@@ -1744,8 +2157,9 @@ bool CalibrationKey(uint32_t key)
         return true;
     }
     // Escape also leaves the Mods page; Enter stays Start there (jump to Save).
-    const bool brightnessKey = ((brightnessOpen.load() || nrOpen.load()) && (key == 13 || key == 27)) ||
-                               (modsOpen.load() && key == 27);
+    // On the Controls page Enter confirms like A, so it starts a capture.
+    const bool brightnessKey = ((brightnessOpen.load() || nrOpen.load() || controlsOpen.load()) && (key == 13 || key == 27)) ||
+                               ((modsOpen.load() || achievementsOpen.load()) && key == 27);
     if (!brightnessKey && (!calibrationOpen.load() || !(key == 8 || key == 13 || key == 27 || (key >= '0' && key <= '9'))))
         return false;
     std::lock_guard lock(calibrationKeyMutex);
@@ -1778,7 +2192,28 @@ void PointerDrag(float x, float y, bool held)
     }
     calibrationDragNits.store(int(CalibrationSliderValue(x, paperWhite)));
 }
-bool FilterInput(uint16_t &buttons, int16_t x, int16_t y)
+bool CaptureKey(uint32_t scancode, bool repeat)
+{
+    const int mode = captureMode.load();
+    if (!mode || !active.load())
+        return false;
+    if (scancode == input_map::EscapeKey)
+    {
+        if (!repeat) captureEscape = true;
+        return true;
+    }
+    if (mode != 2)
+        return false;
+    // A keyboard capture takes every key; a held key repeating (the one that
+    // started the capture) is not a press. F1 stays with the debug menu.
+    if (!repeat && input_map::BindableKey(scancode))
+    {
+        int none = -1;
+        capturedKey.compare_exchange_strong(none, int(scancode));
+    }
+    return true;
+}
+bool FilterInput(uint16_t &buttons, int16_t x, int16_t y, uint16_t defaultButtons)
 {
     // A held Back must not become a fresh press in the parent menu. Consume
     // the neutral poll as well so its edge detector sees the release first.
@@ -1809,6 +2244,16 @@ bool FilterInput(uint16_t &buttons, int16_t x, int16_t y)
     }
     if (!active.load())
         return false;
+    // The Controls page runs on the default layouts. Switching between the
+    // two waits for a release, so a held button is not a fresh press.
+    static bool defaultLayout = false;
+    if (const bool page = controlsOpen.load(); page != defaultLayout)
+    {
+        defaultLayout = page;
+        waitForRelease = true;
+    }
+    if (defaultLayout)
+        buttons = defaultButtons;
     if (swapConfirm.load())
         buttons = (buttons & ~0x3000) | ((buttons & 0x1000) << 1) | ((buttons & 0x2000) >> 1);
     if (x < -16000)
@@ -1929,7 +2374,7 @@ void PointerClick(float x, float y, bool reverse)
             break;
         }
     }
-    if (hit >= snapshot.rows.size())
+    if (hit >= snapshot.rows.size() || snapshot.rows[hit].header)
         return;
     if (x >= 1026)
     {
@@ -1941,8 +2386,12 @@ void PointerClick(float x, float y, bool reverse)
     }
     mouseRow = int(hit);
     if (listPage) {
-        // A switches a mod or runs an action; a right click switches too.
-        if (x >= 386 && snapshot.rows[hit].enabled) mouseAction = reverse ? 4 : 0x1000;
+        // Controls: Button prompts and Vibration step like on a tab.
+        if (controlsOpen.load() && (hit == size_t(ControlsPromptRow) || hit == size_t(ControlsVibrationRow))) {
+            if (x >= 386) mouseAction = reverse ? 4 : 8;
+        }
+        // A switches a mod, captures a button or runs an action; a right click switches too.
+        else if (x >= 386 && snapshot.rows[hit].enabled) mouseAction = reverse ? 4 : 0x1000;
     } else if (x >= 386 && snapshot.rows[hit].enabled) {
         const bool hdrLevel = snapshot.tab == 2 &&
             (hit == size_t(GraphicsRow::HdrPaperWhite) || hit == size_t(GraphicsRow::HdrPeak));
@@ -2094,10 +2543,18 @@ PPC_FUNC(sub_822F19B0)
         mainMenuPrompt = false;
         importPrompt = false;
         importLaunchPending = false;
+        shaderBundlePrompt = false;
         modsOpen = false;
         modsDiscardPrompt = false;
         restartForMods = false;
         modsEntries.clear();
+        achievementsOpen = false;
+        achievementItems.clear();
+        achievementIcons.clear();
+        RefreshAchievementSummary();
+        controlsOpen = false;
+        controlsDiscardPrompt = false;
+        EndCapture();
         displayConfirm = displayReverting = false;
         displayConfirmOpen = false;
         {
@@ -2139,6 +2596,12 @@ PPC_FUNC(sub_822F19B0)
     if (int selected = mouseRow.exchange(-1); selected >= 0)
     {
         if (modsOpen) modsFocus = selected;
+        else if (achievementsOpen) achievementsFocus = selected;
+        else if (controlsOpen)
+        {
+            // A capture keeps its row; a section title is never focused.
+            if (captureRow < 0 && selected < ControlsRowCount && !ControlsTitle(selected)) controlsFocus = selected;
+        }
         else row = selected;
         input |= 0x400;
     }
@@ -2158,6 +2621,10 @@ PPC_FUNC(sub_822F19B0)
         brightnessOpen = false;
         nrOpen = false;
         modsOpen = false;
+        achievementsOpen = false;
+        controlsOpen = false;
+        controlsDiscardPrompt = false;
+        EndCapture();
         cancelPolls = 0;
         pending = 0;
         PPCContext apply = ctx;
@@ -2328,6 +2795,35 @@ PPC_FUNC(sub_822F19B0)
                 restart::RequestInstall();
                 importLaunchPending = true;
                 status = Tr(L"Closing game and opening importer…", L"正在關閉遊戲並開啟匯入器……");
+            }
+        }
+        Publish(base, config);
+        return;
+    }
+    if (shaderBundlePrompt)
+    {
+        if (int selected = mouseDialog.exchange(-1); selected >= 0)
+            shaderBundleChoice = std::min(selected, 1);
+        if (input & 3) shaderBundleChoice = 1 - shaderBundleChoice;
+        if (input & 0x2000) shaderBundleChoice = 1;
+        if (input & 0x3000)
+        {
+            shaderBundlePrompt = false;
+            if (shaderBundleChoice == 0)
+            {
+                if (!updater::shader_pack::RequestRedownload())
+                    status = Tr(L"Could not save the request. Check that the game folder is writable.",
+                                L"無法儲存請求。請確認遊戲資料夾可寫入。");
+                else
+                {
+#ifdef _WIN32
+                    restart::Request();
+                    status = Tr(L"Restarting to download the shader bundle…", L"正在重新啟動以下載著色器包……");
+#else
+                    status = Tr(L"Restart the game to download the shader bundle again.",
+                                L"重新啟動遊戲後會重新下載著色器包。");
+#endif
+                }
             }
         }
         Publish(base, config);
@@ -2742,6 +3238,10 @@ PPC_FUNC(sub_822F19B0)
                 LOG_INFO("settings: mod list saved ({} mods)", order.size());
                 // Saving the order this run started with needs no restart.
                 if (order == modsRunning) status = Tr(L"Mod list saved.", L"Mod 清單已儲存。");
+                // The mods switch while the game runs (patches/mod_hot_reload.h): textures
+                // at once, models from the next area; the help line says so meanwhile.
+                else if (mod_hot_reload::Request())
+                    modsRunning = order;
                 else
                 {
                     restartPrompt = savedRestartPrompt = restartForMods = true;
@@ -2758,6 +3258,187 @@ PPC_FUNC(sub_822F19B0)
                 modsDiscardChoice = 1; // Cancel unless Discard is chosen
             }
             else CloseModsPage();
+        }
+        Publish(base, config);
+        return;
+    }
+    if (achievementsOpen.load())
+    {
+        std::vector<uint32_t> keys;
+        {
+            std::lock_guard lock(calibrationKeyMutex);
+            keys.swap(calibrationKeys);
+        }
+        // B, Back (keyboard Backspace) and Escape leave the page.
+        const bool back = (input & 0x2020) != 0 || std::find(keys.begin(), keys.end(), 27u) != keys.end();
+        const int count = AchievementsFirstRow + int(achievementItems.size());
+        if (input & 0x331f) status.clear();
+        // The summary title is never focused.
+        if (input & 1)
+            do { achievementsFocus = (achievementsFocus + count - 1) % count; } while (achievementsFocus == AchievementsSummaryRow);
+        if (input & 2)
+            do { achievementsFocus = (achievementsFocus + 1) % count; } while (achievementsFocus == AchievementsSummaryRow);
+        if (back) CloseAchievementsPage();
+        else if (achievementsFocus == AchievementsNotificationsRow && (input & 0x100c))
+            CycleAchievementNotifications((input & 4) ? -1 : 1);
+        Publish(base, config);
+        return;
+    }
+    if (controlsOpen.load())
+    {
+        std::vector<uint32_t> keys;
+        {
+            std::lock_guard lock(calibrationKeyMutex);
+            keys.swap(calibrationKeys);
+        }
+        if (captureRow >= 0)
+        {
+            // A capture takes no menu input: the next press binds, Escape
+            // cancels, and it gives up after ControlsCaptureSeconds.
+            mouseDialog = -1;
+            bool keyboard = false;
+            const int target = ControlsInput(captureRow, keyboard);
+            bool done = false;
+            int swapped = -1;
+            if (captureEscape.exchange(false))
+            {
+                status = Tr(L"Cancelled.", L"已取消。");
+                done = true;
+            }
+            else if (keyboard)
+            {
+                if (const int key = capturedKey.exchange(-1); key >= 0)
+                {
+                    swapped = input_map::BoundElsewhere(controlsKeyboard, target, uint16_t(key));
+                    input_map::Assign(controlsKeyboard, target, uint16_t(key));
+                    done = true;
+                }
+            }
+            else
+            {
+                // Wait for the press that started the capture to end.
+                const uint32_t held = hid::PressedSources() & input_map::BindableSources;
+                if (!captureArmed)
+                    captureArmed = held == 0;
+                else if (held)
+                {
+                    const auto source = input_map::Source(std::countr_zero(held));
+                    swapped = input_map::BoundElsewhere(controlsController, target, source);
+                    input_map::Assign(controlsController, target, source);
+                    done = true;
+                }
+            }
+            if (!done && MenuNow() >= captureDeadline)
+            {
+                status = keyboard ? Tr(L"No key pressed. Nothing changed.", L"未按下任何鍵，沒有變更。")
+                                  : Tr(L"No button pressed. Nothing changed.", L"未按下任何按鍵，沒有變更。");
+                done = true;
+            }
+            if (done)
+            {
+                if (swapped >= 0) status = Tr(L"Swapped with: ", L"已互換：") + InputLabel(swapped);
+                EndCapture();
+                // The captured button is still held: not a press on the page.
+                waitForRelease = true;
+            }
+            Publish(base, config);
+            return;
+        }
+        // B, Back (keyboard Backspace) and Escape leave the page; Enter confirms.
+        const bool back = (input & 0x2020) != 0 || std::find(keys.begin(), keys.end(), 27u) != keys.end();
+        if (std::find(keys.begin(), keys.end(), 13u) != keys.end()) input |= 0x1000;
+        if (controlsDiscardPrompt)
+        {
+            if (int selected = mouseDialog.exchange(-1); selected >= 0) controlsDiscardChoice = std::min(selected, 1);
+            if (input & 3) controlsDiscardChoice = 1 - controlsDiscardChoice;
+            if (back) controlsDiscardPrompt = false;
+            else if (input & 0x1000)
+            {
+                controlsDiscardPrompt = false;
+                if (controlsDiscardChoice == 0) CloseControlsPage();
+            }
+            Publish(base, config);
+            return;
+        }
+        if (input & 0x331f) status.clear();
+        const auto step = [&](int direction) {
+            do controlsFocus = (controlsFocus + ControlsRowCount + direction) % ControlsRowCount;
+            while (ControlsTitle(controlsFocus));
+        };
+        if (input & 1) step(-1);
+        if (input & 2) step(1);
+        // Start goes to Save, and saves when pressed there.
+        if (input & 0x10)
+        {
+            if (controlsFocus == ControlsSaveRow) input |= 0x1000;
+            else
+            {
+                controlsFocus = ControlsSaveRow;
+                input &= ~0x1000;
+            }
+        }
+        const int delta = (input & 4) ? -1 : (input & 8) ? 1 : 0;
+        bool keyboard = false;
+        const int target = ControlsInput(controlsFocus, keyboard);
+        if (back) {}
+        else if (delta && controlsFocus == ControlsPromptRow)
+        {
+            // Host setting: applied and saved at once, like Vibration.
+            const auto style = uint32_t((int(std::min(edit.buttonPrompts, 2u)) + 3 + delta) % 3);
+            edit.buttonPrompts = style;
+            Config saved = GetConfig();
+            saved.buttonPrompts = style;
+            if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+            hid::SetPromptStyle(style);
+        }
+        else if (delta && controlsFocus == ControlsVibrationRow)
+        {
+            // Host setting: applied and saved at once, merged into the saved
+            // settings so unsaved Graphics edits stay unsaved. Min turns it off.
+            const auto strength = uint32_t(std::clamp(int(edit.vibrationPercent) + delta * 10, 0, 100));
+            if (strength != edit.vibrationPercent)
+            {
+                edit.vibrationPercent = strength;
+                Config saved = GetConfig();
+                saved.vibrationPercent = strength;
+                if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+                hid::SetVibrationStrength(strength);
+                hid::PreviewVibration();
+            }
+        }
+        else if ((input & 0x1000) && target >= 0)
+            BeginCapture(controlsFocus, keyboard);
+        else if ((input & 0x1000) && controlsFocus == ControlsRestoreRow)
+        {
+            controlsController = input_map::DefaultController;
+            controlsKeyboard = input_map::DefaultKeyboard;
+            status = Tr(L"Default buttons restored. Save to keep them.", L"已恢復預設按鍵。儲存後保留。");
+        }
+        else if ((input & 0x1000) && controlsFocus == ControlsSaveRow)
+        {
+            // Merged into the saved settings, so unsaved Graphics edits stay unsaved.
+            Config saved = GetConfig();
+            saved.controllerMap = controlsController;
+            saved.keyboardMap = controlsKeyboard;
+            if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+            else
+            {
+                hid::SetInputMaps(controlsController, controlsKeyboard);
+                controlsControllerStart = edit.controllerMap = controlsController;
+                controlsKeyboardStart = edit.keyboardMap = controlsKeyboard;
+                status = Tr(L"Controls saved.", L"按鍵設定已儲存。");
+                LOG_INFO("settings: controls saved: controller_map={} keyboard_map={}",
+                         input_map::FormatController(controlsController), input_map::FormatKeyboard(controlsKeyboard));
+            }
+        }
+        if (back)
+        {
+            if (controlsController != controlsControllerStart || controlsKeyboard != controlsKeyboardStart)
+            {
+                controlsDiscardPrompt = true;
+                controlsDiscardChoice = 1; // Cancel unless Discard is chosen
+            }
+            else CloseControlsPage();
         }
         Publish(base, config);
         return;
@@ -2807,32 +3488,7 @@ PPC_FUNC(sub_822F19B0)
     };
     if (delta)
     {
-        if (tab == 0 && row == GamePromptRow)
-        {
-            // Host setting: applied and saved at once, like Vibration.
-            const uint32_t style = cycle(std::min(edit.buttonPrompts, 2u), 3);
-            edit.buttonPrompts = style;
-            Config saved = GetConfig();
-            saved.buttonPrompts = style;
-            if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
-            hid::SetPromptStyle(style);
-        }
-        else if (tab == 0 && row == GameVibrationRow)
-        {
-            // Host setting: applied and saved at once, merged into the saved
-            // settings so unsaved Graphics edits stay unsaved. Min turns it off.
-            const auto strength = uint32_t(std::clamp(int(edit.vibrationPercent) + delta * 10, 0, 100));
-            if (strength != edit.vibrationPercent)
-            {
-                edit.vibrationPercent = strength;
-                Config saved = GetConfig();
-                saved.vibrationPercent = strength;
-                if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
-                hid::SetVibrationStrength(strength);
-                hid::PreviewVibration();
-            }
-        }
-        else if (tab == 0 && row < GameRetailRowCount && !TitleModeHidden(0, row))
+        if (tab == 0 && row < GameRetailRowCount && !TitleModeHidden(0, row))
         {
             if (row == 0)
                 PPC_STORE_U32(config, cycle(PPC_LOAD_U32(config), 3));
@@ -2968,6 +3624,15 @@ PPC_FUNC(sub_822F19B0)
                 edit.height = list[index][1];
                 break;
             }
+            case GraphicsRow::Preset:
+            {
+                // Original and Low-end; from Custom, Right picks Original and Left Low-end.
+                const auto current = graphics_menu::PresetOf(edit);
+                const uint32_t index = current == graphics_menu::Preset::Custom ? (delta > 0 ? graphics_menu::PresetChoiceCount - 1 : 0)
+                                                                                : uint32_t(current);
+                graphics_menu::ApplyPreset(edit, graphics_menu::Preset(cycle(index, graphics_menu::PresetChoiceCount)));
+                break;
+            }
             case GraphicsRow::RenderResolution:
                 edit.internalResolution = graphics_menu::RenderResolutions[
                     cycle(graphics_menu::RenderResolutionChoice(edit), uint32_t(std::size(graphics_menu::RenderResolutions)))];
@@ -3050,6 +3715,9 @@ PPC_FUNC(sub_822F19B0)
             }
 #endif
                 break;
+            case GraphicsRow::PerformanceOverlay:
+                edit.performanceOverlay = cycle(std::min(edit.performanceOverlay, 2u), 3);
+                break;
             case GraphicsRow::FrameGeneration:
             {
                 const auto providers = FgProviders();
@@ -3085,6 +3753,8 @@ PPC_FUNC(sub_822F19B0)
                         int(edit.hdrPaperWhiteNits), 10000));
                 }
                 break;
+            case GraphicsRow::NeuralRenderingTuning:
+            case GraphicsRow::HdrCalibration:
             case GraphicsRow::Brightness:
             case GraphicsRow::Save:
             case GraphicsRow::Count:
@@ -3141,7 +3811,14 @@ PPC_FUNC(sub_822F19B0)
         importChoice = 1;
         status.clear();
     }
-    if ((input & 0x1000) && tab == 2 && row == int(GraphicsRow::HdrPeak) &&
+    if ((input & 0x1000) && tab == 3 && row == SystemShaderBundleRow)
+    {
+        shaderBundlePrompt = true;
+        shaderBundleChoice = 1;
+        status.clear();
+    }
+    if ((input & 0x1000) && tab == 2 &&
+        (row == int(GraphicsRow::HdrPeak) || row == int(GraphicsRow::HdrCalibration)) &&
         graphics_menu::HdrAvailable(edit.graphicsBackend))
     {
         calibrationStartAutomatic = edit.hdrPeakAutomatic;
@@ -3223,13 +3900,26 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 3 && row == SystemAchievementsRow)
+    {
+        OpenAchievementsPage();
+        Publish(base, config);
+        return;
+    }
     if ((input & 0x1000) && !(input & 0x2000) && tab == 3 && row == SystemModsRow)
     {
         OpenModsPage();
         Publish(base, config);
         return;
     }
-    if ((input & 0x1000) && !(input & 0x2000) && tab == 2 && row == int(GraphicsRow::DlssNeuralRendering) &&
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 0 && row == GameControlsRow)
+    {
+        OpenControlsPage();
+        Publish(base, config);
+        return;
+    }
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 2 &&
+        (row == int(GraphicsRow::DlssNeuralRendering) || row == int(GraphicsRow::NeuralRenderingTuning)) &&
         !GraphicsRowHidden(row))
     {
         nrStart = edit;

@@ -30,6 +30,20 @@
 
 </div>
 
+## 目录
+
+- [开始游戏](#开始游戏)
+- [功能](#功能)
+- [操作按键](#操作按键)
+- [调试菜单](#调试菜单)
+- [文件与目录](#文件与目录)
+- [命令行参数](#命令行参数)
+- [反馈问题](#反馈问题)
+- [实机画面](#实机画面)
+- [开发](#开发)
+- [赞助者](#赞助者)
+- [致谢与游戏数据](#致谢与游戏数据)
+
 ## 开始游戏
 
 从[最新发布页](https://github.com/freefrank/LostOdysseyRecomp/releases/latest)下载对应平台的安装包。
@@ -56,10 +70,11 @@
 
 - **游戏数据：** 打开应用会建好 `Android/data/io.github.freefrank.lostodyssey/files/game/`。用 USB 把解出的 `disc1`–`disc4` 复制进去，或者用 **Game folder → Import disc images…** 导入光盘镜像。**CTRL → Game folder** 可以改用其他文件夹或 SD 卡。
 - **高通设备：** 首次启动前会打开 **GPU driver** 页面，在那里下载 Turnip 驱动。
+- **Mali 设备：** 同样会先打开 **GPU driver** 页面，在那里下载推荐的 PanVK 驱动；需要 Mali-G57、G68、G77、G78 或 Mali-G610 及更新的 GPU。
 - **操作：** 连接手柄后触摸按键自动隐藏。**CTRL** 可以调整触摸按键的大小、透明度和布局。
 - **更新：** 新 APK 直接覆盖安装，存档保留。
-- **存档：** **CTRL → Saves** 可以把存档导出成 ZIP，也能导入来自电脑、Xenia 或 RGH 存档转换器的 ZIP。
-- **日志：** 在 `Android/data/io.github.freefrank.lostodyssey/files/logs/`（[获取方法](docs/INSTALLING.zh-CN.md#android-logs)）。
+- **存档：** **CTRL → Saves and logs** 可以把存档导出成 ZIP，也能导入来自电脑、Xenia 或 RGH 存档转换器的 ZIP。
+- **日志：** **CTRL → Saves and logs → Export logs** 可以把日志导出成 ZIP，用于反馈问题（[详见](docs/INSTALLING.zh-CN.md#android-logs)）。
 
 [详细步骤](docs/INSTALLING.zh-CN.md#android)。
 
@@ -80,12 +95,14 @@
 | 显示 | 窗口或全屏，可选显示器和 GPU，16:9 和 21:9 分辨率（16:10 等更高的屏幕会被画面铺满），[HDR](#hdr) 和**亮度 / Gamma**。 |
 | 抗锯齿与超分 | FXAA、SMAA、TAA、DLSS、FSR 3.1、XeSS（Windows Direct3D 12）和 MetalFX（macOS）。 |
 | 图像选项 | 阴影分辨率 1×／2×／4×、SSAO／GTAO、各向异性过滤、景深和泛光。 |
-| 帧率 | 30／60／90／120 FPS；垂直同步可选关、开或 FreeSync／G-SYNC Compatible VRR。 |
+| 帧率 | 30／60／90／120 FPS；垂直同步可选关、开或 FreeSync／G-SYNC Compatible VRR。**性能信息**可显示帧率，或显示包含超分、插帧、CPU 和 GPU 负载的信息栏。 |
 | 插帧 | Windows Direct3D 12 上可用 DLSS、FSR 或 XeSS；Windows Vulkan 上可用 DLSS。 |
+| DLSS 5 神经渲染 | Windows 上开启 DLSS 的 RTX 显卡可用。需要 `nvngx_dlssnr.dll`，游戏不附带该文件：请把自备的副本（测试版本 310.8.0.0）放在 `LostOdysseyRecomp.exe` 旁并重启。 |
 | 着色器 | 首次启动下载预编译着色器，或在本机编译一次并缓存。 |
 | 声音 | 立体声、5.1 环绕声，或交给 AV 功放还原的矩阵环绕声。过场对白有单独的音量。 |
 | 输入 | 手柄、键盘和震动；Android 上有触摸按键。 |
-| Mod | 仅 Windows：纹理、菜单和字体替换、文本翻译和语言包，以及 PlayStation 按键提示，可手动安装或用 Mod Organizer 2 管理。其他平台也可能加载 Mod，但不提供支持。见 [Mod 指南](docs/wiki/Modding.md)。 |
+| Mod | 仅 Windows：纹理、模型、菜单和字体替换、过场影片替换、文本翻译和语言包（可补充游戏字体缺少的字母），以及 PlayStation 按键提示，可手动安装或用 Mod Organizer 2 管理（插件在 Windows ZIP 中）。其他平台也可能加载 Mod，但不提供支持。见 [Mod 指南](docs/wiki/Modding.md)。现成的 Mod（例如 4x 高清纹理包）在 [Discord](https://discord.gg/z2yPct6z2w) 的 **#mods** 论坛里分享。 |
+| 成就 | 游戏的 36 个 Xbox 360 成就，解锁时显示 Xbox 360 风格的通知并播放提示音。**设置 → 系统 → 成就**列出全部成就和解锁日期，也可以把通知设为开启、静音或关闭。在 `settings.ini` 旁边放一个 `achievement.wav` 可以替换提示音。 |
 | 调试菜单 | 渲染捕获、随时存档、遇敌开关、传送、快进和修改。见[调试菜单](#调试菜单)。 |
 
 ## 操作按键
@@ -101,7 +118,9 @@
 | 左／右扳机 | E／R |
 | 调试菜单 | F1 |
 
-按 **Back** 切换小地图缩放，按住约半秒可隐藏小地图。Ring 操作用手柄**右扳机**或键盘 **R**。设置中的**震动**可调整震动强度。
+以上是默认按键。**设置 → 游戏 → 按键设置**可以更改键盘按键和手柄按键，也可以设置按键提示和震动强度。
+
+按 **Back** 切换小地图缩放，按住约半秒可隐藏小地图。Ring 操作用手柄**右扳机**或键盘 **R**。
 
 ## 调试菜单
 
@@ -225,6 +244,6 @@ flatpak run io.github.freefrank.LostOdysseyRecomp --game ~/Games/LostOdyssey
 
 感谢所有提交过 PR 和补丁的人：[MikeRavenelle](https://github.com/MikeRavenelle)、[dj5927](https://github.com/dj5927)、[Xarishark](https://github.com/Xarishark)、[navjack](https://github.com/navjack)、[frankzzz](https://github.com/frankzzz) 和 [cngjd](https://github.com/cngjd)。macOS 版本最初来自 MikeRavenelle 在 Apple Silicon 上的工作。
 
-本项目参考 [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp)、[re:Blue](https://github.com/zolaware/reblue)、[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)、[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)、[plume](https://github.com/renderbag/plume) 和 [Xenia](https://github.com/xenia-project/xenia)。音频采用 [Xenia FFmpeg 分支](https://github.com/xenia-project/FFmpeg)（[许可证](thirdparty/ffmpeg-LICENSE.txt)）。Android 上的 Turnip GPU 驱动来自 [Eden](https://git.eden-emu.dev/eden-emu/eden) 模拟器的驱动列表，通过 [libadrenotools](https://github.com/bylaws/libadrenotools) 加载。
+本项目参考 [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp)、[re:Blue](https://github.com/zolaware/reblue)、[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)、[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)、[plume](https://github.com/renderbag/plume) 和 [Xenia](https://github.com/xenia-project/xenia)。音频采用 [Xenia FFmpeg 分支](https://github.com/xenia-project/FFmpeg)（[许可证](thirdparty/ffmpeg-LICENSE.txt)）。Android 上的 Turnip GPU 驱动来自 [Eden](https://git.eden-emu.dev/eden-emu/eden) 模拟器的驱动列表，通过 [libadrenotools](https://github.com/bylaws/libadrenotools) 加载；Mali 上的 PanVK 驱动来自 [panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android)。
 
 《失落的奥德赛》及其资产归各自权利人所有，本项目为非官方移植。请从自己拥有的光盘提取数据，不要向仓库提交游戏程序、资源包、纹理、音视频、生成的游戏代码或捕获数据。依赖保留各自许可证。
