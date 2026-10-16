@@ -5745,6 +5745,50 @@ void main()
                 return nullptr;
             }
 
+            // Experiment (Switch, LO_EXPERIMENT_NO_ALPHA_KILL=1): every translated pixel
+            // shader ends with the alpha test's dynamic `discard`, so the driver marks
+            // all of them as killing pixels and the GPU tests depth only after shading
+            // (no early-Z). This turns a pixel shader's only OpKill into OpReturn so the
+            // GPU time can be compared with early-Z. Alpha-tested objects (foliage,
+            // hair) then draw without their cut-outs: for measuring only. Shaders with
+            // more than one kill (the game's own clip()) are left alone.
+            static bool ExperimentNoAlphaKill()
+            {
+#if LO_PLATFORM_SWITCH
+                static const bool enabled = [] {
+                    const char* value = getenv("LO_EXPERIMENT_NO_ALPHA_KILL");
+                    return value && value[0] == '1';
+                }();
+                return enabled;
+#else
+                return false;
+#endif
+            }
+            static inline std::atomic<uint32_t> experimentKillsStripped{0};
+            // An empty result means: use the original binary.
+            static std::vector<uint8_t> StripSoleKill(bool pixel, const std::vector<uint8_t>& binary)
+            {
+                if (!pixel || !ExperimentNoAlphaKill() || binary.size() < 20 || binary.size() % 4 != 0) return {};
+                std::vector<uint8_t> out = binary;
+                const size_t words = out.size() / 4;
+                auto word = [&](size_t i) { uint32_t w; std::memcpy(&w, out.data() + i * 4, 4); return w; };
+                if (word(0) != 0x07230203u) return {};
+                size_t kills = 0, at = 0;
+                for (size_t i = 5; i < words;) {
+                    const uint32_t w = word(i);
+                    const uint32_t count = w >> 16, opcode = w & 0xFFFFu;
+                    if (count == 0) return {};
+                    if (opcode == 252u /*OpKill*/ || opcode == 4416u /*OpTerminateInvocation*/) { ++kills; at = i; }
+                    i += count;
+                }
+                if (kills != 1) return {};
+                const uint32_t ret = (1u << 16) | 253u; // OpReturn
+                std::memcpy(out.data() + at * 4, &ret, 4);
+                const uint32_t n = experimentKillsStripped.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n == 1 || n % 100 == 0) LOG_NOTICE("renderer: experiment: alpha-test kill removed from {} pixel shaders", n);
+                return out;
+            }
+
             // Startup: makes pack shader modules on worker threads (MSL compilation on
             // Metal is the slow part) and publishes them in the shader maps.
             void LoadPackShaders(std::vector<std::pair<bool, uint64_t>> wanted)
@@ -5762,7 +5806,9 @@ void main()
                     for (size_t i; (i = next.fetch_add(1)) < wanted.size();) {
                         try {
                             if (auto record = reader.Get(wanted[i].first, wanted[i].second)) {
-                                loads[i].module = device->createShader(record->binary.data(), record->binary.size(), "main", renderFormat);
+                                const auto stripped = StripSoleKill(wanted[i].first, record->binary);
+                                const auto& binary = stripped.empty() ? record->binary : stripped;
+                                loads[i].module = device->createShader(binary.data(), binary.size(), "main", renderFormat);
                                 loads[i].info = std::move(record->info);
                             }
                         } catch (const std::exception& e) {
@@ -6531,7 +6577,9 @@ void main()
             {
                 try {
                     if (auto record = (reader ? *reader : *job.pack).Get(job.pixel, job.hash)) {
-                        job.module = device->createShader(record->binary.data(), record->binary.size(), "main", renderFormat);
+                        const auto stripped = StripSoleKill(job.pixel, record->binary);
+                        const auto& binary = stripped.empty() ? record->binary : stripped;
+                        job.module = device->createShader(binary.data(), binary.size(), "main", renderFormat);
                         job.raw = job.module.get();
                         job.info = std::move(record->info);
                     }
