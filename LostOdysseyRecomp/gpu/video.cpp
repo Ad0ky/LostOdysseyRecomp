@@ -4815,6 +4815,7 @@ namespace gpu::video
         }
 
         uint32_t imageIndex = 0;
+        gpu::lsfg::BeforeAcquire();
         if (!g_swapChain->acquireTexture(g_acquireSemaphore.get(), &imageIndex))
         {
             return false;
@@ -5130,6 +5131,7 @@ namespace gpu::video
                 }
 #endif
                 uint32_t imageIndex = 0;
+                gpu::lsfg::BeforeAcquire();
                 if (!g_swapChain->acquireTexture(g_acquireSemaphore.get(), &imageIndex))
                 {
                     return;

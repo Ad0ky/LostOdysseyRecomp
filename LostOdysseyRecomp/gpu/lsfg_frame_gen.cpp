@@ -21,6 +21,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -29,6 +30,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 // libnx's default native window (the one the swapchain was made for);
@@ -179,6 +182,8 @@ public:
         const size_t slotCount = std::max<size_t>(images_.size(), 3);
         slots_.reserve(slotCount);
         for (size_t i = 0; i < slotCount; ++i) slots_.emplace_back(*vulkan_, generatedFrames_);
+        queueMutex_ = queue->queue->mutex.get();
+        worker_ = std::thread([this] { WorkerMain(); });
         LOG_NOTICE("framegen: LSFG ready {}x{} ({} swapchain images, flow scale {}, {} mode, x{})", extent_.width,
                    extent_.height, images_.size(), flowScale, performance ? "performance" : "quality",
                    generatedFrames_ + 1);
@@ -195,6 +200,15 @@ public:
 
     ~Runtime()
     {
+        if (worker_.joinable())
+        {
+            {
+                std::lock_guard lock(jobMutex_);
+                stopWorker_ = true;
+            }
+            jobWake_.notify_all();
+            worker_.join();
+        }
         if (locked_) SetSwapInterval(1);
         if (vulkan_ && vulkan_->df().DeviceWaitIdle) (void)vulkan_->df().DeviceWaitIdle(vulkan_->dev());
     }
@@ -247,9 +261,82 @@ public:
         const VkResult generated = PresentImage(queue, info, imageIndex, slot.generated.handle());
         if (generated != VK_SUCCESS && generated != VK_SUBOPTIMAL_KHR) return generated;
 
-        // Further generated frames (x3), each into a freshly acquired image.
-        // They were all written by the frame command buffer above, which these
-        // copies follow on the same queue.
+        // The other generated frames and the real one are presented by the
+        // worker thread: each of them first waits for a free swapchain image,
+        // and the command processor goes on with the next frame meanwhile.
+        // The caller waits for the worker before its next acquire (WaitWorker).
+        slot.pending = true; // the worker submits the slot's fence
+        ++realFrame_;
+        {
+            std::lock_guard lock(jobMutex_);
+            job_ = Job{&slot, source, queue};
+            jobPending_ = true;
+        }
+        jobWake_.notify_one();
+        return generated;
+    }
+
+    // Waits until the worker has presented the previous frame's remaining
+    // images. Must not be called with the queue mutex held. Throws on a
+    // worker failure; returns the worker's last present result.
+    VkResult WaitWorker()
+    {
+        std::unique_lock lock(jobMutex_);
+        jobDone_.wait(lock, [this] { return !jobPending_ && !jobRunning_; });
+        if (!workerError_.empty()) throw std::runtime_error(std::exchange(workerError_, {}));
+        return std::exchange(workerResult_, VK_SUCCESS);
+    }
+
+private:
+    struct Job
+    {
+        FrameSlot* slot{};
+        VkImage source{};
+        VkQueue queue{};
+    };
+
+    void WorkerMain()
+    {
+        for (;;)
+        {
+            Job job;
+            {
+                std::unique_lock lock(jobMutex_);
+                jobWake_.wait(lock, [this] { return jobPending_ || stopWorker_; });
+                if (stopWorker_) return;
+                job = job_;
+                jobPending_ = false;
+                jobRunning_ = true;
+            }
+            VkResult result = VK_SUCCESS;
+            std::string error;
+            try
+            {
+                result = FinishFrame(job);
+            }
+            catch (const std::exception& e)
+            {
+                error = e.what();
+            }
+            {
+                std::lock_guard lock(jobMutex_);
+                jobRunning_ = false;
+                if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) workerResult_ = result;
+                if (!error.empty()) workerError_ = std::move(error);
+            }
+            jobDone_.notify_all();
+        }
+    }
+
+    // Worker: the generated frames after the first, then the kept real frame,
+    // each into a freshly acquired image. Acquires wait without the queue
+    // mutex; submits and presents take it.
+    VkResult FinishFrame(const Job& job)
+    {
+        FrameSlot& slot = *job.slot;
+        VkPresentInfoKHR info{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        info.swapchainCount = 1;
+        info.pSwapchains = &swapchain_;
         for (size_t i = 1; i < generatedFrames_; ++i)
         {
             uint32_t extraIndex = 0;
@@ -261,9 +348,10 @@ public:
             copy.begin(*vulkan_);
             RecordCopyToSwapchain(copy, backend_->destinationImage(*context_, i), images_[extraIndex], true, false);
             copy.end(*vulkan_);
+            std::lock_guard lock(*queueMutex_);
             copy.submit(*vulkan_, {slot.extraAcquired[i - 1].handle()}, VK_NULL_HANDLE, 0,
                         {slot.extraGenerated[i - 1].handle()}, VK_NULL_HANDLE, 0);
-            const VkResult extraPresent = PresentImage(queue, info, extraIndex, slot.extraGenerated[i - 1].handle());
+            const VkResult extraPresent = PresentImage(job.queue, info, extraIndex, slot.extraGenerated[i - 1].handle());
             if (extraPresent != VK_SUCCESS && extraPresent != VK_SUBOPTIMAL_KHR) return extraPresent;
         }
 
@@ -272,18 +360,15 @@ public:
                                                                    slot.acquired.handle(), VK_NULL_HANDLE, &realIndex);
         if (acquire != VK_SUCCESS && acquire != VK_SUBOPTIMAL_KHR) return acquire;
         if (realIndex >= images_.size()) throw std::runtime_error("reacquired image index out of range");
-
         slot.restore.begin(*vulkan_);
-        RecordCopyToSwapchain(slot.restore, source, images_[realIndex], false, false);
+        RecordCopyToSwapchain(slot.restore, job.source, images_[realIndex], false, false);
         slot.restore.end(*vulkan_);
+        std::lock_guard lock(*queueMutex_);
         slot.restore.submit(*vulkan_, {slot.acquired.handle()}, VK_NULL_HANDLE, 0, {slot.original.handle()},
                             VK_NULL_HANDLE, 0, slot.completion.handle());
-        slot.pending = true;
-        ++realFrame_;
-        return PresentImage(queue, info, realIndex, slot.original.handle());
+        return PresentImage(job.queue, info, realIndex, slot.original.handle());
     }
 
-private:
     FrameSlot& PrepareSlot()
     {
         FrameSlot& slot = slots_.at(slotCursor_++ % slots_.size());
@@ -351,6 +436,14 @@ private:
     std::array<bool, 2> sourceInitialized_{false, false};
     uint64_t realFrame_{};
     size_t generatedFrames_{1};
+    std::mutex* queueMutex_{};
+    std::thread worker_;
+    std::mutex jobMutex_;
+    std::condition_variable jobWake_, jobDone_;
+    Job job_{};
+    bool jobPending_{}, jobRunning_{}, stopWorker_{};
+    VkResult workerResult_{VK_SUCCESS};
+    std::string workerError_;
     size_t slotCursor_{};
     bool locked_{};
 };
@@ -366,6 +459,26 @@ void Fail(const char* what, const std::string& detail)
     g_runtime.reset();
     g_failed.store(true, std::memory_order_relaxed);
     LOG_ERROR("framegen: {} ({}); frame generation off for this session", what, detail);
+}
+
+// Waits for the worker's presents of the previous frame. A swapchain that went
+// out of date there is flagged on the next call that has it. False after a
+// worker failure (frame generation is then off).
+bool g_workerOutOfDate = false;
+bool WaitForWorker(plume::VulkanSwapChain* swapChain)
+{
+    if (!g_runtime) return true;
+    try
+    {
+        if (g_runtime->WaitWorker() == VK_ERROR_OUT_OF_DATE_KHR) g_workerOutOfDate = true;
+    }
+    catch (const std::exception& error)
+    {
+        Fail("present failed", error.what());
+        return false;
+    }
+    if (swapChain && std::exchange(g_workerOutOfDate, false)) swapChain->surfaceOutOfDate = true;
+    return true;
 }
 }
 
@@ -396,6 +509,9 @@ bool Present(plume::RenderSwapChain* swapChain, uint32_t imageIndex, plume::Rend
         return false;
     }
     auto* queue = vulkanSwapChain.commandQueue;
+    // The previous frame's remaining presents (worker thread) come first;
+    // the worker takes the queue lock, so wait before taking it here.
+    if (!WaitForWorker(&vulkanSwapChain)) return false;
     // LSFG submits and presents on the presenter's queue: hold its lock.
     std::scoped_lock lock(*queue->queue->mutex);
     try
@@ -446,6 +562,11 @@ bool Present(plume::RenderSwapChain* swapChain, uint32_t imageIndex, plume::Rend
     return true;
 }
 
+void BeforeAcquire()
+{
+    (void)WaitForWorker(nullptr);
+}
+
 void Reset()
 {
     if (!g_runtime) return;
@@ -460,6 +581,7 @@ namespace gpu::lsfg
 bool Enabled() { return false; }
 bool Present(plume::RenderSwapChain*, uint32_t, plume::RenderCommandSemaphore*, bool&) { return false; }
 void Reset() {}
+void BeforeAcquire() {}
 }
 
 #endif

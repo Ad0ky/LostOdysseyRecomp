@@ -9,6 +9,8 @@
 // LO_FRAMEGEN=1 turns it on. Each real frame then presents one generated
 // in-between frame and the real one, both through FIFO at the display rate,
 // so a steady 30 fps game shows 60 frames per second.
+//   LO_FRAMEGEN_MULTIPLIER=3       two generated frames (20 fps game, 60 shown)
+//   LO_FRAMEGEN_LOCK=1             x2 with every image held two refreshes (15/30)
 //   LO_FRAMEGEN_FLOW=<0.125..0.5>  motion estimation scale (default 0.25)
 //   LO_FRAMEGEN_PERF=0             quality mode (default: performance mode)
 
@@ -27,6 +29,7 @@ namespace gpu::lsfg
 inline bool Enabled() { return false; }
 inline bool Present(plume::RenderSwapChain*, uint32_t, plume::RenderCommandSemaphore*, bool&) { return false; }
 inline void Reset() {}
+inline void BeforeAcquire() {}
 #else
 // LO_FRAMEGEN=1 and not given up after a failure.
 bool Enabled();
@@ -40,5 +43,10 @@ bool Present(plume::RenderSwapChain* swapChain, uint32_t imageIndex, plume::Rend
 
 // Releases the frame generation resources (swapchain recreation, shutdown).
 void Reset();
+
+// Call before acquiring a swapchain image: waits until the previous frame's
+// generated and real images (presented on a worker thread) are queued, since
+// the Switch allows only one acquired image at a time.
+void BeforeAcquire();
 #endif
 }
