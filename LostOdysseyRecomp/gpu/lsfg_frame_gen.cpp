@@ -57,9 +57,16 @@ VkImageMemoryBarrier ImageBarrier(VkImage image, VkAccessFlags sourceAccess, VkA
 
 struct FrameSlot
 {
-    explicit FrameSlot(const vk::Vulkan& vulkan)
+    FrameSlot(const vk::Vulkan& vulkan, size_t generatedFrames)
         : frame(vulkan), restore(vulkan), completion(vulkan), acquired(vulkan), generated(vulkan), original(vulkan)
     {
+        // The second and later generated frames each go to a freshly acquired image.
+        for (size_t i = 1; i < generatedFrames; ++i)
+        {
+            extraCopy.emplace_back(vulkan);
+            extraAcquired.emplace_back(vulkan);
+            extraGenerated.emplace_back(vulkan);
+        }
     }
 
     vk::CommandBuffer frame;
@@ -68,6 +75,9 @@ struct FrameSlot
     vk::Semaphore acquired;
     vk::Semaphore generated;
     vk::Semaphore original;
+    std::vector<vk::CommandBuffer> extraCopy;
+    std::vector<vk::Semaphore> extraAcquired;
+    std::vector<vk::Semaphore> extraGenerated;
     bool pending{};
 };
 
@@ -96,6 +106,18 @@ void SetSwapInterval(uint32_t interval)
     NWindow* window = nwindowGetDefault();
     const uint32_t result = window ? nwindowSetSwapInterval(window, interval) : 1;
     if (result != 0) LOG_WARNING("framegen: setting swap interval {} failed ({:#x})", interval, result);
+}
+
+// LO_FRAMEGEN_MULTIPLIER=3: two generated frames per game frame. At 60 Hz each
+// of the three images is shown for one refresh, so the game is held to 20 fps
+// and the screen gets an evenly paced 60 fps. 2 (default): one generated frame.
+uint32_t Multiplier()
+{
+    static const uint32_t multiplier = [] {
+        const char* value = std::getenv("LO_FRAMEGEN_MULTIPLIER");
+        return value && value[0] == '3' ? 3u : 2u;
+    }();
+    return multiplier;
 }
 
 std::filesystem::path DataRoot()
@@ -148,17 +170,22 @@ public:
             .pipelineCachePath = DataRoot() / "cache" / "lsfg-vk-pipeline-cache.bin",
         };
         backend_ = std::make_unique<lsfgvk::backend::Instance>(borrowed, DataRoot() / "lsfg" / "Lossless.dll", false);
-        context_ = &backend_->openLocalContext(extent_.width, extent_.height, false, 1.0f / flowScale, performance, 1,
-                                               VK_QUEUE_FAMILY_IGNORED);
+        generatedFrames_ = Multiplier() - 1;
+        context_ = &backend_->openLocalContext(extent_.width, extent_.height, false, 1.0f / flowScale, performance,
+                                               generatedFrames_, VK_QUEUE_FAMILY_IGNORED);
         vulkan_ = &backend_->vulkan();
         if (!vulkan_->df().AcquireNextImageKHR || !vulkan_->df().QueuePresentKHR)
             throw std::runtime_error("swapchain entry points are unavailable");
         const size_t slotCount = std::max<size_t>(images_.size(), 3);
         slots_.reserve(slotCount);
-        for (size_t i = 0; i < slotCount; ++i) slots_.emplace_back(*vulkan_);
-        LOG_NOTICE("framegen: LSFG ready {}x{} ({} swapchain images, flow scale {}, {} mode)", extent_.width,
-                   extent_.height, images_.size(), flowScale, performance ? "performance" : "quality");
-        if (LockRequested())
+        for (size_t i = 0; i < slotCount; ++i) slots_.emplace_back(*vulkan_, generatedFrames_);
+        LOG_NOTICE("framegen: LSFG ready {}x{} ({} swapchain images, flow scale {}, {} mode, x{})", extent_.width,
+                   extent_.height, images_.size(), flowScale, performance ? "performance" : "quality",
+                   generatedFrames_ + 1);
+        if (generatedFrames_ > 1)
+            LOG_NOTICE("framegen: x{}: one game frame per {} refreshes, every image shown for one",
+                       generatedFrames_ + 1, generatedFrames_ + 1);
+        else if (LockRequested())
         {
             SetSwapInterval(2);
             locked_ = true;
@@ -211,7 +238,7 @@ public:
         backend_->recordFrame(*context_, slot.frame);
         // VI allows one acquired image: present the generated frame in this
         // image, reacquire, then copy the kept real frame into the next one.
-        RecordCopyToSwapchain(slot.frame, backend_->destinationImage(*context_, 0), images_[imageIndex], true);
+        RecordCopyToSwapchain(slot.frame, backend_->destinationImage(*context_, 0), images_[imageIndex], true, true);
         slot.frame.end(*vulkan_);
         slot.frame.submit(*vulkan_, std::move(waits), VK_NULL_HANDLE, 0, {slot.generated.handle()}, VK_NULL_HANDLE,
                           0);
@@ -220,6 +247,26 @@ public:
         const VkResult generated = PresentImage(queue, info, imageIndex, slot.generated.handle());
         if (generated != VK_SUCCESS && generated != VK_SUBOPTIMAL_KHR) return generated;
 
+        // Further generated frames (x3), each into a freshly acquired image.
+        // They were all written by the frame command buffer above, which these
+        // copies follow on the same queue.
+        for (size_t i = 1; i < generatedFrames_; ++i)
+        {
+            uint32_t extraIndex = 0;
+            const VkResult extraAcquire = vulkan_->df().AcquireNextImageKHR(
+                vulkan_->dev(), swapchain_, UINT64_MAX, slot.extraAcquired[i - 1].handle(), VK_NULL_HANDLE, &extraIndex);
+            if (extraAcquire != VK_SUCCESS && extraAcquire != VK_SUBOPTIMAL_KHR) return extraAcquire;
+            if (extraIndex >= images_.size()) throw std::runtime_error("reacquired image index out of range");
+            auto& copy = slot.extraCopy[i - 1];
+            copy.begin(*vulkan_);
+            RecordCopyToSwapchain(copy, backend_->destinationImage(*context_, i), images_[extraIndex], true, false);
+            copy.end(*vulkan_);
+            copy.submit(*vulkan_, {slot.extraAcquired[i - 1].handle()}, VK_NULL_HANDLE, 0,
+                        {slot.extraGenerated[i - 1].handle()}, VK_NULL_HANDLE, 0);
+            const VkResult extraPresent = PresentImage(queue, info, extraIndex, slot.extraGenerated[i - 1].handle());
+            if (extraPresent != VK_SUCCESS && extraPresent != VK_SUBOPTIMAL_KHR) return extraPresent;
+        }
+
         uint32_t realIndex = 0;
         const VkResult acquire = vulkan_->df().AcquireNextImageKHR(vulkan_->dev(), swapchain_, UINT64_MAX,
                                                                    slot.acquired.handle(), VK_NULL_HANDLE, &realIndex);
@@ -227,7 +274,7 @@ public:
         if (realIndex >= images_.size()) throw std::runtime_error("reacquired image index out of range");
 
         slot.restore.begin(*vulkan_);
-        RecordCopyToSwapchain(slot.restore, source, images_[realIndex], false);
+        RecordCopyToSwapchain(slot.restore, source, images_[realIndex], false, false);
         slot.restore.end(*vulkan_);
         slot.restore.submit(*vulkan_, {slot.acquired.handle()}, VK_NULL_HANDLE, 0, {slot.original.handle()},
                             VK_NULL_HANDLE, 0, slot.completion.handle());
@@ -265,18 +312,19 @@ private:
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL)});
     }
 
-    // generatedOutput: the LSFG destination image (written by compute) to
-    // the presented image; otherwise the kept real frame to a fresh image.
+    // generatedOutput: from an LSFG destination image (written by compute),
+    // otherwise from the kept real frame. presentedImage: into the image just
+    // captured (in PRESENT_SRC), otherwise into a freshly acquired one.
     void RecordCopyToSwapchain(const vk::CommandBuffer& command, VkImage from, VkImage swapchainImage,
-                               bool generatedOutput) const
+                               bool generatedOutput, bool presentedImage) const
     {
         const VkAccessFlags fromAccess = generatedOutput ? VK_ACCESS_SHADER_WRITE_BIT : VK_ACCESS_SHADER_READ_BIT;
         command.copyImage(*vulkan_,
             {ImageBarrier(from, fromAccess, VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                           VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-             ImageBarrier(swapchainImage, generatedOutput ? VK_ACCESS_MEMORY_READ_BIT : 0,
+             ImageBarrier(swapchainImage, presentedImage ? VK_ACCESS_MEMORY_READ_BIT : 0,
                           VK_ACCESS_TRANSFER_WRITE_BIT,
-                          generatedOutput ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED,
+                          presentedImage ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED,
                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)},
             {from, swapchainImage}, extent_,
             {ImageBarrier(from, VK_ACCESS_TRANSFER_READ_BIT, fromAccess, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -302,6 +350,7 @@ private:
     std::vector<FrameSlot> slots_;
     std::array<bool, 2> sourceInitialized_{false, false};
     uint64_t realFrame_{};
+    size_t generatedFrames_{1};
     size_t slotCursor_{};
     bool locked_{};
 };
