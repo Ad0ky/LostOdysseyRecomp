@@ -262,6 +262,7 @@ struct FileHandle : KernelObject
     // Language packs: bytes served from memory over and after the file
     // (modding/text_overlay.h); size then includes them, fileSize does not.
     std::vector<modding::text_overlay::Range> ranges;
+    std::shared_ptr<void> cachePin; // overflow archive's cache set, until this handle closes
     uint64_t fileSize = 0;
     bool writable = false;
     // Writable save file: synced to disk before it closes.
@@ -342,6 +343,11 @@ bool FileSystem::SelectDisc(uint32_t discNumber)
 }
 
 std::filesystem::path FileSystem::GetGameRoot() { return g_gameRoot; }
+std::filesystem::path FileSystem::GetDiscRoot()
+{
+    std::lock_guard lock(g_discMutex);
+    return g_discRoot;
+}
 std::filesystem::path FileSystem::GetSaveRoot() { return g_saveRoot; }
 std::filesystem::path FileSystem::GetCacheRoot() { return g_cacheRoot; }
 std::filesystem::path GetGamePath() { return g_gameRoot; }
@@ -569,6 +575,15 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
 
     if (hostPath.empty()) hostPath = FileSystem::ResolvePath(name);
     const bool wantWrite = (DesiredAccess & 0x40000000) != 0 || (DesiredAccess & 0x2) != 0 || (DesiredAccess & 0x4) != 0;
+    // A mod overflow archive the patched index names lives in the mod cache.
+    bool overflow = false;
+    std::shared_ptr<void> cachePin;
+    if (!wantWrite && !hostPath.empty())
+        if (auto cached = modding::text_overlay::OverflowArchive(hostPath, &cachePin); !cached.empty())
+        {
+            hostPath = std::move(cached);
+            overflow = true;
+        }
 
     std::error_code ec;
     bool exists = !hostPath.empty() && std::filesystem::exists(hostPath, ec);
@@ -618,6 +633,7 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
 
     auto handle = CreateKernelObject<FileHandle>();
     handle->path = hostPath;
+    handle->cachePin = std::move(cachePin);
 
     if (isDir || ((CreateOptions & FILE_DIRECTORY_FILE) && !exists))
     {
@@ -664,11 +680,11 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
         _fseeki64(handle->file, 0, SEEK_END);
         handle->size = handle->fileSize = uint64_t(_ftelli64(handle->file));
         _fseeki64(handle->file, 0, SEEK_SET);
-        if (!wantWrite)
+        if (!wantWrite && !overflow)
         {
             handle->ranges = modding::text_overlay::RangesFor(hostPath);
             for (const auto &range : handle->ranges)
-                handle->size = std::max<uint64_t>(handle->size, range.offset + range.bytes->size());
+                handle->size = std::max<uint64_t>(handle->size, range.offset + range.size);
         }
     }
 
@@ -739,8 +755,8 @@ uint32_t NtOpenFile(be<uint32_t>* FileHandle, uint32_t DesiredAccess, XOBJECT_AT
     return OpenFileHandle(FileHandle, DesiredAccess, Attributes, IoStatusBlock, FILE_OPEN, OpenOptions);
 }
 
-// Reads a handle that has language-pack ranges: the file's bytes up to its
-// real end, zeros after it, and the ranges' bytes over both.
+// Reads a handle that has language-pack or model ranges: the file's bytes up
+// to its real end, zeros after it, and the ranges' bytes over both.
 static uint32_t ReadWithRanges(FileHandle& handle, uint64_t offset, uint8_t* out, size_t length, size_t& read)
 {
     read = 0;
@@ -761,9 +777,9 @@ static uint32_t ReadWithRanges(FileHandle& handle, uint64_t offset, uint8_t* out
     for (const auto& range : handle.ranges)
     {
         const uint64_t begin = std::max(offset, range.offset);
-        const uint64_t end = std::min<uint64_t>(offset + length, range.offset + range.bytes->size());
-        if (begin < end)
-            std::memcpy(out + (begin - offset), range.bytes->data() + (begin - range.offset), size_t(end - begin));
+        const uint64_t end = std::min<uint64_t>(offset + length, range.offset + range.size);
+        if (begin < end && !range.Read(begin - range.offset, out + (begin - offset), size_t(end - begin)))
+            return FileIoError(EIO);
     }
     read = length;
     return STATUS_SUCCESS;
@@ -1281,6 +1297,8 @@ uint32_t NtQueryFullAttributesFile(XOBJECT_ATTRIBUTES* Attributes, X_FILE_NETWOR
 {
     std::string name = GuestAnsiString(Attributes ? Attributes->Name.get() : nullptr);
     std::filesystem::path hostPath = FileSystem::ResolvePath(name);
+    if (auto cached = hostPath.empty() ? hostPath : modding::text_overlay::OverflowArchive(hostPath); !cached.empty())
+        hostPath = std::move(cached);
     std::error_code ec;
     if (hostPath.empty() || !std::filesystem::exists(hostPath, ec))
     {

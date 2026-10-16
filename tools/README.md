@@ -96,7 +96,7 @@ The catalog below lists maintained groups and representative root utilities. `th
 | `tools/build_runtime.bat` | Windows | Fast incremental build for the primary runtime target `LostOdysseyRecomp`. |
 | `tools/build_tools.bat` | Windows | Builds offline developer tools (`LoShaderPackTool`, `LoShaderTool`, etc.). |
 | `tools/build_target.bat` | Windows | Configures and builds a specific CMake target with specified arguments. |
-| `tools/build_worktree.bat` | Windows | Configures and builds a target in a git worktree, taking the SDKs, FSR shaders and dependency checkouts from the main checkout (`LO_MAIN_CHECKOUT`, `LO_DEPS_DIR`, `LO_BUILD_JOBS`; the main checkout defaults to the first `git worktree list` entry). The worktree must be prepared first; see the header of the script. |
+| `tools/build_worktree.bat` | Windows | Configures and builds a target in a git worktree, taking the SDKs, FSR shaders and dependency checkouts from the main checkout (`LO_MAIN_CHECKOUT`, `LO_DEPS_DIR`, `LO_BUILD_JOBS`; the main checkout defaults to the first `git worktree list` entry). It builds DLSS, FSR (Vulkan and D3D12) and XeSS like a release, compiles the FSR D3D12 conversion shader into the worktree, and stops if the main checkout lacks the FSR shader folders. The worktree must be prepared first; see the header of the script. |
 | `tools/build_linux.sh` | Linux | Native Linux Clang build script for runtime and tools. |
 | `tools/build_wsl.bat` | Windows/WSL | Dispatches Linux builds inside Windows Subsystem for Linux. |
 

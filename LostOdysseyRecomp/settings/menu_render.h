@@ -7,7 +7,7 @@
 #include <vector>
 namespace settings
 {
-namespace menu_assets { struct Assets; }
+namespace menu_assets { struct Assets; struct Image; }
 // Visible list slots: rows start at y=150 with height 43 and clip at y=640,
 // so (640 - 150) / 43 == 11 rows fit without scrolling.
 inline constexpr int kMenuVisibleRows = 11;
@@ -34,6 +34,20 @@ struct MenuRow
     // author). The choice cells then take the last ModsCellsWidth; with no
     // choices and no value the text has the whole column.
     std::wstring detail;
+    // A section title in a list page (Controls): the name over a rule, never
+    // focused.
+    bool header = false;
+    // The value is literal text, such as a key name: no PlayStation glyph
+    // takes the place of a letter.
+    bool literal = false;
+    // Opens a page (NR tuning, HDR calibration, Brightness, Controls, Mods,
+    // Achievements): one cell across the value column with the value, the
+    // confirm button and a chevron.
+    bool pageEntry = false;
+    // A picture at the start of the row (Achievements page): the name then
+    // starts after it. Without an image, iconGlyph is drawn on a dark square.
+    std::shared_ptr<const menu_assets::Image> icon;
+    std::wstring iconGlyph;
     bool operator==(const MenuRow &) const = default;
 };
 struct MenuSnapshot
@@ -44,6 +58,8 @@ struct MenuSnapshot
     int scroll = 0;
     uint32_t language = 0;
     bool playStationPrompts = false;
+    // B confirms and A goes back (the game's swapped button setting).
+    bool confirmB = false;
     std::vector<MenuRow> rows;
     std::wstring help;
     // Graphics-tab DLSS status. Empty on other tabs, so those pages keep one help line.
@@ -74,6 +90,27 @@ struct MenuSnapshot
     // just TitleHintBounds of the output.
     bool titleHint = false;
 };
+// How a single line of explanatory text fits its box: scale 1 when it is drawn
+// at its normal size, below 1 when the renderer shrinks it to fit the width.
+// Same face choice and metrics as RasterizeMenu; face is "body", "title", "abc"
+// (the game's faces) or "host" (the built-in font).
+struct TextFit
+{
+    std::wstring text;
+    double scale = 1;
+    const char *face = "";
+};
+// The explanatory lines of the page a snapshot shows: under the list the help
+// box (help alone, or help over the notice); on the neural rendering page its
+// help line and the preview message; on a calibration page its key legend.
+struct HelpFit
+{
+    TextFit help, notice;
+};
+HelpFit MeasureHelp(const MenuSnapshot &snapshot);
+// The text with its isolated A/B/X/Y (and LB/RB, LT/RT) button labels swapped for
+// the PlayStation faces when playStation is set; any other text is unchanged.
+std::wstring PromptGlyphs(const std::wstring &value, bool playStation);
 // The list cursor arrow, top-left corner in the 1280x720 layout.
 struct MenuArrow
 {

@@ -19,6 +19,19 @@ namespace os::scheduling
 // opts out of App Nap. Call once, early in main().
 void BeginLatencyCriticalActivity();
 
+// Android: restricts the calling game thread (guest threads and the render
+// thread) to the performance cores, so the scheduler stops parking it on the
+// efficiency cores, where these threads run at less than half the speed.
+// No-op elsewhere, on devices without efficiency cores, or with
+// LO_PERFORMANCE_CORES=0. guestMain marks the thread LO_FRAME_STATS reports.
+void PreferPerformanceCores(bool guestMain = false);
+// Render thread, once per guest swap: LO_FRAME_STATS=<seconds> logs frame
+// interval percentiles and per-frame thread CPU time (Android only).
+void OnRenderFrame();
+// Audio producer thread, once at its start: Android's audio thread priority,
+// so a busy, thermally capped CPU still runs it on time. No-op elsewhere.
+void RaiseAudioThreadPriority();
+
 // Sleeps until deadline with sub-millisecond wakeup accuracy. macOS applies
 // timer coalescing to ordinary threads, which wakes 18 ms sleeps about 5 ms
 // late (worse than a whole audio period). A time-constraint (real-time) policy

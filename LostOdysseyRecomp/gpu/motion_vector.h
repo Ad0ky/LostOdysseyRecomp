@@ -2,6 +2,7 @@
 
 #include "temporal_math.h"
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -71,6 +72,9 @@ struct MotionRasterContract {
 struct MotionConstantUsage {
     std::array<uint64_t,4> slots{};
     bool known = false;
+    // Slots that can reach oPos (xenos::TranslatedShader::positionConstantSlots).
+    std::array<uint64_t,4> positionSlots{};
+    bool positionKnown = false;
 };
 // Only the canonical translator's main body is accepted. The prelude defines
 // XeConst(int), which must not be confused with a dynamic call. Unknown syntax
@@ -106,6 +110,15 @@ inline MotionConstantUsage ParseMotionConstantUsage(std::string_view source, boo
     result.known=true;return result;
 }
 
+// Renderer evidence for camera-only motion. vpSlot is the reviewed position
+// view-projection window (temporal_scene.h DrawPositionVPSlot); sceneCamera says
+// that window holds exactly the frame's scene camera, the camera HistoryOwner
+// reprojects depth with, under the same raster mapping.
+struct MotionCameraEvidence {
+    int vpSlot = -1;
+    bool sceneCamera = false;
+};
+
 struct DrawTemporalState {
     DrawHistoryKey key;
     std::array<float, 1024> vsConstants;
@@ -114,9 +127,12 @@ struct DrawTemporalState {
     std::array<uint32_t, 52> shared;
     MotionRasterContract raster;
     MotionConstantUsage constantUsage;
+    MotionCameraEvidence camera;
     uint32_t previousIndex = UINT32_MAX;
     uint32_t occurrence = 0;
     bool usesRelativeConstants = false, valid = false;
+    // Its replay pipeline was ready; carried while the draw keeps matching.
+    bool replayWarm = false;
     DrawTemporalState() noexcept {} // overwritten by memcpy; do not zero 4 KiB per insertion
 };
 
@@ -173,9 +189,17 @@ public:
         uint32_t sceneDrawCount = 0, trackedCurrentDraws = 0, matchedPreviousDraws = 0;
         uint32_t unmatchedDraws = 0, orderedDuplicateDraws = 0, directConstantMatches = 0, relativeConstantMatches = 0;
         uint32_t overflowDraws = 0, lateDraws = 0;
+        // Matched draws whose motion is the scene camera's alone, and why the
+        // others are not (first failing rule).
+        uint32_t cameraStaticDraws = 0, staticNotSceneCamera = 0, staticRelative = 0,
+            staticConstants = 0, staticShared = 0, staticRaster = 0;
         uint64_t snapshotBytes = 0;
     };
-    struct Match { uint32_t tag = 0; const DrawTemporalState* previous = nullptr; bool exactStationary = false; };
+    // cameraStatic: every input of the position other than the scene camera's VP
+    // window is bit-identical to the previous frame, and that window held the
+    // scene camera in both frames. Camera reprojection of the visible depth then
+    // gives the same motion a replay would.
+    struct Match { uint32_t tag = 0; const DrawTemporalState* previous = nullptr; bool exactStationary = false, cameraStatic = false, replayWarm = false; };
     explicit DrawTemporalTracker(size_t limit = kMaxDraws) : limit_(std::clamp(limit, size_t(1), kMaxDraws)) {}
     void BeginFrame(uint64_t frame, uint64_t epoch = 0) {
         if (begun_ && frame == frame_ && epoch == epoch_) return;
@@ -189,7 +213,8 @@ public:
     }
     void Invalidate() { failed_ = true; std::fill(validity_.begin(), validity_.end(), 0); }
     Match Collect(const DrawHistoryKey& key, const void* constants, const void* sharedPrefix, bool relative,
-        int restoredSlot = -1, const void* originalVP = nullptr, const MotionRasterContract* raster = nullptr, const MotionConstantUsage* usage = nullptr) {
+        int restoredSlot = -1, const void* originalVP = nullptr, const MotionRasterContract* raster = nullptr, const MotionConstantUsage* usage = nullptr,
+        MotionCameraEvidence camera = {}) {
         if (!begun_ || finalized_) { ++stats_.lateDraws; Invalidate(); return {}; }
         ++stats_.trackedCurrentDraws;
         if (failed_) return {};
@@ -208,6 +233,7 @@ public:
             (restoredSlot == -1 || (restoredSlot >= 0 && restoredSlot <= 252 && originalVP));
         s.raster = raster ? *raster : MotionRasterContract{};
         s.constantUsage = usage && !relative ? *usage : MotionConstantUsage{};
+        s.camera = camera.vpSlot >= 0 && camera.vpSlot <= 252 ? camera : MotionCameraEvidence{};
         s.previousIndex = prev.Find(key, occurrence);
         if (constants) std::memcpy(s.vsConstants.data(), constants, sizeof(s.vsConstants));
         else s.vsConstants.fill(0);
@@ -232,18 +258,55 @@ public:
                     if(std::memcmp(s.vsConstants.data()+slot*4,p->vsConstants.data()+slot*4,16)!=0){constantsEqual=false;break;}
             } else constantsEqual = std::memcmp(s.vsConstants.data(),p->vsConstants.data(),sizeof(s.vsConstants)) == 0;
         }
+        // Camera-static: equal outside the scene camera's VP window, over the
+        // constants that reach the position when both frames know them, else
+        // over every read constant, else over the whole bank.
+        bool outsideEqual = constantsEqual;
+        const int window = s.camera.vpSlot;
+        if (p && !constantsEqual && window >= 0) {
+            const auto& su = s.constantUsage; const auto& pu = p->constantUsage;
+            const bool position = su.positionKnown && pu.positionKnown && su.positionSlots == pu.positionSlots;
+            if (position || (su.known && pu.known && su.slots == pu.slots)) {
+                auto slots = position ? su.positionSlots : su.slots;
+                for (unsigned slot = unsigned(window); slot < unsigned(window) + 4; ++slot) slots[slot / 64] &= ~(uint64_t(1) << (slot % 64));
+                outsideEqual = true;
+                for (unsigned word = 0; word < 4 && outsideEqual; ++word)
+                    for (uint64_t bits = slots[word]; bits && outsideEqual; bits &= bits - 1) {
+                        const unsigned slot = word * 64 + unsigned(std::countr_zero(bits));
+                        outsideEqual = std::memcmp(s.vsConstants.data()+slot*4,p->vsConstants.data()+slot*4,16) == 0;
+                    }
+            } else {
+                const size_t begin = size_t(window) * 4, end = begin + 16;
+                outsideEqual = std::memcmp(s.vsConstants.data(),p->vsConstants.data(),begin*sizeof(float)) == 0 &&
+                    std::memcmp(s.vsConstants.data()+end,p->vsConstants.data()+end,(s.vsConstants.size()-end)*sizeof(float)) == 0;
+            }
+        }
         // VS epilogue reads xyz of both NDC vectors, both half-pixel words,
         // vtxFmt, and flags bits 2/3. Other flag bits control pixel shading.
         bool sharedEqual = p && std::memcmp(s.shared.data(),p->shared.data(),43*sizeof(uint32_t))==0 &&
             std::memcmp(s.shared.data()+44,p->shared.data()+44,3*sizeof(uint32_t))==0 &&
             std::memcmp(s.shared.data()+48,p->shared.data()+48,3*sizeof(uint32_t))==0 &&
             ((s.shared[51]^p->shared[51])&0xCu)==0;
-        const bool stationary = s.valid && p && s.raster.Supported() && p->raster.Supported() &&
+        const bool rasterEqual = s.valid && p && s.raster.Supported() && p->raster.Supported() &&
             s.raster.width == p->raster.width && s.raster.height == p->raster.height &&
-            std::memcmp(s.raster.viewport.data(), p->raster.viewport.data(), sizeof(s.raster.viewport)) == 0 &&
-            constantsEqual &&
-            sharedEqual;
-        return {index + 1, s.valid ? p : nullptr, stationary};
+            std::memcmp(s.raster.viewport.data(), p->raster.viewport.data(), sizeof(s.raster.viewport)) == 0;
+        const bool stationary = rasterEqual && constantsEqual && sharedEqual;
+        // Relative addressing may read the VP window for more than oPos.
+        bool cameraStatic = false;
+        if (s.valid && p) {
+            if (!rasterEqual) ++stats_.staticRaster;
+            else if (!s.camera.sceneCamera || !p->camera.sceneCamera || s.camera.vpSlot != p->camera.vpSlot) ++stats_.staticNotSceneCamera;
+            else if (relative || p->usesRelativeConstants) ++stats_.staticRelative;
+            else if (!sharedEqual) ++stats_.staticShared;
+            else if (!outsideEqual) ++stats_.staticConstants;
+            else { cameraStatic = true; ++stats_.cameraStaticDraws; }
+        }
+        s.replayWarm = s.valid && p && p->replayWarm;
+        return {index + 1, s.valid ? p : nullptr, stationary, cameraStatic, s.replayWarm};
+    }
+    void MarkReplayWarm(uint32_t tag) {
+        auto& cur = tables_[current_];
+        if (tag && tag <= cur.draws.size()) cur.draws[tag - 1].replayWarm = true;
     }
     // Compatibility entry for CPU fixtures. Production uses Collect with complete shared prefix.
     const DrawTemporalState* RecordDraw(const DrawHistoryKey& key, const float* c,

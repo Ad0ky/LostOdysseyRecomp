@@ -28,6 +28,8 @@ PREAMBLE = r'''
 #include <settings/restart.h>
 #include <settings/language_selection.h>
 #include <settings/mods_page.h>
+#include <patches/mod_hot_reload.h>
+#include <settings/achievements_page.h>
 #include <gpu/frame_plan.h>
 #include <gpu/frame_rate.h>
 #include <gpu/dlss_nr_state.h>
@@ -61,7 +63,13 @@ bool UsesPlayStationPrompts() { return playStationPrompts; }
 void SetVibrationStrength(uint32_t) {}
 void SetPromptStyle(uint32_t) {}
 void PreviewVibration() {}
+// Controls page: no controller is held; keys are named by scancode.
+void SetInputMaps(const input_map::ControllerMap&, const input_map::KeyboardMap&) {}
+uint32_t PressedSources() { return 0; }
+std::string KeyName(uint32_t scancode) { return "#" + std::to_string(scancode); }
 }
+// System -> Shader bundle records nothing here.
+namespace updater::shader_pack { bool RequestRedownload(){return true;} }
 namespace settings {
 Config savedConfig;
 Config GetConfig(){return savedConfig;}
@@ -112,6 +120,12 @@ bool SetConsent(bool){++consents;return true;}
 namespace apu { bool surround=false; uint32_t matrixRear=110; void SetOutput(Output o){surround=o==Output::Surround;}
 void SetMatrixRearAngle(uint32_t d){matrixRear=d;} void SetVoiceVolume(uint32_t){} void SetTestSignal(bool){} float TestSignalPosition(){return -1.0f;} uint32_t OutputChannels(){return surround?6:2;} }
 namespace settings { bool SaveAudioOutput(uint32_t o){savedConfig.audioOutput=o;return true;} }
+// No title data: the Achievements page lists nothing.
+namespace achievements {
+std::vector<Info> List(){return {};}
+int64_t EarnedTime(uint16_t){return 0;}
+Icon IconOf(uint16_t){return {};}
+}
 // No mods folder: the Mods page shows its empty state.
 namespace modding {
 std::vector<ModInfo> ListMods(){return {};}
@@ -120,6 +134,7 @@ bool Enabled(){return true;}
 ResolutionMode Mode(){return ResolutionMode::Combined;}
 bool SaveModList(const std::vector<std::pair<std::string,bool>>&,std::string*){Check(false,"empty Mods page must not save");return false;}
 }
+namespace mod_hot_reload { bool Request(){return false;} Status GetStatus(){return {};} }
 '''
 TEST = r'''
 extern "C" PPC_FUNC(__imp__sub_822F19B0) {}
@@ -144,7 +159,7 @@ int main(int argc, char** argv) {
     auto tick=[&](uint16_t input=0){settings::pending=input;PPCContext ctx;ctx.r3.u64=Menu;
         sub_822F19B0(ctx,base);Check(ctx.r3.u32==Menu && ctx.cookie==1234,"guest helper calls preserve context");};
     tick();Check(settings::active,"menu opens");
-    uint16_t neutral=0;settings::FilterInput(neutral,0,0);
+    uint16_t neutral=0;settings::FilterInput(neutral,0,0,neutral);
     // A must not cycle ANY ordinary setting, not just the new graphics choice.
     for(int tab=0;tab<4;++tab){
         settings::tab=tab;
@@ -172,10 +187,15 @@ int main(int argc, char** argv) {
     settings::tab=1;settings::row=settings::AudioOutputRow;tick(8);
     Check(settings::edit.audioOutput==1 && settings::savedConfig.audioOutput==1 && apu::surround && applies==1,
           "audio output switches live and saves without a guest apply");
-    settings::tab=0;settings::row=settings::GameVibrationRow;settings::edit.vibrationPercent=100;tick(4);
+    settings::tab=0;settings::row=settings::GameControlsRow;tick(0x1000);
+    Check(settings::controlsOpen && settings::snapshot.pageTitle==L"Controls" &&
+          settings::snapshot.rows.size()==size_t(settings::ControlsRowCount),"Gameplay Controls opens the Controls page");
+    settings::controlsFocus=settings::ControlsVibrationRow;settings::edit.vibrationPercent=100;tick(4);
     Check(settings::edit.vibrationPercent==90 && settings::savedConfig.vibrationPercent==90 && applies==1 &&
-          settings::snapshot.rows[settings::GameVibrationRow].sliderPercent==90,
-          "Gameplay vibration lowers, saves at once and needs no guest apply");
+          settings::snapshot.rows[settings::ControlsVibrationRow].sliderPercent==90,
+          "Controls page vibration lowers, saves at once and needs no guest apply");
+    tick(0x2000);
+    Check(!settings::controlsOpen && settings::tab==0 && settings::row==settings::GameControlsRow,"B leaves the Controls page");
     using settings::GraphicsRow;using gpu::upscaling::Upscaler;
     settings::tab=2;settings::row=int(GraphicsRow::AntiAliasing);settings::edit={};
     settings::edit.dlssQuality=gpu::upscaling::DlssQuality::Dlaa;
@@ -452,16 +472,16 @@ int main(int argc, char** argv) {
     Check(saves==oldSaves+1,"mouse Save stays a confirm action");
     settings::restartPrompt=false;settings::savedRestartPrompt=false;settings::displayTicket=0;
     settings::tab=2;settings::row=0;settings::waitForRelease=false;
-    uint16_t input=0;settings::FilterInput(input,0,0);
-    input=2;Check(settings::FilterInput(input,0,0) && input==0,"input is consumed");
+    uint16_t input=0;settings::FilterInput(input,0,0,input);
+    input=2;Check(settings::FilterInput(input,0,0,input) && input==0,"input is consumed");
     Check(settings::pending.load()==2,"fresh navigation enqueues immediately without debounce wait");
     auto edge=settings::pending.exchange(0);tick(edge);Check(settings::row==1,"first following guest tick updates focus");
-    input=2;settings::FilterInput(input,0,0);Check(!settings::pending.load(),"held input does not repeat immediately");
-    input=0;settings::FilterInput(input,0,0);input=2;settings::FilterInput(input,0,0);
+    input=2;settings::FilterInput(input,0,0,input);Check(!settings::pending.load(),"held input does not repeat immediately");
+    input=0;settings::FilterInput(input,0,0,input);input=2;settings::FilterInput(input,0,0,input);
     Check(settings::pending.load()==2,"quick release/repress not swallowed by repeat timer");settings::pending=0;
-    input=0;settings::FilterInput(input,0,0);settings::swapConfirm=true;
-    input=0x2000;settings::FilterInput(input,0,0);Check(settings::pending.exchange(0)==0x1000,"swapped B is confirm");
-    input=0;settings::FilterInput(input,0,0);input=0x1000;settings::FilterInput(input,0,0);
+    input=0;settings::FilterInput(input,0,0,input);settings::swapConfirm=true;
+    input=0x2000;settings::FilterInput(input,0,0,input);Check(settings::pending.exchange(0)==0x1000,"swapped B is confirm");
+    input=0;settings::FilterInput(input,0,0,input);input=0x1000;settings::FilterInput(input,0,0,input);
     Check(settings::pending.exchange(0)==0x2000,"swapped A is back");settings::swapConfirm=false;
     settings::tab=3;settings::row=settings::SystemCollectionRow;tick(0x1000);Check(!settings::collectionPrompt && !consents,"A does not toggle collection");
     tick(8);Check(settings::collectionPrompt,"right enables collection confirmation");

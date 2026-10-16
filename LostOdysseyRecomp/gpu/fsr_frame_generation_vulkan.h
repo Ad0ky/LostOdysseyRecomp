@@ -24,6 +24,8 @@ public:
     bool Available() const;
     bool Failed() const;
     bool UsesProxySwapchain() const;
+    // Host presents plus the frames the SDK generated between them; cumulative.
+    uint64_t PresentedFrames() const;
     void PrepareAfterHostDrain(const frame_generation::CompositeHandoff& inputs,
         plume::VulkanSwapChain& swap, plume::VulkanCommandList& commands);
     void SubmitStart();

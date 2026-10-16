@@ -8,6 +8,7 @@
 #include "gpu/backend_selection.h"
 #include "gpu/upscaling_plan.h"
 #include "../../shared/frame_generation/core.h"
+#include "hid/input_map.h"
 namespace settings
 {
 // Persisted 2 (the removed exclusive fullscreen) loads as Borderless.
@@ -94,12 +95,10 @@ struct Config
                                   // 720/1080/1440/2160 select scene height;
                                   // InternalResolutionNative renders at the drawable's pixel size.
     WindowMode windowMode = WindowMode::Windowed;
-#ifdef _WIN32
-    GraphicsBackend graphicsBackend = GraphicsBackend::D3D12; // Applied on the next process start.
-#elif LO_PLATFORM_MACOS
+#if LO_PLATFORM_MACOS
     GraphicsBackend graphicsBackend = GraphicsBackend::Metal; // The only macOS backend.
 #else
-    GraphicsBackend graphicsBackend = GraphicsBackend::Vulkan; // Applied on the next process start.
+    GraphicsBackend graphicsBackend = GraphicsBackend::Vulkan; // Every other platform's default. Applied on the next process start.
 #endif
     // Adapter name as the backend lists it; empty selects automatically.
     // Applied on the next process start.
@@ -159,6 +158,10 @@ struct Config
     uint32_t frameGenerationTargetFps = 0; // Dynamic mode: 0 asks the SDK to use the display rate.
     uint32_t vibrationPercent = 100; // Controller rumble strength; 0 Off, 100 retail. Applied live.
     uint32_t buttonPrompts = 0; // Button icons: 0 Auto (last active controller), 1 Xbox, 2 PlayStation. Applied live.
+    // Gameplay → Controls: the controller button and the key for each Xbox 360
+    // input (hid/input_map.h). Applied live.
+    hid::input_map::ControllerMap controllerMap = hid::input_map::DefaultController;
+    hid::input_map::KeyboardMap keyboardMap = hid::input_map::DefaultKeyboard;
     bool fxaa = false; // Legacy serialized mirror; antialiasing is authoritative.
     bool automaticUpdates = true;
     bool debugLog = false; // Writes info and kernel lines to the runtime log. Applied live.
@@ -166,6 +169,12 @@ struct Config
     uint32_t audioMatrixRear = 110; // Matrix surround rear angle, 90-150 degrees in 10 degree steps. Applied live.
     uint32_t voiceVolume = 100; // Cutscene dialogue, 0-100, in place of the Sound effects volume. Applied live.
     bool skipShaderPrebuild = false;
+    // Achievement-unlocked toast and its chime (ui/achievement_overlay.cpp). Applied live.
+    bool achievementNotifications = true;
+    bool achievementSound = true;
+    // Performance overlay over game frames (ui/performance_overlay.cpp): 0 Off,
+    // 1 FPS, 2 Detailed (upscaler, FG, CPU and GPU load). Applied live.
+    uint32_t performanceOverlay = 0;
     bool saveAnywhere = false; // Debug-only preference; defaults off for existing profiles.
     bool noRandomEncounters = false; // Debug-only preference, persisted like saveAnywhere.
     // Debug-menu fast-forward, persisted like saveAnywhere: switch, 0 Hold / 1 Toggle,
@@ -187,6 +196,9 @@ bool SaveAudioOutput(uint32_t output);
 // The player moved the window to another display (Win+Shift+arrow, dragging):
 // saves only the display choice, merged with the persisted settings.
 bool SaveDisplayChoice(const std::string &name, uint32_t index);
+// The player accepted another backend for the next start (GPU-stopped dialog):
+// saves only graphics_backend, merged with the persisted settings.
+bool SaveGraphicsBackend(GraphicsBackend backend);
 uint32_t GameLanguage();
 // The selected language pack's id, if it is installed and its base is
 // GameLanguage(); empty otherwise. Fixed at the first call, after LanguagePacks.

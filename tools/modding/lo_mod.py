@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import tempfile
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
+from fractions import Fraction
 from pathlib import Path, PurePosixPath
 
 MAGIC = b"LOTEX1\r\n"
@@ -35,6 +37,20 @@ FOLDERS = {"image": "images", "font": "fonts", "model": "models", "movie": "movi
 KIND_FOLDERS = ("images", "fonts", "models", "movies", "textures", "text")
 # api_version=2 display metadata: UTF-8 bytes per field, as the runtime checks them.
 META_LIMITS = {"name": 128, "version": 64, "author": 128, "description": 1024}
+# overlay.loarc: one file that holds a mod's overlay/ files (format in docs/wiki/Creating-Mods.md).
+LOARC_MAGIC = b"LOARC1\r\n"
+LOARC_HEADER = struct.Struct("<8sIIQQI28x")  # 64 bytes
+LOARC_RECORD = struct.Struct("<QQI")  # offset, size, name length; the name follows
+LOARC_ALIGN = 4096
+LOARC_MAX_INDEX = 64 << 20
+LOARC_KINDS = {"images": 1, "fonts": 2, "models": 3, "movies": 4, "textures": 5, "text": 6}
+LOARC_NAMES = {1: r"key-fnv1a64-[0-9a-f]{16}\.lotex", 2: r"key-fnv1a64-[0-9a-f]{16}\.loasset",
+               3: r"key-fnv1a64-[0-9a-f]{16}\.loasset", 4: r"[a-z0-9_]{1,64}\.mp4",
+               5: r"fp-[0-9a-f]{16}\.lotex2"}
+# Model replacements keep the path --export-assets gives the model.
+MODEL_NAME = re.compile(r".+/[^/]+\.[0-9]+\.glb")
+LOARC_CHUNK = 1 << 20
+ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
 
 def text(value: object) -> str:
@@ -81,9 +97,19 @@ def canonical_key(value: str) -> str:
     return make_key(package, int(index), name)
 
 
+def movie_key(value: str) -> str:
+    """A movie key: the original video's file name stem (mv_00v for mv_00v.wmv), 1-64 of [a-z0-9_], any ASCII case."""
+    key = text(value).translate(ASCII_LOWER)
+    if not re.fullmatch(r"[a-z0-9_]{1,64}", key):
+        raise ValueError("movie key must be 1-64 ASCII letters, digits or '_' (the original file name without .wmv)")
+    return key
+
+
 def overlay_path(key: str, kind: str = "image") -> str:
     if kind not in FOLDERS:
         raise ValueError("unknown asset kind")
+    if kind == "movie":
+        return f"overlay/movies/{movie_key(key)}.mp4"
     hash_value = 14695981039346656037
     for byte in canonical_key(key).encode("utf-8"):
         hash_value = ((hash_value ^ byte) * 1099511628211) & 0xffffffffffffffff
@@ -702,12 +728,296 @@ def language_clean(pack: Path, original: Path | None, output: Path | None) -> di
         stats["entries"] += len(kept)
     target.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ini, target / "language.ini")
+    if (pack / "fonts").is_dir():
+        # Glyphs made with font-glyphs are the pack's own artwork.
+        shutil.copytree(pack / "fonts", target / "fonts")
     settings = dict(line.split("=", 1) for line in ini.read_text(encoding="utf-8-sig").splitlines()
                     if "=" in line and not line.lstrip().startswith(("#", ";")))
     if settings.get("name", "").strip() == settings.get("id", "").strip():
         print("warning: language.ini still has name= set to the id; Settings will show it as the language name")
     stats["output"] = str(target)
     return stats
+
+
+# LOFONT1: glyphs a language pack adds to one of the game's fonts (format in docs/wiki/Modding-API.md).
+LOFONT_HEADER = struct.Struct("<12sIIIII")  # magic + 3 zero bytes, header size, glyphs, width, height, 0
+LOFONT_MAGIC = b"LOFONT1\r\n\0\0\0"
+LOFONT_GLYPH = struct.Struct("<IHHHH")
+TEXT_TOKEN = re.compile(r"\{[0-9A-Fa-f]{4}(?::[0-9A-Fa-f]{4})?\}")
+
+
+def pack_characters(pack: Path) -> set[str]:
+    """Every character the pack's translations use, without the game's {XXXX} codes."""
+    chars: set[str] = set()
+    for file in sorted((pack / "text").rglob("*.json")):
+        data = json.loads(file.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError(f"{file}: not a JSON object")
+        for value in data.values():
+            if isinstance(value, str):
+                chars.update(TEXT_TOKEN.sub("", value))
+    return {c for c in chars if ord(c) >= 32 and ord(c) <= 0xFFFF}
+
+
+ZWJ = "‍"
+DECOMPOSITION_FORMS = {"<initial>": (True, False), "<medial>": (True, True), "<final>": (False, True), "<isolated>": (False, False)}
+
+
+def shaping_input(ch: str) -> tuple[str, bool, bool]:
+    """Text that makes a shaper draw this character, and whether it joins on its visual left and right.
+    A presentation form (U+FB50..U+FEFF) becomes its letters between zero-width joiners: modern
+    fonts draw those forms through OpenType shaping and do not map the code points themselves."""
+    import unicodedata
+    if ch == "ـ":  # tatweel
+        return ch, True, True
+    tag, _, rest = unicodedata.decomposition(ch).partition(" ")
+    if tag not in DECOMPOSITION_FORMS:
+        return ch, False, False
+    letters = "".join(chr(int(h, 16)) for h in rest.split())
+    left, right = DECOMPOSITION_FORMS[tag]
+    # Logical order: a letter that joins on its left joins the next letter, on its right the previous one.
+    return (ZWJ if right else "") + letters + (ZWJ if left else ""), left, right
+
+
+class GlyphPainter:
+    """Shapes text with HarfBuzz and draws it with FreeType: fill plus an outline grown around it."""
+
+    def __init__(self, ttf_path: Path, size: float):
+        try:
+            import uharfbuzz as hb
+            from fontTools.pens.freetypePen import FreeTypePen  # needs freetype-py
+            from fontTools.ttLib import TTFont
+        except ImportError as exc:
+            raise ValueError("font-glyphs requires fontTools, freetype-py and uharfbuzz: "
+                             "python -m pip install fonttools freetype-py uharfbuzz") from exc
+        self.hb, self.pen_type = hb, FreeTypePen
+        self.tt = TTFont(str(ttf_path))
+        self.glyph_set = self.tt.getGlyphSet()
+        self.order = self.tt.getGlyphOrder()
+        self.cmap = self.tt.getBestCmap()
+        self.font = hb.Font(hb.Face(hb.Blob.from_file_path(str(ttf_path))))
+        self.scale = size / self.tt["head"].unitsPerEm
+
+    def covers(self, text: str) -> bool:
+        return all(ord(c) in self.cmap for c in text if c != ZWJ)
+
+    def draw(self, text: str, baseline: int, height: int, stroke: int, fill, outline_colour, joins=(False, False)):
+        """One glyph cell (RGBA, `height` tall) and the ink box on the uncut canvas, or None for no ink."""
+        from fontTools.pens.transformPen import TransformPen
+        from PIL import Image, ImageFilter
+        buf = self.hb.Buffer()
+        buf.add_str(text)
+        buf.guess_segment_properties()
+        self.hb.shape(self.font, buf, {})
+        pen = self.pen_type(self.glyph_set)
+        x = 0
+        for info, pos in zip(buf.glyph_infos, buf.glyph_positions):
+            self.glyph_set[self.order[info.codepoint]].draw(TransformPen(pen, (1, 0, 0, 1, x + pos.x_offset, pos.y_offset)))
+            x += pos.x_advance
+        advance = max(1, round(x * self.scale))
+        margin = advance + 4 * stroke + 16
+        width = advance + 2 * margin
+        coverage = pen.image(width=width, height=height, transform=(self.scale, 0, 0, self.scale, margin, height - baseline)).getchannel("A")
+        cell = Image.new("RGBA", (width, height), tuple(outline_colour) + (0,))
+        if stroke:
+            cell.putalpha(coverage.filter(ImageFilter.MaxFilter(2 * stroke + 1)))
+        face = Image.new("RGBA", (width, height), tuple(fill) + (0,))
+        face.putalpha(coverage)
+        cell.alpha_composite(face)
+        box = cell.getchannel("A").point(lambda v: 255 if v > 24 else 0).getbbox()
+        join_left, join_right = joins
+        # Cut where the letter joins: the neighbour continues the stroke, so no outline there.
+        left = margin if join_left or not box else min(margin, box[0])
+        right = margin + advance if join_right or not box else max(margin + advance, box[2])
+        return cell.crop((left, 0, right, height)), box
+
+
+def pixels(image) -> list[tuple[int, int, int, int]]:
+    data = image.convert("RGBA").tobytes()
+    return [tuple(data[i:i + 4]) for i in range(0, len(data), 4)]
+
+
+def ink_box(image, threshold: int = 24) -> tuple[int, int, int, int] | None:
+    return image.getchannel("A").point(lambda v: 255 if v > threshold else 0).getbbox()
+
+
+# Letters to size a font by when it has no H (Japanese fonts with kana and kanji only):
+# measured against a font of the same export that has both.
+STAND_INS = "口あアの一日十0123456789"
+
+
+class FontCrops:
+    """Glyph pictures of an exported font."""
+
+    def __init__(self, meta: dict, textures: Path):
+        self.meta, self.textures, self.pages = meta, textures, {}
+        self.glyphs = {g[0]: g[1:] for g in meta["glyphs"]}
+
+    def crop(self, cp: int):
+        from PIL import Image
+        x, y, w, h, page = self.glyphs[cp]
+        if page not in self.pages:
+            self.pages[page] = Image.open(self.textures / self.meta["pages"][page]["png"]).convert("RGBA")
+        return self.pages[page].crop((x, y, x + w, y + h))
+
+    def box(self, cp: int):
+        return ink_box(self.crop(cp)) if cp in self.glyphs else None
+
+
+def h_from_stand_in(font: FontCrops, others: list[FontCrops]) -> tuple[int, int, int] | None:
+    """(stand-in, H top, H bottom) for a font without H, from a font that has H and the same stand-in.
+
+    The H is placed where it would stand relative to the stand-in in that font: its height and its
+    bottom as fractions of the stand-in's ink height."""
+    for ch in STAND_INS:
+        mine = font.box(ord(ch))
+        if not mine:
+            continue
+        for other in others:
+            h, ref = other.box(0x48), other.box(ord(ch))
+            if not h or not ref or ref[3] == ref[1]:
+                continue
+            unit, own = ref[3] - ref[1], mine[3] - mine[1]
+            bottom = mine[3] + (h[3] - ref[3]) * own / unit
+            return ord(ch), round(bottom - (h[3] - h[1]) * own / unit), round(bottom)
+    return None
+
+
+def font_reference(meta: dict, textures: Path, others: list[FontCrops] = ()) -> dict:
+    """Cell height, the 'H' ink box, outline width and colours of an exported font.
+
+    A font without H and I is measured by a stand-in letter it shares with one of `others`."""
+    font = FontCrops(meta, textures)
+    glyphs = font.glyphs
+    crop = font.crop
+    if 0x48 in glyphs and 0x49 in glyphs:
+        letter_h = crop(0x48)
+        box = ink_box(letter_h)
+        if not box:
+            raise ValueError("the H glyph is empty")
+        h_top, h_bottom, stroke_letter = box[1], box[3], 0x49
+    else:
+        found = h_from_stand_in(font, [o for o in others if o.meta is not meta])
+        if not found:
+            raise ValueError("the font has no H or I, and no letter shared with a font that has them")
+        stroke_letter, h_top, h_bottom = found
+        letter_h = crop(stroke_letter)
+    heights = sorted(g[3] for g in glyphs.values())
+    # Outline: dark opaque pixels before the first bright one across the middle of I.
+    letter_i = crop(stroke_letter)
+    row = [letter_i.getpixel((x, letter_i.height // 2)) for x in range(letter_i.width)]
+    outline, started = 0, False
+    for r, g, b, a in row:
+        if a > 128 and max(r, g, b) < 128:
+            outline += 1
+            started = True
+        elif started or (a > 128 and max(r, g, b) >= 128):
+            break
+    both = pixels(letter_h) + pixels(letter_i)
+    bright = [p for p in both if p[3] > 200 and max(p[:3]) >= 160]
+    dark = [p for p in both if p[3] > 200 and max(p[:3]) < 96]
+    median = lambda found, fallback: tuple(sorted(c[i] for c in found)[len(found) // 2] for i in range(3)) if found else fallback
+    return {"height": heights[len(heights) // 2], "h_top": h_top, "h_bottom": h_bottom, "outline": max(1, min(outline, 3)) if dark else 0,
+            "fill": median(bright, (255, 255, 255)), "outline_colour": median(dark, (0, 0, 0)), "glyphs": glyphs}
+
+
+def font_glyphs(export: Path, pack: Path, ttf_path: Path, only: set[str] | None = None, extra: str = "",
+                scale: float = 1.0) -> list[dict]:
+    """LOFONT1 files with the glyphs a language pack uses that the game's fonts lack."""
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        raise ValueError("font-glyphs requires Pillow: python -m pip install Pillow") from exc
+    ini = {}
+    for line in (pack / "language.ini").read_text(encoding="utf-8-sig").splitlines():
+        if "=" in line and not line.lstrip().startswith(("#", ";")):
+            key, _, value = line.partition("=")
+            ini[key.strip()] = value.strip()
+    base = ini.get("base", "int")
+    wanted = pack_characters(pack) | set(extra)
+    fonts_root, textures = export / "fonts", export / "textures"
+    if not fonts_root.is_dir() or not textures.is_dir():
+        raise ValueError(f"{export} needs fonts/ and textures/: run --export-assets with --export-kinds textures,fonts")
+    probe = GlyphPainter(ttf_path, 100)
+    results = []
+    metas = [json.loads(f.read_text(encoding="utf-8")) for f in sorted(fonts_root.rglob("*.json"))]
+    metas = [m for m in metas if m["package"].endswith(f"_{base}.xxx")]
+    # Fonts with an H, same package first: what a font without H is measured against.
+    others = [FontCrops(m, textures) for m in metas if any(g[0] == 0x48 for g in m["glyphs"])]
+    for meta in metas:
+        package, name = meta["package"], meta["font"]
+        if only and name not in only:
+            continue
+        try:
+            ref = font_reference(meta, textures, sorted(others, key=lambda o: o.meta["package"] != package))
+        except ValueError as exc:
+            results.append({"font": name, "package": package, "skipped": str(exc)})
+            continue
+        missing = sorted(c for c in wanted if ord(c) not in ref["glyphs"] and not c.isspace())
+        shaped = {ch: shaping_input(ch) for ch in missing}
+        unsupported = "".join(ch for ch in missing if not probe.covers(shaped[ch][0]))
+        drawable = [ch for ch in missing if ch not in unsupported]
+        if not drawable:
+            if unsupported:
+                results.append({"font": name, "package": package, "skipped": f"the TTF has none of {unsupported}"})
+            continue
+        cell, stroke, fill, dark = ref["height"], ref["outline"], ref["fill"], ref["outline_colour"]
+        # Size: the TTF's H as tall as the game's H (heights scale with the size), then
+        # smaller until every new glyph fits the cell.
+        _, box = probe.draw("H", cell * 2, cell * 4, stroke, fill, dark)
+        size = max(4.0, (ref["h_bottom"] - ref["h_top"] - 2 * stroke) * 100 / max(1, box[3] - box[1] - 2 * stroke) * scale)
+        while True:
+            painter = GlyphPainter(ttf_path, size)
+            _, box = painter.draw("H", cell * 2, cell * 4, stroke, fill, dark)
+            baseline = ref["h_bottom"] + cell * 2 - box[3]  # the H stands where the game's does
+            top = bottom = None
+            for ch in drawable:
+                _, ink = painter.draw(shaped[ch][0], baseline + cell, cell * 3, stroke, fill, dark)
+                if ink:
+                    top = ink[1] - cell if top is None else min(top, ink[1] - cell)
+                    bottom = ink[3] - cell if bottom is None else max(bottom, ink[3] - cell)
+            if top is not None and bottom - top > cell and size > 4:
+                size *= 0.95
+                continue
+            if top is not None:
+                # Keep the shared baseline unless a glyph would leave the cell.
+                shift = -(bottom - cell) if bottom > cell else 0
+                baseline += shift - min(0, top + shift)
+            break
+        width = meta["pages"][-1]["width"]
+        kerning = meta["kerning"]
+        cells = []
+        for ch in drawable:
+            text_in, join_left, join_right = shaped[ch]
+            image, _ = painter.draw(text_in, baseline, cell, stroke, fill, dark, (join_left, join_right))
+            if kerning < 0:
+                # The game advances by width + kerning: pad so the advance is the ink's width.
+                padded = Image.new("RGBA", (image.width - kerning, cell), (0, 0, 0, 0))
+                padded.paste(image, (0, 0))
+                image = padded
+            if image.width > width:
+                raise ValueError(f"{name}: glyph U+{ord(ch):04X} is wider than the page ({image.width} > {width})")
+            cells.append((ord(ch), image))
+        # Rows of cells, one transparent pixel between them.
+        x = y = 0
+        placed = []
+        for cp, image in cells:
+            if x + image.width > width:
+                x, y = 0, y + cell + 1
+            placed.append((cp, x, y, image))
+            x += image.width + 1
+        atlas = Image.new("RGBA", (width, y + cell), (0, 0, 0, 0))
+        records = b""
+        for cp, gx, gy, image in placed:
+            atlas.paste(image, (gx, gy))
+            records += LOFONT_GLYPH.pack(cp, gx, gy, image.width, image.height)
+        data = LOFONT_HEADER.pack(LOFONT_MAGIC, LOFONT_HEADER.size, len(placed), atlas.width, atlas.height, 0) + records + atlas.tobytes()
+        target_file = pack / "fonts" / PurePosixPath(package) / f"{name}.lofont"
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        target_file.write_bytes(data)
+        results.append({"font": name, "package": package, "glyphs": len(placed), "size": round(size, 1),
+                        "atlas": f"{atlas.width}x{atlas.height}", "file": str(target_file), "unsupported": unsupported})
+    return results
 
 
 def overlay_to_mod(mods: Path, identity: str, priority: int = 0, meta: dict | None = None,
@@ -752,6 +1062,306 @@ def overlay_to_mod(mods: Path, identity: str, priority: int = 0, meta: dict | No
     except OSError:
         pass
     return moves, ini_text
+
+
+def warn(message: str) -> None:
+    print(f"lo_mod: warning: {message}", file=sys.stderr)
+
+
+def mp4_atom_order(path: Path) -> tuple[int | None, int | None]:
+    """Offsets of the top-level moov and mdat boxes of an MP4 (None when absent); reads box headers only."""
+    found: dict[bytes, int] = {}
+    size = path.stat().st_size
+    with path.open("rb") as file:
+        pos = 0
+        while pos + 8 <= size and not {b"moov", b"mdat"} <= found.keys():
+            file.seek(pos)
+            length, kind = struct.unpack(">I4s", file.read(8))
+            if length == 1:
+                length = struct.unpack(">Q", file.read(8))[0]
+            elif length == 0:
+                length = size - pos
+            found.setdefault(kind, pos)
+            if length < 8:
+                break
+            pos += length
+    return found.get(b"moov"), found.get(b"mdat")
+
+
+def check_movie(path: Path) -> None:
+    """Check a movie replacement. ValueError when the game cannot play it; warnings for settings that are not recommended.
+    ffprobe is optional: without it only the box order is checked."""
+    moov, mdat = mp4_atom_order(path)
+    if moov is None or mdat is None:
+        raise ValueError(f"{path}: not an MP4 file (no moov and mdat boxes)")
+    if moov > mdat:
+        warn(f"{path}: moov is after mdat; re-encode with ffmpeg -movflags +faststart")
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        print(f"lo_mod: note: ffprobe not found, {path.name}: codec and frame rate were not checked", file=sys.stderr)
+        return
+    run = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0", "-of", "json", "-show_entries",
+                          "stream=codec_name,pix_fmt,field_order,avg_frame_rate,width,height", str(path)],
+                         capture_output=True, text=True, timeout=60)
+    streams = json.loads(run.stdout or "{}").get("streams") if run.returncode == 0 else None
+    if not streams:
+        raise ValueError(f"{path}: ffprobe found no video stream")
+    video = streams[0]
+    if video.get("codec_name") != "h264":
+        raise ValueError(f"{path}: video must be H.264, not {video.get('codec_name')}")
+    if video.get("pix_fmt") != "yuv420p":
+        raise ValueError(f"{path}: pixel format must be yuv420p, not {video.get('pix_fmt')}")
+    if video.get("field_order") not in (None, "progressive", "unknown"):
+        raise ValueError(f"{path}: video must be progressive, not {video.get('field_order')}")
+    rate = video.get("avg_frame_rate", "0/1")
+    numerator, _, denominator = rate.partition("/")
+    # The game matches frames by time, so any rate works; outside 24-120 fps is likely a mistake.
+    if (not denominator.isdigit() or not numerator.isdigit() or int(denominator) == 0
+            or not 24 <= Fraction(int(numerator), int(denominator)) <= 120):
+        warn(f"{path}: frame rate {rate} is outside 24-120 fps")
+    width, height = video.get("width") or 0, video.get("height") or 0
+    if width * 9 != height * 16:
+        warn(f"{path}: {width}x{height} is not 16:9")
+
+
+def loarc_kind(name: str) -> int:
+    """Kind (1-6) of a stored archive name; ValueError unless it is the runtime's canonical overlay name."""
+    if not name.startswith("overlay/"):
+        raise ValueError("name does not start with overlay/")
+    folder, _, rest = name[8:].partition("/")
+    kind = LOARC_KINDS.get(folder)
+    if kind is None:
+        raise ValueError("unknown kind folder")
+    if kind == 6:
+        stem = rest[:-5]
+        if (not rest.endswith(".json") or not stem or len(stem.encode("utf-8")) > 1024
+                or any(part in ("", ".", "..") for part in stem.split("/"))
+                or stem != stem.translate(ASCII_LOWER)
+                or any(c in ":\\" or ord(c) < 32 or ord(c) == 127 for c in stem)):
+            raise ValueError("text name must be a relative lower-case <path>.json")
+    elif kind == 3:
+        if (not MODEL_NAME.fullmatch(rest) or len(rest.encode("utf-8")) > 1024
+                or any(part in ("", ".", "..") for part in rest.split("/"))
+                or rest != rest.translate(ASCII_LOWER)
+                or any(c in ":\\" or ord(c) < 32 or ord(c) == 127 for c in rest)):
+            raise ValueError("model name must be a lower-case <package path>/<object>.<export index>.glb")
+    elif not re.fullmatch(LOARC_NAMES[kind], rest):
+        raise ValueError("file name does not match the kind's naming rule")
+    return kind
+
+
+def loarc_scan(overlay: Path) -> dict[str, Path]:
+    """Stored name -> source file for every overlay file the runtime would load; others are skipped with a warning."""
+    found: dict[str, Path] = {}
+
+    def add(name: str, path: Path) -> None:
+        try:
+            if loarc_kind(name) == 4:
+                check_movie(path)
+        except ValueError as exc:
+            warn(f"skipped {path}: {exc}")
+            return
+        if name in found:
+            raise ValueError(f"{path} and {found[name]} both map to {name}")
+        found[name] = path
+
+    for folder in sorted(overlay.iterdir()):
+        kind = folder.name.translate(ASCII_LOWER)
+        if kind not in LOARC_KINDS or not folder.is_dir():
+            warn(f"skipped {folder}: not a kind folder ({', '.join(LOARC_KINDS)})")
+        elif kind == "text":
+            for base, dirs, files in os.walk(folder):
+                dirs.sort()
+                for file in sorted(files):
+                    path = Path(base) / file
+                    member = path.relative_to(folder).as_posix()
+                    if len(member) <= 5 or member[-5:].translate(ASCII_LOWER) != ".json":
+                        warn(f"skipped {path}: not a .json file")
+                    else:
+                        add("overlay/text/" + member[:-5].translate(ASCII_LOWER) + ".json", path)
+        elif kind == "models":
+            for base, dirs, files in os.walk(folder):
+                dirs.sort()
+                for file in sorted(files):
+                    path = Path(base) / file
+                    member = path.relative_to(folder).as_posix().translate(ASCII_LOWER)
+                    if not MODEL_NAME.fullmatch(member):
+                        warn(f"skipped {path}: not <package path>/<object>.<export index>.glb")
+                    else:
+                        add("overlay/models/" + member, path)
+        else:
+            for path in sorted(folder.iterdir()):
+                if path.is_file():
+                    add(f"overlay/{kind}/{path.name.translate(ASCII_LOWER)}", path)
+                else:
+                    warn(f"skipped {path}: only files directly in {folder.name} are loaded")
+    return found
+
+
+def loarc_write(entries: dict[str, Path], target: Path) -> tuple[dict[str, bytes], int]:
+    """Stream the entries into a new archive file; returns the data hash of each entry and the total data bytes."""
+    names = sorted(entries, key=lambda n: n.encode("utf-8"))
+    digests: dict[str, bytes] = {}
+    index, mask, total, pos = [], 0, 0, LOARC_HEADER.size
+    with target.open("wb") as file:
+        file.write(bytes(LOARC_HEADER.size))  # Replaced once the index is known.
+        for name in names:
+            offset = -(-pos // LOARC_ALIGN) * LOARC_ALIGN
+            file.write(bytes(offset - pos))
+            digest, size = hashlib.blake2b(digest_size=16), 0
+            with entries[name].open("rb") as source:
+                while chunk := source.read(LOARC_CHUNK):
+                    file.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            digests[name] = digest.digest()
+            raw = name.encode("utf-8")
+            index.append(LOARC_RECORD.pack(offset, size, len(raw)) + raw)
+            mask |= 1 << loarc_kind(name)
+            total += size
+            pos = offset + size
+        blob = b"".join(index)
+        file.write(blob)
+        file.seek(0)
+        file.write(LOARC_HEADER.pack(LOARC_MAGIC, LOARC_HEADER.size, len(names), pos, len(blob), mask))
+    return digests, total
+
+
+def loarc_read(path: Path, digests: dict[str, bytes] | None = None) -> list[tuple[str, int, int]]:
+    """Check an archive against every format rule; returns (name, offset, size) in index order.
+    With `digests` (name -> blake2b-128 from loarc_write) it also re-reads every entry's data."""
+    with path.open("rb") as file:
+        total = file.seek(0, os.SEEK_END)
+        file.seek(0)
+        head = file.read(LOARC_HEADER.size)
+        if len(head) < LOARC_HEADER.size:
+            raise ValueError("archive is shorter than its header")
+        magic, header_size, count, index_offset, index_size, mask = LOARC_HEADER.unpack(head)
+        if magic != LOARC_MAGIC or header_size != LOARC_HEADER.size or any(head[36:]):
+            raise ValueError("not a LOARC1 archive (bad magic, header size or reserved bytes)")
+        if (index_offset < LOARC_HEADER.size or index_size > LOARC_MAX_INDEX or index_offset + index_size > total
+                or count * (LOARC_RECORD.size + 1) > index_size):
+            raise ValueError("index lies outside the file or is too large")
+        file.seek(index_offset)
+        index = file.read(index_size)
+        entries, pos, previous, seen = [], 0, None, 0
+        for _ in range(count):
+            if pos + LOARC_RECORD.size > index_size:
+                raise ValueError("index is truncated")
+            offset, size, length = LOARC_RECORD.unpack_from(index, pos)
+            pos += LOARC_RECORD.size
+            if not 1 <= length <= 1100 or pos + length > index_size:
+                raise ValueError("invalid name length in the index")
+            raw = index[pos:pos + length]
+            pos += length
+            if previous is not None and raw <= previous:
+                raise ValueError("index names are not sorted and unique")
+            previous = raw
+            try:
+                name = raw.decode("utf-8")
+                seen |= 1 << loarc_kind(name)
+            except ValueError as exc:
+                raise ValueError(f"invalid entry name {raw!r}: {exc}") from exc
+            if offset % LOARC_ALIGN or offset < LOARC_ALIGN or offset + size > index_offset:
+                raise ValueError(f"{name}: data is unaligned or outside the data area")
+            entries.append((name, offset, size))
+        if pos != index_size:
+            raise ValueError("index has trailing bytes")
+        if seen != mask:
+            raise ValueError("kind_mask does not match the entries")
+        end = 0
+        for name, offset, size in sorted(entries, key=lambda e: (e[1], e[2])):
+            if offset < end:
+                raise ValueError(f"{name}: data overlaps another entry")
+            end = offset + size
+        if digests is not None:
+            for name, offset, size in entries:
+                digest = hashlib.blake2b(digest_size=16)
+                file.seek(offset)
+                left = size
+                while left:
+                    chunk = file.read(min(left, LOARC_CHUNK))
+                    if not chunk:
+                        raise ValueError(f"{name}: data is truncated")
+                    digest.update(chunk)
+                    left -= len(chunk)
+                if digest.digest() != digests.get(name):
+                    raise ValueError(f"{name}: archived data differs from the source file")
+    return entries
+
+
+def archive_mod(src: Path, dest: Path, force: bool = False, quick: bool = False) -> str:
+    """Copy a mod folder, putting its overlay/ files into overlay.loarc; returns a summary line."""
+    src, dest = src.resolve(), dest.resolve()
+    ini = src / "mod.ini"
+    if not ini.is_file() or not re.search(r"^\s*api_version\s*=\s*2\s*$", ini.read_text(encoding="utf-8-sig"), re.M):
+        raise ValueError(f"{ini} must exist and say api_version=2")
+    overlay = next((c for c in sorted(src.iterdir()) if c.is_dir() and c.name.translate(ASCII_LOWER) == "overlay"), None)
+    if overlay is None:
+        raise ValueError(f"{src} has no overlay/ folder")
+    if dest == src or dest.is_relative_to(src) or src.is_relative_to(dest):
+        raise ValueError("source and destination folders must not contain each other")
+    entries = loarc_scan(overlay)  # Name collisions fail here, before anything is written.
+    if not entries:
+        raise ValueError(f"{overlay} has no files the game loads")
+    if dest.exists() and (not dest.is_dir() or (any(dest.iterdir()) and not force)):
+        raise FileExistsError(f"{dest} is not empty (--force writes into it)")
+    created = not dest.exists()
+    dest.mkdir(parents=True, exist_ok=True)
+    tmp, final = dest / "overlay.loarc.tmp", dest / "overlay.loarc"
+    try:
+        digests, total = loarc_write(entries, tmp)
+        names = sorted(entries, key=lambda n: n.encode("utf-8"))
+        if [e[0] for e in loarc_read(tmp, None if quick else digests)] != names:
+            raise ValueError("archive index does not list the source files")
+        os.replace(tmp, final)
+        for base, dirs, files in os.walk(src):
+            folder = Path(base).relative_to(src)
+            if folder == Path("."):
+                dirs[:] = [d for d in dirs if d != overlay.name]
+            for file in files:
+                if folder == Path(".") and file.translate(ASCII_LOWER) in ("overlay.loarc", "overlay.loarc.tmp"):
+                    warn(f"skipped {Path(base) / file}: the archive is written fresh")
+                    continue
+                (dest / folder).mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(Path(base) / file, dest / folder / file)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        if created:
+            shutil.rmtree(dest, ignore_errors=True)
+        raise
+    kinds = {n: sum(1 for name in entries if loarc_kind(name) == k) for n, k in LOARC_KINDS.items()}
+    shown = ", ".join(f"{n}={c}" for n, c in kinds.items() if c)
+    return f"Archived {len(entries)} entries ({shown}), {total} bytes ({total / 1048576:.1f} MiB): {final}"
+
+
+def extract_archive(archive: Path, dest: Path, list_only: bool = False) -> list[tuple[str, int, int]]:
+    """Validate an archive and write its entries under dest (never overwriting); list_only writes nothing."""
+    entries = loarc_read(archive)
+    if list_only:
+        return entries
+    targets = []
+    for name, offset, size in entries:
+        parts = name.split("/")
+        if name.startswith("/") or ":" in name or "\\" in name or ".." in parts or "" in parts:
+            raise ValueError(f"unsafe entry name {name!r}")
+        target = dest.joinpath(*parts)
+        if target.exists() or target.is_symlink():
+            raise FileExistsError(f"{target} already exists")
+        targets.append(target)
+    with archive.open("rb") as file:
+        for target, (name, offset, size) in zip(targets, entries):
+            target.parent.mkdir(parents=True, exist_ok=True)
+            file.seek(offset)
+            with target.open("xb") as out:
+                left = size
+                while left:
+                    chunk = file.read(min(left, LOARC_CHUNK))
+                    if not chunk:
+                        raise ValueError(f"{name}: data is truncated")
+                    out.write(chunk)
+                    left -= len(chunk)
+    return entries
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -821,6 +1431,24 @@ def main(argv: list[str] | None = None) -> int:
     clean_parser.add_argument("--original", type=Path,
                               help="untranslated export (default: original/ beside the pack, from --export-language-pack)")
     clean_parser.add_argument("--output", type=Path, help="new folder (default: share/<pack folder name> beside the pack)")
+    glyph_parser = sub.add_parser("font-glyphs", help="draw the letters a language pack uses that the game's fonts lack "
+                                  "into <pack>/fonts/ (LOFONT1)")
+    glyph_parser.add_argument("pack", type=Path, help="the pack folder (holds language.ini and text/)")
+    glyph_parser.add_argument("--export", type=Path, required=True,
+                              help="--export-assets folder made with --export-kinds textures,fonts")
+    glyph_parser.add_argument("--ttf", type=Path, required=True, help="TrueType/OpenType font to draw the letters with")
+    glyph_parser.add_argument("--fonts", help="comma-separated game font names to cover (default: every font of the base language)")
+    glyph_parser.add_argument("--chars", default="", help="extra characters to draw even if the text does not use them yet")
+    glyph_parser.add_argument("--scale", type=float, default=1.0, help="size factor on top of matching the game's H (default 1)")
+    archive_parser = sub.add_parser("archive", help="copy an api_version=2 mod folder, packing its overlay/ files into one overlay.loarc")
+    archive_parser.add_argument("src", type=Path, help="the mod folder (mod.ini and overlay/)")
+    archive_parser.add_argument("dest", type=Path, help="the new mod folder")
+    archive_parser.add_argument("--force", action="store_true", help="write into an existing, non-empty dest")
+    archive_parser.add_argument("--quick", action="store_true", help="check the header and index only; skip re-reading the data")
+    extract_parser = sub.add_parser("extract", help="check an overlay.loarc and write its files out, or list them")
+    extract_parser.add_argument("archive", type=Path)
+    extract_parser.add_argument("dest", type=Path, help="folder that receives overlay/... (never overwrites)")
+    extract_parser.add_argument("--list", action="store_true", help="print name<TAB>size per entry and write nothing")
     args = parser.parse_args(argv)
     meta = {field: getattr(args, field, None) for field in META_LIMITS}
     try:
@@ -897,6 +1525,23 @@ def main(argv: list[str] | None = None) -> int:
             with args.file.open("rb") as file:
                 data = file.read(MAX_FILE + 1)
             print(json.dumps(inspect(data), ensure_ascii=False, indent=2))
+        elif args.command == "archive":
+            print(archive_mod(args.src, args.dest, args.force, args.quick))
+        elif args.command == "extract":
+            entries = extract_archive(args.archive, args.dest, args.list)
+            if args.list:
+                for name, _, size in entries:
+                    print(f"{name}\t{size}")
+            else:
+                print(f"Extracted {len(entries)} file(s) to {args.dest}")
+        elif args.command == "font-glyphs":
+            only = {name.strip() for name in args.fonts.split(",") if name.strip()} if args.fonts else None
+            for row in font_glyphs(args.export, args.pack, args.ttf, only, args.chars, args.scale):
+                if "skipped" in row:
+                    print(f"{row['package']} {row['font']}: skipped ({row['skipped']})")
+                else:
+                    print(f"{row['package']} {row['font']}: {row['glyphs']} glyphs at {row['size']} px, atlas {row['atlas']}"
+                          + (f"; not in the TTF: {row['unsupported']}" if row["unsupported"] else ""))
         elif args.command == "language-clean":
             stats = language_clean(args.pack, args.original, args.output)
             print(f"Kept {stats['entries']} translated entries in {stats['files']} files; dropped "

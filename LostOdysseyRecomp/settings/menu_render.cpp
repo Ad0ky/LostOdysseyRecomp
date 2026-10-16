@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <cwchar>
 
 #ifdef LO_MENU_RENDER_TRACE
 // Only the direct raster fixture enables this observer; no runtime tracing.
@@ -49,6 +50,159 @@ namespace
     constexpr int kHintX = 1036, kHintY = 646, kHintKey = 22, kHintWidth = 180, kHintHeight = 28;
     constexpr int kHintLeft = kHintX - 8, kHintTop = kHintY - 4, kHintRight = kHintX + kHintWidth + 8,
                   kHintBottom = kHintY + kHintHeight + 4;
+
+    // The help box under the list: one line at 20 pt, or the help over the
+    // notice at 16 pt each.
+    constexpr int kHelpX = 131, kHelpY = 650, kHelpWidth = 1063, kHelpHeight = 45, kHelpSize = 20;
+    constexpr int kHelpLineHeight = 22, kHelpLineSize = 16;
+    // The neural rendering page: its help line, and the message in the preview
+    // rectangle when no frame can be shown, wrapped into up to three lines.
+    constexpr int kNrHelpX = 160, kNrHelpY = 666, kNrHelpWidth = 960, kNrHelpHeight = 32, kNrHelpSize = 16;
+    constexpr int kNrMessageX = settings::NrPreviewLeft + 20, kNrMessageCenter = settings::NrPreviewTop + 135,
+                  kNrMessageWidth = settings::NrPreviewRight - settings::NrPreviewLeft - 40, kNrMessageLineHeight = 30,
+                  kNrMessageSize = 20;
+    constexpr size_t kNrMessageLines = 3;
+
+    // Replace isolated physical button labels at render time so hot-plug and
+    // active-controller changes do not require rebuilding translated help text.
+    // Private face codepoints use vector drawing, without font coverage.
+    std::wstring PromptText(std::wstring value, bool playStation)
+    {
+        if (!playStation) return value;
+        const auto word = [](wchar_t c) {
+            return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9');
+        };
+        for (size_t i = 0; i + 1 < value.size(); ++i)
+        {
+            const bool isolated = (i == 0 || !word(value[i - 1])) &&
+                                  (i + 2 == value.size() || !word(value[i + 2]));
+            if (!isolated || (value[i] != L'L' && value[i] != L'R')) continue;
+            if (value[i + 1] == L'B') value[i + 1] = L'1';
+            else if (value[i + 1] == L'T') value[i + 1] = L'2';
+        }
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            const bool isolated = (i == 0 || !word(value[i - 1])) && (i + 1 == value.size() || !word(value[i + 1]));
+            // A letter right after a colon is part of a name (Neural:X), not a button.
+            if (!isolated || (i > 0 && value[i - 1] == L':')) continue;
+            switch (value[i]) {
+            case L'A': value[i] = 0xe100; break;
+            case L'B': value[i] = 0xe101; break;
+            case L'X': value[i] = 0xe102; break;
+            case L'Y': value[i] = 0xe103; break;
+            }
+        }
+        return value;
+    }
+
+    // The game face that draws a whole string: the title face from 32 pt, else
+    // the body face, or the Abc face when only it has every character. Null:
+    // the host font draws it.
+    const settings::menu_assets::Font *GameFace(const settings::menu_assets::Assets *assets,
+                                                const std::wstring &value, int size)
+    {
+        if (!assets || value.empty()) return nullptr;
+        const auto covers = [&](const settings::menu_assets::Font &font) {
+            return font.height && std::all_of(value.begin(), value.end(), [&](wchar_t c) {
+                return c == L' ' || font.glyphs.contains(uint32_t(c));
+            });
+        };
+        const auto *face = size >= 32 && !assets->title.glyphs.empty() ? &assets->title : &assets->body;
+        if (!covers(*face) && covers(assets->fallback)) face = &assets->fallback;
+        return covers(*face) ? face : nullptr;
+    }
+
+    // Unscaled width of a string in a game face, spaces as drawn.
+    double FaceAdvance(const settings::menu_assets::Font &font, const std::wstring &value)
+    {
+        double advance = 0;
+        for (const auto c : value)
+            advance += c == L' ' ? font.height * 0.3 : int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
+        return advance;
+    }
+
+    // Glyph scale of a game face: the size asked for, limited by the box
+    // height (`fitted` false) and also by its width (`fitted` true).
+    double FaceRatio(const settings::menu_assets::Font &font, const std::wstring &value, int w, int h, int size,
+                     bool fitted)
+    {
+        const double desired = size >= 32 ? size * 1.25 : size * 1.30;
+        const double unconstrained = std::min(desired / font.height, double(h) / font.height);
+        if (!fitted) return unconstrained;
+        return std::min(unconstrained, std::max(1.0, double(w - 8)) / std::max(1.0, FaceAdvance(font, value)));
+    }
+
+    // Output width of a string in the host font at a glyph scale.
+    int HostAdvance(const std::wstring &value, float fontScale)
+    {
+        int width = 0;
+        for (wchar_t c : value)
+        {
+            auto g = host_ui::font::GetGlyph(uint32_t(c));
+            width += int(((c >= 0xe100 && c <= 0xe103) ? 17 : (g.width + 1)) * fontScale);
+        }
+        return width;
+    }
+
+    // The neural rendering page's help line for a focused control.
+    std::wstring NrHelp(uint32_t language, int focus)
+    {
+        static constexpr const wchar_t *en[settings::NrFocusCount] = {
+            L"How many times the model runs on each frame. More passes look stronger and cost more frame time.",
+            L"The look the model renders. Default lets the model choose; Cinematic is experimental.",
+            L"Model preset hint. Its effect is unverified; keep Default unless you are experimenting.",
+            L"Overall strength of the effect. 100% is the model's default.",
+            L"Strength of whole-image tone changes. Some nvngx_dlssnr.dll versions ignore it.",
+            L"Strength of local light and shadow changes. With more than one pass it applies to the first pass only.",
+            L"Strength of the surface detail the model adds.",
+            L"Detail on faces and skin. Below 0 it follows Structure.",
+            L"Lets the model find characters and treat them separately.",
+            L"Restores the model settings to their defaults.",
+            L"Keeps these values. Save them on the Graphics tab.",
+            L"Discards the changes made on this page.",
+        };
+        static constexpr const wchar_t *zh[settings::NrFocusCount] = {
+            L"模型在每個影格上執行的次數。次數越多效果越強，影格耗時也越高。",
+            L"模型呈現的風格。預設由模型自行決定；電影感為實驗性質。",
+            L"模型預設組提示。實際效果未經驗證，除非要實驗，否則請維持預設。",
+            L"整體效果強度。100% 為模型預設值。",
+            L"整張畫面的色調變化強度。部分版本的 nvngx_dlssnr.dll 會忽略此項。",
+            L"局部光影變化的強度。執行多次時，只作用於第一次。",
+            L"模型所加入表面細節的強度。",
+            L"臉部與皮膚的細節。低於 0 時跟隨「結構」。",
+            L"讓模型辨識角色並單獨處理。",
+            L"將模型設定還原為預設值。",
+            L"保留這些數值。請在「圖像」分頁儲存。",
+            L"捨棄在此頁所做的變更。",
+        };
+        const int i = std::clamp(focus, 0, settings::NrFocusCount - 1);
+        return settings::Translate(language, en[i], zh[i]);
+    }
+
+    // What the neural rendering preview says when it has no frame to show.
+    std::wstring NrMessage(uint32_t language, settings::NeuralRenderingTuning::Blocker blocker)
+    {
+        using Blocker = settings::NeuralRenderingTuning::Blocker;
+        return blocker == Blocker::MissingRuntime
+            ? settings::Translate(language, L"No preview: nvngx_dlssnr.dll is missing or unusable. The game does not include it; put your own copy (tested: 310.8.0.0) next to LostOdysseyRecomp.exe and restart.",
+                  L"無法預覽：找不到 nvngx_dlssnr.dll 或無法使用。遊戲不附帶該檔案，請將自備的副本（測試版本：310.8.0.0）放在 LostOdysseyRecomp.exe 旁並重新啟動。")
+            : blocker == Blocker::Unsupported
+            ? settings::Translate(language, L"No preview: this GPU or driver cannot run DLSS 5 neural rendering.",
+                  L"無法預覽：此顯示卡或驅動程式無法執行 DLSS 5 神經渲染。")
+            : settings::Translate(language, L"Play a scene with DLSS on to see a preview.", L"請在開啟 DLSS 的情況下進入遊戲場景以預覽。");
+    }
+
+    // The key legends of the brightness and HDR peak calibration pages.
+    const wchar_t *BrightnessLegend(uint32_t language)
+    {
+        return settings::Translate(language, L"D-pad: select / adjust · A: choose · B: back · LB / RB: scene / pattern",
+                                   L"方向鍵：選擇／調整 · A：確認 · B：返回 · LB / RB：場景／圖案");
+    }
+    const wchar_t *CalibrationLegend(uint32_t language)
+    {
+        return settings::Translate(language, L"D-pad: adjust · A: choose · B: back · LB / RB: scene / pattern · type digits for exact value",
+                                   L"方向鍵：調整 · A：確認 · B：返回 · LB / RB：場景／圖案 · 鍵盤輸入精確數值");
+    }
 
     void Line(const Canvas &c, int x1, int y1, int x2, int y2, uint32_t color, int thickness = 1)
     {
@@ -199,6 +353,11 @@ settings::MenuRect settings::MenuArrowBounds(uint32_t width, uint32_t height, in
             edge(std::ceil(c.offsetX + (x + 38) * c.scale), width), edge(std::ceil(c.offsetY + (y + 24) * c.scale), height)};
 }
 
+std::wstring settings::PromptGlyphs(const std::wstring &value, bool playStation)
+{
+    return PromptText(value, playStation);
+}
+
 settings::MenuRect settings::DrawSpeakerMarker(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, float position,
                                                float rearAngle)
 {
@@ -233,6 +392,96 @@ settings::MenuRect settings::DrawSpeakerMarker(std::vector<uint32_t> &pixels, ui
     const auto edge = [](double value, uint32_t limit) { return size_t(std::clamp(value, 0.0, double(limit))); };
     return {edge(std::floor(c.offsetX + left * c.scale), width), edge(std::floor(c.offsetY + top * c.scale), height),
             edge(std::ceil(c.offsetX + right * c.scale), width), edge(std::ceil(c.offsetY + bottom * c.scale), height)};
+}
+
+namespace
+{
+    settings::TextFit Fit(const settings::MenuSnapshot &s, std::wstring source, int w, int h, int size)
+    {
+        settings::TextFit fit{std::move(source)};
+        const std::wstring value = PromptText(fit.text, s.playStationPrompts);
+        if (value.empty()) return fit;
+        if (const auto *font = GameFace(s.assets.get(), value, size))
+        {
+            fit.face = font == &s.assets->fallback ? "abc" : font == &s.assets->title ? "title" : "body";
+            fit.scale = FaceRatio(*font, value, w, h, size, true) / FaceRatio(*font, value, w, h, size, false);
+            return fit;
+        }
+        fit.face = "host";
+        const int width = HostAdvance(value, size / 16.0f);
+        const double allowed = std::max(8.0, double(w - 4));
+        fit.scale = width > allowed ? allowed / width : 1.0;
+        return fit;
+    }
+
+    // Up to `count` lines that each fit `w` at full size, broken at spaces or
+    // between characters of scripts written without them. What is left goes on
+    // the last line, which then shrinks.
+    std::vector<std::wstring> WrapLines(const settings::MenuSnapshot &s, const std::wstring &text, int w, int h, int size,
+                                        size_t count)
+    {
+        const auto wide = [](wchar_t c) { return c >= 0x2e80; };
+        // No line starts with a closing mark or ends with an opening one.
+        const auto closing = [](wchar_t c) { return c && std::wcschr(L"、。，．）」』：；！？", c); };
+        const auto opening = [](wchar_t c) { return c && std::wcschr(L"（「『", c); };
+        std::vector<std::wstring> lines;
+        size_t start = 0;
+        while (start < text.size() && lines.size() + 1 < count)
+        {
+            size_t cut = 0;
+            for (size_t end = start + 1; end < text.size(); ++end)
+            {
+                const bool breakable = (text[end] == L' ' || wide(text[end - 1]) || wide(text[end])) &&
+                                       !closing(text[end]) && !opening(text[end - 1]);
+                if (!breakable) continue;
+                if (Fit(s, text.substr(start, end - start), w, h, size).scale < 0.999) break;
+                cut = end;
+            }
+            if (!cut || Fit(s, text.substr(start), w, h, size).scale >= 0.999) break;
+            lines.push_back(text.substr(start, cut - start));
+            start = cut;
+            while (start < text.size() && text[start] == L' ') ++start;
+        }
+        lines.push_back(text.substr(start));
+        return lines;
+    }
+}
+
+settings::HelpFit settings::MeasureHelp(const MenuSnapshot &s)
+{
+    HelpFit fit;
+    if (s.titleHint) return fit;
+    if (s.neuralRendering.open)
+    {
+        fit.help = Fit(s, NrHelp(s.language, s.neuralRendering.focus), kNrHelpWidth, kNrHelpHeight, kNrHelpSize);
+        if (!s.neuralRendering.sceneAvailable)
+        {
+            const auto message = NrMessage(s.language, s.neuralRendering.blocker);
+            fit.notice.text = message;
+            for (const auto &line : WrapLines(s, message, kNrMessageWidth, kNrMessageLineHeight, kNrMessageSize, kNrMessageLines))
+                if (const auto lineFit = Fit(s, line, kNrMessageWidth, kNrMessageLineHeight, kNrMessageSize);
+                    lineFit.scale < fit.notice.scale || !*fit.notice.face)
+                {
+                    fit.notice.scale = lineFit.scale;
+                    fit.notice.face = lineFit.face;
+                }
+        }
+        return fit;
+    }
+    if (s.brightness.open || s.calibration.open)
+    {
+        fit.help = Fit(s, s.brightness.open ? BrightnessLegend(s.language) : CalibrationLegend(s.language),
+                       kNrHelpWidth, kNrHelpHeight, kNrHelpSize);
+        return fit;
+    }
+    if (s.notice.empty())
+        fit.help = Fit(s, s.help, kHelpWidth, kHelpHeight, kHelpSize);
+    else
+    {
+        fit.help = Fit(s, s.help, kHelpWidth, kHelpLineHeight, kHelpLineSize);
+        fit.notice = Fit(s, s.notice, kHelpWidth, kHelpLineHeight, kHelpLineSize);
+    }
+    return fit;
 }
 
 double settings::menu_motion::RowFade(double t)
@@ -431,76 +680,33 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
     const uint32_t selectedInk = MakeColor(255, 35, 36, 36);
     const uint32_t outline = MakeColor(255, 39, 40, 40);
 
-    // Replace isolated physical button labels at render time so hot-plug and
-    // active-controller changes do not require rebuilding translated help text.
-    // Private face codepoints use vector drawing below, without font coverage.
-    auto promptText = [&](std::wstring value) {
-        if (!current.playStationPrompts) return value;
-        const auto word = [](wchar_t c) {
-            return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9');
-        };
-        for (size_t i = 0; i + 1 < value.size(); ++i)
-        {
-            const bool isolated = (i == 0 || !word(value[i - 1])) &&
-                                  (i + 2 == value.size() || !word(value[i + 2]));
-            if (!isolated || (value[i] != L'L' && value[i] != L'R')) continue;
-            if (value[i + 1] == L'B') value[i + 1] = L'1';
-            else if (value[i + 1] == L'T') value[i + 1] = L'2';
-        }
-        for (size_t i = 0; i < value.size(); ++i)
-        {
-            const bool isolated = (i == 0 || !word(value[i - 1])) && (i + 1 == value.size() || !word(value[i + 1]));
-            if (!isolated) continue;
-            switch (value[i]) {
-            case L'A': value[i] = 0xe100; break;
-            case L'B': value[i] = 0xe101; break;
-            case L'X': value[i] = 0xe102; break;
-            case L'Y': value[i] = 0xe103; break;
-            }
-        }
-        return value;
-    };
-
     auto text = [&](int x, int y, int w, int h, const std::wstring &source, int size, uint32_t color,
                      bool bold = false, int alignment = 0 /* 0=left, 1=center, 2=right */,
-                     uint32_t edge = MakeColor(255, 39, 40, 40), int minimum = 13) {
-        const std::wstring value = promptText(source);
-        if (current.assets && !value.empty())
+                     uint32_t edge = MakeColor(255, 39, 40, 40), int minimum = 13, bool prompts = true) {
+        const std::wstring value = prompts ? PromptText(source, current.playStationPrompts) : source;
+        if (const auto *selectedFont = GameFace(current.assets.get(), value, size))
         {
-            const auto covers = [&](const menu_assets::Font &font) {
-                return font.height && std::all_of(value.begin(), value.end(), [&](wchar_t c) {
-                    return c == L' ' || font.glyphs.contains(uint32_t(c));
-                });
-            };
-            const auto *selectedFont = size >= 32 && !current.assets->title.glyphs.empty() ? &current.assets->title : &current.assets->body;
-            if (!covers(*selectedFont) && covers(current.assets->fallback)) selectedFont = &current.assets->fallback;
-            if (covers(*selectedFont))
-            {
-                const auto &font = *selectedFont;
+            const auto &font = *selectedFont;
 #ifdef LO_MENU_RENDER_TRACE
-                LoMenuRenderTrace(value, true);
+            LoMenuRenderTrace(value, true);
 #endif
-                // Measure spaces the way they are drawn below, or right-aligned
-                // and centered text with spaces runs past its box.
-                double advance = 0;
-                for (const auto c : value)
-                    advance += c == L' ' ? font.height * 0.3 : int(font.glyphs.at(uint32_t(c)).width) + font.kerning;
-                const double desired = size >= 32 ? size * 1.25 : size * 1.30;
-                const double ratio = std::min({desired / font.height, double(h) / font.height, std::max(1.0, double(w - 8)) / std::max(1.0, advance)});
-                double left = x;
-                if (alignment == 1) left += (w - advance * ratio) * .5;
-                else if (alignment == 2) left += w - advance * ratio;
-                const double top = y + (h - font.height * ratio) * .5;
-                for (const auto c : value)
-                {
-                    if (c == L' ') { left += (font.height * 0.3) * ratio; continue; }
-                    const auto &g = font.glyphs.at(uint32_t(c));
-                    sprite(font.pages[g.page], int(g.x), int(g.y), int(g.width), int(g.height),
-                           left, top, g.width * ratio, g.height * ratio, 255, false, color, edge);
-                    left += (int(g.width) + font.kerning) * ratio;
-                }
-                return;
+            // Measure spaces the way they are drawn below, or right-aligned
+            // and centered text with spaces runs past its box.
+            const double advance = FaceAdvance(font, value);
+            const double ratio = FaceRatio(font, value, w, h, size, true);
+            double left = x;
+            if (alignment == 1) left += (w - advance * ratio) * .5;
+            else if (alignment == 2) left += w - advance * ratio;
+            const double top = y + (h - font.height * ratio) * .5;
+            for (const auto c : value)
+            {
+                if (c == L' ') { left += (font.height * 0.3) * ratio; continue; }
+                const auto &g = font.glyphs.at(uint32_t(c));
+                sprite(font.pages[g.page], int(g.x), int(g.y), int(g.width), int(g.height),
+                       left, top, g.width * ratio, g.height * ratio, 255, false, color, edge);
+                left += (int(g.width) + font.kerning) * ratio;
             }
+            return;
         }
 #ifdef LO_MENU_RENDER_TRACE
         LoMenuRenderTrace(value, false);
@@ -510,23 +716,13 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
 
         // Auto-scale font down to fit available width w without overflowing
         float fontScale = float(scale * (size / 16.0f));
-        auto measureWidth = [&](float fscale) {
-            int tw = 0;
-            for (wchar_t c : value)
-            {
-                auto g = host_ui::font::GetGlyph(uint32_t(c));
-                tw += int(((c >= 0xe100 && c <= 0xe103) ? 17 : (g.width + 1)) * fscale);
-            }
-            return tw;
-        };
-
-        int totalWidth = measureWidth(fontScale);
+        int totalWidth = HostAdvance(value, fontScale);
         const double maxAllowedWidth = std::max(8.0, double(w - 4) * scale);
         if (totalWidth > maxAllowedWidth)
         {
             float shrinkRatio = float(maxAllowedWidth / totalWidth);
             fontScale *= shrinkRatio;
-            totalWidth = measureWidth(fontScale);
+            totalWidth = HostAdvance(value, fontScale);
         }
 
         const double screenX = offsetX + x * scale;
@@ -661,11 +857,16 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         text(mid, 52, NrPreviewRight - mid, 26, tr(L"DLSS + NR", L"DLSS + NR"), 18, ink, false, 1, outline, 13);
         if (!page.sceneAvailable)
         {
+            // Without a usable DLL no frame is ever held; say so rather than
+            // asking for a scene the player may already be in.
             fill(NrPreviewLeft, NrPreviewTop, NrPreviewRight - NrPreviewLeft, NrPreviewBottom - NrPreviewTop,
                  MakeColor(255, 40, 45, 50));
-            text(NrPreviewLeft + 20, NrPreviewTop + 100, NrPreviewRight - NrPreviewLeft - 40, 70,
-                 tr(L"Play a scene with DLSS on to see a preview.", L"請在開啟 DLSS 的情況下進入遊戲場景以預覽。"),
-                 20, muted, false, 1, outline, 14);
+            const auto lines = WrapLines(current, NrMessage(current.language, page.blocker), kNrMessageWidth,
+                                         kNrMessageLineHeight, kNrMessageSize, kNrMessageLines);
+            const int top = kNrMessageCenter - int(lines.size()) * kNrMessageLineHeight / 2;
+            for (size_t i = 0; i < lines.size(); ++i)
+                text(kNrMessageX, top + int(i) * kNrMessageLineHeight, kNrMessageWidth, kNrMessageLineHeight, lines[i],
+                     kNrMessageSize, muted, false, 1, outline, 14);
         }
         const auto percent = [](uint32_t value) { return std::to_wstring(value) + L"%"; };
         const std::wstring skin = page.skin > 0 ? L"+" + std::to_wstring(page.skin) : std::to_wstring(page.skin);
@@ -725,36 +926,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             text(x + 8, NrButtonTop, NrButtonWidth - 16, NrButtonHeight, tr(buttonEn[i], buttonZh[i]),
                  19, ink, false, 1, outline, 14);
         }
-        const wchar_t *helpEn[NrFocusCount] = {
-            L"How many times the model runs on each frame. More passes look stronger and cost more frame time.",
-            L"The look the model renders. Default lets the model choose; Cinematic is experimental.",
-            L"Model preset hint. Its effect is unverified; keep Default unless you are experimenting.",
-            L"Overall strength of the effect. 100% is the model's default.",
-            L"Strength of whole-image tone changes. Some nvngx_dlssnr.dll versions ignore it.",
-            L"Strength of local light and shadow changes. With more than one pass it applies to the first pass only.",
-            L"Strength of the surface detail the model adds.",
-            L"Detail on faces and skin. Below 0 it follows Structure.",
-            L"Lets the model find characters and treat them separately.",
-            L"Restores the model settings to their defaults.",
-            L"Keeps these values. Save them on the Graphics tab.",
-            L"Discards the changes made on this page.",
-        };
-        const wchar_t *helpZh[NrFocusCount] = {
-            L"模型在每個影格上執行的次數。次數越多效果越強，影格耗時也越高。",
-            L"模型呈現的風格。預設由模型自行決定；電影感為實驗性質。",
-            L"模型預設組提示。實際效果未經驗證，除非要實驗，否則請維持預設。",
-            L"整體效果強度。100% 為模型預設值。",
-            L"整張畫面的色調變化強度。部分版本的 nvngx_dlssnr.dll 會忽略此項。",
-            L"局部光影變化的強度。執行多次時，只作用於第一次。",
-            L"模型所加入表面細節的強度。",
-            L"臉部與皮膚的細節。低於 0 時跟隨「結構」。",
-            L"讓模型辨識角色並單獨處理。",
-            L"將模型設定還原為預設值。",
-            L"保留這些數值。請在「圖像」分頁儲存。",
-            L"捨棄在此頁所做的變更。",
-        };
-        const int helpFocus = std::clamp(page.focus, 0, NrFocusCount - 1);
-        text(160, 666, 960, 32, tr(helpEn[helpFocus], helpZh[helpFocus]), 16, ink, false, 1, outline, 12);
+        text(kNrHelpX, kNrHelpY, kNrHelpWidth, kNrHelpHeight, NrHelp(current.language, page.focus), kNrHelpSize, ink,
+             false, 1, outline, 12);
         return true;
     }
     if (current.brightness.open)
@@ -813,10 +986,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, buttons[i].label, 19,
                  i == 1 && !page.originalPattern ? muted : ink, false, 1, outline, 14);
         }
-        text(160, 666, 960, 32,
-             Translate(current.language, L"D-pad: select / adjust · A: choose · B: back · LB / RB: scene / pattern",
-                 L"方向鍵：選擇／調整 · A：確認 · B：返回 · LB / RB：場景／圖案"),
-             16, ink, false, 1, outline, 13);
+        text(kNrHelpX, kNrHelpY, kNrHelpWidth, kNrHelpHeight, BrightnessLegend(current.language), kNrHelpSize, ink,
+             false, 1, outline, 13);
         return true;
     }
     if (current.calibration.open)
@@ -900,10 +1071,8 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             text(buttons[i].x + 8, 610, buttons[i].w - 16, 40, label,
                  19, ink, false, 1, outline, 14);
         }
-        text(160, 666, 960, 32,
-             Translate(current.language, L"D-pad: adjust · A: choose · B: back · LB / RB: scene / pattern · type digits for exact value",
-                 L"方向鍵：調整 · A：確認 · B：返回 · LB / RB：場景／圖案 · 鍵盤輸入精確數值"),
-             16, ink, false, 1, outline, 13);
+        text(kNrHelpX, kNrHelpY, kNrHelpWidth, kNrHelpHeight, CalibrationLegend(current.language), kNrHelpSize, ink,
+             false, 1, outline, 13);
         return true;
     }
 
@@ -1001,7 +1170,18 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         const int y = rowTop + slot * rowHeight;
         if (y + rowHeight > 640) break;
         const bool focused = int(index) == current.row;
-        if (current.tab == 2 && (index == size_t(GraphicsRow::AntiAliasing) ||
+        if (row.header)
+        {
+            // A section title: the name over a rule across both columns.
+            text(labelLeft + 4, y + 6, labelWidth, rowHeight - 8, row.name, 22, ink, true, 0, outline, 15);
+            if (!row.detail.empty())
+                text(choiceLeft + 8, y + 6, choiceWidth - 16, rowHeight - 8, row.detail, 18, muted, false, 0, outline, 13);
+            line(labelLeft, y + rowHeight - 3, choiceLeft + choiceWidth, y + rowHeight - 3, MakeColor(255, 173, 176, 177));
+            continue;
+        }
+        // The preset opens the rendering group; on Android no row comes before it.
+        if (current.tab == 2 && ((index == size_t(GraphicsRow::Preset) && visible > 1) ||
+                                 index == size_t(GraphicsRow::AntiAliasing) ||
                                  index == size_t(GraphicsRow::AmbientOcclusion) ||
                                  index == size_t(GraphicsRow::FrameRate) ||
                                  index == size_t(GraphicsRow::Hdr) ||
@@ -1019,8 +1199,22 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
         line(labelLeft, y, labelLeft + labelWidth, y, focused ? MakeColor(255, 244, 244, 239) : MakeColor(255, 145, 147, 146));
         line(labelLeft, y + rowHeight - 2, labelLeft + labelWidth, y + rowHeight - 2,
              focused ? MakeColor(255, 56, 57, 57) : MakeColor(255, 69, 71, 71));
-        text(82, y, 274, rowHeight - 2, row.name, 24,
-             !row.enabled ? disabled : focused ? selectedInk : ink, false, 0,
+        const bool pictured = (row.icon && !row.icon->pixels.empty()) || !row.iconGlyph.empty();
+        if (pictured)
+        {
+            // Achievement entry: the picture, then the name.
+            constexpr int iconSize = rowHeight - 6, iconLeft = labelLeft + 6;
+            if (row.icon && !row.icon->pixels.empty())
+                sprite(*row.icon, 0, 0, int(row.icon->width), int(row.icon->height), iconLeft, y + 2, iconSize, iconSize);
+            else
+            {
+                fill(iconLeft, y + 2, iconSize, iconSize, MakeColor(255, 30, 31, 31));
+                cell(iconLeft, y + 2, iconSize, iconSize, false);
+                text(iconLeft, y + 2, iconSize, iconSize, row.iconGlyph, 24, muted, false, 1, outline, 16);
+            }
+        }
+        text(pictured ? labelLeft + 6 + rowHeight - 6 + 8 : 82, y, pictured ? 244 : 274, rowHeight - 2, row.name,
+             pictured ? 22 : 24, !row.enabled ? disabled : focused ? selectedInk : ink, false, 0,
              focused ? MakeColor(255, 222, 223, 219) : outline, 16);
 
         if (row.sliderPercent >= 0)
@@ -1082,6 +1276,29 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             }
             continue;
         }
+        if (row.pageEntry)
+        {
+            // A page entry: one cell across the value column with the value,
+            // then the confirm button and a chevron (drawn: the menu fonts
+            // have no "›").
+            constexpr int buttonSize = 24, chevronWidth = 11, margin = 14, gap = 12;
+            const int right = choiceLeft + choiceWidth;
+            const int chevronLeft = right - margin - chevronWidth;
+            const int buttonLeft = chevronLeft - gap - buttonSize;
+            cell(choiceLeft, y, choiceWidth, rowHeight - 2, focused);
+            const uint32_t valueInk = !row.enabled ? disabled : focused ? selectedInk : ink;
+            text(choiceLeft + margin, y, buttonLeft - gap - choiceLeft - margin, rowHeight - 2, (*choices)[selected], 22,
+                 valueInk, false, 1, focused ? MakeColor(255, 222, 223, 219) : outline, 13);
+            const wchar_t confirm = current.confirmB ? L'B' : L'A';
+            controllerButton(buttonLeft, y + (rowHeight - 2 - buttonSize) / 2, confirm, confirm == L'A', row.enabled);
+            const int middle = y + (rowHeight - 2) / 2;
+            for (int dy = -7; dy <= 7; ++dy)
+            {
+                const int x = chevronLeft + (7 - std::abs(dy)) * 6 / 7;
+                line(x, middle + dy, x + 5, middle + dy, valueInk);
+            }
+            continue;
+        }
         if (row.controllerButtons && choices->size() >= 2)
         {
             for (int option = 0; option < 2; ++option)
@@ -1127,7 +1344,7 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
             cell(left, y, right - left, rowHeight - 2, focused && currentChoice);
             text(left + 7, y, right - left - 14, rowHeight - 2, (*choices)[option], 22,
                  !row.enabled ? disabled : currentChoice ? (focused ? selectedInk : ink) : muted,
-                 false, 1, focused && currentChoice ? MakeColor(255, 222, 223, 219) : outline, 13);
+                 false, 1, focused && currentChoice ? MakeColor(255, 222, 223, 219) : outline, 13, !row.literal);
         }
     }
 
@@ -1182,11 +1399,12 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
     line(116, 650, 1210, 650, MakeColor(255, 154, 156, 155));
     line(116, 694, 1210, 694, MakeColor(255, 55, 56, 56));
     if (current.notice.empty())
-        text(131, 650, 1063, 45, current.help, 20, ink, false, 0, outline, 14);
+        text(kHelpX, kHelpY, kHelpWidth, kHelpHeight, current.help, kHelpSize, ink, false, 0, outline, 14);
     else
     {
-        text(131, 650, 1063, 22, current.help, 16, ink, false, 0, outline, 12);
-        text(131, 672, 1063, 22, current.notice, 16, ink, false, 0, outline, 12);
+        text(kHelpX, kHelpY, kHelpWidth, kHelpLineHeight, current.help, kHelpLineSize, ink, false, 0, outline, 12);
+        text(kHelpX, kHelpY + kHelpLineHeight, kHelpWidth, kHelpLineHeight, current.notice, kHelpLineSize, ink, false, 0,
+             outline, 12);
     }
 
     if (!current.dialogChoices.empty())

@@ -30,6 +30,20 @@
 
 </div>
 
+## Contents
+
+- [Start playing](#start-playing)
+- [Features](#features)
+- [Controls](#controls)
+- [Debug menu](#debug-menu)
+- [Files and folders](#files-and-folders)
+- [Command-line options](#command-line-options)
+- [Reporting a problem](#reporting-a-problem)
+- [Screenshots](#screenshots)
+- [Development](#development)
+- [Sponsors](#sponsors)
+- [Credits and game data](#credits-and-game-data)
+
 ## Start playing
 
 Download the package for your platform from the [latest release](https://github.com/freefrank/LostOdysseyRecomp/releases/latest).
@@ -56,10 +70,11 @@ The app is not notarized, so macOS blocks the first launch: try to open it once,
 
 - **Game data:** opening the app creates `Android/data/io.github.freefrank.lostodyssey/files/game/`. Copy your extracted `disc1`–`disc4` into it over USB, or import disc images with **Game folder → Import disc images…**. **CTRL → Game folder** can point the game at another folder or an SD card.
 - **Qualcomm devices:** the **GPU driver** page opens before the first start. Download a Turnip driver there.
+- **Mali devices:** the **GPU driver** page also opens first. Download the recommended PanVK driver there; it needs a Mali-G57, G68, G77, G78 or Mali-G610 and newer GPU.
 - **Controls:** the touch controls hide when a controller is connected. **CTRL** sets their size, opacity and layout.
 - **Updates:** a new APK installs over the old one and keeps your saves.
-- **Saves:** **CTRL → Saves** exports saves to a ZIP and imports ZIPs from a PC, Xenia or the RGH save converter.
-- **Logs:** they are in `Android/data/io.github.freefrank.lostodyssey/files/logs/` ([how to get them](docs/INSTALLING.md#android-logs)).
+- **Saves:** **CTRL → Saves and logs** exports saves to a ZIP and imports ZIPs from a PC, Xenia or the RGH save converter.
+- **Logs:** **CTRL → Saves and logs → Export logs** saves them to a ZIP for a bug report ([details](docs/INSTALLING.md#android-logs)).
 
 [Step-by-step guide](docs/INSTALLING.md#android).
 
@@ -80,12 +95,14 @@ Turn on **HDR** in Graphics and save. **HDR peak brightness** opens a calibratio
 | Display | Windowed or fullscreen, monitor and GPU choice, 16:9 and 21:9 resolutions (taller screens such as 16:10 are filled), [HDR](#hdr) and **Brightness / Gamma**. |
 | Anti-aliasing and upscaling | FXAA, SMAA, TAA, DLSS, FSR 3.1, XeSS (Windows Direct3D 12) and MetalFX (macOS). |
 | Graphics options | Shadow resolution 1×/2×/4×, SSAO/GTAO, anisotropic filtering, depth of field and bloom. |
-| Frame rate | 30/60/90/120 FPS; VSync Off, On or FreeSync / G-SYNC Compatible VRR. |
+| Frame rate | 30/60/90/120 FPS; VSync Off, On or FreeSync / G-SYNC Compatible VRR. **Performance overlay** shows the frame rate, or a bar with the upscaler, frame generation, CPU and GPU load. |
 | Frame generation | DLSS, FSR or XeSS on Windows Direct3D 12; DLSS on Windows Vulkan. |
+| DLSS 5 neural rendering | Windows with DLSS on an RTX GPU. It needs `nvngx_dlssnr.dll`, which the game does not include: put your own copy (tested with 310.8.0.0) next to `LostOdysseyRecomp.exe` and restart. |
 | Shaders | Precompiled shaders downloaded on the first start, or compiled once and cached. |
 | Audio | Stereo, 5.1 surround, or matrix surround for an AV receiver. Cutscene dialogue has its own volume. |
 | Input | Controllers, keyboard and rumble; touch controls on Android. |
-| Mods | Windows only: texture, menu and font replacements, text translations and language packs, and PlayStation button prompts, installed by hand or with Mod Organizer 2. Other platforms may load mods but are not supported. See the [modding guide](docs/wiki/Modding.md). |
+| Mods | Windows only: texture, model, menu and font replacements, cutscene videos, text translations and language packs (which can add letters the game's fonts lack), and PlayStation button prompts, installed by hand or with Mod Organizer 2 (its plugins are in the Windows ZIP). Other platforms may load mods but are not supported. See the [modding guide](docs/wiki/Modding.md). Ready-made mods, such as the 4x HD texture pack, are shared in the **#mods** forum on [Discord](https://discord.gg/z2yPct6z2w). |
+| Achievements | The game's 36 Xbox 360 achievements, with an Xbox 360-style notification and sound when you unlock one. **Settings → System → Achievements** lists them with your unlock dates and turns the notification on, silent or off. An `achievement.wav` next to `settings.ini` replaces the sound. |
 | Debug menu | Render captures, Save Anywhere, encounter switches, teleport, fast-forward and cheats. See [Debug menu](#debug-menu). |
 
 ## Controls
@@ -101,7 +118,9 @@ Controllers and the keyboard work together for player 1. If your controller is n
 | Left / right trigger | E / R |
 | Debug Menu | F1 |
 
-Press **Back** to zoom the minimap; hold it for about half a second to hide the minimap. For Ring actions, use the controller's **right trigger** or **R**. **Vibration** in Settings sets the rumble strength.
+These are the default keys. **Settings → Gameplay → Controls** changes the keys and the controller buttons, and sets the button prompts and the vibration strength.
+
+Press **Back** to zoom the minimap; hold it for about half a second to hide the minimap. For Ring actions, use the controller's **right trigger** or **R**.
 
 ## Debug menu
 
@@ -225,6 +244,6 @@ Thank you to **Frenzy Fresh**, **José Antonio Martínez Godoy**, **C_BAR**, **A
 
 Thanks to everyone who sent pull requests and patches: [MikeRavenelle](https://github.com/MikeRavenelle), [dj5927](https://github.com/dj5927), [Xarishark](https://github.com/Xarishark), [navjack](https://github.com/navjack), [frankzzz](https://github.com/frankzzz) and [cngjd](https://github.com/cngjd). The macOS port started from MikeRavenelle's Apple Silicon work.
 
-With research and tools from [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp), [re:Blue](https://github.com/zolaware/reblue), [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), [plume](https://github.com/renderbag/plume) and [Xenia](https://github.com/xenia-project/xenia). Audio uses the [Xenia FFmpeg fork](https://github.com/xenia-project/FFmpeg) ([license](thirdparty/ffmpeg-LICENSE.txt)). The Android Turnip GPU drivers come from the driver list of the [Eden](https://git.eden-emu.dev/eden-emu/eden) emulator and load through [libadrenotools](https://github.com/bylaws/libadrenotools).
+With research and tools from [UnleashedRecomp](https://github.com/hedge-dev/UnleashedRecomp), [re:Blue](https://github.com/zolaware/reblue), [XenonRecomp](https://github.com/hedge-dev/XenonRecomp), [XenosRecomp](https://github.com/hedge-dev/XenosRecomp), [plume](https://github.com/renderbag/plume) and [Xenia](https://github.com/xenia-project/xenia). Audio uses the [Xenia FFmpeg fork](https://github.com/xenia-project/FFmpeg) ([license](thirdparty/ffmpeg-LICENSE.txt)). The Android Turnip GPU drivers come from the driver list of the [Eden](https://git.eden-emu.dev/eden-emu/eden) emulator and load through [libadrenotools](https://github.com/bylaws/libadrenotools); the Mali PanVK driver comes from [panvk-kbase-android](https://github.com/zenithblue-oss/panvk-kbase-android).
 
 Lost Odyssey and its assets belong to their respective owners. This is an unofficial project. Supply data extracted from your own discs; do not commit game executables, resource archives, textures, audio, video, generated game code or captures to this repository. Dependencies retain their respective licenses.

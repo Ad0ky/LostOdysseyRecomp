@@ -36,7 +36,7 @@ The game finds the files under `overlay/` by name, so `mod.ini` needs no file li
 
 Zip it with `mods/` at the top of the archive: `mods/<id>/mod.ini`, `mods/<id>/overlay/...`. Players extract the archive into the game folder; Mod Organizer 2 installs it as it is. Mod folders never conflict with each other. When two of them replace the same file, the in-game mod order decides, then `priority` in `mod.ini` (see [Modding API](Modding-API.md#order-and-mod-listini)). Changes take effect after a restart.
 
-Players manage installed mods in Settings → System → Mods. The page lists each mod with its `name`, `version` and `author`. The confirm button (A, or B if the game's confirm and cancel buttons are swapped) switches the selected mod On or Off, LB / RB move it up or down, and **Save mod list** (or Start) saves the order and offers a restart. The selected mod's `description` and folder appear in the help line. A mod with a broken `mod.ini` shows an error there with its first problem. Language packs are listed below the mods; choose one in Settings → System → Game language.
+Players manage installed mods in Settings → System → Mods. The page lists each mod with its `name`, `version` and `author`. The confirm button (A, or B if the game's confirm and cancel buttons are swapped) switches the selected mod On or Off, LB / RB move it up or down, and **Save mod list** (or Start) saves the order and applies it while the game runs: texture mods change at once, model mods from the next area you enter. Until then the help line says so. Party members' models, and the letters a language pack adds to the fonts, are loaded once at startup, so a change to them needs a restart; an area the game still holds in memory, such as one you just left, can show the old models until it is loaded again. The selected mod's `description` and folder appear in the help line. A mod with a broken `mod.ini` shows an error there with its first problem. Language packs are listed below the mods; choose one in Settings → System → Game language.
 
 To turn a top-level `overlay/` folder (an overlay pack) into a mod folder without packing it again:
 
@@ -47,9 +47,47 @@ python tools/modding/lo_mod.py overlay-to-mod mods --id my-textures --name "My T
 
 This moves `mods/overlay/textures` (and `images`, `text` and the other kind folders) into `mods/my-textures/overlay/` and writes `mod.ini`. Folders are renamed, not copied, so even a large pack moves at once; across drives the command fails instead of copying. It refuses when `mods/my-textures` exists, and `--dry-run` only prints what it would do. For a mod already installed in Mod Organizer 2, pass that mod's folder (the one that holds `overlay/`).
 
+## Ship a mod as one archive
+
+A mod with thousands of files under `overlay/` (a full texture pack) is slow to copy, unzip and install. `overlay.loarc` holds all of them in one file that sits in the mod folder; the game reads the files from it as if they were loose. Only `api_version=2` mod folders can use it.
+
+1. Build the mod folder as usual: `mod.ini` plus `overlay/`.
+2. Run, with the mod folder first and a new folder second:
+
+   ```sh
+   python tools/modding/lo_mod.py archive mods/my-textures packed/my-textures
+   ```
+
+   The command copies `mod.ini` and every other file outside `overlay/`, and writes `overlay.loarc` into the new folder with every overlay file the game loads. Files it does not load (wrong name, wrong folder) are skipped with a warning. Two files that end up under the same name (`FP-…` and `fp-…`) are an error and nothing is written. The new folder must not exist or must be empty; `--force` writes into a non-empty one.
+3. The command re-reads the archive and compares every file with its source. `--quick` checks only the archive's header and file list, which is much faster for a mod of tens of gigabytes.
+4. Install `packed/my-textures` like any mod folder: `mods/my-textures/mod.ini` and `mods/my-textures/overlay.loarc`. Do not leave the `overlay/` folder in it unless you want loose files to override the archive.
+
+Things to know:
+
+- `mod.ini` always stays a loose file; the game reads it before it opens the archive.
+- A loose file in the same mod's `overlay/` folder wins over the archive entry with the same name. Between different mods the usual order and `priority` still decide.
+- One archive can be larger than 4 GB, so it cannot sit on a FAT32 drive.
+- To look inside an archive: `python tools/modding/lo_mod.py extract mods/my-textures/overlay.loarc out --list` prints `name` and `size` of every file. Without `--list` it writes the files to `out/overlay/...` (and refuses to overwrite existing files). Extracting gives back exactly the files that were archived.
+
+### Archive format
+
+All numbers are little endian. The header is 64 bytes:
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | 8 | magic `LOARC1\r\n` |
+| 8 | 4 | header size, 64 |
+| 12 | 4 | entry count |
+| 16 | 8 | index offset |
+| 24 | 8 | index size in bytes (at most 64 MiB) |
+| 32 | 4 | kind mask: bit `1 << kind` for each kind present (Image 1, Font 2, Model 3, Movie 4, Texture 5, Text 6) |
+| 36 | 28 | zero |
+
+Each file's data starts at a multiple of 4096 (at least 4096) and ends before the index offset; data ranges do not overlap. The index follows the last file's data. It holds one record per file, sorted by name bytes, names unique: `u64` offset, `u64` size, `u32` name length (1 to 1100), then the UTF-8 name. A name is the file's path inside the mod folder with `/` separators and lower case: `overlay/textures/fp-<16 hex>.lotex2`, `overlay/images/key-fnv1a64-<16 hex>.lotex`, `overlay/<fonts|models>/key-fnv1a64-<16 hex>.loasset`, `overlay/movies/<name>.mp4` (`<name>` is 1 to 64 of `a-z`, `0-9`, `_`), or `overlay/text/<path>.json`.
+
 ## Export the original assets
 
-The game can export its own textures, movies and text from your game data as a starting point. The export is for your reference only: it comes from your copy of the game and must not be redistributed or bundled in a mod.
+The game can export its own textures, movies, text, 3D models and animations from your game data as a starting point. The export is for your reference only: it comes from your copy of the game and must not be redistributed or bundled in a mod.
 
 ```sh
 LostOdysseyRecomp.exe --export-assets my-export --export-kinds textures,movies --export-filter UI_MAIN
@@ -57,10 +95,13 @@ LostOdysseyRecomp.exe --export-assets my-export --export-kinds textures,movies -
 
 The output folder must not exist or must be empty, and it must be outside the game data. Optional arguments:
 
-- `--export-kinds`: `textures`, `movies`, `text`, or `fingerprints` (the texture index without PNG files). The default is textures, movies and text.
+- `--export-kinds`: `textures`, `movies`, `text`, `models`, `animations`, `fonts` (each font's size, pages and letters as JSON, for [adding letters](#add-letters-the-fonts-lack)), or `fingerprints` (the texture index without PNG files). The default is textures, movies and text; models and animations are not in the default because of their size.
 - `--export-filter`: only names containing this text.
 - `--export-language`: the text of one language only: `int`, `jpn`, `deu`, `fra`, `spa`, `ita`, `kor`, `chi` or `sch`.
 - `--export-language-pack <id>`: only text, written as a language pack to translate (see [make a language pack](#make-a-language-pack-a-new-language)).
+- `--export-model-textures`: with `models`, writes each material's colour texture as a PNG file to a `textures` folder beside the models and links it from the `.glb` files.
+- `--export-select <file>`: exports only the names listed in a UTF-8 text file, one per line (see [models and animations](#models-and-animations-for-reference)).
+- `--export-preview`: with `models` or `animations`, writes a 512×512 PNG picture of each model, or of the character an animation set moves, in place of its `.glb` file; `index.csv` lists the pictures. The MO2 tool shows these.
 
 No window opens; the program prints progress and exits (exit code 1 on a fatal error). With [Mod Organizer 2](Mod-Organizer-2.md#export-the-original-assets), the **Export Lost Odyssey assets** tool does the same from a window; that page has step-by-step instructions.
 
@@ -70,12 +111,144 @@ my-export/textures/index.csv        key,file,width,height,format,fingerprint,fin
 my-export/movies/<name>.wmv         original videos, unchanged
 my-export/text/<file path>.json     {"key": "text"} for one game text file
 my-export/text/index.csv            path,language,format,source,entries,round_trip
+my-export/models/<package path>/<object>.<export index>.glb   3D models (glTF)
+my-export/models/index.csv          key,file,class,vertices,triangles,bones
+my-export/animations/<package path>/<set>.<index>.glb         animation sets (glTF)
+my-export/animations/index.csv      key,file,sequences,tracks,frames,model
+my-export/fonts/<package path>/<font>.json                   font size, kerning, pages and letters
 my-export/export-summary.txt
 ```
 
 `textures/index.csv` holds the mod key and the fingerprint of every texture, so no catalog is needed.
 
+### Models and animations (for reference)
+
+Models and animations are exported as glTF binaries (`.glb`). Blender opens them with **File → Import → glTF 2.0**; [Open models in Blender](Open-Models-in-Blender.md) has the steps. Models, map pieces included, can be edited and put back with a mod (see [Replace a model](#replace-a-model)); animations are for reference only.
+
+1. Export the models, the animations or both. Add `--export-model-textures` to link each material's colour texture:
+
+   ```sh
+   LostOdysseyRecomp.exe --export-assets my-export --export-kinds models,animations --export-model-textures
+   ```
+
+   In the [MO2 tool](Mod-Organizer-2.md#export), tick **Models** (with **With textures**) and **Animations**. Both are off by default because they are large.
+2. Open `my-export/models/index.csv` or `my-export/animations/index.csv` to find a file by its `key`. A model file holds the highest-detail level with its skeleton, normals, UV sets, vertex colours and material slot names. An animation file holds the character model whose skeleton the set moves (without textures), and every sequence of the set as its own glTF animation; Blender lists them as Actions (use the NLA editor to combine them). Some animation sets, such as weapon props in cutscenes and camera boxes, have no matching model and are skipped; `export-summary.txt` lists them.
+3. To export only some of them, first write the list. Run the export with `--export-list` and the same kinds:
+
+   ```sh
+   LostOdysseyRecomp.exe --export-assets my-list --export-kinds models,animations --export-list
+   ```
+
+   `my-list/list.csv` has a row for each model and animation set, with its `name`. Its `name` rows give the game's own names: a map code (`u36_0`) or character code (`pc_000`, `en_043a0`) in `name`, the language in `language` and the name in `label`. Copy the `name` values you want into a UTF-8 text file, one per line, for example `selected.txt`. Then export into a new folder:
+
+   ```sh
+   LostOdysseyRecomp.exe --export-assets my-selection --export-kinds models,animations --export-select selected.txt
+   ```
+
 Text covers the menus, item and skill names and descriptions, battle messages, field dialogue, cutscene subtitles, the credits and the engine's own messages, for every language on your discs. Each game file becomes one UTF-8 JSON file with its own path plus `.json`, for example `text/bin/xenon/scr/mes/int/u3b_0_scrw.jmd.json`. Codes that are not text appear as tokens such as `{E001}` (a line break in dialogue) or `{E10D:0500}` (a code with its value); keep them where they are. `source` in `text/index.csv` is `base`, or the DLC whose version the game uses instead of the disc's (`lodlc002`, `lodlc003`). `round_trip` is `ok` when the file was rebuilt from its exported text byte for byte; only those files can take translations. The Thousand Years of Dreams stories and place names in `name_data.xmb` are not exported yet.
+
+## Replace a cutscene video
+
+A mod can replace a cutscene with an upscaled or re-rendered video. This works in the Windows build; other platforms play the original video. The replacement takes the place of the picture only: the game keeps playing the original audio and subtitles. The video is drawn at the game's render resolution, so a 4K video shows its full detail only when Settings → Graphics → Render resolution is as large as your screen.
+
+The video is named after the original. [Export the movies](#export-the-original-assets) to see the names: `my-export/movies/mv_00v.wmv` is replaced by the key `mv_00v`. A key has 1 to 64 characters from `a-z`, `0-9` and `_`.
+
+What the video must be:
+
+- MP4 container with the `moov` box at the front (ffmpeg `-movflags +faststart`). Fragmented MP4, which Topaz Video AI writes, also works.
+- H.264 High profile, 8-bit `yuv420p`, progressive, BT.709 limited range, constant frame rate.
+- Any frame rate from 24 to 120 fps. The game picks frames by time, so the rate does not have to match the original. Twice the original's rate is easiest when a tool doubles the frames: 60 fps for a 30 fps original, 60000/1001 for 29.97. `ffprobe` on the exported video shows its rate (most are 30 or 29.97).
+- 16:9. Use 3840x2160 for desktop packs (H.264 level 5.2) and 1920x1080 for Steam Deck and phones (level 4.2).
+- No audio track is needed. An audio track in the file is ignored.
+- The same length as the original picture, lined up from the first frame. A video up to 1% longer or shorter is stretched or squeezed evenly to the original's length, which covers a tool that labels 29.97 fps as 30 or drops a few frames. A bigger difference plays as it is, so check the length when a tool changes the frame rate: a video that runs longer or shorter drifts away from the sound.
+
+Example ffmpeg command:
+
+```sh
+ffmpeg -i mv_00v_upscaled.mov -c:v libx264 -profile:v high -pix_fmt yuv420p -r 60000/1001 -crf 18 -preset slow -colorspace bt709 -color_primaries bt709 -color_trc bt709 -color_range tv -an -movflags +faststart mv_00v.mp4
+```
+
+Install it as a mod:
+
+1. Make the folder `mods/my-cutscenes/overlay/movies/` in the game folder and put `mv_00v.mp4` in it.
+2. Make `mods/my-cutscenes/mod.ini` with this text:
+
+   ```ini
+   api_version=2
+   id=my-cutscenes
+   name=My Cutscenes
+   ```
+
+3. Start the game and play the cutscene.
+
+Instead of the `overlay/movies/` folder, a `mod.ini` line can point at the file anywhere in the mod folder (`api_version=1` also works):
+
+```ini
+movie:mv_00v=movies/mv_00v.mp4
+```
+
+`python tools/modding/lo_mod.py archive` packs `overlay/movies/*.mp4` into the `.loarc` like other files. It checks each video before packing: if `ffprobe` is installed it must be H.264, `yuv420p` and progressive, or the file is skipped with a message. It warns when the frame rate is outside 24-120 fps, the picture is not 16:9, or `moov` is after the video data.
+
+## Replace a model
+
+A mod can replace a 3D model with one you edited: a character, monster or moving object (a `SkeletalMesh`), or a map piece or other fixed object (`StaticMesh`, `StaticMeshRPG`), such as a building or a stretch of ground made more detailed. The new model keeps the original's materials, so it uses the original textures, or those of a [texture pack](#make-a-texture-pack-experimental). A character model also keeps the original's skeleton, so it moves with the game's own animations. Map pieces have more to keep in mind; see [Map pieces](#map-pieces-and-other-static-models).
+
+1. Export the model. In the [MO2 tool](Mod-Organizer-2.md#export), select its row and press **Open model**, or run:
+
+   ```sh
+   LostOdysseyRecomp.exe --export-assets my-export --export-kinds models --export-model-textures --export-filter pc_000a0_m
+   ```
+
+   The file is `my-export/models/<package path>/<object>.<export index>.glb`. Kaim's is `my-export/models/bin/xenon/chr/pc/pc_000a0_m.xxx/pc_000a0_m.0.glb`.
+2. In Blender, choose **File → Import → glTF 2.0** and open the file.
+3. Edit the mesh: move, add or delete vertices and faces, change the UV map, paint the weights. Keep these as they are:
+   - Character models: the armature and its bone names. Weight the mesh only to bones that are already there. Do not add, rename or delete bones.
+   - The material names. Every face needs one of the original materials, such as `MAT_pc_000a0_bodyMT`. New materials do not work. Names that Blender gives a `.001` ending are fine.
+   - A UV map.
+4. Choose **File → Export → glTF 2.0**, set **Format** to **glTF Binary (.glb)**, and export. The other options can stay as they are. Textures and animations in the file are not used.
+5. Put the file in a mod at the same path it was exported to, under `overlay/models/`:
+
+   ```text
+   mods/my-models/overlay/models/bin/xenon/chr/pc/pc_000a0_m.xxx/pc_000a0_m.0.glb
+   ```
+
+6. Make `mods/my-models/mod.ini` with this text:
+
+   ```ini
+   api_version=2
+   id=my-models
+   name=My Models
+   ```
+
+7. Start the game. The newest `logs/runtime-*.log` in the game folder shows the result:
+   - `[mods] model bin/xenon/chr/pc/pc_000a0_m.xxx: pc_000a0_m: … vertices` means the model was replaced.
+   - `kept original` means it was not, followed by the reason (for example a bone or material the original does not have).
+
+Limits of character models:
+
+- At most 65,535 vertices. The game splits the model into parts of up to 75 bones, and vertices on the seams count twice.
+- Up to 4 bone weights per vertex. Extra weights are dropped and the largest 4 are kept.
+- The replacement is shown at every distance; the original's lower-detail versions are not used.
+- A few models are in more than one package, such as a boss in its battle and event packages. Export and replace each copy.
+
+### Map pieces and other static models
+
+Buildings, ground, walls and other fixed parts of a map are in the map's `_map.xxx` package. A magic car in Uhra, for example, is `my-export/models/bin/xenon/field/u3b_0/u3b_0_map.xxx/StaticMesh_467.61.glb`. The file names do not say what a piece is: export a whole map with `--export-filter u3b_0_map` and open the files in Blender to find the one you want.
+
+The steps are the same as above. In addition:
+
+- Keep the model where the original is. The map's light and shadow were worked out in advance for each vertex of the original. When the game starts, each vertex of your model takes them from the point of the original's surface nearest to it, so a more detailed version of the same shape is lit like the original. Parts far from the original's surface take the light of the nearest original part.
+- Faces with a material that is not one of the original's, or with none, take the material of the original surface beneath them. This keeps the materials of a model that an upscaling tool merged or renamed.
+- In Blender's glTF export, open **Data → Mesh** and set **Vertex Color** to **Active**. With the default, some models are exported with white vertex colours.
+- Where characters can walk and where they stop is set by the map's own collision, which stays as it was. Keep floors and walls where they were, or characters will walk through the new shapes or float above them.
+- `[mods] model lighting … follow the new vertices` in the log means the light and shadow were carried over.
+
+Limits of map pieces:
+
+- At most 65,536 vertices per model. Most map pieces have a few hundred to a few thousand, so there is room for many times more detail.
+- The first start after a mod is installed or changed, or after a game update that changes how mods are applied, rebuilds the game files it changes: about half a minute to a minute per disc on an 8-core PC for a mod that replaces every map's pieces, longer on fewer cores. Meanwhile the window shows "Preparing mods" with a progress bar. The rebuilt files are kept in the `cache/mods` folder (in the game folder, or next to the shader cache when the game folder cannot be written) and later starts read them from there. For such a mod they take up to about 6 GB per disc. Rebuilt files that no longer fit in the disc's own 4 GB archives go into extra `xenon_mod0.fpd`, `xenon_mod1.fpd`… files there. While you play, the other discs' files are rebuilt in the background, the next disc first, on one low-priority thread that rests half the time (about 6 to 15 minutes per disc on an 8-core PC), so switching discs later only reads them; a switch that comes before that waits with the same progress window. `LO_MODS_PREBUILD=0` turns the background rebuild off (on Android it is off unless `LO_MODS_PREBUILD=1`), and `LO_MODS_PREBUILD_THREADS` gives it more threads. The game keeps the files of your current and your previous set of mods, also while it runs with no mods, so turning a mod off and on again does not rebuild; older sets are removed. Delete `cache/mods` to free the space.
+
+`python tools/modding/lo_mod.py archive` packs `overlay/models/` into the `.loarc` like other files.
 
 ## Make a texture pack (experimental)
 
@@ -152,6 +325,26 @@ The log shows `mods: language pack pt-br (Português (Brasil), base int)` at sta
 
 The game runs as the base language underneath: voices, artwork with words in it and everything you have not translated stay in that language (English for `int`). While the pack is selected, its files replace the same files from other text mods. Players who pick another language do not see the pack.
 
+### Add letters the fonts lack
+
+The game draws text with bitmap fonts: each letter is a small picture on a texture page, white with a dark outline, at one fixed size. A language that needs letters those fonts do not have, such as Polish, Russian or Arabic, can add them to a language pack: `lo_mod.py font-glyphs` draws every letter the pack's text uses and the fonts lack from a TrueType or OpenType font, at each game font's size and in its style, and the game adds them to its fonts while the pack is selected.
+
+1. Export the fonts and their pages: `LostOdysseyRecomp.exe --export-assets my-fonts --export-kinds textures,fonts --export-filter rpfonts`. Besides the page PNGs in `textures/`, `my-fonts/fonts/<package path>/<font>.json` has each font's size, kerning, pages and letters.
+2. Translate the pack's text first: the letters drawn are the ones it uses. `--chars` adds more.
+3. Install what the command needs: `python -m pip install Pillow fonttools freetype-py uharfbuzz`.
+4. Draw the letters with a font whose licence lets you share it, such as an OFL font:
+
+   ```sh
+   python tools/modding/lo_mod.py font-glyphs my-export/pt-br --export my-fonts --ttf MyFont-Regular.ttf
+   ```
+
+   For each font of the pack's base language (`rpfontscommon_int.xxx`, `rpfontsdream_int.xxx`, `rpfontstitle_int.xxx` for `int`) it writes `my-export/pt-br/fonts/<package path>/<font>.lofont` and prints how many letters it drew and at which size. The size matches the TTF's `H` to the game's `H`, then shrinks until every new letter fits the font's line height; `--scale` makes them larger or smaller, `--fonts Maru23,Meiyo18` limits the fonts. A heavier weight of the TTF reads better at the small sizes. A font without `H`, such as the Japanese `Yume24` (kana and kanji only), is measured by a letter it shares with a font that has one (`口`, `あ`, `ア`, a digit…): its `H` would stand where it does relative to that letter there. Fonts without letters, such as `Icon`, are skipped.
+5. Start the game with the pack selected. The log shows `[mods] font: N glyph files in M packages from language pack pt-br` and one `[mods] font <package>: <font>: … glyphs` line per font; the first start after a change rebuilds the font packages with the other mod files. The game reads its fonts once, at startup, so changed glyph files need a restart; saving the Mods page does not apply them.
+
+`language-clean` copies the pack's `fonts/` folder with the text. A letter the game's font already has keeps the game's own glyph unless `fonts/` draws it again.
+
+The game draws every line from left to right and does not join letters. Arabic, Persian and other right-to-left scripts work when the text in the pack is already shaped and in display order: each letter as its presentation form (U+FB50–U+FEFF, which `font-glyphs` draws by shaping the letter with its neighbours) and each line reversed, with codes such as `{E001}` kept in place. Lines the game wraps on its own, such as long subtitles, wrap from the wrong end; break them by hand.
+
 ### Change a language the game already has
 
 1. Export the text: `LostOdysseyRecomp.exe --export-assets my-export --export-kinds text --export-language int` (or tick Text in the MO2 tool). Without `--export-language` you get every language on your discs.
@@ -161,7 +354,7 @@ The game runs as the base language underneath: voices, artwork with words in it 
 
 ### For both
 
-Translated text can be longer than the original. Menus and message boxes do not grow, so long lines may need a manual break. Use only characters the game's font has (see [Modding API](Modding-API.md#text-language-packs)); languages that need other letters, such as Polish or Russian, are not possible yet. The Thousand Years of Dreams stories and the place names in `name_data.xmb` are not exported yet.
+Translated text can be longer than the original. Menus and message boxes do not grow, so long lines may need a manual break. Use only characters the game's font has (see [Modding API](Modding-API.md#text-language-packs)); a language pack can [add the letters it lacks](#add-letters-the-fonts-lack). The Thousand Years of Dreams stories and the place names in `name_data.xmb` are not exported yet.
 
 ## Settings-menu artwork
 
@@ -241,7 +434,7 @@ No shared manifest is included in an overlay ZIP. Competing mods deliberately pr
 
 For a portable installation, extract the ZIP beside the executable so that `mods/my-menu/mod.ini` is under the runtime's mod root. For another layout, copy the ZIP's `mods/` contents to `LO_MODS_DIR` or the application's selected mods directory.
 
-Use `LO_MODS_MODE=standalone` to ignore the top-level overlay while testing a mod folder. Restart, open the native settings menu in the chosen language, and compare an obvious artwork change. Set `enabled=false` in that mod's `mod.ini` and restart to verify restoration. Removing the mod folder also uninstalls it.
+Use `LO_MODS_MODE=standalone` to let the mod folder win over the top-level overlay while testing it. Restart, open the native settings menu in the chosen language, and compare an obvious artwork change. Set `enabled=false` in that mod's `mod.ini` and restart to verify restoration. Removing the mod folder also uninstalls it.
 
 To inspect an extracted payload:
 

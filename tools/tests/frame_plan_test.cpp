@@ -352,5 +352,47 @@ int main()
     fsrInput.fsrQuality = gpu::upscaling::FsrQuality::Performance;
     Require(providerPlanner.Begin(fsrInput).requestSignature != fsrFallback.requestSignature,
         "FSR quality affects request identity without NGX sizing");
+
+    // Menus, pause and the title screen draw no scene. The newest execution
+    // stays per frame for the log; the settings menu reads the last frame of
+    // the same request that had a scene.
+    PlannerState menuPlanner;
+    const auto scenePlan = menuPlanner.Begin(dlssInput);
+    Require(!StatusExecution(menuPlanner.Observe()), "no execution before the first frame");
+    const DlssExecutionObservation titleFrame{scenePlan, 1, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::NoEligibleScene};
+    Require(menuPlanner.ReportExecution(titleFrame) && !menuPlanner.Observe().eligible &&
+        StatusExecution(menuPlanner.Observe())->reason == DlssEffectReason::NoEligibleScene,
+        "title-screen frames leave no eligible frame and report NoEligibleScene");
+    Require(menuPlanner.ReportExecution({scenePlan, 2, 21, DlssExecutionOutcome::Submitted, DlssEffectReason::None}),
+        "field frame submitted");
+    Require(menuPlanner.ReportExecution({scenePlan, 3, 22, DlssExecutionOutcome::Submitted, DlssEffectReason::None}) &&
+        menuPlanner.Observe().eligible->renderFrame == 2, "a steady outcome is stored once, not per frame");
+    Require(menuPlanner.ReportExecution({scenePlan, 4, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::NoEligibleScene}),
+        "menu frame stored");
+    auto menuView = menuPlanner.Observe();
+    Require(menuView.execution->renderFrame == 4 && menuView.execution->reason == DlssEffectReason::NoEligibleScene,
+        "the newest execution is still the menu frame");
+    Require(StatusExecution(menuView)->outcome == DlssExecutionOutcome::Submitted &&
+        StatusExecution(menuView)->submissionSerial == 21, "the menu reads the last submitted field frame");
+    // Opening the camp menu blurs the scene for one frame, which falls back
+    // with UnknownColorEncoding before the menu frames.
+    Require(menuPlanner.ReportExecution({scenePlan, 5, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::UnknownColorEncoding}) &&
+        menuPlanner.ReportExecution({scenePlan, 6, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::NoEligibleScene}) &&
+        StatusExecution(menuPlanner.Observe())->submissionSerial == 21 &&
+        menuPlanner.Observe().execution->reason == DlssEffectReason::NoEligibleScene,
+        "a frame fallback after a submit does not hide that the request runs");
+    auto balancedInput = dlssInput; balancedInput.quality = gpu::upscaling::DlssQuality::Balanced;
+    const auto balancedPlan = menuPlanner.Begin(balancedInput);
+    Require(balancedPlan.geometryEpoch != scenePlan.geometryEpoch && !menuPlanner.Observe().eligible &&
+        !StatusExecution(menuPlanner.Observe()), "a saved quality change starts without the old request's frame");
+    Require(menuPlanner.ReportExecution({balancedPlan, 7, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::MotionPipelinePending}) &&
+        menuPlanner.ReportExecution({balancedPlan, 8, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::UnknownColorEncoding}) &&
+        menuPlanner.ReportExecution({balancedPlan, 9, 0, DlssExecutionOutcome::Fallback, DlssEffectReason::NoEligibleScene}) &&
+        StatusExecution(menuPlanner.Observe())->reason == DlssEffectReason::UnknownColorEncoding,
+        "a request that never submitted shows the reason of its last scene frame");
+    Require(menuPlanner.ReportExecution({balancedPlan, 10, 23, DlssExecutionOutcome::Submitted, DlssEffectReason::None}) &&
+        StatusExecution(menuPlanner.Observe())->submissionSerial == 23, "its first submit replaces that reason");
+    menuPlanner.Begin(dlssInput);
+    Require(!menuPlanner.Observe().eligible, "returning to the first quality does not revive its frame");
     std::printf("frame plan: %d checks passed\n", checks);
 }

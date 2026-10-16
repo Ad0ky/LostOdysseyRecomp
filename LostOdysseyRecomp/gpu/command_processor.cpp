@@ -1,6 +1,7 @@
 #include <stdafx.h>
 #include "command_processor.h"
 #include "movie_clear.h"
+#include "movie_replace.h"
 #include "frame_plan.h"
 #include "display_gamma.h"
 #include "video.h"
@@ -16,6 +17,7 @@
 #include <kernel/function.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
+#include <os/host_scheduling.h>
 #include <os/shader_log.h>
 #include <chrono>
 #include <kernel/io/file_system.h>
@@ -106,8 +108,7 @@ namespace gpu
 
     // -----------------------------------------------------------------------
     // Draw statistics and shader capture (LO_GPU_STATS=1, LO_SHADER_DUMP_DIR).
-    // Purely diagnostic: tells us what the title screen actually draws before
-    // a renderer exists.
+    // Purely diagnostic: logs what the title issues, independent of the renderer.
     // -----------------------------------------------------------------------
     struct FrameStats
     {
@@ -132,14 +133,16 @@ namespace gpu
     static const char* const g_shaderDumpDirectory = getenv("LO_SHADER_DUMP_DIR");
     static uint32_t g_detailBudget = 0;
 
-    // words point at big-endian microcode in guest memory.
-    static void CaptureShader(uint32_t type, const uint32_t* words, uint32_t count)
+    // words point at big-endian microcode: guest memory for IM_LOAD, the
+    // packet's inline payload for IM_LOAD_IMMEDIATE (`immediate`).
+    static void CaptureShader(uint32_t type, const uint32_t* words, uint32_t count, bool immediate)
     {
         if (type > 1 || count == 0 || count > 0x10000)
             return;
         if (g_gpuStats) g_frame.shaderLoads++;
         auto& snapshot = g_activeShaderSnapshots[type];
-        if (!snapshot.Load(words, count)) return;
+        if (!(immediate ? snapshot.LoadImmediate(words, count) : snapshot.Load(words, count, g_commandProcessor.SyncEpoch())))
+            return;
         const char* dumpDirectory = g_shaderDumpDirectory;
         if (!g_gpuStats && !dumpDirectory) return;
         const uint64_t hash = snapshot.CommandHash();
@@ -472,6 +475,36 @@ namespace gpu
             }
             return;
         }
+        if (index >= movie_replace::RegisterBase && index <= movie_replace::Commit)
+        {
+            using namespace movie_replace;
+            auto& stage = m_movieReplace;
+            switch (index)
+            {
+            case Begin:
+                stage = {};
+                stage.active = value == Magic;
+                break;
+            case SurfaceInfo: if (stage.active) stage.surfaceInfo = value; break;
+            case ColorInfo: if (stage.active) stage.colorInfo = value; break;
+            case X: if (stage.active) stage.x = value; break;
+            case Y: if (stage.active) stage.y = value; break;
+            case Width: if (stage.active) stage.width = value; break;
+            case Height: if (stage.active) stage.height = value; break;
+            case Session: if (stage.active) stage.session = value; break;
+            case TimeLow: if (stage.active) stage.timeLow = value; break;
+            case TimeHigh: if (stage.active) stage.timeHigh = value; break;
+            case Commit:
+                if (stage.active && value == Magic)
+                    renderer::DrawMovieReplacement(stage.surfaceInfo, stage.colorInfo,
+                        std::bit_cast<float>(stage.x), std::bit_cast<float>(stage.y),
+                        std::bit_cast<float>(stage.width), std::bit_cast<float>(stage.height),
+                        stage.session, int64_t(uint64_t(stage.timeHigh) << 32 | stage.timeLow));
+                stage = {};
+                break;
+            }
+            return;
+        }
         if (index >= REGISTER_COUNT)
             return;
         if (index >= display_gamma::RegisterFirst && index <= display_gamma::RegisterLast)
@@ -657,6 +690,7 @@ namespace gpu
     void CommandProcessor::WorkerMain()
     {
         os::SetCurrentThreadName("GPU CmdProc");
+        os::scheduling::PreferPerformanceCores();
         const bool timingEnabled = frame_timing::Enabled();
         auto idleStart = std::chrono::steady_clock::time_point{};
         bool timingIdle = false;
@@ -1039,6 +1073,7 @@ namespace gpu
             ++m_counter;
             uint32_t swaps = ++g_swapCount;
             g_presentedSwaps = swaps;
+            os::scheduling::OnRenderFrame();
             // Optional progress log with the last game file the title opened.
             if (g_gpuStats && (swaps % 60) == 1)
             {
@@ -1603,7 +1638,7 @@ namespace gpu
                 LOG_ERROR("IM_LOAD: invalid physical shader extent");
                 return false;
             }
-            CaptureShader(addrType & 3, reinterpret_cast<uint32_t*>(TranslatePhysical(addrType & ~3u)), sizeDwords);
+            CaptureShader(addrType & 3, reinterpret_cast<uint32_t*>(TranslatePhysical(addrType & ~3u)), sizeDwords, false);
             reader.Advance(count - 2);
             return true;
         }
@@ -1620,7 +1655,7 @@ namespace gpu
             }
             if (const auto* words = reader.Contiguous(sizeDwords))
             {
-                CaptureShader(type & 3, words, sizeDwords);
+                CaptureShader(type & 3, words, sizeDwords, true);
                 reader.Advance(count - 2);
             }
             else
@@ -1629,7 +1664,7 @@ namespace gpu
                 // instead of passing a span that runs beyond the ring storage.
                 std::vector<uint32_t> snapshotWords(sizeDwords);
                 for (auto& word : snapshotWords) word = ByteSwap(reader.ReadAndSwap());
-                CaptureShader(type & 3, snapshotWords.data(), sizeDwords);
+                CaptureShader(type & 3, snapshotWords.data(), sizeDwords, true);
                 reader.Advance(count - 2 - sizeDwords);
             }
             return true;
@@ -1731,7 +1766,7 @@ namespace gpu
         }
 
         default:
-            // Remaining state packets: no renderer yet. Count unhandled opcodes
+            // Packets with no handler are ignored. Count unhandled opcodes
             // only when draw statistics are requested.
             if (g_gpuStats) g_frame.unknownOpcode[opcode & 127]++;
             {

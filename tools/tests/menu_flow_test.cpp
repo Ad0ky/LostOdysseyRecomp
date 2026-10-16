@@ -6,6 +6,7 @@
 #define SDL_MAIN_HANDLED // This host fixture supplies its own main and does not initialize SDL.
 #include <SDL3/SDL.h>
 #include <fstream>
+#include <map>
 #include <stdexcept>
 #include <tuple>
 extern "C" int SDLCALL MenuFlowPushEvent(SDL_Event* event);
@@ -44,6 +45,10 @@ inline uint64_t BeginDisplayRevert(const settings::Config& c) { return MenuFlowB
 #include <settings/mods_page.h>
 namespace settings::mods_page { bool MenuFlowOpenFolder(const std::filesystem::path& folder); }
 #define OpenFolder MenuFlowOpenFolder
+// The Achievements page reads a fake list instead of the title data and profile.
+#include <settings/achievements_page.h>
+namespace settings::achievements_page { std::vector<Item> MenuFlowAchievementItems(bool withIcons); }
+#define LoadAchievementItems MenuFlowAchievementItems
 #define GetConfig MenuFlowGetConfig
 #define SaveConfig MenuFlowSaveConfig
 #define SaveAudioOutput MenuFlowSaveAudioOutput
@@ -63,6 +68,7 @@ namespace settings::mods_page { bool MenuFlowOpenFolder(const std::filesystem::p
 #undef SDL_PushEvent
 #undef Translate
 #undef OpenFolder
+#undef LoadAchievementItems
 #undef GetConfig
 #undef SaveConfig
 #undef SaveAudioOutput
@@ -77,11 +83,18 @@ namespace settings::mods_page { bool MenuFlowOpenFolder(const std::filesystem::p
 #undef __imp__sub_828710A0
 #undef __imp__sub_82889E50
 
+// System → Shader bundle records the request instead of writing the marker file.
+namespace updater::shader_pack {
+int menuFlowRedownloads = 0;
+bool RequestRedownload() { ++menuFlowRedownloads; return true; }
+}
+
 namespace gpu::video {
 FrameGenerationStatus menuFlowFgStatus{};
 FrameGenerationStatus GetFrameGenerationStatus() { return menuFlowFgStatus; }
 std::vector<std::string> GpuDeviceNames() { return {}; }
-std::string ActiveGpuDeviceName() { return {}; }
+std::string menuFlowActiveGpu;
+std::string ActiveGpuDeviceName() { return menuFlowActiveGpu; }
 std::vector<display_choice::Display> Displays() { return {}; }
 }
 
@@ -98,8 +111,16 @@ using settings::GraphicsRow;
 
 namespace gpu::frame_plan {
 DlssEffectSnapshot menuFlowDlssEffect{};
+// PlannerObservation::eligible: the last execution of the request that had a scene.
+std::optional<UpscalerExecutionObservation> menuFlowEligible;
 DlssEffectSnapshot CurrentDlssEffect() { return menuFlowDlssEffect; }
-std::optional<UpscalerExecutionObservation> CurrentUpscalerExecution() { return menuFlowDlssEffect.execution; }
+std::optional<UpscalerExecutionObservation> CurrentUpscalerExecution()
+{
+    PlannerObservation observed;
+    observed.execution = menuFlowDlssEffect.execution;
+    observed.eligible = menuFlowEligible;
+    return StatusExecution(observed);
+}
 }
 namespace {
 uint32_t vibrationStrength = 100;
@@ -108,17 +129,85 @@ uint32_t promptStyle = 0;
 unsigned modsFolderOpens = 0;
 std::filesystem::path modsFolderOpened;
 }
+std::vector<settings::achievements_page::Item> settings::achievements_page::MenuFlowAchievementItems(bool withIcons)
+{
+    const auto make = [&](uint16_t id, uint16_t score, const char* name, const char* unlocked, const char* locked, bool secret,
+                          int64_t time) {
+        Item item;
+        item.info.id = id;
+        item.info.score = score;
+        item.info.name = name;
+        item.info.unlockedText = unlocked;
+        item.info.lockedText = locked;
+        item.info.secret = secret;
+        item.earnedTime = time;
+        // RGBA pixel 0xff332211: R 0x11, G 0x22, B 0x33.
+        if (withIcons) item.icon = {std::vector<uint32_t>(4, 0xff332211u), 2, 2};
+        return item;
+    };
+    return {make(1, 10, "Oldest", "Did it", "Do it", false, 1700000000),
+            make(2, 30, "Locked one", "Done", "Do it", false, 0),
+            make(3, 20, "Newest", "Done it", "Do it", false, 2000000000),
+            make(4, 20, "Secret name", "Secret done", "Secret hint", true, 0),
+            make(5, 10, "Hidden too", "Hidden done", "Hidden hint", true, 0)};
+}
 bool settings::mods_page::MenuFlowOpenFolder(const std::filesystem::path& folder)
 {
     ++modsFolderOpens;
     modsFolderOpened = folder;
     return true;
 }
+// The Mods page's live reload (patches/mod_hot_reload.h): a request re-reads the
+// mod list as the runtime does; the page shows whatever status the test sets.
+namespace {
+unsigned modsReloadRequests = 0;
+bool modsReloadAvailable = true;
+mod_hot_reload::Status modsReloadStatus;
+}
+bool mod_hot_reload::Request()
+{
+    ++modsReloadRequests;
+    if (!modsReloadAvailable) return false;
+    modding::Reload();
+    modsReloadStatus = {Phase::Preparing};
+    return true;
+}
+mod_hot_reload::Status mod_hot_reload::GetStatus() { return modsReloadStatus; }
+namespace {
+// Controls page: the sources held on the controllers, the layouts handed to hid.
+uint32_t heldSources = 0;
+hid::input_map::ControllerMap appliedController = hid::input_map::DefaultController;
+hid::input_map::KeyboardMap appliedKeyboard = hid::input_map::DefaultKeyboard;
+unsigned inputMapApplies = 0;
+}
 namespace hid {
 bool UsesPlayStationPrompts() { return false; }
 void SetVibrationStrength(uint32_t percent) { vibrationStrength = percent; }
 void SetPromptStyle(uint32_t style) { promptStyle = style; }
 void PreviewVibration() { ++vibrationPreviews; }
+void SetInputMaps(const input_map::ControllerMap& controller, const input_map::KeyboardMap& keyboard)
+{
+    appliedController = controller;
+    appliedKeyboard = keyboard;
+    ++inputMapApplies;
+}
+uint32_t PressedSources() { return heldSources; }
+// Without SDL: SDL's names for the default keys and Space, numbers otherwise.
+std::string KeyName(uint32_t scancode)
+{
+    if (scancode >= 4 && scancode <= 29) return std::string(1, char('A' + scancode - 4));
+    switch (scancode)
+    {
+    case 40: return "Return";
+    case 42: return "Backspace";
+    case 44: return "Space";
+    case 79: return "Right";
+    case 80: return "Left";
+    case 81: return "Down";
+    case 82: return "Up";
+    }
+    return "#" + std::to_string(scancode);
+}
 }
 namespace apu {
 Output menuFlowOutput = Output::Stereo;
@@ -150,7 +239,7 @@ void Require(bool condition, const char* message)
 void Poll(uint16_t buttons, bool consumed, int16_t x = 0, int16_t y = 0)
 {
     const auto original = buttons;
-    Require(settings::FilterInput(buttons, x, y) == consumed, "input ownership");
+    Require(settings::FilterInput(buttons, x, y, buttons) == consumed, "input ownership");
     Require(buttons == (consumed ? 0 : original), "filtered buttons");
 }
 void Tick(uint8_t* base)
@@ -384,6 +473,51 @@ void CheckBr03DlssMenu(uint8_t* base)
     Require(settings::edit.ambientOcclusion == 2, "ambient occlusion selects GTAO");
     settings::pending = 8; Tick(base);
     Require(settings::edit.ambientOcclusion == 0, "ambient occlusion wraps to Off");
+    // Graphics preset: derived from the rows it sets, Custom when they match neither.
+    {
+        const settings::Config before = settings::edit;
+        const auto& preset = settings::snapshot.rows[int(GraphicsRow::Preset)];
+        Require(preset.choices == std::vector<std::wstring>{L"Original", L"Low-end", L"Custom"} &&
+                preset.selectedChoice == 0, "the factory effects show the Original preset");
+        settings::row = int(GraphicsRow::Preset);
+        settings::pending = 8; Tick(base);
+        Require(!settings::edit.dynamicShadows && !settings::edit.motionBlur && settings::edit.depthOfFieldPercent == 0 &&
+                !settings::edit.bloom && settings::edit.scalingQuality == 0 &&
+                settings::edit.internalResolution == 720 && settings::edit.frameRate == 30 &&
+                settings::snapshot.rows[int(GraphicsRow::Preset)].value == L"Low-end", "Right selects the Low-end preset");
+        settings::Config others = settings::edit;
+        others.dynamicShadows = before.dynamicShadows; others.motionBlur = before.motionBlur;
+        others.depthOfFieldPercent = before.depthOfFieldPercent; others.bloom = before.bloom;
+        others.scalingQuality = before.scalingQuality;
+        others.internalResolution = before.internalResolution; others.frameRate = before.frameRate;
+        Require(others == before, "the preset changes only its own rows");
+        // Render resolution and frame rate are preset rows too.
+        for (const auto [presetRow, label] : {std::pair{GraphicsRow::RenderResolution, "render resolution"},
+                                              std::pair{GraphicsRow::FrameRate, "frame rate"}})
+        {
+            settings::row = int(presetRow);
+            settings::pending = 8; Tick(base);
+            Require(settings::snapshot.rows[int(GraphicsRow::Preset)].value == L"Custom",
+                    (std::string("a changed ") + label + " shows Custom").c_str());
+            settings::pending = 4; Tick(base);
+            Require(settings::snapshot.rows[int(GraphicsRow::Preset)].value == L"Low-end",
+                    (std::string("the ") + label + " back at the preset value shows Low-end").c_str());
+        }
+        settings::row = int(GraphicsRow::Bloom);
+        settings::pending = 8; Tick(base);
+        Require(settings::edit.bloom && settings::snapshot.rows[int(GraphicsRow::Preset)].value == L"Custom" &&
+                settings::snapshot.rows[int(GraphicsRow::Preset)].selectedChoice == 2, "one changed row shows Custom");
+        settings::row = int(GraphicsRow::Preset);
+        settings::pending = 4; Tick(base);
+        Require(settings::graphics_menu::PresetOf(settings::edit) == settings::graphics_menu::Preset::LowEnd,
+                "Left from Custom selects Low-end");
+        settings::pending = 8; Tick(base);
+        Require(settings::edit.dynamicShadows && settings::edit.motionBlur && settings::edit.depthOfFieldPercent == 100 &&
+                settings::edit.bloom && settings::edit.scalingQuality == 1 &&
+                settings::edit.internalResolution == 720 && settings::edit.frameRate == 30 &&
+                settings::snapshot.rows[int(GraphicsRow::Preset)].value == L"Original", "Right back to Original");
+        settings::edit = before;
+    }
     settings::row = int(GraphicsRow::AntiAliasing);
     settings::pending = 0; Tick(base);
     Require(settings::snapshot.help == L"Saves the DLSS preference. The status line shows the latest DLSS result.",
@@ -423,7 +557,7 @@ void CheckBr03DlssMenu(uint8_t* base)
         Require(!model.hidden && model.enabled && model.choices == std::vector<std::wstring>{L"M", L"L"} &&
                 model.selectedChoice == 0 && model.value == L"M", "DLSS model offers M (default) and L with DLSS");
     }
-    Require(settings::snapshot.help == L"M: steadier and sharper than older DLSS models at a moderate cost. L: the steadiest image with the least ghosting, but slower, especially on RTX 20 and 30 series.",
+    Require(settings::snapshot.help == L"M: steadier and sharper than older models, moderate cost. L: steadiest, least ghosting, but slower, mainly on RTX 20 and 30.",
             "DLSS model help explains the cost of each model");
     settings::pending = 8; Tick(base);
     Require(settings::edit.dlssModel == 1 && settings::snapshot.rows[int(GraphicsRow::DlssModel)].value == L"L",
@@ -497,7 +631,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution.",
             "size pending comes from the classified reason, not sizingState");
     saveState("03-size-pending.bmp");
 
@@ -508,7 +642,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is waiting for the graphics device. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is waiting for the graphics device.",
             "device wait comes from the classified reason, not deviceReady");
 
     running.device.deviceReady = true;
@@ -525,7 +659,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Balanced;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"Submitted DLSS Quality output. The selected DLSS quality is not applied yet.",
+    Require(settings::snapshot.notice == L"Submitted DLSS Quality output. The new quality is not applied yet.",
             "editing quality does not replace the submitted Quality output");
     Require(settings::snapshot.notice.find(L"Performance") == std::wstring::npos,
             "CPU plan quality is not described as the submitted mode");
@@ -578,14 +712,14 @@ void CheckBr03DlssMenu(uint8_t* base)
             "backend edit keeps the DLSS preference");
     Require(settings::snapshot.rows[int(GraphicsRow::Backend)].enabled && settings::snapshot.rows[int(GraphicsRow::Backend)].selectedChoice == 1, "Vulkan cell stays selectable");
     Require(settings::snapshot.rows[int(GraphicsRow::AntiAliasing)].enabled && !settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden, "pending backend does not hide DLSS");
-    Require(settings::snapshot.notice == needsVulkan + L" Still using Direct3D 12 until restart. DLSS is checked after restart.",
+    Require(settings::snapshot.notice == needsVulkan + L" Still on Direct3D 12 until restart.",
             "pending backend is added after the current plan and does not replace it");
     Require(saves == savesAtCycle, "selecting Vulkan does not save by itself");
     saveState("05-backend-pending.bmp");
     settings::pending = 8;
     Tick(base);
     Require(settings::edit.graphicsBackend == settings::GraphicsBackend::D3D11, "Direct3D 11 remains selectable");
-    Require(settings::snapshot.notice == needsVulkan + L" Still using Direct3D 12 until restart. DLSS is checked after restart.",
+    Require(settings::snapshot.notice == needsVulkan + L" Still on Direct3D 12 until restart.",
             "an unapplied backend still names the running device");
 
     settings::edit.graphicsBackend = settings::GraphicsBackend::D3D12;
@@ -620,16 +754,16 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"已提交 DLSS 质量输出。 1280×720 - 1920×1080", "simplified status");
+    Require(settings::snapshot.notice == L"已提交 DLSS 质量输出。1280×720 - 1920×1080", "simplified status");
     saveState("06-active-simplified.bmp");
     settings::edit.uiLanguage = 1;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"已提交 DLSS 品質輸出。 1280×720 - 1920×1080", "traditional status");
+    Require(settings::snapshot.notice == L"已提交 DLSS 品質輸出。1280×720 - 1920×1080", "traditional status");
     settings::edit.uiLanguage = 2;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS 品質出力を提出しました。 1280×720 - 1920×1080", "japanese status");
+    Require(settings::snapshot.notice == L"DLSS 品質出力を提出。1280×720 - 1920×1080", "japanese status");
     settings::edit.uiLanguage = 3;
     settings::pending = 0;
     Tick(base);
@@ -648,13 +782,13 @@ void CheckBr03DlssMenu(uint8_t* base)
     gpu::frame_plan::menuFlowDlssEffect = running;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution.",
             "an open graphics page reads a new result without reopening");
     Require(settings::snapshot.notice.find(L"1280") == std::wstring::npos, "a querying result does not keep the submitted size");
     settings::edit.upscaler = Upscaler::Off;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. Normal rendering is used for now. The Off choice is not applied yet.",
+    Require(settings::snapshot.notice == L"DLSS is querying the render resolution. The Off choice is not applied yet.",
             "an unsaved Off choice does not replace a plan that is still querying resolution");
     Require(settings::snapshot.rows[int(GraphicsRow::DlssQuality)].hidden && settings::snapshot.rows.size() == size_t(GraphicsRow::Count),
             "turning DLSS off hides quality and keeps the row count");
@@ -691,7 +825,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Balanced;
     settings::pending = 0;
     Tick(base);
-    Require(settings::snapshot.notice == activePlan + L" The selected DLSS quality is not applied yet.",
+    Require(settings::snapshot.notice == activePlan + L" The new quality is not applied yet.",
             "Active Quality stays visible when Balanced is not saved");
     Require(settings::snapshot.notice.find(L"DLSS Balanced") == std::wstring::npos, "unsaved Balanced is not described as submitted");
     Require(settings::snapshot.notice.find(L"Performance") == std::wstring::npos, "CPU plan quality is not described as submitted");
@@ -776,9 +910,63 @@ void CheckBr03DlssMenu(uint8_t* base)
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::UnknownColorEncoding);
     Require(settings::snapshot.notice == L"Color conditions do not support DLSS.", "unsupported color");
     saveState("13-color-unsupported.bmp");
-    show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
-    Require(settings::snapshot.notice == L"No eligible scene this frame.", "no eligible scene");
-    saveState("14-no-eligible-scene.bmp");
+    {
+        // Menus, pause and the title screen draw no scene, so the newest frame
+        // reports NoEligibleScene. The row describes the request's submitted
+        // frame, or its last scene fallback when none (PlannerObservation::eligible).
+        const auto previousExecution = running.execution;
+        auto menuFrame = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+        menuFrame.submissionSerial = 0;
+        menuFrame.reason = DlssEffectReason::NoEligibleScene;
+        running.execution = menuFrame;
+        gpu::frame_plan::menuFlowEligible.reset();
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "title screen or fresh boot: no frame with a scene yet");
+        Require(settings::snapshot.notice.find(L"eligible") == std::wstring::npos, "the menu frame itself is not described");
+        saveState("14-title-not-started.bmp");
+        gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Submitted DLSS Quality output. 1707×960 - 2560×1440",
+                "menu opened after gameplay shows the last game frame");
+        saveState("14-menu-after-gameplay.bmp");
+        settings::edit.dlssQuality = DlssQuality::Performance;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice ==
+                    L"Submitted DLSS Quality output. 1707×960 - 2560×1440 The new quality is not applied yet.",
+                "an unsaved quality edit keeps its note after the last game frame");
+        settings::edit.dlssQuality = DlssQuality::Quality;
+        auto stalled = menuFrame;
+        stalled.reason = DlssEffectReason::UnknownColorEncoding;
+        gpu::frame_plan::menuFlowEligible = stalled;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Color conditions do not support DLSS.",
+                "a request that never submitted shows its last scene fallback");
+        saveState("14-menu-after-fallback.bmp");
+        stalled.reason = DlssEffectReason::UnsupportedProjection;
+        gpu::frame_plan::menuFlowEligible = stalled;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"DLSS is not running for now.",
+                "an unnamed scene fallback still says DLSS is not running");
+        auto otherRequest = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        otherRequest.plan.requestSignature = 77;
+        gpu::frame_plan::menuFlowEligible = otherRequest;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::NoEligibleScene);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "a frame of another request is not described");
+        gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+        running.failure = gpu::frame_plan::FailureReason::InvalidInput;
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::RequestFailure);
+        Require(settings::snapshot.notice == L"DLSS request failed; no automatic retry.",
+                "a request failure wins over the last game frame");
+        running.failure.reset();
+        show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::CapabilityUnavailable);
+        Require(settings::snapshot.notice == L"DLSS is not available on this device.",
+                "missing DLSS wins over the last game frame");
+        gpu::frame_plan::menuFlowEligible.reset();
+        running.execution = previousExecution;
+    }
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::FeatureReconfigurePending);
     Require(settings::snapshot.notice == L"Waiting to rebuild DLSS.", "rebuild wait");
     saveState("15-rebuild-waiting.bmp");
@@ -795,7 +983,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     Require(settings::snapshot.notice == L"Render resolution is unavailable.", "resolution unavailable");
     running.failure = gpu::frame_plan::FailureReason::InvalidInput;
     show(DlssEffectPhase::TemporaryFallback, DlssEffectReason::RequestFailure);
-    Require(settings::snapshot.notice == L"DLSS request failed and fell back. No automatic retry.",
+    Require(settings::snapshot.notice == L"DLSS request failed; no automatic retry.",
             "request failure names the fallback and does not promise a retry");
     Require(settings::snapshot.notice.find(L"InvalidInput") == std::wstring::npos, "failure enum is not shown");
     Require(settings::snapshot.notice.find(L"will retry") == std::wstring::npos, "request failure does not promise a retry");
@@ -831,7 +1019,7 @@ void CheckBr03DlssMenu(uint8_t* base)
     settings::edit.dlssQuality = DlssQuality::Quality;
     show(DlssEffectPhase::Active, DlssEffectReason::None);
     Require(settings::snapshot.notice ==
-                L"Submitted DLSS Balanced output. 1500×844 - 2560×1440 The selected DLSS quality is not applied yet.",
+                L"Submitted DLSS Balanced output. 1500×844 - 2560×1440 The new quality is not applied yet.",
             "submitted Balanced stays visible when the edit is still Quality");
     Require(settings::snapshot.notice.find(L"Quality output") == std::wstring::npos, "the edit is not described as submitted");
 
@@ -848,9 +1036,633 @@ void CheckBr03DlssMenu(uint8_t* base)
     Require(saves == savesAtExecution, "execution status refresh does not save");
     Require(settings::snapshot.rows.size() == size_t(GraphicsRow::Count), "execution status keeps every graphics row");
     Require(settings::active, "execution status refresh leaves the menu open");
+
+    // FSR, XeSS and MetalFX read the same last frame with a scene.
+    for (const auto provider : {Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+    {
+        const std::wstring name = provider == Upscaler::Fsr ? L"FSR" : provider == Upscaler::Xess ? L"XeSS" : L"MetalFX";
+        currentConfig.upscaler = provider;
+        settings::edit.upscaler = provider;
+        settings::edit.fsrQuality = gpu::upscaling::FsrQuality::Quality;
+        running = {};
+        running.hasPlan = true;
+        running.plannedRequest = provider;
+        running.device.backend = Backend::Vulkan;
+        running.device.deviceReady = true;
+        running.device.fsrAvailable = running.device.xessAvailable = running.device.metalFxAvailable = true;
+        running.phase = DlssEffectPhase::Inactive;
+        auto scene = SubmittedObservation(DlssQuality::Quality, 1280, 720, 1920, 1080);
+        scene.plan.requestedUpscaler = provider;
+        scene.plan.consumer = gpu::upscaling::FsrQualityConsumer(provider);
+        scene.plan.fsrQuality = gpu::upscaling::FsrQuality::Quality;
+        scene.actualProvider = provider;
+        auto menuFrame = scene;
+        menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+        menuFrame.submissionSerial = 0;
+        menuFrame.reason = DlssEffectReason::NoEligibleScene;
+        running.execution = menuFrame;
+        gpu::frame_plan::menuFlowDlssEffect = running;
+        gpu::frame_plan::menuFlowEligible.reset();
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == L"Upscaling starts once the game scene is on screen.",
+                "FSR, XeSS and MetalFX before a frame with a scene");
+        gpu::frame_plan::menuFlowEligible = scene;
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == name + L" Quality output submitted. 1280×720 - 1920×1080",
+                "FSR, XeSS and MetalFX after gameplay show the last game frame");
+        auto pending = menuFrame;
+        pending.reason = DlssEffectReason::MotionPipelinePending;
+        gpu::frame_plan::menuFlowEligible = pending;
+        settings::pending = 0;
+        Tick(base);
+        Require(settings::snapshot.notice == name + L": motion data is still being prepared.",
+                "FSR, XeSS and MetalFX show a fallback in the last game frame");
+    }
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    currentConfig.upscaler = Upscaler::Dlss;
+    settings::edit.upscaler = Upscaler::Dlss;
     notes.close();
     Require(bool(notes), "write BR-03 notice list");
     std::puts("PASS BR-03 menu status from stubbed snapshots: submitted output, waiting, probe, fallback reasons, GPU stopped, unsaved edits");
+}
+
+// Help lines are single lines: one that is too long for its box is drawn
+// smaller until it is unreadable. Every help line a settings page can show, in
+// every menu language and with the longest status it can carry, must keep at
+// least this share of its normal size. With an installation the game's own
+// faces are measured, otherwise the built-in font.
+constexpr double kMinHelpFit = 0.85;
+struct HelpLine
+{
+    double scale = 1;
+    std::string where;
+    const char* face = "";
+};
+struct HelpAudit
+{
+    std::array<std::shared_ptr<const settings::menu_assets::Assets>, 5> assets{};
+    // The smallest scale of each distinct text, per language.
+    std::map<std::pair<uint32_t, std::wstring>, HelpLine> lines;
+    // A Japanese, Korean or Simplified Chinese line identical to the English
+    // one of the same state: its translation key no longer matches.
+    std::vector<std::string> untranslated;
+    // English lines whose article "A" PlayStation prompts would draw as a glyph.
+    std::vector<std::string> articleGlyphs;
+    void Record(const settings::TextFit& fit, uint32_t language, const std::string& where)
+    {
+        if (fit.text.empty()) return;
+        // With PlayStation prompts, a glyph followed by a lowercase word other than
+        // "to" is an article "A" (A key, A test sound) turned into the cross
+        // button. Real prompts read "A:", "A /", "Press A to".
+        if (language == 0)
+        {
+            const std::wstring glyphs = settings::PromptGlyphs(fit.text, true);
+            for (size_t i = 0; i + 2 < glyphs.size(); ++i)
+                if (glyphs[i] >= 0xe100 && glyphs[i] <= 0xe103 && glyphs[i + 1] == L' ' && glyphs[i + 2] >= L'a' &&
+                    glyphs[i + 2] <= L'z' && glyphs.compare(i + 2, 3, L"to ") != 0)
+                {
+                    articleGlyphs.push_back(where + ": " + Utf8(fit.text));
+                    break;
+                }
+        }
+        auto [it, inserted] = lines.try_emplace({language, fit.text}, HelpLine{fit.scale, where, fit.face});
+        if (!inserted && fit.scale < it->second.scale) it->second = {fit.scale, where, fit.face};
+    }
+    // Both prompt styles: PlayStation faces move a line with A/B/X/Y to the built-in font.
+    void Measure(settings::MenuSnapshot shown, const std::string& where)
+    {
+        shown.assets = assets[shown.language];
+        for (const bool playStation : {false, true})
+        {
+            shown.playStationPrompts = playStation;
+            const auto fit = settings::MeasureHelp(shown);
+            const std::string at = where + (playStation ? " (PlayStation prompts)" : "");
+            Record(fit.help, shown.language, at);
+            Record(fit.notice, shown.language, at);
+        }
+    }
+    // A help box under the list with this help and notice.
+    void MeasureBox(uint32_t language, std::wstring help, std::wstring notice, const std::string& where)
+    {
+        settings::MenuSnapshot shown;
+        shown.language = language;
+        shown.help = std::move(help);
+        shown.notice = std::move(notice);
+        Measure(std::move(shown), where);
+    }
+    // Also a line with an English sentence in it: four or more plain lowercase
+    // words, which no Japanese, Korean or Chinese line has.
+    void CompareWithEnglish(const std::wstring& english, const std::wstring& text, uint32_t language, const std::string& where)
+    {
+        if (language < 2 || text.empty()) return;
+        int words = 0;
+        for (size_t start = 0; start < text.size();)
+        {
+            size_t end = text.find_first_of(L" \n", start);
+            if (end == std::wstring::npos) end = text.size();
+            std::wstring word = text.substr(start, end - start);
+            while (!word.empty() && std::wcschr(L",.;:()", word.back())) word.pop_back();
+            words += word.size() >= 2 && std::all_of(word.begin(), word.end(), [](wchar_t c) { return c >= L'a' && c <= L'z'; });
+            start = end + 1;
+        }
+        if (text == english || words >= 4)
+            untranslated.push_back(std::to_string(language) + " " + where + ": " + Utf8(text));
+    }
+};
+
+// LO_HELP_CAPTURE_DIR: every settings row with the installed faces in English
+// and Simplified Chinese, for before / after pictures of help text changes.
+// Graphics rows show DLSS with a submitted frame; the NR row also with each
+// runtime state.
+void CaptureHelpRows(uint8_t* base, const char* installRoot)
+{
+    const char* folder = std::getenv("LO_HELP_CAPTURE_DIR");
+    if (!folder || !installRoot) return;
+    using gpu::backend::Backend;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    std::filesystem::create_directories(folder);
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    gpu::video::menuFlowActiveGpu = "NVIDIA GeForce RTX 5080";
+    currentConfig.graphicsBackend = Backend::D3D12;
+    currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+    currentConfig.dlssQuality = gpu::upscaling::DlssQuality::Quality;
+    currentConfig.frameGenerationProvider = framegen::Provider::Off;
+    currentConfig.hdr = false;
+    gpu::frame_plan::DlssEffectSnapshot running{};
+    running.hasPlan = true;
+    running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+    running.device.backend = Backend::D3D12;
+    running.device.deviceReady = running.device.dlssAvailable = true;
+    running.phase = gpu::frame_plan::DlssEffectPhase::Active;
+    running.execution = SubmittedObservation(gpu::upscaling::DlssQuality::Quality, 1707, 960, 2560, 1440);
+    gpu::frame_plan::menuFlowDlssEffect = running;
+    const auto capture = [&](uint32_t language, const std::string& name) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        auto preview = settings::snapshot;
+        preview.assets = settings::menu_assets::Cached(installRoot, language);
+        Require(bool(preview.assets), "installed capture assets");
+        std::vector<uint32_t> pixels;
+        Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "help capture raster");
+        WriteBmp(std::filesystem::path(folder) / (name + (language ? "-zh-hans.bmp" : "-en.bmp")), pixels);
+    };
+    for (const uint32_t language : {0u, 4u})
+    {
+        for (const int tab : {0, 1, 2, 3})
+        {
+            const int count = tab == 0 ? settings::GameRowCount : tab == 1 ? settings::AudioRowCount :
+                              tab == 2 ? int(GraphicsRow::Count) : settings::SystemRowCount;
+            for (int row = 0; row < count; ++row)
+            {
+                settings::edit = currentConfig;
+                settings::tab = tab;
+                settings::row = row;
+                if (tab == 1) settings::edit.audioOutput = settings::AudioOutputMatrix;
+                capture(language, "tab" + std::to_string(tab) + "-row" + std::to_string(row));
+                if (tab == 1 && row == settings::AudioOutputRow)
+                {
+                    settings::edit.audioOutput = settings::AudioOutputSurround;
+                    capture(language, "tab1-row" + std::to_string(row) + "-surround-on-stereo");
+                }
+            }
+        }
+        settings::edit = currentConfig;
+        settings::tab = 2;
+        settings::row = int(GraphicsRow::DlssNeuralRendering);
+        const std::pair<NrState, const char*> states[] = {{NrState::Active, "running"}, {NrState::MissingRuntime, "dll-missing"},
+            {NrState::Unsupported, "unsupported"}, {NrState::Failed, "failed"}};
+        for (const auto& [state, name] : states)
+        {
+            gpu::dlss::g_neuralRenderingState = state;
+            capture(language, std::string("nr-help-") + name);
+        }
+        gpu::dlss::g_neuralRenderingState = NrState::Off;
+    }
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::video::menuFlowActiveGpu.clear();
+    currentConfig = savedConfig;
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    std::printf("help captures written to %s\n", folder);
+}
+
+// LO_SUBPAGE_CAPTURE_DIR: the page entry rows (Graphics with HDR and DLSS on,
+// Gameplay, System) and the page each one opens, with the installed faces in
+// English and Simplified Chinese.
+void CaptureSubpageEntries(uint8_t* base, const char* installRoot)
+{
+    const char* folder = std::getenv("LO_SUBPAGE_CAPTURE_DIR");
+    if (!folder || !installRoot) return;
+    using gpu::backend::Backend;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    std::filesystem::create_directories(folder);
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    currentConfig.graphicsBackend = Backend::D3D12;
+    currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+    currentConfig.dlssQuality = gpu::upscaling::DlssQuality::Quality;
+    currentConfig.frameGenerationProvider = framegen::Provider::Off;
+    currentConfig.hdr = true;
+    gpu::frame_plan::DlssEffectSnapshot running{};
+    running.hasPlan = true;
+    running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+    running.device.backend = Backend::D3D12;
+    running.device.deviceReady = running.device.dlssAvailable = true;
+    running.phase = gpu::frame_plan::DlssEffectPhase::Active;
+    running.execution = SubmittedObservation(gpu::upscaling::DlssQuality::Quality, 1707, 960, 2560, 1440);
+    gpu::frame_plan::menuFlowDlssEffect = running;
+    gpu::dlss::g_neuralRenderingState = NrState::MissingRuntime;
+    // A confirms (the game's default button setting).
+    const uint32_t savedFlags = PPC_LOAD_U32(ConfigData + 4);
+    PPC_STORE_U32(ConfigData + 4, savedFlags & ~0x02000000u);
+    const auto capture = [&](uint32_t language, const std::string& name) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        auto preview = settings::snapshot;
+        preview.assets = settings::menu_assets::Cached(installRoot, language);
+        Require(bool(preview.assets), "installed capture assets");
+        std::vector<uint32_t> pixels;
+        Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "page entry capture raster");
+        WriteBmp(std::filesystem::path(folder) / (name + (language ? "-zh-hans.bmp" : "-en.bmp")), pixels);
+    };
+    for (const uint32_t language : {0u, 4u})
+    {
+        settings::edit = currentConfig;
+        settings::tab = 2;
+        for (const auto [row, name] : {std::pair{GraphicsRow::NeuralRenderingTuning, "graphics-nr-tuning-row"},
+                                        std::pair{GraphicsRow::HdrCalibration, "graphics-hdr-calibration-row"},
+                                        std::pair{GraphicsRow::Brightness, "graphics-brightness-row"}})
+        {
+            settings::row = int(row);
+            capture(language, name);
+        }
+        // The pages, as Confirm on those rows opens them (menu.cpp input).
+        settings::row = int(GraphicsRow::NeuralRenderingTuning);
+        settings::nrStart = settings::edit;
+        settings::nrFocus = 0;
+        settings::nrOpen = true;
+        capture(language, "page-nr-tuning-dll-missing");
+        settings::nrOpen = false;
+        settings::row = int(GraphicsRow::HdrCalibration);
+        settings::calibrationStartAutomatic = settings::edit.hdrPeakAutomatic;
+        settings::calibrationStartPeakNits = settings::edit.hdrPeakNits;
+        settings::calibrationFocus = 0;
+        settings::calibrationScenePreview = true;
+        settings::calibrationOpen = true;
+        capture(language, "page-hdr-calibration");
+        settings::calibrationOpen = false;
+        settings::row = int(GraphicsRow::Brightness);
+        settings::brightnessStart = settings::edit.displayBrightness;
+        settings::gammaStart = settings::edit.displayGamma;
+        settings::brightnessFocus = 0;
+        settings::calibrationScenePreview = true;
+        settings::brightnessOpen = true;
+        capture(language, "page-brightness");
+        settings::brightnessOpen = false;
+        settings::tab = 0;
+        settings::row = settings::GameControlsRow;
+        capture(language, "gameplay-controls-row");
+        settings::tab = 3;
+        settings::row = settings::SystemModsRow;
+        capture(language, "system-mods-row");
+    }
+    PPC_STORE_U32(ConfigData + 4, savedFlags);
+    gpu::dlss::g_neuralRenderingState = NrState::Off;
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    currentConfig = savedConfig;
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    std::printf("page entry captures written to %s\n", folder);
+}
+
+void CheckHelpFit(uint8_t* base, const char* installRoot)
+{
+    using gpu::backend::Backend;
+    using gpu::frame_plan::DlssEffectPhase;
+    using gpu::frame_plan::DlssEffectReason;
+    using gpu::upscaling::Upscaler;
+    using NrState = gpu::dlss::NeuralRenderingState;
+    HelpAudit audit;
+    if (installRoot)
+        for (uint32_t language = 0; language < 5; ++language)
+        {
+            audit.assets[language] = settings::menu_assets::Cached(installRoot, language);
+            Require(bool(audit.assets[language]), "installed menu assets for every menu language");
+        }
+    const auto savedEdit = settings::edit;
+    const auto savedConfig = currentConfig;
+    const int savedTab = settings::tab, savedRow = settings::row;
+    const auto savedFg = gpu::video::menuFlowFgStatus;
+    const auto savedOutput = apu::menuFlowOutput;
+    settings::status.clear();
+    settings::restartPrompt = false;
+    gpu::video::menuFlowActiveGpu = "NVIDIA GeForce RTX 5080 Laptop GPU";
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::video::menuFlowFgStatus = {};
+
+    // Each tab's rows through the real Publish, in states that change their help.
+    struct Graphics
+    {
+        const char* name;
+        Backend backend;
+        Upscaler upscaler;
+        uint32_t antialiasing;
+        framegen::Provider fg;
+        bool hdr;
+        uint32_t frameRate;
+    };
+    const Graphics graphics[] = {
+        {"D3D12 TAA", Backend::D3D12, Upscaler::Off, 3, framegen::Provider::Off, false, 60},
+        {"D3D12 DLSS", Backend::D3D12, Upscaler::Dlss, 0, framegen::Provider::Dlss, true, 120},
+        {"D3D12 FSR", Backend::D3D12, Upscaler::Fsr, 0, framegen::Provider::Fsr, true, 60},
+        {"D3D12 XeSS", Backend::D3D12, Upscaler::Xess, 0, framegen::Provider::Xess, false, 60},
+        {"Vulkan DLSS", Backend::Vulkan, Upscaler::Dlss, 0, framegen::Provider::Dlss, true, 60},
+        {"Vulkan FSR", Backend::Vulkan, Upscaler::Fsr, 0, framegen::Provider::Fsr, true, 60},
+        {"Metal MetalFX", Backend::Metal, Upscaler::MetalFx, 0, framegen::Provider::MetalFx, true, 60},
+    };
+    const NrState nrStates[] = {NrState::Off, NrState::Active, NrState::MissingRuntime, NrState::Unsupported, NrState::Failed};
+    const char* nrNames[] = {"off", "running", "DLL missing", "unsupported", "failed"};
+    std::map<std::string, std::wstring> english;
+    const auto publish = [&](uint32_t language, const std::string& where) {
+        settings::edit.uiLanguage = language;
+        settings::Publish(base, ConfigData);
+        const auto& shown = settings::snapshot;
+        audit.Measure(shown, where);
+        if (language == 0) english[where] = shown.help + L"\n" + shown.notice;
+        else audit.CompareWithEnglish(english[where], shown.help + L"\n" + shown.notice, language, where);
+    };
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        for (const int tab : {0, 1, 3})
+        {
+            const int count = tab == 0 ? settings::GameRowCount : tab == 1 ? settings::AudioRowCount : settings::SystemRowCount;
+            settings::edit = savedConfig;
+            settings::tab = tab;
+            for (int row = 0; row < count; ++row)
+                for (const uint32_t output : {settings::AudioOutputStereo, settings::AudioOutputSurround, settings::AudioOutputMatrix})
+                    for (const bool pack : {false, true})
+                    {
+                        settings::edit.audioOutput = output;
+                        apu::menuFlowOutput = apu::Output::Stereo;
+                        settings::edit.gameLanguagePack = pack ? "pt-br" : "";
+                        settings::row = row;
+                        publish(language, "tab " + std::to_string(tab) + " row " + std::to_string(row) +
+                            " audio " + std::to_string(output) + (pack ? " language pack" : ""));
+                    }
+        }
+        settings::tab = 2;
+        for (const auto& state : graphics)
+            for (int row = 0; row < int(GraphicsRow::Count); ++row)
+            {
+                const bool nr = row == int(GraphicsRow::DlssNeuralRendering);
+                for (size_t n = 0; n < (nr ? std::size(nrStates) : 1); ++n)
+                {
+                    settings::edit = savedConfig;
+                    settings::edit.graphicsBackend = state.backend;
+                    settings::edit.upscaler = state.upscaler;
+                    settings::edit.antialiasing = state.antialiasing;
+                    settings::edit.frameGenerationProvider = state.fg;
+                    settings::edit.hdr = state.hdr;
+                    settings::edit.frameRate = state.frameRate;
+                    gpu::dlss::g_neuralRenderingState = nrStates[n];
+                    settings::row = row;
+                    publish(language, std::string("Graphics row ") + std::to_string(row) + " " + state.name +
+                        (nr ? std::string(" NR ") + nrNames[n] : std::string()));
+                }
+            }
+        gpu::dlss::g_neuralRenderingState = NrState::Off;
+    }
+    settings::edit = savedConfig;
+
+    // Graphics notices: every upscaler status against every unsaved edit.
+    // Each provider's sentence first, then what is not applied yet.
+    struct Running
+    {
+        std::string name;
+        gpu::frame_plan::DlssEffectSnapshot effect;
+        std::optional<gpu::frame_plan::DlssExecutionObservation> eligible;
+    };
+    const auto runningStates = [&](Upscaler provider) {
+        std::vector<Running> states;
+        gpu::frame_plan::DlssEffectSnapshot base{};
+        base.device.backend = Backend::D3D12;
+        base.device.deviceReady = true;
+        base.device.dlssAvailable = base.device.fsrAvailable = base.device.xessAvailable = base.device.metalFxAvailable = true;
+        base.hasPlan = true;
+        base.plannedRequest = provider;
+        auto submitted = SubmittedObservation(gpu::upscaling::DlssQuality::Performance, 1920, 1080, 3840, 2160);
+        submitted.actualProvider = provider;
+        submitted.plan.requestedUpscaler = provider;
+        submitted.plan.consumer = provider == Upscaler::Dlss ? gpu::upscaling::TemporalConsumer::DlssSr
+                                                             : gpu::upscaling::FsrQualityConsumer(provider);
+        submitted.plan.fsrQuality = gpu::upscaling::FsrQuality::Performance;
+        for (int phase = 0; phase <= int(DlssEffectPhase::GpuStopped); ++phase)
+            for (int reason = 0; reason <= int(DlssEffectReason::UnsupportedProjection); ++reason)
+            {
+                auto effect = base;
+                effect.phase = DlssEffectPhase(phase);
+                effect.reason = DlssEffectReason(reason);
+                const std::string at = "phase " + std::to_string(phase) + " reason " + std::to_string(reason);
+                states.push_back({at, effect, {}});
+                auto withExecution = effect;
+                withExecution.execution = submitted;
+                states.push_back({at + " submitted", withExecution, {}});
+                auto fallback = submitted;
+                fallback.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+                fallback.reason = DlssEffectReason(reason);
+                withExecution.execution = fallback;
+                states.push_back({at + " fallback", withExecution, {}});
+                // The menu frame has no scene; the last game frame is described.
+                auto menuFrame = fallback;
+                menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+                menuFrame.reason = DlssEffectReason::NoEligibleScene;
+                menuFrame.submissionSerial = 0;
+                auto sceneless = effect;
+                sceneless.phase = DlssEffectPhase::TemporaryFallback;
+                sceneless.reason = DlssEffectReason::NoEligibleScene;
+                sceneless.execution = menuFrame;
+                states.push_back({at + " last game frame submitted", sceneless, submitted});
+                states.push_back({at + " last game frame fallback", sceneless, fallback});
+                auto failed = effect;
+                failed.failure = gpu::frame_plan::FailureReason{};
+                states.push_back({at + " failed", failed, {}});
+            }
+        for (const auto device : {0, 1, 2})
+        {
+            auto effect = base;
+            if (device == 0) effect.device.gpuWorkStopped = true;
+            if (device == 1) effect.device.deviceReady = false;
+            if (device == 2) effect.device.fsrAvailable = effect.device.xessAvailable = effect.device.metalFxAvailable = false;
+            states.push_back({"device " + std::to_string(device), effect, {}});
+        }
+        return states;
+    };
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::edit.uiLanguage = language;
+        for (const auto provider : {Upscaler::Dlss, Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+            for (const auto& running : runningStates(provider))
+                for (const auto edited : {Upscaler::Off, Upscaler::Dlss, Upscaler::Fsr, Upscaler::Xess, Upscaler::MetalFx})
+                    for (const auto backends : {std::pair{Backend::D3D12, Backend::D3D12}, std::pair{Backend::Vulkan, Backend::D3D12},
+                                                std::pair{Backend::D3D12, Backend::Vulkan}, std::pair{Backend::D3D12, Backend::D3D11},
+                                                std::pair{Backend::D3D12, Backend::Metal}})
+                        for (const bool otherQuality : {false, true})
+                        {
+                            currentConfig = savedConfig;
+                            currentConfig.upscaler = provider;
+                            settings::edit = currentConfig;
+                            settings::edit.uiLanguage = language;
+                            settings::edit.upscaler = edited;
+                            settings::edit.graphicsBackend = backends.first;
+                            settings::edit.dlssQuality = otherQuality ? gpu::upscaling::DlssQuality::Dlaa
+                                                                      : gpu::upscaling::DlssQuality::Performance;
+                            settings::edit.fsrQuality = otherQuality ? gpu::upscaling::FsrQuality::NativeAA
+                                                                     : gpu::upscaling::FsrQuality::Performance;
+                            auto effect = running.effect;
+                            effect.device.backend = backends.second;
+                            gpu::frame_plan::menuFlowDlssEffect = effect;
+                            gpu::frame_plan::menuFlowEligible = running.eligible;
+                            audit.MeasureBox(language, L"-", settings::DlssNotice(),
+                                "upscaler notice " + std::to_string(int(provider)) + " " + running.name + " edit " +
+                                std::to_string(int(edited)) + (otherQuality ? " other quality" : ""));
+                        }
+        // Frame generation status, and the restart after DLSS FG on D3D12.
+        for (int phase = 0; phase <= int(gpu::video::FrameGenerationPhase::RestartRequired); ++phase)
+            for (const auto provider : {framegen::Provider::Dlss, framegen::Provider::Fsr, framegen::Provider::MetalFx, framegen::Provider::Xess})
+                for (const bool overridden : {false, true})
+                    for (const bool afterDlss : {false, true})
+                    {
+                        gpu::video::menuFlowFgStatus = {};
+                        gpu::video::menuFlowFgStatus.phase = gpu::video::FrameGenerationPhase(phase);
+                        gpu::video::menuFlowFgStatus.applied = provider;
+                        gpu::video::menuFlowFgStatus.requested = provider;
+                        gpu::video::menuFlowFgStatus.environmentOverride = overridden;
+                        if (afterDlss) gpu::video::menuFlowFgStatus.sessionProvider = framegen::Provider::Dlss;
+                        audit.MeasureBox(language, L"-", settings::FgNotice(), "FG notice phase " + std::to_string(phase));
+                    }
+    }
+    gpu::frame_plan::menuFlowDlssEffect = {};
+    gpu::frame_plan::menuFlowEligible.reset();
+    gpu::video::menuFlowFgStatus = savedFg;
+    currentConfig = savedConfig;
+
+    // The list pages: Controls (help over the page note), Mods, Achievements.
+    const auto savedControlsFocus = settings::controlsFocus;
+    const auto savedCaptureRow = settings::captureRow;
+    const auto savedModsFocus = settings::modsFocus;
+    const auto savedAchievementsFocus = settings::achievementsFocus;
+    const auto savedAchievements = settings::achievementItems;
+    settings::achievementItems = settings::achievements_page::MenuFlowAchievementItems(false);
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::edit.uiLanguage = language;
+        for (int focus = 0; focus < settings::ControlsRowCount; ++focus)
+            for (const int capture : {0, 1, 2})
+            {
+                settings::controlsFocus = focus;
+                settings::captureRow = capture ? focus : -1;
+                settings::captureMode = capture;
+                const auto [help, note] = settings::ControlsHelp();
+                audit.MeasureBox(language, help, note, "Controls row " + std::to_string(focus));
+            }
+        const auto rows = settings::mods_page::Layout({}, settings::mods_page::CanOpenFolder);
+        for (const int focus : {rows.empty, rows.open, rows.save})
+        {
+            if (focus < 0) continue;
+            settings::modsFocus = focus;
+            const auto [help, note] = settings::ModsHelp(rows);
+            // The mods folder path is the player's own.
+            audit.MeasureBox(language, help, note == settings::PathText(modding::Root()) ? L"" : note,
+                             "Mods row " + std::to_string(focus));
+        }
+        modsReloadStatus = {mod_hot_reload::Phase::Preparing, 1234, 5678};
+        {
+            const auto [help, note] = settings::ModsHelp(rows);
+            audit.MeasureBox(language, help, note, "Mods page while the new mods are prepared");
+        }
+        modsReloadStatus = {};
+        for (int focus = 0; focus < settings::AchievementsFirstRow + int(settings::achievementItems.size()); ++focus)
+        {
+            settings::achievementsFocus = focus;
+            audit.MeasureBox(language, settings::AchievementsHelp(), L"", "Achievements row " + std::to_string(focus));
+        }
+    }
+    settings::controlsFocus = savedControlsFocus;
+    settings::captureRow = savedCaptureRow;
+    settings::captureMode = 0;
+    settings::modsFocus = savedModsFocus;
+    settings::achievementsFocus = savedAchievementsFocus;
+    settings::achievementItems = savedAchievements;
+
+    // Full pages: neural rendering (help line and preview message), brightness, HDR peak.
+    for (uint32_t language = 0; language < 5; ++language)
+    {
+        settings::MenuSnapshot page;
+        page.language = language;
+        page.neuralRendering.open = true;
+        for (int focus = 0; focus < settings::NrFocusCount; ++focus)
+            for (const auto blocker : {settings::NeuralRenderingTuning::Blocker::None,
+                                       settings::NeuralRenderingTuning::Blocker::MissingRuntime,
+                                       settings::NeuralRenderingTuning::Blocker::Unsupported})
+            {
+                page.neuralRendering.focus = focus;
+                page.neuralRendering.blocker = blocker;
+                audit.Measure(page, "NR page focus " + std::to_string(focus));
+            }
+        page.neuralRendering.open = false;
+        page.brightness.open = true;
+        audit.Measure(page, "Brightness page");
+        page.brightness.open = false;
+        page.calibration.open = true;
+        audit.Measure(page, "HDR peak page");
+    }
+
+    settings::edit = savedEdit;
+    settings::tab = savedTab;
+    settings::row = savedRow;
+    apu::menuFlowOutput = savedOutput;
+    gpu::video::menuFlowActiveGpu.clear();
+
+    std::vector<std::pair<std::pair<uint32_t, std::wstring>, HelpLine>> sorted(audit.lines.begin(), audit.lines.end());
+    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.scale < b.second.scale; });
+    size_t failed = 0;
+    for (const auto& [key, line] : sorted)
+    {
+        if (line.scale >= 0.97) break;
+        const bool fails = line.scale < kMinHelpFit;
+        failed += fails;
+        std::printf("%s help fit %3d%% lang %u %s [%s]: %s\n", fails ? "FAIL" : "    ", int(line.scale * 100 + 0.5),
+                    key.first, line.face, line.where.c_str(), Utf8(key.second).c_str());
+    }
+    for (const auto& line : audit.untranslated) std::printf("FAIL untranslated: %s\n", line.c_str());
+    for (const auto& line : audit.articleGlyphs) std::printf("FAIL article drawn as a button: %s\n", line.c_str());
+    std::printf("help fit: %zu lines measured (%s), %zu below %d%%, %zu untranslated\n", audit.lines.size(),
+                installRoot ? "game faces" : "built-in font", failed, int(kMinHelpFit * 100), audit.untranslated.size());
+    Require(failed == 0, "a settings help line shrinks below the minimum");
+    Require(audit.untranslated.empty(), "a settings help line has no translation");
+    Require(audit.articleGlyphs.empty(), "an English help line has a bare article A");
+    {
+        const std::wstring cross(1, wchar_t(0xe100)), circle(1, wchar_t(0xe101));
+        Require(settings::PromptGlyphs(L"A key already in use", false) == L"A key already in use", "no glyphs without PlayStation prompts");
+        Require(settings::PromptGlyphs(L"Press A to compare", true) == L"Press " + cross + L" to compare", "Press A becomes the cross");
+        Require(settings::PromptGlyphs(L"A: choose     B: back", true) == cross + L": choose     " + circle + L": back", "A: and B: become faces");
+        Require(settings::PromptGlyphs(L"Pro Logic II or Neural:X receivers", true) == L"Pro Logic II or Neural:X receivers", "Neural:X is a name");
+        Require(settings::PromptGlyphs(L"Scales 4x and 2x", true) == L"Scales 4x and 2x", "4x is not a button");
+    }
+    std::puts("PASS settings help lines keep their size in every language, state and page");
 }
 
 int main(int argc, char** argv)
@@ -938,6 +1750,35 @@ int main(int argc, char** argv)
             Require(settings::edit.dlssNeuralRendering == 2, "left on the row still cycles passes");
             Require(settings::snapshot.help.find(L"tuning page") != std::wstring::npos ||
                     settings::snapshot.help.find(L"調整頁面") != std::wstring::npos, "the row help mentions the tuning page");
+
+            // Its own entry row, right under it, opens the same page: by
+            // Confirm and by a click. Cancel returns to the entry row.
+            {
+                const int tuning = int(GraphicsRow::NeuralRenderingTuning);
+                press(2);
+                Require(settings::row == tuning && settings::snapshot.rows[size_t(tuning)].pageEntry &&
+                        settings::snapshot.rows[size_t(tuning)].value == L"Open", "down from NR reaches NR tuning & preview");
+                press(0x1000);
+                Require(settings::nrOpen && settings::nrFocus == 0 && settings::snapshot.neuralRendering.open,
+                        "NR tuning & preview opens the NR page");
+                settings::nrFocus = 11; press(0x1000);
+                Require(!settings::nrOpen && settings::row == tuning, "Cancel returns to NR tuning & preview");
+                int visible = 0;
+                for (int i = 0; i < tuning; ++i) visible += !settings::snapshot.rows[size_t(i)].hidden;
+                settings::PointerClick(700, float(150 + (visible - settings::snapshot.scroll) * 43 + 20), false);
+                press(0);
+                Require(settings::nrOpen, "a click on NR tuning & preview opens the NR page");
+                settings::nrFocus = 11; press(0x1000);
+                Require(!settings::nrOpen, "Cancel closes the page opened by a click");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Fsr;
+                press(0);
+                Require(settings::snapshot.rows[size_t(tuning)].hidden &&
+                        settings::snapshot.rows[int(GraphicsRow::DlssNeuralRendering)].hidden,
+                        "NR tuning & preview hides with the NR row");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Dlss;
+                settings::row = int(GraphicsRow::DlssNeuralRendering);
+                press(0);
+            }
 
             // Cancel restores every field, passes included.
             openPage();
@@ -1459,6 +2300,24 @@ int main(int argc, char** argv)
             settings::pending = 0x2000; Tick(base);
             Require(!settings::restartPrompt && diskConfig.frameGenerationProvider == Provider::Fsr,
                     "Later retains the FSR FG choice for the next launch");
+            // A running DLSS FG session changes its multiplier in place, HDR on or not.
+            settings::Config hdrFg = diskConfig;
+            hdrFg.graphicsBackend = settings::GraphicsBackend::Vulkan;
+            hdrFg.hdr = true;
+            hdrFg.frameGenerationProvider = Provider::Dlss;
+            hdrFg.frameGenerationMode = framegen::Mode::Fixed;
+            hdrFg.frameGenerationMultiplier = 2;
+            currentConfig = diskConfig = hdrFg;
+            settings::edit = hdrFg;
+            gpu::video::menuFlowFgStatus = {};
+            gpu::video::menuFlowFgStatus.sessionProvider = gpu::video::menuFlowFgStatus.requested =
+                gpu::video::menuFlowFgStatus.applied = Provider::Dlss;
+            gpu::video::menuFlowFgStatus.phase = gpu::video::FrameGenerationPhase::Ready;
+            settings::edit.frameGenerationMultiplier = 3;
+            settings::row = int(GraphicsRow::Save);
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::restartPrompt && diskConfig.frameGenerationMultiplier == 3 && diskConfig.hdr,
+                    "an FG multiplier change with HDR on saves without a restart prompt");
             gpu::video::menuFlowFgStatus = {};
             currentConfig = priorCurrent;
             diskConfig = priorDisk;
@@ -1555,21 +2414,57 @@ int main(int argc, char** argv)
                     "left from Off wraps to 4x");
             std::puts("PASS DLSS neural rendering visibility and pass cycling");
         }
-        // Button prompts follow the seven retail Game settings. Right cycles
-        // Auto, Xbox, PlayStation, applies live and saves at once.
+        // Gameplay's host row is Controls, after the seven retail settings: it
+        // opens the Controls page with Button prompts and Vibration, the
+        // controller and keyboard layouts, Restore and Save. Button prompts
+        // cycles Auto, Xbox, PlayStation, applies live and saves at once.
         {
+            namespace map = hid::input_map;
+            // The retail Confirmation button stays A / B through the Controls tests.
+            const uint32_t retailFlags = PPC_LOAD_U32(ConfigData + 4);
+            PPC_STORE_U32(ConfigData + 4, retailFlags & ~0x02000000u);
             settings::tab = 0;
-            settings::row = settings::GamePromptRow;
+            settings::row = settings::GameControlsRow;
             settings::status.clear();
             currentConfig.buttonPrompts = diskConfig.buttonPrompts = 0;
             settings::edit = currentConfig;
             settings::edit.uiLanguage = 0;
+            settings::pending = 0; Tick(base);
+            const auto& rows = settings::snapshot.rows;
+            Require(settings::GameRowCount == 10 && rows.size() == size_t(settings::GameRowCount) &&
+                    rows[settings::GameControlsRow].name == L"Controls" && rows[settings::GameControlsRow].value == L"Open" &&
+                    rows[settings::GameControlsRow].pageEntry &&
+                    rows[settings::GameRestoreRow].name == L"Restore game defaults" &&
+                    settings::graphics_menu::IsAction(0, settings::GameControlsRow) &&
+                    settings::snapshot.help == L"Button prompts, vibration, and the controller and keyboard buttons.",
+                    "Gameplay has ten rows: the retail settings, Controls, Restore and Quit");
+            settings::pending = 8; Tick(base);
+            Require(!settings::controlsOpen, "right does not open the Controls page");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::controlsOpen && settings::snapshot.pageTitle == L"Controls" &&
+                    settings::snapshot.row == settings::ControlsPromptRow && rows.size() == size_t(settings::ControlsRowCount) &&
+                    settings::snapshot.keyLegend == L"A: change     Start: save     B: back" &&
+                    settings::snapshot.notice == L"This page always uses the default buttons and keys.",
+                    "A on Controls opens the Controls page");
+            const int padA = settings::ControlsControllerFirst + map::A, keyA = settings::ControlsKeyboardFirst + map::A;
+            Require(rows[settings::ControlsPromptRow].name == L"Button prompts" && rows[settings::ControlsVibrationRow].name == L"Vibration" &&
+                    rows[settings::ControlsControllerTitle].header && rows[settings::ControlsControllerTitle].name == L"Controller" &&
+                    rows[settings::ControlsKeyboardTitle].header && rows[settings::ControlsKeyboardTitle].name == L"Keyboard" &&
+                    rows[padA].name == L"A" && rows[padA].value == L"A" && !rows[padA].literal &&
+                    rows[padA + map::LeftTrigger].name == L"LT" && rows[padA + map::LeftTrigger].value == L"LT" &&
+                    rows[padA + map::LeftThumb].name == L"Left stick click" &&
+                    rows[padA + map::DpadRight].name == L"D-pad right" && rows[padA + map::DpadRight].value == L"D-pad right" &&
+                    rows[keyA].name == L"A" && rows[keyA].value == L"Z" && rows[keyA].literal &&
+                    rows[keyA + map::X].value == L"A" && rows[keyA + map::Start].value == L"Return" &&
+                    rows[keyA + map::LeftThumb].value == L"None" && !rows[keyA + map::LeftThumb].literal &&
+                    rows[keyA + map::StickUp].name == L"Left stick up" && rows[keyA + map::StickUp].value == L"I" &&
+                    rows[settings::ControlsRestoreRow].name == L"Restore default buttons" &&
+                    rows[settings::ControlsSaveRow].name == L"Save controls" && rows[settings::ControlsSaveRow].value == L"Save",
+                    "the page lists each Xbox 360 input with its controller button, then with its key; a stick click has no key");
             const unsigned beforeSaves = saves;
             promptStyle = 0;
             settings::pending = 8; Tick(base);
-            Require(settings::snapshot.rows[settings::GamePromptRow].name == L"Button prompts" &&
-                    settings::snapshot.rows[settings::GamePromptRow].choices.size() == 3 &&
-                    settings::snapshot.rows[settings::GamePromptRow].selectedChoice == 1 &&
+            Require(rows[settings::ControlsPromptRow].choices.size() == 3 && rows[settings::ControlsPromptRow].selectedChoice == 1 &&
                     promptStyle == 1 && diskConfig.buttonPrompts == 1 && saves == beforeSaves + 1,
                     "Button prompts cycles to Xbox, applies live and saves");
             settings::pending = 8; Tick(base);
@@ -1577,24 +2472,24 @@ int main(int argc, char** argv)
             settings::pending = 8; Tick(base);
             Require(promptStyle == 0 && diskConfig.buttonPrompts == 0, "Button prompts wraps back to Auto");
             Require(settings::snapshot.help.find(L"Auto follows the controller") != std::wstring::npos, "Button prompts help");
-            std::puts("PASS Button prompts row");
+            PPC_STORE_U32(ConfigData + 4, retailFlags);
+            std::puts("PASS Gameplay Controls row opens the Controls page; its rows; Button prompts");
         }
-        // Vibration follows Button prompts on the Gameplay tab. It applies and saves
-        // at once, stays within 0-100 and never commits unsaved Graphics edits.
+        // Vibration follows Button prompts on the Controls page. It applies and
+        // saves at once, stays within 0-100 and never commits unsaved Graphics edits.
         {
-            settings::tab = 0;
-            settings::row = settings::GamePromptRow;
             settings::status.clear();
             currentConfig.vibrationPercent = diskConfig.vibrationPercent = 100;
             settings::edit = currentConfig;
             settings::edit.uiLanguage = 0;
             settings::edit.width = currentConfig.width == 2560 ? 1920 : 2560;
+            settings::controlsFocus = settings::ControlsPromptRow;
             const unsigned beforeSaves = saves, beforeApplies = applies, beforePreviews = vibrationPreviews;
             settings::pending = 2; Tick(base);
-            Require(settings::row == settings::GameVibrationRow && settings::snapshot.rows.size() == size_t(settings::GameRowCount) &&
-                    settings::snapshot.rows[settings::GameVibrationRow].name == L"Vibration" &&
-                    settings::snapshot.rows[settings::GameVibrationRow].sliderPercent == 100,
-                    "Vibration slider follows Button prompts on the Gameplay tab");
+            Require(settings::controlsOpen && settings::controlsFocus == settings::ControlsVibrationRow &&
+                    settings::snapshot.rows[settings::ControlsVibrationRow].name == L"Vibration" &&
+                    settings::snapshot.rows[settings::ControlsVibrationRow].sliderPercent == 100,
+                    "Vibration slider follows Button prompts on the Controls page");
             Require(settings::snapshot.help.find(L"Min turns it off") != std::wstring::npos, "Vibration help");
             settings::pending = 8; Tick(base);
             Require(settings::edit.vibrationPercent == 100 && saves == beforeSaves, "right at 100 clamps without saving");
@@ -1603,12 +2498,17 @@ int main(int argc, char** argv)
                     vibrationStrength == 90 && vibrationPreviews == beforePreviews + 1 && applies == beforeApplies,
                     "left lowers, saves, applies live and previews without a guest apply");
             Require(diskConfig.width != settings::edit.width, "vibration save leaves unsaved Graphics edits unsaved");
-            Require(settings::snapshot.rows[settings::GameVibrationRow].sliderPercent == 90, "slider follows the strength");
+            Require(settings::snapshot.rows[settings::ControlsVibrationRow].sliderPercent == 90, "slider follows the strength");
             settings::edit.vibrationPercent = currentConfig.vibrationPercent = 0;
             settings::pending = 4; Tick(base);
             Require(settings::edit.vibrationPercent == 0 && saves == beforeSaves + 1, "left at 0 does not wrap");
             settings::pending = 2; Tick(base);
-            Require(settings::row == settings::GameRestoreRow, "the game actions follow Vibration");
+            Require(settings::controlsFocus == settings::ControlsControllerFirst, "down skips the Controller title");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::controlsOpen && settings::tab == 0 && settings::row == settings::GameControlsRow,
+                    "B without changes returns to Gameplay's Controls row");
+            settings::pending = 2; Tick(base);
+            Require(settings::row == settings::GameRestoreRow, "the game actions follow Controls");
             // Voice volume follows Sound effects: a host slider in the retail volume
             // steps, saved at once, with a guest apply so the game refreshes its gains.
             settings::tab = 1;
@@ -1618,7 +2518,7 @@ int main(int argc, char** argv)
                     settings::snapshot.rows[settings::AudioVoiceVolumeRow].name == L"Voice volume" &&
                     settings::snapshot.rows[settings::AudioVoiceVolumeRow].sliderPercent == 100,
                     "Voice volume follows Sound effects at 100%");
-            Require(settings::snapshot.help.find(L"Spoken dialogue in cutscenes") != std::wstring::npos, "Voice volume help");
+            Require(settings::snapshot.help.find(L"Cutscene dialogue volume") != std::wstring::npos, "Voice volume help");
             settings::pending = 8; Tick(base);
             Require(settings::edit.voiceVolume == 100 && saves == beforeSaves + 1 && applies == beforeApplies,
                     "right at 100 clamps without saving");
@@ -1663,6 +2563,334 @@ int main(int argc, char** argv)
                     "down from Rear angle wraps to Voice language and stops the test noise and layout");
             settings::edit = currentConfig;
             std::puts("PASS Gameplay Vibration, Voice volume and Audio output: bounds, immediate save, live apply, Graphics edits untouched");
+            // System > Achievements opens the page; Notifications cycles On -> Silent -> Off and saves alone.
+            settings::tab = 3; settings::row = settings::SystemAchievementsRow;
+            settings::edit.achievementNotifications = true; settings::edit.achievementSound = true;
+            const int beforeAchSaves = saves;
+            Tick(base);
+            Require(settings::snapshot.rows[settings::SystemAchievementsRow].name == L"Achievements" &&
+                    settings::snapshot.rows[settings::SystemAchievementsRow].value == L"2/5 · 30G" &&
+                    settings::graphics_menu::IsAction(3, settings::SystemAchievementsRow) &&
+                    settings::snapshot.rows.size() == size_t(settings::SystemRowCount),
+                    "System row shows earned/total and gamerscore");
+            settings::pending = 0x1000; Tick(base);
+            {
+                const auto &rows = settings::snapshot.rows;
+                Require(settings::achievementsOpen && settings::snapshot.pageTitle == L"Achievements" &&
+                        settings::snapshot.row == settings::AchievementsNotificationsRow &&
+                        rows.size() == size_t(settings::AchievementsFirstRow + 5) && !settings::snapshot.keyLegend.empty(),
+                        "A on System Achievements opens the page");
+                Require(rows[settings::AchievementsNotificationsRow].name == L"Notifications" &&
+                        rows[settings::AchievementsNotificationsRow].choices.size() == 3 &&
+                        rows[settings::AchievementsNotificationsRow].selectedChoice == 0 &&
+                        rows[settings::AchievementsSummaryRow].header && rows[settings::AchievementsSummaryRow].name == L"Earned 2 of 5" &&
+                        rows[settings::AchievementsSummaryRow].detail == L"30 / 90G",
+                        "Notifications row and the summary title");
+                const auto entry = [&](int i) -> const settings::MenuRow & { return rows[size_t(settings::AchievementsFirstRow + i)]; };
+                Require(entry(0).name == L"Newest" && entry(0).detail == L"Done it" &&
+                        entry(0).value == L"20G   " + settings::achievements_page::FormatDate(2000000000) && entry(0).icon &&
+                        entry(1).name == L"Oldest" && entry(1).value.rfind(L"10G   ", 0) == 0 &&
+                        entry(2).name == L"Locked one" && entry(2).detail == L"Do it" && entry(2).value == L"30G" && entry(2).icon &&
+                        entry(3).name == L"Secret achievement" && entry(3).value == L"20G" && !entry(3).icon && entry(3).iconGlyph == L"?" &&
+                        entry(3).detail == L"Keep playing to unlock this secret achievement." &&
+                        entry(4).name == L"Secret achievement" && entry(4).detail == entry(3).detail,
+                        "earned newest first, then locked by id; a locked secret hides name, text and icon");
+                // Earned icons keep colour (BGRA from RGBA); locked ones are gray and darker.
+                const uint32_t locked = entry(2).icon->pixels[0];
+                Require(entry(0).icon->pixels[0] == 0xff112233u && ((locked >> 16) & 255) == ((locked >> 8) & 255) &&
+                        (locked & 255) == ((locked >> 8) & 255) && (locked & 255) < 0x22,
+                        "icon converted to BGRA; locked icon desaturated and dimmed");
+            }
+            settings::pending = 2; Tick(base);
+            Require(settings::achievementsFocus == settings::AchievementsFirstRow, "Down skips the summary title");
+            settings::pending = 1; Tick(base);
+            Require(settings::achievementsFocus == settings::AchievementsNotificationsRow, "Up skips the summary title");
+            settings::pending = 8; Tick(base);
+            Require(settings::edit.achievementNotifications && !settings::edit.achievementSound &&
+                    diskConfig.achievementNotifications && !diskConfig.achievementSound && saves == beforeAchSaves + 1 &&
+                    settings::snapshot.rows[settings::AchievementsNotificationsRow].selectedChoice == 1, "Right selects Silent and saves");
+            settings::pending = 8; Tick(base);
+            Require(!settings::edit.achievementNotifications && !diskConfig.achievementNotifications &&
+                    saves == beforeAchSaves + 2 && settings::snapshot.rows[settings::AchievementsNotificationsRow].selectedChoice == 2,
+                    "Right again selects Off and saves");
+            settings::pending = 8; Tick(base);
+            Require(settings::edit.achievementNotifications && settings::edit.achievementSound && diskConfig.achievementSound &&
+                    settings::snapshot.rows[settings::AchievementsNotificationsRow].selectedChoice == 0, "Right wraps to On with sound");
+            settings::pending = 4; Tick(base);
+            Require(!settings::edit.achievementNotifications && saves == beforeAchSaves + 4, "Left wraps to Off");
+            settings::pending = 2; Tick(base);
+            Require(settings::snapshot.help.find(L"Newest: Done it") == 0, "help for an entry");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::achievementsOpen && settings::tab == 3 && settings::row == settings::SystemAchievementsRow &&
+                    settings::snapshot.pageTitle.empty(), "B leaves the page for the System row");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::achievementsOpen, "the page opens again");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::achievementsOpen, "and B leaves it");
+            std::puts("PASS System Achievements page: summary, order, secret hiding, icons, notifications On / Silent / Off, back");
+        }
+        // Controls page layouts. A, Enter or a click on a layout row starts a
+        // capture; the next press binds it, a button or key already in use
+        // swaps, Escape cancels, and 5 s without a press change nothing.
+        // Restore, Save (live, merged into the saved settings), the discard
+        // prompt, and the default layout the page itself runs on.
+        {
+            namespace map = hid::input_map;
+            const uint32_t retailFlags = PPC_LOAD_U32(ConfigData + 4);
+            PPC_STORE_U32(ConfigData + 4, retailFlags & ~0x02000000u);
+            settings::tab = 0;
+            settings::row = settings::GameControlsRow;
+            settings::status.clear();
+            settings::menuClockOffset = {};
+            currentConfig.controllerMap = diskConfig.controllerMap = map::DefaultController;
+            currentConfig.keyboardMap = diskConfig.keyboardMap = map::DefaultKeyboard;
+            settings::edit = currentConfig;
+            settings::edit.uiLanguage = 0;
+            settings::edit.width = currentConfig.width == 2560 ? 1920 : 2560; // an unsaved Graphics edit
+            heldSources = 0;
+            const unsigned beforeApplies = inputMapApplies;
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::controlsOpen, "Controls page opens");
+            const auto& rows = settings::snapshot.rows;
+            const auto rowY = [&](int r) { return float(150 + (r - settings::snapshot.scroll) * 43 + 20); };
+            const int padA = settings::ControlsControllerFirst + map::A, padB = padA + map::B;
+            const int keyA = settings::ControlsKeyboardFirst + map::A, keyB = keyA + map::B;
+            const auto preview = [&](const char* name, bool playStation = false) {
+                auto shown = settings::snapshot;
+                shown.assets.reset();
+                shown.playStationPrompts = playStation;
+                std::vector<uint32_t> pixels;
+                Require(settings::RasterizeMenu(shown, 1280, 720, pixels), "Controls page preview");
+                const auto evidence = std::filesystem::current_path() / "out" / "controls-page-preview";
+                std::filesystem::create_directories(evidence);
+                WriteBmp(evidence / name, pixels);
+            };
+            preview("controls-page.bmp");
+
+            // A on a controller row: the A that started it is ignored until released.
+            settings::controlsFocus = padA;
+            heldSources = 1u << 0;
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::captureRow == padA && settings::captureMode == 1 && rows[padA].value == L"Press a button… (5)" &&
+                    settings::snapshot.help == L"Press a button on any controller. Esc on the keyboard cancels.",
+                    "A starts a controller capture with a 5 s countdown");
+            preview("controls-capture.bmp");
+            Tick(base);
+            Require(settings::captureRow == padA && !settings::captureArmed, "the press that started the capture is not taken");
+            heldSources = 0; Tick(base);
+            Require(settings::captureArmed, "releasing it arms the capture");
+            settings::pending = 0x2000 | 1; Tick(base);
+            Require(settings::captureRow == padA && settings::controlsOpen && settings::controlsFocus == padA,
+                    "menu input does nothing during a capture");
+            heldSources = 1u << 1; Tick(base);
+            Require(settings::captureRow < 0 && settings::captureMode == 0 && settings::waitForRelease &&
+                    settings::controlsController[map::A] == 1 && settings::controlsController[map::B] == 0 &&
+                    rows[padA].value == L"B" && rows[padB].value == L"A" && settings::snapshot.help == L"Swapped with: B",
+                    "a button in use swaps: A takes B's button and B takes A's");
+            Require(diskConfig.controllerMap == map::DefaultController && inputMapApplies == beforeApplies,
+                    "a capture stays unsaved");
+            heldSources = 0;
+            settings::waitForRelease = false;
+            // A trigger past half way binds as well; Guide never does.
+            const int padLb = settings::ControlsControllerFirst + map::LeftShoulder;
+            settings::controlsFocus = padLb;
+            settings::pending = 0x1000; Tick(base); Tick(base);
+            heldSources = 1u << map::GuideSource; Tick(base);
+            Require(settings::captureRow == padLb, "Guide is not bound");
+            heldSources |= 1u << map::LeftTriggerSource; Tick(base);
+            Require(settings::controlsController[map::LeftShoulder] == map::LeftTriggerSource &&
+                    settings::controlsController[map::LeftTrigger] == 9 && rows[padLb].value == L"LT" &&
+                    rows[settings::ControlsControllerFirst + map::LeftTrigger].value == L"LB",
+                    "a pulled trigger binds and LT takes LB's button");
+            heldSources = 0;
+            settings::waitForRelease = false;
+            // Escape cancels a controller capture; other keys stay with the game.
+            const int padY = settings::ControlsControllerFirst + map::Y;
+            settings::controlsFocus = padY;
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::CaptureKey(29, false), "a controller capture leaves other keys alone");
+            Require(settings::CaptureKey(map::EscapeKey, false), "Escape belongs to the capture");
+            Tick(base);
+            Require(settings::captureRow < 0 && settings::controlsController[map::Y] == 3 && settings::snapshot.help == L"Cancelled.",
+                    "Escape cancels without a change");
+            Require(!settings::CaptureKey(map::EscapeKey, false), "without a capture no key is taken");
+            // Five seconds without a press change nothing.
+            const int padX = settings::ControlsControllerFirst + map::X;
+            settings::controlsFocus = padX;
+            settings::pending = 0x1000; Tick(base);
+            settings::menuClockOffset += std::chrono::milliseconds(4100); Tick(base);
+            Require(settings::captureRow == padX && rows[padX].value == L"Press a button… (1)", "the countdown runs");
+            settings::menuClockOffset += std::chrono::seconds(1); Tick(base);
+            Require(settings::captureRow < 0 && settings::controlsController[map::X] == 2 &&
+                    settings::snapshot.help == L"No button pressed. Nothing changed.", "the capture times out after 5 s");
+            settings::menuClockOffset = {};
+
+            // Keyboard: Enter starts a capture; repeats, F1 and the controller do not bind.
+            settings::controlsFocus = keyA;
+            Require(settings::CalibrationKey(13), "Enter belongs to the Controls page");
+            settings::pending = 0; Tick(base);
+            Require(settings::captureRow == keyA && settings::captureMode == 2 && rows[keyA].value == L"Press a key… (5)" &&
+                    settings::snapshot.help == L"Press a key. Esc cancels.", "Enter starts a keyboard capture");
+            preview("controls-capture-key.bmp");
+            Require(settings::CaptureKey(40, true), "a keyboard capture takes a repeating Enter"); Tick(base);
+            Require(settings::captureRow == keyA, "a repeat is not a press");
+            Require(settings::CaptureKey(map::F1Key, false), "a keyboard capture takes F1"); Tick(base);
+            Require(settings::captureRow == keyA, "F1 is not bound");
+            heldSources = 1u << 0; Tick(base); Tick(base);
+            Require(settings::captureRow == keyA, "a controller button does not bind a key");
+            heldSources = 0;
+            Require(settings::CaptureKey(27, false), "a keyboard capture takes X"); Tick(base);
+            Require(settings::captureRow < 0 && settings::controlsKeyboard[map::A] == 27 && settings::controlsKeyboard[map::B] == 29 &&
+                    rows[keyA].value == L"X" && rows[keyA].literal && rows[keyB].value == L"Z" &&
+                    settings::snapshot.help == L"Swapped with: B", "a key in use swaps");
+            // With PlayStation prompts the inputs show their glyphs; key names stay letters.
+            settings::controlsFocus = keyA + map::Y;
+            settings::pending = 0; Tick(base);
+            preview("controls-keys-playstation.bmp", true);
+            // A stick click has no key: a free key binds and no other key moves.
+            const int keyThumb = settings::ControlsKeyboardFirst + map::LeftThumb;
+            settings::controlsFocus = keyThumb;
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::CaptureKey(44, false), "a keyboard capture takes Space"); Tick(base);
+            Require(settings::controlsKeyboard[map::LeftThumb] == 44 && rows[keyThumb].value == L"Space" &&
+                    settings::controlsKeyboard[map::A] == 27 && settings::snapshot.help.empty() == false &&
+                    settings::snapshot.help.find(L"Swapped") == std::wstring::npos, "a free key binds a stick click");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::CaptureKey(map::EscapeKey, false), "Escape belongs to a keyboard capture"); Tick(base);
+            Require(settings::captureRow < 0 && settings::controlsKeyboard[map::LeftThumb] == 44 &&
+                    settings::snapshot.help == L"Cancelled.", "Escape cancels a keyboard capture");
+            settings::pending = 0x1000; Tick(base);
+            settings::menuClockOffset += std::chrono::seconds(6); Tick(base);
+            Require(settings::captureRow < 0 && settings::controlsKeyboard[map::LeftThumb] == 44 &&
+                    settings::snapshot.help == L"No key pressed. Nothing changed.", "a keyboard capture times out too");
+            settings::menuClockOffset = {};
+
+            // Navigation steps over the section titles; Start goes to Save.
+            settings::controlsFocus = settings::ControlsKeyboardFirst;
+            settings::pending = 1; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsControllerFirst + map::DpadRight, "up skips the Keyboard title");
+            settings::pending = 2; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsKeyboardFirst, "down skips it too");
+            settings::controlsFocus = settings::ControlsSaveRow;
+            settings::pending = 2; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsPromptRow && settings::snapshot.scroll == 0, "down from Save wraps to the top");
+            settings::pending = 1; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsSaveRow &&
+                    settings::snapshot.scroll == settings::ControlsRowCount - settings::kMenuVisibleRows, "the page scrolls to Save");
+            preview("controls-page-end.bmp");
+            // Pointer: a title is not a row; a click on a layout row starts its capture.
+            settings::controlsFocus = settings::ControlsControllerFirst + map::DpadRight;
+            settings::pending = 0; Tick(base);
+            Require(settings::snapshot.scroll == settings::controlsFocus, "the focused row tops the list");
+            settings::PointerClick(500, rowY(settings::ControlsKeyboardTitle), false); Tick(base);
+            Require(settings::controlsFocus == settings::ControlsControllerFirst + map::DpadRight && settings::captureRow < 0,
+                    "a click on a section title does nothing");
+            settings::PointerClick(700, rowY(keyB), false); Tick(base);
+            Require(settings::controlsFocus == keyB && settings::captureRow == keyB && settings::captureMode == 2,
+                    "a click on a key row starts its capture");
+            settings::PointerClick(700, rowY(keyA), false); Tick(base);
+            Require(settings::controlsFocus == keyB && settings::captureRow == keyB, "a click during a capture changes nothing");
+            settings::CaptureKey(map::EscapeKey, false); Tick(base);
+
+            // Leaving with changes asks first; Cancel is the default.
+            settings::pending = 0x2000; Tick(base);
+            Require(settings::controlsDiscardPrompt && settings::snapshot.dialogTitle == L"Unsaved changes" &&
+                    settings::snapshot.dialogMessage == L"Leave without saving the controls?" &&
+                    settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Discard changes", L"Cancel"} &&
+                    settings::snapshot.dialogSelection == 1, "B with unsaved changes asks before leaving");
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::controlsDiscardPrompt && settings::controlsOpen && settings::controlsController[map::A] == 1,
+                    "Cancel keeps the page and the changes");
+            Require(settings::CalibrationKey(27), "Escape belongs to the Controls page"); Tick(base);
+            Require(settings::controlsDiscardPrompt, "Escape asks as well");
+            settings::pending = 1; Tick(base);
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::controlsOpen && settings::tab == 0 && settings::row == settings::GameControlsRow &&
+                    diskConfig.controllerMap == map::DefaultController && inputMapApplies == beforeApplies,
+                    "Discard leaves without saving");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::controlsOpen && settings::controlsController == map::DefaultController &&
+                    settings::snapshot.rows[padA].value == L"A", "reopened, the page shows the saved layout");
+
+            // Save: Start goes to Save, a second Start saves and applies at once.
+            settings::controlsFocus = padA;
+            settings::pending = 0x1000; Tick(base); Tick(base);
+            heldSources = 1u << 1; Tick(base);
+            heldSources = 0;
+            settings::controlsFocus = keyA;
+            settings::pending = 0x1000; Tick(base);
+            settings::CaptureKey(44, false); Tick(base);
+            const unsigned beforeSaves = saves;
+            settings::pending = 0x10; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsSaveRow && saves == beforeSaves, "Start moves to Save without saving");
+            settings::pending = 0x10; Tick(base);
+            Require(saves == beforeSaves + 1 && diskConfig.controllerMap[map::A] == 1 && diskConfig.controllerMap[map::B] == 0 &&
+                    diskConfig.keyboardMap[map::A] == 44 && appliedController == diskConfig.controllerMap &&
+                    appliedKeyboard == diskConfig.keyboardMap && inputMapApplies == beforeApplies + 1 &&
+                    settings::edit.controllerMap == diskConfig.controllerMap && settings::snapshot.help == L"Controls saved.",
+                    "Save writes both layouts and applies them at once");
+            Require(diskConfig.width != settings::edit.width, "Save leaves unsaved Graphics edits unsaved");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::controlsOpen && !settings::controlsDiscardPrompt, "after Save, B leaves without asking");
+            // Restore puts the defaults back, unsaved until Save.
+            settings::pending = 0x1000; Tick(base);
+            settings::controlsFocus = settings::ControlsRestoreRow;
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::controlsController == map::DefaultController && settings::controlsKeyboard == map::DefaultKeyboard &&
+                    diskConfig.controllerMap[map::A] == 1 && settings::snapshot.help == L"Default buttons restored. Save to keep them.",
+                    "Restore puts the default layouts back without saving");
+            settings::pending = 0x1000 | 2; Tick(base);
+            Require(settings::controlsFocus == settings::ControlsSaveRow && diskConfig.controllerMap == map::DefaultController &&
+                    diskConfig.keyboardMap == map::DefaultKeyboard && appliedController == map::DefaultController,
+                    "A on Save saves the defaults");
+
+            // The page runs on the default layout: with A and B swapped, the
+            // button labelled A still confirms here, and the swap applies again
+            // after the page closes and every button is up.
+            {
+                settings::pending = 0;
+                uint16_t buttons = 0;
+                settings::FilterInput(buttons, 0, 0, 0);
+                buttons = 0;
+                settings::FilterInput(buttons, 0, 0, 0);
+                settings::pending = 0;
+                buttons = 0x2000; // the guest's B from the button labelled A
+                Require(settings::FilterInput(buttons, 0, 0, 0x1000) && buttons == 0, "the menu takes the input");
+                Require(settings::pending == 0x1000, "the Controls page sees the default A");
+                settings::pending = 0;
+                buttons = 0;
+                settings::FilterInput(buttons, 0, 0, 0);
+                settings::controlsOpen = false;
+                buttons = 0x2000;
+                settings::FilterInput(buttons, 0, 0, 0x1000);
+                Require(settings::pending == 0, "leaving the page waits for a release");
+                buttons = 0;
+                settings::FilterInput(buttons, 0, 0, 0);
+                buttons = 0x2000;
+                settings::FilterInput(buttons, 0, 0, 0x1000);
+                Require(settings::pending == 0x2000, "the rest of the menu uses the layout");
+                settings::pending = 0;
+                buttons = 0;
+                settings::FilterInput(buttons, 0, 0, 0);
+                settings::controlsOpen = true;
+                settings::FilterInput(buttons, 0, 0, 0);
+                settings::pending = 0;
+            }
+            // Translations.
+            for (const auto& [language, title, controller] : {std::tuple{1u, L"按鍵設定", L"控制器"}, std::tuple{2u, L"操作設定", L"コントローラー"},
+                                                              std::tuple{3u, L"조작 설정", L"컨트롤러"}, std::tuple{4u, L"按键设置", L"手柄"}})
+            {
+                settings::edit.uiLanguage = language;
+                settings::pending = 0; Tick(base);
+                Require(settings::snapshot.pageTitle == title && settings::snapshot.rows[settings::ControlsControllerTitle].name == controller,
+                        "translated Controls page");
+            }
+            settings::edit.uiLanguage = 0;
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::controlsOpen, "B leaves the Controls page");
+            settings::edit = currentConfig;
+            PPC_STORE_U32(ConfigData + 4, retailFlags);
+            std::puts("PASS Controls page: capture, swap, trigger, Guide, Escape, timeout, keyboard capture, titles, pointer, discard prompt, Save, Restore, default-layout navigation, translations");
         }
         // The host Settings game tab is reached from the retail System menu.
         // Only explicit dialog confirmation may request the guest title transition.
@@ -1765,7 +2993,7 @@ int main(int argc, char** argv)
                     settings::snapshot.rows[settings::SystemImportRow].value == L"Open" &&
                     settings::snapshot.rows[settings::SystemSaveRow].name == L"Save settings" &&
                     settings::graphics_menu::IsAction(3, settings::SystemImportRow),
-                    "gamepad reaches the importer action on System, just before Save settings");
+                    "gamepad reaches the importer action on System, before Shader bundle and Save settings");
             settings::pending = 8; Tick(base);
             Require(!settings::importPrompt && !settings::restart::Requested(), "right arrow cannot launch importer");
             settings::PointerClick(500, float(150 + (settings::SystemImportRow - settings::snapshot.scroll) * 43 + 20), false);
@@ -1822,6 +3050,41 @@ int main(int argc, char** argv)
             Require(!settings::restart::Requested() && !settings::importPrompt,
                     "idle ticks do not create a second import request");
             std::puts("PASS import action: gamepad/mouse focus, cancel-first dialog, translations, guarded restart request, previews");
+        }
+        // System → Shader bundle: cancel-first dialog, then one redownload request.
+        {
+            settings::tab = 3;
+            settings::row = settings::SystemImportRow;
+            settings::pending = 2; Tick(base);
+            Require(settings::row == settings::SystemShaderBundleRow &&
+                    settings::snapshot.rows[settings::SystemShaderBundleRow].name == L"Shader bundle" &&
+                    settings::snapshot.rows[settings::SystemShaderBundleRow].value == L"Download again" &&
+                    settings::graphics_menu::IsAction(3, settings::SystemShaderBundleRow),
+                    "the Shader bundle action follows Import discs & DLC on System");
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::shaderBundlePrompt && settings::snapshot.dialogSelection == 1 &&
+                    settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Download again", L"Cancel"},
+                    "confirm opens a cancel-first dialog");
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::shaderBundlePrompt && updater::shader_pack::menuFlowRedownloads == 0 &&
+                    !settings::restart::Requested(), "confirm on the default Cancel requests nothing");
+            settings::pending = 0x1000; Tick(base);
+            settings::pending = 1; Tick(base);
+            settings::pending = 0x1000; Tick(base);
+            Require(!settings::shaderBundlePrompt && updater::shader_pack::menuFlowRedownloads == 1,
+                    "Download again records one redownload request");
+#ifdef _WIN32
+            Require(settings::restart::Requested() && !settings::restart::InstallRequested() &&
+                    settings::snapshot.help == L"Restarting to download the shader bundle…",
+                    "Windows restarts the game for the download");
+            settings::restart::Cancel();
+#else
+            Require(!settings::restart::Requested() &&
+                    settings::snapshot.help == L"Restart the game to download the shader bundle again.",
+                    "other platforms ask for a manual restart");
+#endif
+            settings::pending = 0; Tick(base);
+            std::puts("PASS shader bundle action: cancel-first dialog, one redownload request, restart on Windows");
         }
         // System → Mods over a real mods folder and mod-list.ini through the mod API.
         {
@@ -1895,7 +3158,7 @@ int main(int argc, char** argv)
             Require(settings::snapshot.rows[3].name == L"broken" && settings::snapshot.rows[3].value == L"Error",
                     "A and RB leave a rejected mod alone");
             settings::pending = 2; Tick(base);
-            Require(settings::snapshot.help == L"A language pack. Choose it in System → Game language." &&
+            Require(settings::snapshot.help == L"This is a language pack. Choose it in System → Game language." &&
                     settings::snapshot.notice == L"Folder: pt-br" && !settings::snapshot.reorder, "a language pack is read-only");
             // Pointer: select Alpha, then its move up cell.
             settings::PointerClick(200, rowY(1), false); Tick(base);
@@ -1928,11 +3191,42 @@ int main(int argc, char** argv)
             Require(settings::modsFocus == save && !std::filesystem::exists(list), "Start moves to Save without saving");
             settings::pending = 0x10; Tick(base);
             Require(readList() == "beta=off\nalpha=on\ngamma=on\n", "Save writes the order and switches to mod-list.ini");
+            // A changed list applies while the game runs: no restart, one line says when models follow.
+            Require(modsReloadRequests == 1 && !settings::restartPrompt && !settings::restartForMods && settings::modsOpen &&
+                    settings::snapshot.help == L"Models update in the next area; party members after a restart." && settings::snapshot.notice.empty(),
+                    "a changed mod list reloads in game and says when models follow");
+            modsReloadStatus = {mod_hot_reload::Phase::Preparing, 12, 393};
+            settings::pending = 0; Tick(base);
+            Require(settings::snapshot.help == L"Models update in the next area; party members after a restart." &&
+                    settings::snapshot.notice == L"Preparing mods  12 / 393", "the count of packages prepared so far");
+            modsReloadStatus = {mod_hot_reload::Phase::Done};
+            settings::pending = 0; Tick(base);
+            Require(settings::snapshot.help == L"Saves the order and switches. Textures change at once, models in the next area.",
+                    "the row help returns once the new models are in use");
+            settings::pending = 0x2000; Tick(base);
+            Require(!settings::modsOpen && settings::tab == 3 && settings::row == settings::SystemModsRow,
+                    "B without changes returns to the System tab");
+            // Reopened, the page lists the mods as the reload read them: the saved order.
+            settings::pending = 0x1000; Tick(base);
+            Require(settings::snapshot.rows[0].name == L"Beta" && settings::snapshot.rows[0].selectedChoice == 1,
+                    "the reopened page shows the saved order");
+            // Saving the list in use changes nothing.
+            settings::pending = 0x10; Tick(base);
+            settings::pending = 0x10; Tick(base);
+            Require(readList() == "beta=off\nalpha=on\ngamma=on\n" && modsReloadRequests == 1 && !settings::restartPrompt &&
+                    settings::snapshot.help == L"Mod list saved.", "saving the running order needs no reload");
+            // Without a live reload (mods off for this run) a change asks for a restart.
+            modsReloadAvailable = false;
+            settings::modsFocus = 0;
+            settings::pending = 0x200; Tick(base);
+            settings::pending = 0x10; Tick(base);
+            settings::pending = 0x10; Tick(base);
+            Require(readList() == "alpha=on\nbeta=off\ngamma=on\n" && modsReloadRequests == 2, "Save writes the moved order");
 #ifdef _WIN32
             Require(settings::restartPrompt && settings::savedRestartPrompt && settings::restartForMods &&
                     settings::snapshot.dialogMessage == L"Mod list saved. Restart now?" &&
                     settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Restart now", L"Later"},
-                    "a changed mod list offers the restart");
+                    "a change without a live reload offers the restart");
             settings::pending = 2; Tick(base);
             settings::pending = 0x1000; Tick(base);
             Require(!settings::restartPrompt && !settings::restartForMods && !settings::restart::Requested() &&
@@ -1940,23 +3234,11 @@ int main(int argc, char** argv)
                     "Later stays on the page");
 #else
             Require(settings::restartPrompt && settings::snapshot.dialogMessage == L"Mod list saved. Restart the game to apply the changes.",
-                    "a changed mod list asks for a manual restart");
+                    "a change without a live reload asks for a manual restart");
             settings::pending = 0x1000; Tick(base);
 #endif
-            settings::pending = 0x2000; Tick(base);
-            Require(!settings::modsOpen && settings::tab == 3 && settings::row == settings::SystemModsRow,
-                    "B without changes returns to the System tab");
-            // Reopened before the restart, the page shows the saved order.
-            settings::pending = 0x1000; Tick(base);
-            Require(settings::snapshot.rows[0].name == L"Beta" && settings::snapshot.rows[0].selectedChoice == 1,
-                    "the saved order shows until the restart applies it");
-            // Back to the order this run started with: saved without a restart.
-            settings::pending = 0x1000; Tick(base);
-            settings::pending = 0x200; Tick(base);
-            settings::pending = 0x10; Tick(base);
-            settings::pending = 0x10; Tick(base);
-            Require(readList() == "alpha=on\nbeta=on\ngamma=on\n" && !settings::restartPrompt &&
-                    settings::snapshot.help == L"Mod list saved.", "saving the running order needs no restart");
+            modsReloadAvailable = true;
+            modsReloadStatus = {};
             // Escape leaves too.
             Require(settings::CalibrationKey(27), "Escape belongs to the Mods page");
             settings::pending = 0; Tick(base);
@@ -1988,7 +3270,7 @@ int main(int argc, char** argv)
             Require(!settings::modsOpen, "the empty page has no Save and B leaves");
             modding::Shutdown();
             std::filesystem::remove_all(root);
-            std::puts("PASS Mods page: listing, switches, LB/RB and pointer moves, read-only rows, discard prompt, Open folder, Save + restart, saved order, empty page");
+            std::puts("PASS Mods page: listing, switches, LB/RB and pointer moves, read-only rows, discard prompt, Open folder, Save + live reload, restart without it, saved order, empty page");
         }
         // Opened from the title menu (title_entry.cpp) no game is loaded: the
         // retail Gameplay and Audio options, Restore, Quit and the retail
@@ -2003,24 +3285,23 @@ int main(int argc, char** argv)
             const uint32_t textSpeed = PPC_LOAD_U32(ConfigData), flags = PPC_LOAD_U32(ConfigData + 4);
             const unsigned beforeApplies = applies, beforeDefaults = defaultsCalls, beforeRequests = mainMenuRequests;
             settings::pending = 0; Tick(base);
-            Require(settings::row == settings::GamePromptRow, "title mode focuses the first visible Gameplay row");
+            Require(settings::row == settings::GameControlsRow, "title mode focuses the first visible Gameplay row");
             for (int r = 0; r < settings::GameRowCount; ++r)
-                Require(settings::snapshot.rows[size_t(r)].hidden ==
-                            (r != settings::GamePromptRow && r != settings::GameVibrationRow),
+                Require(settings::snapshot.rows[size_t(r)].hidden == (r != settings::GameControlsRow),
                         "title mode hides the retail options, Restore and Quit");
             settings::pending = 1; Tick(base);
-            Require(settings::row == settings::GameVibrationRow, "Up wraps past the hidden rows");
+            Require(settings::row == settings::GameControlsRow, "Up wraps past the hidden rows");
             settings::pending = 2; Tick(base);
-            Require(settings::row == settings::GamePromptRow, "Down wraps past the hidden rows");
-            settings::row = settings::GameVibrationRow;
+            Require(settings::row == settings::GameControlsRow, "Down wraps past the hidden rows");
+            settings::row = settings::GameRestoreRow;
             settings::PointerClick(100, 150 + 20, false); Tick(base);
-            Require(settings::row == settings::GamePromptRow, "the first list slot is Button prompts");
+            Require(settings::row == settings::GameControlsRow, "the first list slot is Controls");
             // A stale focus on a hidden row edits nothing and moves to a visible row.
             for (int r : {0, settings::GameRetailRowCount - 1, settings::GameRestoreRow, settings::GameMainMenuRow})
             {
                 settings::row = r;
                 settings::pending = 8; Tick(base);
-                Require(settings::row == settings::GamePromptRow, "focus leaves a hidden row");
+                Require(settings::row == settings::GameControlsRow, "focus leaves a hidden row");
                 settings::row = r;
                 settings::pending = 0x1000; Tick(base);
             }
@@ -2079,10 +3360,10 @@ int main(int argc, char** argv)
             Require(!settings::brightnessOpen && settings::active, "B leaves the brightness page");
             settings::pending = 0x100; Tick(base);
             settings::pending = 0x100; Tick(base);
-            Require(settings::tab == 0 && settings::row == settings::GamePromptRow, "back on Gameplay's first visible row");
+            Require(settings::tab == 0 && settings::row == settings::GameControlsRow, "back on Gameplay's first visible row");
             settings::pending = 0x200; Tick(base);
             settings::pending = 0x100; Tick(base);
-            Require(settings::tab == 0 && settings::row == settings::GamePromptRow, "a tab switch lands on a visible row");
+            Require(settings::tab == 0 && settings::row == settings::GameControlsRow, "a tab switch lands on a visible row");
             settings::pending = 0x2000; Tick(base);
             Require(settings::closing && !settings::active && applies == beforeApplies + 1,
                     "Back closes with the usual apply");
@@ -2090,7 +3371,7 @@ int main(int argc, char** argv)
             Poll(0, true); Poll(0, false);
             Require(PPC_LOAD_U32(Menu + 4) == 1 && !settings::titleEntry, "the idle task ends title mode");
             PPC_STORE_U32(Menu + 4, 4); Tick(base); Poll(0, true);
-            Require(settings::active && settings::row == settings::GamePromptRow &&
+            Require(settings::active && settings::row == settings::GameControlsRow &&
                     std::none_of(settings::snapshot.rows.begin(), settings::snapshot.rows.end(),
                                  [](const settings::MenuRow& row) { return row.hidden; }) &&
                     mainMenuRequests == beforeRequests,
@@ -2161,6 +3442,66 @@ int main(int argc, char** argv)
             std::puts("PASS Graphics and bilingual DLSS/English FSR section previews from actual Publish/Translate with installed assets");
         }
         CheckBr03DlssMenu(base);
+        if (argc == 3)
+        {
+            // The DLSS row status over a menu frame, with installed fonts in
+            // English and Simplified Chinese: after gameplay and before any scene.
+            using gpu::frame_plan::DlssEffectPhase;
+            using gpu::frame_plan::DlssEffectReason;
+            using gpu::upscaling::DlssQuality;
+            const auto previousEdit = settings::edit;
+            const auto previousConfig = currentConfig;
+            currentConfig.upscaler = gpu::upscaling::Upscaler::Dlss;
+            currentConfig.dlssQuality = DlssQuality::Quality;
+            currentConfig.graphicsBackend = settings::GraphicsBackend::Vulkan;
+            settings::edit = currentConfig;
+            settings::edit.frameGenerationProvider = framegen::Provider::Off;
+            settings::edit.hdr = false;
+            settings::status.clear();
+            settings::tab = 2;
+            settings::row = int(GraphicsRow::DlssQuality);
+            gpu::frame_plan::DlssEffectSnapshot running{};
+            running.hasPlan = true;
+            running.plannedRequest = gpu::upscaling::Upscaler::Dlss;
+            running.plannedQuality = DlssQuality::Quality;
+            running.device.backend = gpu::backend::Backend::Vulkan;
+            running.device.deviceReady = true;
+            running.device.dlssAvailable = true;
+            running.phase = DlssEffectPhase::TemporaryFallback;
+            running.reason = DlssEffectReason::NoEligibleScene;
+            auto menuFrame = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+            menuFrame.outcome = gpu::frame_plan::DlssExecutionOutcome::Fallback;
+            menuFrame.submissionSerial = 0;
+            menuFrame.reason = DlssEffectReason::NoEligibleScene;
+            running.execution = menuFrame;
+            gpu::frame_plan::menuFlowDlssEffect = running;
+            for (const bool played : {true, false})
+            {
+                gpu::frame_plan::menuFlowEligible.reset();
+                if (played) gpu::frame_plan::menuFlowEligible = SubmittedObservation(DlssQuality::Quality, 1707, 960, 2560, 1440);
+                for (const uint32_t language : {0u, 4u})
+                {
+                    settings::edit.uiLanguage = language;
+                    settings::Publish(base, ConfigData);
+                    auto preview = settings::snapshot;
+                    preview.assets = settings::menu_assets::Cached(argv[1], language);
+                    Require(bool(preview.assets), "installed DLSS status assets");
+                    const std::wstring expected = played
+                        ? (language ? L"已提交 DLSS 质量输出。1707×960 - 2560×1440" : L"Submitted DLSS Quality output. 1707×960 - 2560×1440")
+                        : (language ? L"进入游戏场景后才会开始缩放。" : L"Upscaling starts once the game scene is on screen.");
+                    Require(preview.notice == expected, "translated DLSS status over a menu frame");
+                    std::vector<uint32_t> pixels;
+                    Require(settings::RasterizeMenu(preview, 1280, 720, pixels), "translated DLSS status preview");
+                    WriteBmp(std::filesystem::path(argv[2]) / (std::string("dlss-status-") + (language ? "zh-" : "en-") +
+                        (played ? "last-game-frame.bmp" : "not-started.bmp")), pixels);
+                }
+            }
+            gpu::frame_plan::menuFlowEligible.reset();
+            gpu::frame_plan::menuFlowDlssEffect = {};
+            currentConfig = previousConfig;
+            settings::edit = previousEdit;
+            std::puts("PASS DLSS status after gameplay and before any scene, English and Chinese, installed assets");
+        }
         {
             const auto previousEdit = settings::edit;
             settings::tab = 2;
@@ -2254,6 +3595,44 @@ int main(int argc, char** argv)
                     "retiring the scene immediately removes HDR preview availability");
             Require(settings::CalibrationKey(27), "close reopened calibration");
             settings::pending = 0; Tick(base);
+            // HDR calibration: its own entry row under HDR peak opens the same page.
+            {
+                const int entry = int(GraphicsRow::HdrCalibration);
+                settings::row = int(GraphicsRow::HdrPeak);
+                settings::pending = 2; Tick(base);
+                Require(settings::row == entry && settings::snapshot.rows[size_t(entry)].pageEntry &&
+                        settings::snapshot.rows[size_t(entry)].enabled, "down from HDR peak reaches HDR calibration");
+                settings::pending = 0x1000; Tick(base);
+                Require(settings::snapshot.calibration.open, "HDR calibration opens the calibration page");
+                Require(settings::CalibrationKey(27), "Escape closes calibration opened from its row");
+                settings::pending = 0; Tick(base);
+                Require(!settings::snapshot.calibration.open && settings::row == entry, "Escape returns to HDR calibration");
+                settings::pending = 2; Tick(base);
+                Require(settings::row == int(GraphicsRow::Brightness) &&
+                        settings::snapshot.rows[int(GraphicsRow::Brightness)].pageEntry, "Brightness follows HDR calibration");
+                // HDR and DLSS on is the longest Graphics list; Save at its end stays in view.
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Dlss;
+                settings::row = int(GraphicsRow::Save);
+                settings::pending = 0; Tick(base);
+                int visible = 0, savedAt = 0;
+                for (int i = 0; i < int(GraphicsRow::Count); ++i)
+                {
+                    if (settings::snapshot.rows[size_t(i)].hidden) continue;
+                    if (i == int(GraphicsRow::Save)) savedAt = visible;
+                    ++visible;
+                }
+                Require(!settings::snapshot.rows[int(GraphicsRow::NeuralRenderingTuning)].hidden &&
+                        !settings::snapshot.rows[size_t(entry)].hidden && savedAt - settings::snapshot.scroll < settings::kMenuVisibleRows &&
+                        settings::snapshot.scroll + settings::kMenuVisibleRows == visible,
+                        "with HDR and DLSS on the list scrolls to Save with both entry rows");
+                settings::edit.upscaler = gpu::upscaling::Upscaler::Off;
+                settings::edit.hdr = false;
+                settings::row = int(GraphicsRow::Hdr);
+                settings::pending = 0; Tick(base);
+                Require(settings::snapshot.rows[size_t(entry)].hidden, "HDR off hides HDR calibration");
+                settings::edit.hdr = true;
+                settings::pending = 0; Tick(base);
+            }
             settings::edit.antialiasing = 1;
             settings::pending = 0; Tick(base);
             Require(settings::snapshot.notice.find(L"HDR is paused") == std::wstring::npos &&
@@ -2323,15 +3702,22 @@ int main(int argc, char** argv)
             Require(settings::Read().fsrSharpnessPercent == 0, "negative sharpness keeps Off default");
             writeIni("fsr_sharpness=garbage\n");
             Require(settings::Read().fsrSharpnessPercent == 0, "invalid sharpness keeps Off default");
+            writeIni("performance_overlay=2\n");
+            Require(settings::Read().performanceOverlay == 2, "performance overlay reads from INI");
+            writeIni("performance_overlay=3\n");
+            Require(settings::Read().performanceOverlay == 0, "an unknown performance overlay mode reads as Off");
             settings::Config sharpness{};
             sharpness.upscaler = gpu::upscaling::Upscaler::Fsr;
             sharpness.fsrSharpnessPercent = 64;
+            sharpness.performanceOverlay = 1;
             Require(settings::SaveConfig(sharpness), "real config save succeeds in sandbox");
             Require(settings::GetConfig().fsrSharpnessPercent == 64 && settings::Read().fsrSharpnessPercent == 64,
                     "real config retains sharpness after save and disk reload");
             std::ifstream persisted("settings.ini");
             const std::string text((std::istreambuf_iterator<char>(persisted)), std::istreambuf_iterator<char>());
             Require(text.find("fsr_sharpness=64\n") != std::string::npos, "INI writes fsr_sharpness key");
+            Require(text.find("\nperformance_overlay=1\n") != std::string::npos && settings::Read().performanceOverlay == 1,
+                    "INI writes and reloads performance_overlay");
             persisted.close(); // Windows cannot replace settings.ini while this reader holds it.
             sharpness.fsrSharpnessPercent = 102;
             Require(settings::SaveConfig(sharpness) && settings::Read().fsrSharpnessPercent == 100,
@@ -2410,11 +3796,62 @@ int main(int argc, char** argv)
             Require(settings::Read().displayIndex == 1 && settings::Read().displayName == "M27P20" &&
                     settings::Read().width == 1600 && settings::Read().gpuDevice == "GPU B" &&
                     settings::GetConfig().displayIndex == 1, "a player move saves only the display choice");
+            // Controls layouts: SDL mapping names for the controller, scancodes
+            // for the keys; a bad pair keeps that input's default.
+            {
+                namespace map = hid::input_map;
+                writeIni("button_prompts=1\n");
+                Require(settings::Read().controllerMap == map::DefaultController &&
+                        settings::Read().keyboardMap == map::DefaultKeyboard, "missing layouts read as the defaults");
+                settings::Config layout{};
+                map::Assign(layout.controllerMap, map::A, 1);
+                map::Assign(layout.controllerMap, map::X, 3);
+                map::Assign(layout.controllerMap, map::LeftShoulder, map::LeftTriggerSource);
+                map::Assign(layout.controllerMap, map::Back, 16);
+                map::Assign(layout.keyboardMap, map::A, 44);
+                map::Assign(layout.keyboardMap, map::RightThumb, 29);
+                Require(layout.controllerMap[map::B] == 0 && layout.controllerMap[map::LeftTrigger] == 9 &&
+                        layout.keyboardMap[map::RightThumb] == 29, "Assign swaps a bound value and takes a free one");
+                Require(settings::SaveConfig(layout), "layouts save");
+                const auto read = settings::Read();
+                Require(read.controllerMap == layout.controllerMap && read.keyboardMap == layout.keyboardMap &&
+                        settings::GetConfig().controllerMap == layout.controllerMap, "both layouts survive a real save/reload");
+                std::ifstream layoutIni("settings.ini");
+                const std::string text((std::istreambuf_iterator<char>(layoutIni)), std::istreambuf_iterator<char>());
+                layoutIni.close();
+                Require(text.find("\ncontroller_map=a:b,b:a,x:y,y:x,leftshoulder:lefttrigger,rightshoulder:rightshoulder,"
+                                  "lefttrigger:leftshoulder,righttrigger:righttrigger,back:paddle1,start:start,") != std::string::npos &&
+                        text.find("\nkeyboard_map=a:44,b:27,x:4,y:22,") != std::string::npos &&
+                        text.find(",leftstick:none,rightstick:29,") != std::string::npos,
+                        "INI writes the controller by SDL name and the keys by scancode");
+                writeIni("controller_map=a:b,b:bogus,x:x,nonsense,y:paddle1,start:guide\n"
+                         "keyboard_map=a:44,b:600,x:41,leftstick:29,rightstick:none,y:44,start:abc,dpup:58\n");
+                const auto partial = settings::Read();
+                auto controller = map::DefaultController;
+                controller[map::A] = 1;
+                controller[map::B] = 0;
+                controller[map::Y] = 16;
+                auto keys = map::DefaultKeyboard;
+                keys[map::A] = 44;
+                keys[map::LeftThumb] = 29;
+                Require(partial.controllerMap == controller,
+                        "bad controller pairs keep their defaults; a:b alone reads as a swap; Guide is never bound");
+                Require(partial.keyboardMap == keys,
+                        "bad key pairs keep their defaults: out of range, Escape, F1, text, a key used twice");
+                settings::Config repeated{};
+                repeated.controllerMap[map::Start] = repeated.controllerMap[map::A];
+                repeated.keyboardMap[map::B] = repeated.keyboardMap[map::A];
+                Require(settings::SaveConfig(repeated) && settings::Read().controllerMap == map::DefaultController &&
+                        settings::Read().keyboardMap == map::DefaultKeyboard, "a save never writes a button or key twice");
+            }
             std::puts("PASS FG settings.ini provider and multiplier validation, FSR normalization, and min/max save/reload");
             std::filesystem::current_path(originalDir);
             std::filesystem::remove_all(sandbox);
             std::puts("PASS FSR sharpness settings.ini read, validation and save/reload roundtrip");
         }
+        CaptureHelpRows(base, argc == 3 ? argv[1] : nullptr);
+        CaptureSubpageEntries(base, argc == 3 ? argv[1] : nullptr);
+        CheckHelpFit(base, argc == 3 ? argv[1] : nullptr);
         VirtualFree(base, 0, MEM_RELEASE);
         return 0;
     }

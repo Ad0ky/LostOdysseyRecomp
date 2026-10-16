@@ -35,7 +35,7 @@ Build and run with `cmake --build <dir>` then `ctest --test-dir <dir> --output-o
 
 ## Project review regressions (2026-09-30)
 
-Builds without game data, generated PPC sources or a GPU. It covers the 13 issues in [the fix record](../../docs/notes/PROJECT_REVIEW_FIXES_20260930.md). Needs GCC/Clang, Python 3.11+ and CMake 3.20+ on Linux. The SDL fixtures use an installed SDL3 package when CMake finds one and otherwise build the pinned `thirdparty/SDL` submodule.
+Builds without game data, generated PPC sources or a GPU. It covers the 13 issues in [the fix record](../../docs/archive/notes/PROJECT_REVIEW_FIXES_20260930.md). Needs GCC/Clang, Python 3.11+ and CMake 3.20+ on Linux. The SDL fixtures use an installed SDL3 package when CMake finds one and otherwise build the pinned `thirdparty/SDL` submodule.
 
 ```bash
 git submodule update --init --depth 1 tools/XenonRecomp thirdparty/SDL

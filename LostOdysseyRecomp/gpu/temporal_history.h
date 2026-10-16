@@ -208,6 +208,12 @@ class HistoryOwner {
         image.texture=device_->createTexture(plume::RenderTextureDesc::Texture2D(width_,height_,1,format,plume::RenderTextureFlag::RENDER_TARGET));
         return bool(image.texture);
     }
+    template<class Visit> void VisitOwnedImages(Visit&& visit) {
+        for(auto& image:depth_)visit(image,width_,height_,plume::RenderFormat::R32_FLOAT);
+        visit(source_,width_,height_,sourceFormat_);
+        for(auto& image:history_)visit(image,storageWidth_,storageHeight_,historyFormat_);
+        visit(display_,storageWidth_,storageHeight_,historyFormat_);
+    }
     bool SetHistoryStorage(bool fp16) {
         // HDR already owns FP16 source/history. The SDR precision experiment
         // changes only accumulation and display storage, never the copied source.
@@ -262,6 +268,28 @@ public:
     const GpuPassTimingStats& ResolveTiming() const {return aa_.ResolveTiming();}
     const GpuPassTimingStats& DisplayTiming() const {return aa_.DisplayTiming();}
     void Reset() {valid_=false;motionVectorValid_=false;motionView_={};captureFailure_=InputCaptureFailure::None;for(auto& frame:frames_)frame.completed=frame.inputsComplete=frame.taaResolved=false;}
+    uint64_t HeldBytes() {
+        uint64_t bytes=hybridMotion_.HeldBytes();
+        VisitOwnedImages([&](Image& image,uint32_t width,uint32_t height,plume::RenderFormat format) {
+            if(image.texture)bytes+=uint64_t(width)*height*plume::RenderFormatSize(format);
+        });
+        return bytes;
+    }
+    // No temporal consumer: every owned image goes to fence-qualified retirement
+    // (freed when the batch that last used it completes). Shaders and pipelines
+    // stay; the next capture allocates again and starts without history.
+    uint64_t ReleaseImages() {
+        const uint64_t bytes=HeldBytes();
+        const auto serial=aa_.RecordedSerial();
+        VisitOwnedImages([&](Image& image,uint32_t,uint32_t,plume::RenderFormat) {
+            if(image.texture)retired_.push_back({serial,std::move(image.texture)});
+            image.layout=plume::RenderTextureLayout::UNKNOWN;
+        });
+        hybridMotion_.Release();
+        width_=height_=storageWidth_=storageHeight_=0;
+        Reset();
+        return bytes;
+    }
     bool MotionVectorValid() const { return motionVectorValid_; }
     InputCaptureFailure LastInputCaptureFailure() const {
         return frameResourceFailure_ != InputCaptureFailure::None ? frameResourceFailure_ : captureFailure_;

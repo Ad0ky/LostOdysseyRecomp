@@ -46,7 +46,9 @@ public:
                         std::lock_guard lock(state->mutex);
                         batch = state->pending.Pending();
                     }
-                    if (batch.programs.empty()) { control.Wait(std::chrono::milliseconds(250)); continue; }
+                    // TryGet notifies after queueing; the semaphore keeps a notify
+                    // that lands before this wait.
+                    if (batch.programs.empty()) { control.Wait(); continue; }
                     for (const auto& program : batch.programs) {
                         if (control.Stopped()) return;
                         Summary summary;
