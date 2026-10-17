@@ -13,6 +13,7 @@
 #include <gpu/renderer.h>
 #include <gpu/video.h>
 #include <gpu/pipeline_prepare_progress.h>
+#include <gpu/rtl_text.h>
 #include <apu/audio.h>
 #include <apu/xma.h>
 #include <hid/hid.h>
@@ -587,6 +588,9 @@ int main(int argc, char* argv[])
                    c.frameGenerationMultiplier, c.hdr, c.ambientOcclusion, c.shadowResolution, c.debugLog);
         const auto pack = settings::GameLanguagePack();
         modding::text_overlay::SelectLanguagePack(pack);
+        for (const auto& languagePack : modding::LanguagePacks())
+            if (languagePack.id == pack)
+                rtl_text::SetEnabled(languagePack.rightToLeft);
         modding::text_overlay::EnablePrebuild();
         if (!pack.empty())
             LOG_NOTICE("settings: game language {} with language pack {}", settings::GameLanguage(), pack);

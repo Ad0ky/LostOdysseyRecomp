@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 
 #ifdef LO_MENU_RENDER_TRACE
 // Only the direct raster fixture enables this observer; no runtime tracing.
@@ -104,6 +105,94 @@ namespace
         return value;
     }
 
+    // Arabic text (a language pack's name) in drawing order: letters joined
+    // into presentation forms (Unifont has them), marks dropped, and the line
+    // reversed when its first letter is Arabic, with Latin and digit runs and
+    // brackets kept readable. Other text is returned unchanged.
+    std::wstring ArabicVisual(const std::wstring &value)
+    {
+        // U+0621..U+064A: isolated presentation form and form count (1 none,
+        // 2 joins only to the previous letter, 4 joins both ways); 0 none.
+        static constexpr uint16_t kForms[][2] = {
+            {0xFE80, 1}, {0xFE81, 2}, {0xFE83, 2}, {0xFE85, 2}, {0xFE87, 2}, {0xFE89, 4}, {0xFE8D, 2},
+            {0xFE8F, 4}, {0xFE93, 2}, {0xFE95, 4}, {0xFE99, 4}, {0xFE9D, 4}, {0xFEA1, 4}, {0xFEA5, 4},
+            {0xFEA9, 2}, {0xFEAB, 2}, {0xFEAD, 2}, {0xFEAF, 2}, {0xFEB1, 4}, {0xFEB5, 4}, {0xFEB9, 4},
+            {0xFEBD, 4}, {0xFEC1, 4}, {0xFEC5, 4}, {0xFEC9, 4}, {0xFECD, 4}, {0, 0}, {0, 0}, {0, 0},
+            {0, 0}, {0, 0}, {0, 0}, {0xFED1, 4}, {0xFED5, 4}, {0xFED9, 4}, {0xFEDD, 4}, {0xFEE1, 4},
+            {0xFEE5, 4}, {0xFEE9, 4}, {0xFEED, 2}, {0xFEEF, 2}, {0xFEF1, 4}};
+        const auto forms = [](wchar_t c) {
+            if (c == 0x0640) return 4; // tatweel joins both ways
+            return c >= 0x0621 && c <= 0x064A ? int(kForms[c - 0x0621][1]) : 0;
+        };
+        const auto arabic = [](wchar_t c) { return (c >= 0x0600 && c <= 0x06FF) || (c >= 0xFE70 && c <= 0xFEFF); };
+        if (std::none_of(value.begin(), value.end(), arabic)) return value;
+
+        std::wstring letters;
+        for (const auto c : value)
+            if (!(c >= 0x064B && c <= 0x065F) && c != 0x0670) letters += c;
+        std::wstring shaped;
+        for (size_t i = 0; i < letters.size(); ++i)
+        {
+            const wchar_t c = letters[i];
+            const int n = forms(c);
+            if (!n || c == 0x0640) { shaped += c; continue; }
+            const bool joinsPrevious = n > 1 && i > 0 && forms(letters[i - 1]) == 4;
+            const wchar_t next = i + 1 < letters.size() ? letters[i + 1] : 0;
+            // Lam with alef: one ligature.
+            if (c == 0x0644 && (next == 0x0622 || next == 0x0623 || next == 0x0625 || next == 0x0627))
+            {
+                const wchar_t base = next == 0x0622 ? 0xFEF5 : next == 0x0623 ? 0xFEF7 : next == 0x0625 ? 0xFEF9 : 0xFEFB;
+                shaped += wchar_t(base + (joinsPrevious ? 1 : 0));
+                ++i;
+                continue;
+            }
+            const bool joinsNext = n == 4 && forms(next) > 1;
+            const int form = joinsPrevious ? (joinsNext ? 3 : 1) : (joinsNext ? 2 : 0);
+            shaped += wchar_t(kForms[c - 0x0621][0] + form);
+        }
+
+        // Digits (Western and Arabic-Indic) read left to right but do not set the line's direction.
+        const auto digit = [](wchar_t c) { return (c >= L'0' && c <= L'9') || (c >= 0x0660 && c <= 0x0669) || (c >= 0x06F0 && c <= 0x06F9); };
+        const auto latin = [](wchar_t c) { return (c < 0x0600 && std::iswalpha(c)) || (c > 0x06FF && c < 0xFB50); };
+        const auto letter = [&](wchar_t c) { return arabic(c) && !digit(c); };
+        const auto ltr = [&](wchar_t c) { return latin(c) || digit(c); };
+        const auto first = std::find_if(shaped.begin(), shaped.end(), [&](wchar_t c) { return letter(c) || latin(c); });
+        const bool rtl = first != shaped.end() && letter(*first);
+        const auto reverseRuns = [&](std::wstring &text, auto inRun) {
+            for (size_t i = 0; i < text.size();)
+            {
+                if (!inRun(text[i])) { ++i; continue; }
+                size_t end = i;
+                for (size_t j = i; j < text.size(); ++j)
+                {
+                    if (inRun(text[j])) end = j + 1;
+                    else if (text[j] != L' ' && text[j] != L'.' && text[j] != L'-') break;
+                }
+                std::reverse(text.begin() + i, text.begin() + end);
+                i = end;
+            }
+        };
+        if (!rtl)
+        {
+            reverseRuns(shaped, letter);
+            return shaped;
+        }
+        std::reverse(shaped.begin(), shaped.end());
+        for (auto &c : shaped)
+        {
+            switch (c) {
+            case L'(': c = L')'; break;
+            case L')': c = L'('; break;
+            case L'[': c = L']'; break;
+            case L']': c = L'['; break;
+            case L'<': c = L'>'; break;
+            case L'>': c = L'<'; break;
+            }
+        }
+        reverseRuns(shaped, ltr);
+        return shaped;
+    }
+
     // The game face that draws a whole string: the title face from 32 pt, else
     // the body face, or the Abc face when only it has every character. Null:
     // the host font draws it.
@@ -143,13 +232,16 @@ namespace
     }
 
     // Output width of a string in the host font at a glyph scale.
+    // Arabic presentation forms and the tatweel join their neighbours: no pixel between them.
+    bool JoinedForm(wchar_t c) { return c == 0x0640 || (c >= 0xFB50 && c <= 0xFDFF) || (c >= 0xFE70 && c <= 0xFEFC); }
+
     int HostAdvance(const std::wstring &value, float fontScale)
     {
         int width = 0;
         for (wchar_t c : value)
         {
             auto g = host_ui::font::GetGlyph(uint32_t(c));
-            width += int(((c >= 0xe100 && c <= 0xe103) ? 17 : (g.width + 1)) * fontScale);
+            width += int(((c >= 0xe100 && c <= 0xe103) ? 17 : JoinedForm(c) ? g.width : (g.width + 1)) * fontScale);
         }
         return width;
     }
@@ -412,7 +504,7 @@ namespace
     settings::TextFit Fit(const settings::MenuSnapshot &s, std::wstring source, int w, int h, int size)
     {
         settings::TextFit fit{std::move(source)};
-        const std::wstring value = PromptText(fit.text, s.playStationPrompts);
+        const std::wstring value = ArabicVisual(PromptText(fit.text, s.playStationPrompts));
         if (value.empty()) return fit;
         if (const auto *font = GameFace(s.assets.get(), value, size))
         {
@@ -698,7 +790,7 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
                      bool bold = false, int alignment = 0 /* 0=left, 1=center, 2=right */,
                      uint32_t edge = MakeColor(255, 39, 40, 40), int minimum = 13, bool prompts = true,
                      bool creditSeparators = false) {
-        const std::wstring value = prompts ? PromptText(source, current.playStationPrompts) : source;
+        const std::wstring value = ArabicVisual(prompts ? PromptText(source, current.playStationPrompts) : source);
         if (const auto *selectedFont = GameFace(current.assets.get(), value, size, creditSeparators))
         {
             const auto &font = *selectedFont;
@@ -781,6 +873,11 @@ bool settings::RasterizeMenu(const MenuSnapshot &current, uint32_t width, uint32
                                            std::max(1, int(fontScale)), std::max(1, int(fontScale)), inkColor);
                         });
                     cx += int(17 * fontScale);
+                }
+                else if (JoinedForm(c) && host_ui::font::GetGlyph(uint32_t(c)).bitmap)
+                {
+                    r.DrawChar(cx, top + dy, uint32_t(c), inkColor, fontScale);
+                    cx += int(host_ui::font::GetGlyph(uint32_t(c)).width * fontScale);
                 }
                 else cx += r.DrawChar(cx, top + dy, uint32_t(c), inkColor, fontScale);
             }

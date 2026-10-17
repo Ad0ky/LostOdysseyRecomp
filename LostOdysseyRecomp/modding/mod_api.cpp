@@ -625,12 +625,17 @@ void LoadLanguagePack(Snapshot& snapshot, const std::filesystem::path& file, std
         if (text.empty() || text.front() == '#' || text.front() == ';') continue;
         const auto equal = text.find('=');
         const auto key = equal == text.npos ? std::string_view{} : Trim(text.substr(0, equal));
-        if ((key != "id" && key != "name" && key != "base") ||
+        if ((key != "id" && key != "name" && key != "base" && key != "direction") ||
             !values.emplace(std::string(key), std::string(Trim(text.substr(equal + 1)))).second) {
-            Diagnose(snapshot, file, lineNo, "expected one each of id=, name= and base="); return;
+            Diagnose(snapshot, file, lineNo, "expected one each of id=, name=, base= and an optional direction="); return;
         }
     }
-    LanguagePack pack{values["id"], values["name"], values["base"], file.parent_path()};
+    const auto direction = values.find("direction");
+    if (direction != values.end() && direction->second != "ltr" && direction->second != "rtl") {
+        Diagnose(snapshot, file, 0, "language.ini direction must be ltr or rtl"); return;
+    }
+    LanguagePack pack{values["id"], values["name"], values["base"], file.parent_path(),
+                      direction != values.end() && direction->second == "rtl"};
     for (auto* value : {&pack.id, &pack.base})
         for (char& c : *value) if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
     const bool base = pack.base.size() == 3 &&

@@ -953,7 +953,8 @@ def font_glyphs(export: Path, pack: Path, ttf_path: Path, only: set[str] | None 
         except ValueError as exc:
             results.append({"font": name, "package": package, "skipped": str(exc)})
             continue
-        missing = sorted(c for c in wanted if ord(c) not in ref["glyphs"] and not c.isspace())
+        # A space is drawn too: some fonts have none (Meiyo26, Yume66) and show a box instead.
+        missing = sorted(c for c in wanted if ord(c) not in ref["glyphs"] and (c == " " or not c.isspace()))
         shaped = {ch: shaping_input(ch) for ch in missing}
         unsupported = "".join(ch for ch in missing if not probe.covers(shaped[ch][0]))
         drawable = [ch for ch in missing if ch not in unsupported]

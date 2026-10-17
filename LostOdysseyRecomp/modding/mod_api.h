@@ -42,7 +42,8 @@ struct Diagnostic { std::filesystem::path manifest; size_t line = 0; std::string
 // optional fonts/ folder glyphs for letters the game's fonts lack. It
 // applies only while the player has it selected in Settings, in every mode.
 // id is lower case; base is a three-letter game language code (int, jpn...).
-struct LanguagePack { std::string id, name, base; std::filesystem::path folder; };
+// rightToLeft: direction=rtl, text drawn from the right (gpu/rtl_text.cpp).
+struct LanguagePack { std::string id, name, base; std::filesystem::path folder; bool rightToLeft = false; };
 // Mod: a folder with a mod.ini. LanguagePack: a folder with a language.ini
 // (never a mod, even beside a mod.ini); listed read-only, chosen in Settings.
 enum class ModKind : uint32_t { Mod, LanguagePack };

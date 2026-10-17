@@ -4,6 +4,16 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 
 按新到旧记录简短更新，日期采用 UTC。技术验证见[开发状态](docs/STATUS.md)，后续计划见[路线图](docs/ROADMAP.zh-CN.md)。
 
+## Unreleased
+
+### English
+
+- Language packs for right-to-left languages such as Arabic (`direction=rtl` in `language.ini`): text is right-aligned in menus, lists, help bars and dialogue (layout is not mirrored), Arabic joins correctly on the title and pause screens, and Arabic mod names show in the settings menu. Packs can also translate the Thousand Years of Dreams text and the place names (name_data.xmb).
+
+### 简体中文
+
+- 支持阿拉伯语等从右到左书写的语言包（`language.ini` 中写 `direction=rtl`）：菜单、列表、帮助栏和对话中的文字右对齐（界面布局不镜像），标题画面和暂停画面的阿拉伯文字母正确连写，设置菜单可显示阿拉伯语的 Mod 名称。语言包还可以翻译“千年之梦”的文字和地名（name_data.xmb）。
+
 ## [v1.0.1](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v1.0.1) — 2026-10-17
 
 ### English
