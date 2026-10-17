@@ -1,12 +1,11 @@
 name: FG CPU contracts
 
-# Pull request checks run on git.zkx.ca; this workflow has no GitHub copy.
 on:
   workflow_dispatch:
   push:
     branches: ['**']
     paths:
-      - '.gitea/workflows/fg-cpu-contracts.yml'
+      - '.github/workflows/fg-cpu-contracts.yml'
       - 'LostOdysseyRecomp/apu/**'
       - 'thirdparty/signalsmith*/**'
       - 'tools/tests/fast_forward_audio*/**'
@@ -54,7 +53,7 @@ on:
       - 'LostOdysseyRecomp/gpu/upscaling_plan.*'
   pull_request:
     paths:
-      - '.gitea/workflows/fg-cpu-contracts.yml'
+      - '.github/workflows/fg-cpu-contracts.yml'
       - 'LostOdysseyRecomp/apu/**'
       - 'thirdparty/signalsmith*/**'
       - 'tools/tests/fast_forward_audio*/**'
@@ -109,7 +108,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-2022]
+        os: [ubuntu-24.04, windows-2022]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
@@ -146,7 +145,7 @@ jobs:
         run: ctest --test-dir build/audio -C Release --output-on-failure
       - name: Preserve contract log
         if: always()
-        uses: actions/upload-artifact@v3 # Gitea does not support v4
+        uses: actions/upload-artifact@v4
         with:
           name: fg-contracts-${{ matrix.os }}
           path: |
@@ -154,27 +153,3 @@ jobs:
             build/audio/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 7
-  # Mirror the result onto the GitHub commit so pull requests show it. Needs a
-  # Gitea secret LO_GITHUB_TOKEN (fine-grained PAT, Commit statuses: write).
-  github-status:
-    needs: [contracts]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report to GitHub
-        env:
-          LO_GITHUB_TOKEN: ${{ secrets.LO_GITHUB_TOKEN }}
-          RESULTS: ${{ needs.contracts.result }}
-          CONTEXT: gitea/fg-cpu-contracts
-          RUN_URL: https://git.zkx.ca/${{ github.repository }}/actions/runs/${{ github.run_number }}
-        run: |
-          if [ -z "$LO_GITHUB_TOKEN" ]; then echo 'LO_GITHUB_TOKEN is not set; skipping'; exit 0; fi
-          state=success
-          for r in $RESULTS; do
-            case "$r" in success|skipped) ;; cancelled) [ "$state" = failure ] || state=error ;; *) state=failure ;; esac
-          done
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $LO_GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/freefrank/LostOdysseyRecomp/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"$state\",\"context\":\"$CONTEXT\",\"description\":\"Gitea Actions: $RESULTS\",\"target_url\":\"$RUN_URL\"}") || true
-          echo "GitHub status $state for $GITHUB_SHA -> HTTP $code"

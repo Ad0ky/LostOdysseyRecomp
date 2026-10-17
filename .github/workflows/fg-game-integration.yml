@@ -1,6 +1,5 @@
 name: FG game integration compile
 
-# Pull request checks run on git.zkx.ca; this workflow has no GitHub copy.
 on:
   workflow_dispatch:
   push:
@@ -14,7 +13,7 @@ on:
       - tools/tests/frame_generation/**
       - tools/tests/motion_replay/**
       - tools/tests/native_dlss_renderer_gpu_test.cpp
-      - .gitea/workflows/fg-game-integration.yml
+      - .github/workflows/fg-game-integration.yml
   pull_request:
     paths:
       - LostOdysseyRecomp/gpu/**
@@ -25,7 +24,7 @@ on:
       - tools/tests/frame_generation/**
       - tools/tests/motion_replay/**
       - tools/tests/native_dlss_renderer_gpu_test.cpp
-      - .gitea/workflows/fg-game-integration.yml
+      - .github/workflows/fg-game-integration.yml
 permissions:
   contents: read
 jobs:
@@ -43,17 +42,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # win-t640 sets LO_GIT_REFERENCE to a local mirror of these upstreams;
-          # objects missing from it are still fetched from GitHub.
-          if [ -n "${LO_GIT_REFERENCE:-}" ]; then fetch=(--reference "$LO_GIT_REFERENCE"); else fetch=(--depth 1); fi
-          git submodule update --init "${fetch[@]}" thirdparty/plume tools/XenosRecomp tools/XenonRecomp thirdparty/unordered_dense thirdparty/SDL
+          git submodule update --init --depth 1 thirdparty/plume tools/XenosRecomp tools/XenonRecomp thirdparty/unordered_dense thirdparty/SDL
           git -C thirdparty/plume apply ../../tools/patches/plume-lostodyssey.patch
           git -C thirdparty/plume apply ../../tools/patches/plume-sdl3.patch
-          git -C thirdparty/plume submodule update --init "${fetch[@]}" contrib/volk contrib/Vulkan-Headers contrib/VulkanMemoryAllocator contrib/D3D12MemoryAllocator
-          git -C tools/XenosRecomp submodule update --init --recursive "${fetch[@]}"
-          git -C tools/XenonRecomp submodule update --init "${fetch[@]}" thirdparty/tomlplusplus
-      # actions/checkout would send the Gitea job token to github.com, which
-      # rejects it; fetch the pinned public SDK headers without credentials.
+          git -C thirdparty/plume submodule update --init --depth 1 contrib/volk contrib/Vulkan-Headers contrib/VulkanMemoryAllocator contrib/D3D12MemoryAllocator
+          git -C tools/XenosRecomp submodule update --init --recursive --depth 1
+          git -C tools/XenonRecomp submodule update --init --depth 1 thirdparty/tomlplusplus
       - name: Fetch pinned SDK headers
         shell: bash
         run: |
@@ -83,33 +77,9 @@ jobs:
           ctest --test-dir out/fg-game -C Release --output-on-failure -R '^fg_game_input_contract$'
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Write-Output 'COMPILE_AND_CPU_ONLY: no SDK runtime, game launch or GPU acceptance performed'
-      - uses: actions/upload-artifact@v3 # Gitea does not support v4
+      - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: fg-game-compile-logs
           path: out/fg-game-*.log
           retention-days: 7
-  # Mirror the result onto the GitHub commit so pull requests show it. Needs a
-  # Gitea secret LO_GITHUB_TOKEN (fine-grained PAT, Commit statuses: write).
-  github-status:
-    needs: [windows]
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Report to GitHub
-        env:
-          LO_GITHUB_TOKEN: ${{ secrets.LO_GITHUB_TOKEN }}
-          RESULTS: ${{ needs.windows.result }}
-          CONTEXT: gitea/fg-game-integration
-          RUN_URL: https://git.zkx.ca/${{ github.repository }}/actions/runs/${{ github.run_number }}
-        run: |
-          if [ -z "$LO_GITHUB_TOKEN" ]; then echo 'LO_GITHUB_TOKEN is not set; skipping'; exit 0; fi
-          state=success
-          for r in $RESULTS; do
-            case "$r" in success|skipped) ;; cancelled) [ "$state" = failure ] || state=error ;; *) state=failure ;; esac
-          done
-          code=$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $LO_GITHUB_TOKEN" -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/freefrank/LostOdysseyRecomp/statuses/$GITHUB_SHA" \
-            -d "{\"state\":\"$state\",\"context\":\"$CONTEXT\",\"description\":\"Gitea Actions: $RESULTS\",\"target_url\":\"$RUN_URL\"}") || true
-          echo "GitHub status $state for $GITHUB_SHA -> HTTP $code"
