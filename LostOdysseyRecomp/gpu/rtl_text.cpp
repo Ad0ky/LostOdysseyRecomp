@@ -21,7 +21,8 @@
 //     the widest of them ends;
 //   - styled texts on a screen whose box edge is known (kEdges) end at that edge, and so do text
 //     blocks in such a box (kBlockEdges); a text wider than that room keeps its start;
-//   - a text the game types in letter by letter appears whole (the reveal runs left to right).
+//   - a text the game types in letter by letter appears whole (the reveal runs left to right),
+//     whatever its alignment.
 // The previous frame tells which texts share a column. The game's own per-line x positions
 // (text object +280/+296/+300, used for centring; each replaces x) carry the shift.
 // Every hook here passes straight to the game's code unless the selected language pack is
@@ -148,6 +149,7 @@ struct BlockEdge
 };
 constexpr BlockEdge kBlockEdges[] = {
     {227, 536, 546, 1050}, // tutorial pages (camp menu, Help): the box under the picture, clear of its A button
+    {212, 483, 493, 1078}, // the speaker's name over a message window (box 192..1098): as far in from its right
 };
 
 
@@ -198,6 +200,32 @@ Layout Measure(PPCContext &ctx, uint8_t *base, uint32_t object, float scale)
 constexpr uint32_t kZero = 0x82000E50; // the 0 the draw code compares +216 with
 
 bool Typing(uint32_t object) { return LoadFloat(object + 216) > LoadFloat(kZero) && LoadWord(object + 272) == 1; }
+
+// Draws an Arabic text object; while it would type in, every record takes the first one's opacity.
+// Pop-ups, narration and signs break a line after +252 characters (26, a row of Japanese across the
+// window) by counting, and a line of reversed text would be cut from its wrong end. Arabic letters are
+// narrower: the pack's own rows fit, so the count is off while it draws.
+void DrawWhole(PPCContext &ctx, uint8_t *base, uint32_t object)
+{
+    const bool typing = Typing(object);
+    const uint32_t savedIndexed = LoadWord(object + 276), savedOrder = LoadWord(object + 220), savedStep = LoadWord(object + 228);
+    const uint32_t savedWrap = LoadWord(object + 252);
+    if (typing)
+    {
+        StoreWord(object + 276, 1);
+        StoreWord(object + 220, 1);
+        StoreFloat(object + 228, 0);
+    }
+    StoreWord(object + 252, 0);
+    __imp__sub_82314CD8(ctx, base);
+    StoreWord(object + 252, savedWrap);
+    if (typing)
+    {
+        StoreWord(object + 276, savedIndexed);
+        StoreWord(object + 220, savedOrder);
+        StoreWord(object + 228, savedStep);
+    }
+}
 } // namespace
 
 // Draws one LO text object: r3 = the object, f1/f2 = the canvas scale.
@@ -205,9 +233,16 @@ PPC_FUNC(sub_82314CD8)
 {
     const uint32_t object = ctx.r3.u32;
     const bool leftAnchored = LoadWord(object + 224) != 1 && LoadWord(object + 280) == 0;
-    if (!Enabled() || !leftAnchored || !GuestHasArabic(object + 236))
+    if (!Enabled() || !GuestHasArabic(object + 236))
     {
         __imp__sub_82314CD8(ctx, base);
+        return;
+    }
+    // Centred and right-anchored Arabic keeps the game's placement, but appears whole too
+    // (narration, pop-ups and confirmations are centred).
+    if (!leftAnchored)
+    {
+        DrawWhole(ctx, base, object);
         return;
     }
     const float scale = LoadWord(object + 292) ? LoadFloat(kUnitScale) : LoadFloat(object + 180) * float(ctx.f1.f64);
@@ -242,7 +277,7 @@ PPC_FUNC(sub_82314CD8)
     if (natural <= 0 || layout.lines.size() > kMaxLines)
     {
         lock.unlock();
-        __imp__sub_82314CD8(ctx, base);
+        DrawWhole(ctx, base, object);
         return;
     }
     if (!gOffsets)
@@ -255,21 +290,7 @@ PPC_FUNC(sub_82314CD8)
     StoreWord(object + 296, gOffsets);
     StoreWord(object + 300, uint32_t(layout.lines.size()));
     lock.unlock();
-    const bool typing = Typing(object);
-    const uint32_t savedIndexed = LoadWord(object + 276), savedOrder = LoadWord(object + 220), savedStep = LoadWord(object + 228);
-    if (typing)
-    {
-        StoreWord(object + 276, 1);
-        StoreWord(object + 220, 1);
-        StoreFloat(object + 228, 0);
-    }
-    __imp__sub_82314CD8(ctx, base);
-    if (typing)
-    {
-        StoreWord(object + 276, savedIndexed);
-        StoreWord(object + 220, savedOrder);
-        StoreWord(object + 228, savedStep);
-    }
+    DrawWhole(ctx, base, object);
     StoreWord(object + 280, savedCentre);
     StoreWord(object + 296, savedOffsets);
     StoreWord(object + 300, savedCount);
@@ -497,7 +518,8 @@ PPC_FUNC(sub_82319F70)
 // The game lays its characters out from Postion (+16/+20) to the right, wrapping at Width (+104),
 // and reveals them left to right (delays at +152). A language pack stores each Arabic piece as lines
 // joined by '\n'; here each line ends at the box's right edge, lines stack one under another, and the
-// reveal runs from the top line's right end. Elements in the anchored mode (+132) are left as they are.
+// reveal runs from the top line's right end. In the anchored mode (+132) the same places are written as
+// the offsets from the box's centre that the game uses there.
 PPC_FUNC(sub_828088E0)
 {
     const uint32_t element = ctx.r3.u32;
@@ -507,7 +529,7 @@ PPC_FUNC(sub_828088E0)
     const uint32_t font = LoadWord(element), characters = LoadWord(element + 120), count = LoadWord(element + 124);
     const uint32_t sprites = LoadWord(element + 140), spriteCount = LoadWord(element + 144);
     const uint32_t delays = LoadWord(element + 152), delayCount = LoadWord(element + 156);
-    if (!font || !characters || count < 2 || count > 4096 || spriteCount + 1 != count || (LoadWord(element + 132) >> 24) != 0 ||
+    if (!font || !characters || count < 2 || count > 4096 || spriteCount + 1 != count ||
         !ValidRange(characters, count * 2) || !ValidRange(sprites, spriteCount * 4))
         return;
     std::u16string text;
@@ -519,6 +541,10 @@ PPC_FUNC(sub_828088E0)
     const float widthScale = LoadFloat(font + 112), heightScale = LoadFloat(font + 116);
     const float kerning = float(LoadInt(font + 108)) * widthScale;
     const float right = LoadFloat(element + 16) + LoadFloat(element + 104), top = LoadFloat(element + 20);
+    const float boxX = LoadFloat(element + 16);
+    // Anchored mode (+132): every sprite sits at the anchor (+0/+4) and its place is an offset from the
+    // box's centre in halves of its own size (+60/+64), as sub_828088E0 writes it there.
+    const bool anchored = (LoadWord(element + 132) >> 24) != 0;
     // Lines: [begin, end) character ranges, their widths and the line step.
     std::vector<std::pair<uint32_t, uint32_t>> lines{{0, 0}};
     std::vector<float> widths{0};
@@ -550,8 +576,20 @@ PPC_FUNC(sub_828088E0)
         {
             const uint32_t sprite = LoadWord(sprites + i * 4);
             const float width = LoadFloat(sprite + 36);
-            StoreFloat(sprite, pen + width * kHalf);
-            StoreFloat(sprite + 4, y + LoadFloat(sprite + 40) * kHalf);
+            const float centreX = pen + width * kHalf, centreY = y + LoadFloat(sprite + 40) * kHalf;
+            if (anchored)
+            {
+                const float halfW = width * kHalf, halfH = LoadFloat(sprite + 40) * kHalf;
+                if (halfW > 0)
+                    StoreFloat(sprite + 60, (centreX - (boxX + LoadFloat(element + 104) * kHalf)) / halfW);
+                if (halfH > 0)
+                    StoreFloat(sprite + 64, (centreY - (top + LoadFloat(element + 108) * kHalf)) / halfH);
+            }
+            else
+            {
+                StoreFloat(sprite, centreX);
+                StoreFloat(sprite + 4, centreY);
+            }
             pen += width * widthScale + kerning;
             order.push_back(i);
         }
@@ -565,8 +603,8 @@ PPC_FUNC(sub_828088E0)
         if (text[i] == u'\n')
         {
             const uint32_t sprite = LoadWord(sprites + i * 4);
-            StoreFloat(sprite, -4096.0f);
-            StoreFloat(sprite + 4, -4096.0f);
+            StoreFloat(sprite + (anchored ? 60 : 0), -4096.0f);
+            StoreFloat(sprite + (anchored ? 64 : 4), -4096.0f);
         }
 }
 

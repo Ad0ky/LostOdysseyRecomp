@@ -332,6 +332,14 @@ void Languages(const fs::path& root) {
     auto packs = LanguagePacks();
     // direction= is optional: left to right when left out, rtl for right-to-left text.
     assert(packs.size() == 2 && packs[0].id == "ar" && packs[0].base == "jpn" && packs[0].rightToLeft);
+    // achievements.ini: heading and <id>.name/.unlocked/.locked; anything else is left out.
+    assert(AchievementTexts(packs[0]).empty());
+    Write(root / "ar/achievements.ini", "\xef\xbb\xbf# texts\r\nheading=Unlocked\r\n1.name=Survived\r\n1.unlocked=Done.\r\n"
+        "12.locked=Not yet.\r\n1.icon=x\r\nname=x\r\n.name=x\r\n123456.name=x\r\n2.name=\r\nno equals sign\r\n3.name=a\x01" "b\r\n");
+    const auto achievementTexts = AchievementTexts(packs[0]);
+    assert(achievementTexts.size() == 4 && achievementTexts.at("heading") == "Unlocked" &&
+           achievementTexts.at("1.name") == "Survived" && achievementTexts.at("1.unlocked") == "Done." &&
+           achievementTexts.at("12.locked") == "Not yet.");
     packs.erase(packs.begin());
     assert(packs[0].id == "pt-br" && packs[0].name == name && packs[0].base == "int" && !packs[0].rightToLeft);
     const auto diagnostics = Diagnostics();

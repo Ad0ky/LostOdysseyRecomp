@@ -120,6 +120,11 @@ HelpFit MeasureHelp(const MenuSnapshot &snapshot);
 // The text with its isolated A/B/X/Y (and LB/RB, LT/RT) button labels swapped for
 // the PlayStation faces when playStation is set; any other text is unchanged.
 std::wstring PromptGlyphs(const std::wstring &value, bool playStation);
+// Arabic text (as a language pack names itself or its achievements) in drawing order: joined
+// presentation forms, the line reversed when it starts with an Arabic letter. Other text unchanged.
+std::wstring ArabicDrawOrder(const std::wstring &value);
+// An Arabic presentation form or tatweel: drawn touching its neighbours, without a gap.
+bool ArabicJoinedForm(wchar_t c);
 // The list cursor arrow, top-left corner in the 1280x720 layout.
 struct MenuArrow
 {

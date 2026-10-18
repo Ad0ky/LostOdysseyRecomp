@@ -326,6 +326,8 @@ The log shows `mods: language pack pt-br (Português (Brasil), base int)` at sta
 
 The game runs as the base language underneath: voices, artwork with words in it and everything you have not translated stay in that language (English for `int`). While the pack is selected, its files replace the same files from other text mods. Players who pick another language do not see the pack.
 
+The achievement notification and **Settings → System → Achievements** take their texts from the game's title data, which has no new languages. A pack can give its own in an `achievements.ini` next to `language.ini` (UTF-8, `key=value`, `#` and `;` start comments): `heading=` for the notification's "Achievement unlocked" line, and `<id>.name=`, `<id>.unlocked=` and `<id>.locked=` for an achievement's name and its texts once earned and before. Achievement ids are 1 to 36, in the order of the Achievements page. Anything the file leaves out keeps the base language's text. Write right-to-left text in reading order: the game joins and orders the letters itself. `language-clean` copies the file as it is.
+
 ### Add letters the fonts lack
 
 The game draws text with bitmap fonts: each letter is a small picture on a texture page, white with a dark outline, at one fixed size. A language that needs letters those fonts do not have, such as Polish, Russian or Arabic, can add them to a language pack: `lo_mod.py font-glyphs` draws every letter the pack's text uses and the fonts lack from a TrueType or OpenType font, at each game font's size and in its style, and the game adds them to its fonts while the pack is selected.

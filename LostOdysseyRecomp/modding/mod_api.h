@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iosfwd>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -116,6 +117,10 @@ std::vector<ResolvedAsset> ListTexts(const LanguagePack& pack);
 // The pack's fonts/ files (glyphs it adds to the game's fonts, modding/font_patch.h):
 // fonts/<package member path>/<font>.lofont, keyed <package member path>#<font>.
 std::vector<ResolvedAsset> ListFonts(const LanguagePack& pack);
+// The pack's achievements.ini (UTF-8 key=value, at most 64 KiB): heading= for "Achievement
+// unlocked", and <id>.name=, <id>.unlocked=, <id>.locked= for an achievement's texts. Other keys,
+// and values longer than 512 bytes or with control characters, are left out.
+std::map<std::string, std::string> AchievementTexts(const LanguagePack& pack);
 std::optional<ResolvedAsset> Resolve(const AssetRequest& request);
 // Opens a resolved file at its first byte; length is its size. An archive
 // entry ends before the archive does, so readers stop at length.

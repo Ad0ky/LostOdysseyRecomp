@@ -187,6 +187,8 @@ namespace
             case L']': c = L'['; break;
             case L'<': c = L'>'; break;
             case L'>': c = L'<'; break;
+            case L'«': c = L'»'; break;
+            case L'»': c = L'«'; break;
             }
         }
         reverseRuns(shaped, ltr);
@@ -425,6 +427,10 @@ namespace
             }
     }
 }
+
+std::wstring settings::ArabicDrawOrder(const std::wstring &value) { return ArabicVisual(value); }
+
+bool settings::ArabicJoinedForm(wchar_t c) { return JoinedForm(c); }
 
 void settings::DrawMenuArrow(std::vector<uint32_t> &pixels, uint32_t width, uint32_t height, int x, int y)
 {
