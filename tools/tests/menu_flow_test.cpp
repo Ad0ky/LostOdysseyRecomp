@@ -236,6 +236,7 @@ settings::Config currentConfig{}, diskConfig{};
 unsigned saves = 0, previews = 0, requests = 0;
 bool saveFails = false, modeFailed = false;
 unsigned quitEventAttempts = 0, mainMenuRequests = 0, defaultsCalls = 0;
+bool titleQuitAccepted = true;
 gpu::video::DisplayChangeTracker displayChanges;
 void Require(bool condition, const char* message)
 {
@@ -301,6 +302,12 @@ extern "C" int SDLCALL MenuFlowPushEvent(SDL_Event* event)
     (void)event;
     ++quitEventAttempts;
     throw std::runtime_error("return to main menu must never push an SDL event");
+}
+
+bool settings::quit_action::PushQuit()
+{
+    ++quitEventAttempts;
+    return titleQuitAccepted;
 }
 void settings::RequestMainMenuAfterSettingsClose(PPCContext& ctx, uint8_t* base, uint32_t settingsMenu)
 {
@@ -2138,7 +2145,7 @@ int main(int argc, char** argv)
             Require(pace.name == L"Loading speed" && pace.choices == std::vector<std::wstring>{L"Original", L"Fast"} &&
                     pace.selectedChoice == 1 && !pace.hidden && pace.enabled,
                     "loading pace offers Original and Fast, with Fast selected");
-            Require(settings::snapshot.help == L"Loading pace. Transition effects keep their normal speed.",
+            Require(settings::snapshot.help == L"Original keeps the Xbox 360 loading pace. Fast loads at a higher frame rate. Effects play at normal speed either way.",
                     "loading pace help describes loading and normal-speed effects");
             const auto beforeEdit = saves;
             settings::pending = 0x1000; Tick(base);
@@ -2191,9 +2198,11 @@ int main(int argc, char** argv)
             const wchar_t* original[] = {L"Original", L"原版", L"オリジナル", L"원본", L"原版"};
             const wchar_t* fast[] = {L"Fast", L"快速", L"速い", L"빠르게", L"快"};
             const wchar_t* help[] = {
-                L"Loading pace. Transition effects keep their normal speed.", L"載入節奏；過場效果維持正常速度。",
-                L"ロードの速度を選択します。演出は通常の速度を保ちます。",
-                L"로딩 속도입니다. 전환 효과는 원래 속도로 재생됩니다.", L"加载节奏；过场效果保持正常速度。"};
+                L"Original keeps the Xbox 360 loading pace. Fast loads at a higher frame rate. Effects play at normal speed either way.",
+                L"原版維持 Xbox 360 的載入節奏；快速以更高幀率載入。兩者的過場效果都維持正常速度。",
+                L"オリジナルは Xbox 360 のロード速度、高速はより高いフレームレートで読み込みます。演出はどちらも通常の速度です。",
+                L"원본은 Xbox 360의 로딩 속도를 유지하고, 빠름은 더 높은 프레임 레이트로 불러옵니다. 효과는 어느 쪽이든 원래 속도로 재생됩니다.",
+                L"原版保持 Xbox 360 的加载节奏；快速以更高帧率加载。两种设置下过场效果都保持正常速度。"};
             settings::tab = 2;
             settings::row = int(GraphicsRow::LoadingTransitions);
             for (uint32_t language = 0; language < 5; ++language)
@@ -4140,6 +4149,121 @@ int main(int argc, char** argv)
         CaptureHelpRows(base, argc == 3 ? argv[1] : nullptr);
         CaptureSubpageEntries(base, argc == 3 ? argv[1] : nullptr);
         CheckHelpFit(base, argc == 3 ? argv[1] : nullptr);
+        {
+            // Exercise the same idle report / input polls / consume ordering
+            // as the title hook. No guest menu task or SDL event is started.
+            settings::active = false;
+            settings::controlsOpen = false;
+            settings::releaseToParent = false;
+            settings::cancelPolls = 0;
+            settings::pending = 0;
+            PPC_STORE_U32(ConfigData + 4, 0);
+            const unsigned beforeQuit = quitEventAttempts;
+            const auto titleTick = [&](bool idle) {
+                const bool owned = settings::UpdateTitleQuit(base, idle);
+                Require(!settings::ConsumeTitleShortcut(idle && !owned), "Quit never opens Settings");
+                return owned;
+            };
+            settings::ConsumeTitleShortcut(false);
+            Poll(0x20, false);
+            Require(!titleTick(true), "a held Back from outside the idle menu does not open Quit");
+            Poll(0x20, false);
+            Require(!titleTick(true), "holding Back across the idle gate is not a new press");
+            const auto openQuit = [&] {
+                Require(!titleTick(true), "title menu is idle before shortcut");
+                Poll(0, false); Poll(0x20, false);
+                Require(titleTick(true) && settings::IsOpen() && settings::IsTitleQuitOpen() && !settings::active,
+                        "fresh Back opens host confirmation without opening retail Settings");
+                Require(settings::snapshot.dialogOnly && settings::snapshot.dialogMessage == L"Quit the game?" &&
+                        settings::snapshot.dialogChoices == std::vector<std::wstring>{L"Yes", L"No"} &&
+                        settings::snapshot.dialogSelection == 1, "Quit defaults to No");
+                Poll(0x20, true); Poll(0, true);
+            };
+            const auto release = [&] { Poll(0, true); Poll(0, false); };
+            currentConfig.uiLanguage = 0;
+            openQuit();
+            settings::menuClockOffset = {};
+            settings::menuClockFixed = std::chrono::steady_clock::time_point{};
+            std::vector<uint32_t> dialogPixels, replacementPixels;
+            uint64_t dialogRevision = 0, replacementRevision = 0;
+            Require(!settings::DrawMenu(replacementPixels, replacementRevision, 320, 180) && replacementPixels.empty(),
+                    "title confirmation never replaces the live title through DrawMenu");
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && (dialogPixels.front() >> 24) == 0,
+                    "title confirmation starts with transparent dim");
+            const auto colored = std::find_if(dialogPixels.begin(), dialogPixels.end(), [](uint32_t pixel) {
+                return (pixel & 0x00ffffffu) != 0;
+            });
+            Require(colored != dialogPixels.end(), "transparent opening retains dialog RGB for straight alpha");
+            const size_t coloredIndex = size_t(colored - dialogPixels.begin());
+            const uint32_t coloredRgb = *colored & 0x00ffffffu;
+            const uint64_t snapshotRevision = settings::snapshot.revision, openingRevision = dialogRevision;
+            settings::menuClockOffset = std::chrono::milliseconds(50);
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && (dialogPixels.front() >> 24) == 30 &&
+                    (dialogPixels[coloredIndex] & 0x00ffffffu) == coloredRgb && dialogRevision > openingRevision &&
+                    settings::snapshot.revision == snapshotRevision,
+                    "unchanged title snapshot advances its 100 ms dim without fading straight RGB");
+            const uint64_t halfOpenRevision = dialogRevision;
+            settings::menuClockOffset = std::chrono::milliseconds(100);
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && (dialogPixels.front() >> 24) == 61 &&
+                    dialogRevision > halfOpenRevision, "title dim reaches translucent alpha 61 after 100 ms");
+            const uint64_t settledRevision = dialogRevision;
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && dialogRevision == settledRevision,
+                    "settled title confirmation reuses its raster revision");
+            Poll(0x1000, true);
+            Require(titleTick(true) && !settings::IsOpen() && !settings::IsTitleQuitOpen() && quitEventAttempts == beforeQuit,
+                    "confirming default No holds guest input for its last tick and never quits");
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180),
+                    "dismissed No retains overlay for its closing fade");
+            settings::menuClockOffset = std::chrono::milliseconds(150);
+            Require(settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && (dialogPixels.front() >> 24) == 30 &&
+                    (dialogPixels[coloredIndex] & 0x00ffffffu) == coloredRgb && dialogRevision > settledRevision,
+                    "No fades dim and dialog out over the live title without fading straight RGB");
+            const uint64_t halfClosedRevision = dialogRevision;
+            settings::menuClockOffset = std::chrono::milliseconds(200);
+            Require(!settings::DrawTitleQuit(dialogPixels, dialogRevision, 320, 180) && (dialogPixels.front() >> 24) == 0 &&
+                    dialogRevision > halfClosedRevision, "closing completes after 100 ms and publishes its last frame");
+            settings::menuClockOffset = {};
+            settings::menuClockFixed.reset();
+            Poll(0x1000, true); release();
+            openQuit();
+            Poll(1, true); titleTick(true); Poll(0, true); Poll(0x2000, true);
+            Require(titleTick(true) && !settings::IsOpen() && quitEventAttempts == beforeQuit,
+                    "B cancels even with Yes selected");
+            Poll(0x2000, true); release();
+            openQuit();
+            Require(settings::CalibrationKey(27), "Escape belongs to title confirmation");
+            Require(titleTick(true) && !settings::IsOpen(), "Escape returns to title");
+            release();
+            openQuit();
+            Poll(0x20, true);
+            Require(titleTick(true) && !settings::IsOpen(), "fresh Back cancels its confirmation");
+            release();
+            openQuit();
+            settings::PointerClick(500, 420, false);
+            Require(titleTick(true) && !settings::IsOpen() && quitEventAttempts == beforeQuit,
+                    "mouse No uses the shared dialog hit-test without quitting");
+            release();
+            titleQuitAccepted = false;
+            openQuit();
+            Poll(1, true); titleTick(true); Poll(0, true); Poll(0x10, true);
+            Require(titleTick(true) && !settings::IsOpen() && quitEventAttempts == beforeQuit + 1,
+                    "Yes via keyboard Enter uses shared Quit; rejected event stays on the title");
+            release();
+            titleQuitAccepted = true;
+            openQuit();
+            Poll(2, true); titleTick(true); Poll(0, true); Poll(0x1000, true);
+            Require(titleTick(true) && !settings::IsOpen() && quitEventAttempts == beforeQuit + 2,
+                    "fresh retry Yes queues the same normal quit path once");
+            release();
+            Require(!titleTick(true), "idle gate rearms after dialog");
+            Poll(0, false); Poll(0x20, false);
+            Require(!titleTick(false) && !titleTick(true) && !settings::IsOpen(),
+                    "queued shortcut is discarded when title leaves MenuIdle");
+            Poll(0, false); Poll(0x8000, false);
+            Require(settings::ConsumeTitleShortcut(true), "existing Y Settings shortcut remains available");
+            settings::ConsumeTitleShortcut(false);
+            std::puts("PASS title Quit: overlay-only 100 ms straight-alpha fades, idle edge gate, held input, default No, B/Back/Escape, release consumption, Yes and failed queue retry");
+        }
         VirtualFree(base, 0, MEM_RELEASE);
         return 0;
     }

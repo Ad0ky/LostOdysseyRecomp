@@ -234,13 +234,21 @@ bool FilterInput(uint16_t &buttons, int16_t leftX, int16_t leftY, uint16_t defau
 bool CaptureKey(uint32_t scancode, bool repeat);
 // Snapshot rendered on the presentation thread, never accessing guest memory.
 bool DrawMenu(std::vector<uint32_t> &pixels, uint64_t &revision, uint32_t width = 1280, uint32_t height = 720);
+// Straight-alpha title confirmation, composited over the live title picture.
+// Stays drawable through its closing fade; revision also tracks fade frames.
+bool DrawTitleQuit(std::vector<uint32_t> &pixels, uint64_t &revision, uint32_t width, uint32_t height);
 void PointerClick(float x, float y, bool reverse);
 bool IsOpen();
+bool IsTitleQuitOpen();
 // Title menu entry (title_entry.cpp): Y on the idle title menu opens Settings
 // before a game is loaded. The title tick reports whether its menu is idle and
 // takes a fresh press made there, if any.
 inline constexpr uint16_t TitleSettingsButton = 0x8000; // XINPUT_GAMEPAD_Y
+inline constexpr uint16_t TitleQuitButton = 0x0020; // XINPUT_GAMEPAD_BACK (keyboard Backspace)
 bool ConsumeTitleShortcut(bool titleMenuIdle);
+// Tick the host Yes/No dialog before the title's input handler. True while it
+// owns input, including its dismissal tick. The retail Settings task stays idle.
+bool UpdateTitleQuit(uint8_t* base, bool titleMenuIdle);
 // The retail Settings task was just opened from the title menu. Until that task
 // is idle again, the per-save options are hidden (Gameplay's retail rows,
 // Restore game defaults and Quit to Main Menu; Audio's Voice language, Music and
