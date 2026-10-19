@@ -57,8 +57,16 @@ void Release(uint8_t* base);
 // its C and E aliases). Returns false when the console is out of memory.
 bool Commit(uint32_t address, uint32_t size);
 size_t CommittedBytes();
+// For a guest pointer the game reads although nothing was allocated there
+// (the desktop builds read zeros from such pages; the Switch would fault):
+// backs [address, address + size) with zeroed memory. C and E addresses are
+// committed through their A pages. Cheap when already backed.
+enum class Backing { Failed, AlreadyBacked, NewlyBacked };
+Backing EnsureBacked(uint32_t address, uint32_t size);
 #else
 // Desktop hosts commit on first touch.
 inline bool Commit(uint32_t, uint32_t) { return true; }
+enum class Backing { Failed, AlreadyBacked, NewlyBacked };
+inline Backing EnsureBacked(uint32_t address, uint32_t) { return address >= 0x1000 ? Backing::AlreadyBacked : Backing::Failed; }
 #endif
 }

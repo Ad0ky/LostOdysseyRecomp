@@ -218,10 +218,31 @@ bool Commit(uint32_t address, uint32_t size)
         }
         if (!MapChunk(offset, length))
             return false;
-        s_committed[chunk] = true;
+        __atomic_store_n(&s_committed[chunk], true, __ATOMIC_RELEASE); // read without the lock by EnsureBacked
         s_committedBytes += kChunk;
     }
     return true;
+}
+
+Backing EnsureBacked(uint32_t address, uint32_t size)
+{
+    if (!s_base || address < kPage || size == 0)
+        return Backing::Failed;
+    // C and E alias A: commit the A pages behind them.
+    uint64_t start = address;
+    if (start >= kStarts[3])
+        start = start - kStarts[3] + kStarts[1] + kPage;
+    else if (start >= kStarts[2])
+        start = start - kStarts[2] + kStarts[1];
+    const uint64_t end = start + size;
+    if (end > kStarts[2])
+        return Backing::Failed;
+    bool backed = true;
+    for (uint64_t chunk = start / kChunk; chunk * kChunk < end; ++chunk)
+        backed = backed && __atomic_load_n(&s_committed[chunk], __ATOMIC_ACQUIRE);
+    if (backed)
+        return Backing::AlreadyBacked;
+    return Commit(uint32_t(start), uint32_t(end - start)) ? Backing::NewlyBacked : Backing::Failed;
 }
 
 size_t CommittedBytes()
