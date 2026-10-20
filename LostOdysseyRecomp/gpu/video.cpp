@@ -3144,9 +3144,10 @@ namespace gpu::video
         os::shaderlog::CloseForExit();
         std::fflush(nullptr);
 #if LO_PLATFORM_SWITCH
-        os::switch_platform::AllowExit();
-#endif
+        os::switch_platform::ExitNow();
+#else
         (discord_rpc::Shutdown(), std::_Exit(EXIT_SUCCESS));
+#endif
     }
 
     void PumpEvents()

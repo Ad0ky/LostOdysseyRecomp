@@ -73,6 +73,10 @@ struct RepairInfo
     uint64_t regionStart, regionSize;     // that memory block (guest offsets)
     uint32_t aliasType, aliasPermission;  // the same page through C
     uint32_t result;          // svcMapProcessMemory result of the repair
+    uint64_t source;          // the chunk's code-memory source (0: none recorded)
+    uint32_t sourceType, sourcePermission;
+    uint64_t mappedStart, mappedSize;     // what the repair mapped (guest offsets)
+    char layout[320];         // the chunk's memory blocks: "start-end tTYPE pPERM, ..."
 };
 RepairInfo LastRepair();
 // Logs LastRepair() as an error (patches/unbacked_guest_reads.cpp); the first few only.

@@ -4,6 +4,7 @@
 #include <switch.h>
 #include <malloc.h>
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -283,16 +284,44 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
                 repair.aliasPermission = alias.perm;
             }
         }
-        size_t offset = size_t(chunk * kChunk);
-        size_t length = kChunk;
-        size_t sourceOffset = 0;
-        if (offset == 0)
-        {
-            offset = kPage;
-            length -= kPage;
-        }
+        // Where the chunk's view starts in the window and in its source.
+        const uint64_t chunkStart = chunk * kChunk;
+        const uint64_t mapStart = chunkStart == 0 ? kPage : chunkStart;
+        const uint64_t chunkEnd = chunkStart + kChunk;
         const uintptr_t source = s_source[chunk];
-        repair.result = source ? svcMapProcessMemory(s_base + offset, s_process, source + sourceOffset, length) : 0xFFFFFFFFu;
+        repair.source = source;
+        if (source)
+        {
+            MemoryInfo backing{};
+            if (R_SUCCEEDED(svcQueryMemory(&backing, &pageInfo, source)))
+            {
+                repair.sourceType = backing.type;
+                repair.sourcePermission = backing.perm;
+            }
+        }
+        // The chunk's memory blocks as the kernel sees them now.
+        size_t length = 0;
+        for (uint64_t at = mapStart; at < chunkEnd && length + 48 < sizeof(repair.layout);)
+        {
+            MemoryInfo block{};
+            if (R_FAILED(svcQueryMemory(&block, &pageInfo, uintptr_t(s_base + at))) || block.size == 0)
+                break;
+            const uint64_t blockEnd = std::min<uint64_t>(chunkEnd, uint64_t(block.addr + block.size - uintptr_t(s_base)));
+            const int written = std::snprintf(repair.layout + length, sizeof(repair.layout) - length, "%s%#llx-%#llx t%x p%x",
+                length ? ", " : "", (unsigned long long)at, (unsigned long long)blockEnd, block.type, block.perm);
+            if (written <= 0)
+                break;
+            length += size_t(written);
+            at = blockEnd;
+        }
+        // Map only the unmapped block, within this chunk, onto the matching part of the source.
+        const uint64_t blockStart = std::max<uint64_t>(mapStart, uint64_t(info.addr - uintptr_t(s_base)));
+        const uint64_t blockEnd = std::min<uint64_t>(chunkEnd, uint64_t(info.addr + info.size - uintptr_t(s_base)));
+        repair.mappedStart = blockStart;
+        repair.mappedSize = blockEnd > blockStart ? blockEnd - blockStart : 0;
+        repair.result = source && blockEnd > blockStart
+            ? svcMapProcessMemory(s_base + blockStart, s_process, source + (blockStart - mapStart), blockEnd - blockStart)
+            : 0xFFFFFFFFu;
         repair.count = s_repair.count + 1;
         s_repair = repair;
         if (R_FAILED(repair.result))

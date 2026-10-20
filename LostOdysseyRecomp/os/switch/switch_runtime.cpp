@@ -456,6 +456,12 @@ void AllowExit()
     appletUnlockExit();
 }
 
+void ExitNow()
+{
+    appletUnlockExit();
+    ExitWithLog();
+}
+
 void ShowError(const std::string& summary, const std::string& details)
 {
     std::fprintf(stderr, "fatal: %s\n%s\n", summary.c_str(), details.c_str());

@@ -228,7 +228,11 @@ namespace apu::xma
                     LOG_WARNING("guest memory: xma buffer {:#x} (+{:#x}) is in unallocated memory: {}", address, size,
                         backing == Backing::Failed ? "cannot back it, skipping" : "backed it");
                 if (backing == Backing::Failed)
+                {
+                    if (GuestAddressSpace::LastRepair().count != 0)
+                        GuestAddressSpace::LogRepair("xma (failed repair)");
                     return nullptr;
+                }
             }
 #endif
             return Physical(physicalAddress);

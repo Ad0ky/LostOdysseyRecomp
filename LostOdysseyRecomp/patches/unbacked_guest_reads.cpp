@@ -31,6 +31,8 @@ void LogBackingFailure(const char* what, uint32_t address)
         what, address, GuestAddressSpace::FailureOperationName(failure.operation), failure.error, failure.address,
         failure.size, failure.offset, failure.viewIndex, GuestAddressSpace::CommittedBytes() >> 20,
         os::switch_platform::MemorySummary());
+    if (GuestAddressSpace::LastRepair().count != 0)
+        GuestAddressSpace::LogRepair("sub_82B6E908 (failed repair)");
 }
 }
 
@@ -41,10 +43,11 @@ void GuestAddressSpace::LogRepair(const char* who)
         return;
     const auto repair = GuestAddressSpace::LastRepair();
     LOG_ERROR("guest memory: {} read committed address {:#x} but the kernel had nothing mapped there "
-              "(type {:#x} attribute {:#x} permission {:#x}, block {:#x}+{:#x}; C alias type {:#x} permission {:#x}); "
-              "mapped it again: result {:#x}, repair {}",
+              "(type {:#x} attribute {:#x} permission {:#x}, block {:#x}+{:#x}; C alias type {:#x} permission {:#x}; "
+              "source {:#x} type {:#x} permission {:#x}); mapped {:#x}+{:#x} again: result {:#x}, repair {}; chunk now: {}",
         who, repair.address, repair.type, repair.attribute, repair.permission, repair.regionStart, repair.regionSize,
-        repair.aliasType, repair.aliasPermission, repair.result, repair.count);
+        repair.aliasType, repair.aliasPermission, repair.source, repair.sourceType, repair.sourcePermission,
+        repair.mappedStart, repair.mappedSize, repair.result, repair.count, repair.layout);
 }
 #endif
 

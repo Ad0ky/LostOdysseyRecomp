@@ -59,5 +59,9 @@ namespace os::switch_platform
     // holds the exit; call this right before the process ends. Horizon kills
     // the game anyway 15 s after the request.
     void AllowExit();
+    // Ends the process at once after writing the logs (no newlib/libnx exit
+    // teardown): quitting through std::_Exit unmounted the SD card while game
+    // threads were still reading it, and one faulted in lseek.
+    [[noreturn]] void ExitNow();
 }
 #endif
