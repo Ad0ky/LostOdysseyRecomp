@@ -5042,6 +5042,18 @@ namespace gpu::video
     uint64_t CompletedPresentCount() { return g_completedPresentCount; }
     void SetCalibrationGameMenuOpen(bool open)
     {
+#if LO_PLATFORM_SWITCH
+        // The scene copy for the HDR / brightness calibration preview drains
+        // the renderer and submits an extra copy each time the camp menu
+        // opens. A tester's console lost the GPU (VK_ERROR_DEVICE_LOST) right
+        // after closing that menu; the Switch has no HDR output, so leave the
+        // copy out unless LO_MENU_SCENE_CAPTURE=1.
+        static const bool capture = [] {
+            const char* value = std::getenv("LO_MENU_SCENE_CAPTURE");
+            return value && std::strcmp(value, "1") == 0;
+        }();
+        if (!capture) return;
+#endif
 #if defined(LO_GPU_PLUME)
         const bool previous = g_calibrationGameMenuOpen.exchange(open, std::memory_order_acq_rel);
         if (open && !previous) g_calibrationCaptureRequested.store(true, std::memory_order_release);
