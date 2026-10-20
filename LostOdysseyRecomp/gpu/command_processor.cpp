@@ -8,6 +8,7 @@
 #include "video.h"
 #include "renderer.h"
 #include "frame_pacer.h"
+#include "loading_pacing.h"
 #include "deadline_wait.h"
 #include "register_snapshot.h"
 #include "render_timing.h"
@@ -441,8 +442,10 @@ namespace gpu
         }
         if (index >= frame_plan::wire::PlanBase && index < frame_plan::wire::PlanBase + frame_plan::wire::PlanWordCount)
         {
-            if (const auto plan = m_framePlan.Write(index, value))
+            if (const auto plan = m_framePlan.Write(index, value)) {
+                m_cinematicBars = plan->cinematicBars;
                 renderer::SelectFramePlan(*plan);
+            }
             return;
         }
         if (index >= movie_clear::RegisterBase && index <= movie_clear::Commit)
@@ -1106,12 +1109,14 @@ namespace gpu
             os::switch_cpu_profiler::Heartbeat();
 #endif
             const auto timingPace = std::chrono::steady_clock::now();
-            // Load boost (cpu/render_fence.h): loading-screen frames are not
-            // paced; vblanks come faster (VsyncMain) and only about 30 of them
-            // a second reach the display (below).
+            // Load boost (cpu/render_fence.h, LO_LOAD_BOOST=1): loading-screen
+            // frames are not paced; vblanks come faster (VsyncMain) and only
+            // about 30 of them a second reach the display (below). Otherwise
+            // loading frames follow the loading pace (gpu/loading_pacing.h).
             const bool loadBoost = render_fence::LoadBoost();
-            const uint32_t nativeTarget = loadBoost ? 0 : GetFrameRateTarget();
-            const auto fpsCap = video::GetFramePacingTarget(nativeTarget);
+            const auto fpsCap = loadBoost ? video::GetFramePacingTarget(0)
+                : loading::Active() ? loading::Target(GetFrameRateTarget())
+                : video::GetFramePacingTarget(GetFrameRateTarget());
             const bool timingEnabled = frame_timing::Enabled();
             frame_timing::PacingSample pacing;
             {
@@ -1120,7 +1125,8 @@ namespace gpu
                 static DeadlineWait pacingWait;
                 // Preserve the original schedule anchor; sleep without millisecond rounding.
                 const auto nativeDeadline = pacer.Schedule(timingPace, fpsCap);
-                const auto output = video::GetDynamicFgOutputPacing(GetFrameRateTarget());
+                const auto output = loading::Active() ? video::DynamicFgOutputPacing{}
+                    : video::GetDynamicFgOutputPacing(GetFrameRateTarget());
                 const auto outputDeadline = outputPacer.Schedule(timingPace, output.outputFps, output.actualPresents);
                 const auto deadline = std::max(nativeDeadline, outputDeadline);
                 const auto sleepStart = timingEnabled ? std::chrono::steady_clock::now() : timingPace;
@@ -1150,7 +1156,8 @@ namespace gpu
             {
                 s_lastHostPresent = timingPresent;
                 video::PresentFrontbuffer(frontbuffer, width, height, ReadRegister(0x231B),
-                    captureTicket.active ? &captureTicket : nullptr, captureTicket.active ? &captureResult : nullptr);
+                    captureTicket.active ? &captureTicket : nullptr, captureTicket.active ? &captureResult : nullptr,
+                    m_cinematicBars);
             }
             renderer::CompleteDebugCaptureFrame(captureResult);
             renderer::PollDebugCapture();

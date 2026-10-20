@@ -79,6 +79,7 @@
 #include "shader/portable_shader_pack.h"
 #include "shader/portable_shader_contract.h"
 #include "shader/portable_shader_pack_location.h"
+#include "shader_preparation_request.h"
 #include "shader/resource_scan.h"
 #include "shader/source_store.h"
 #include "shader/resource_xex.h"
@@ -898,6 +899,7 @@ namespace gpu::renderer
             std::unordered_set<PipelineKey, PipelineKeyHash> preparedPipelineKeys, usedPreparedPipelineKeys;
             std::future<gpu::pipeline_cache::WriteResult> pipelineWrite;
             bool pipelineCacheEnabled = false, pipelineRecipesDirty = false;
+            bool reprepareRequested = false;
             uint64_t preparedPipelineHits = 0, runtimePipelineCreates = 0;
             std::mutex pipelineRecipeMutex;
             // Scene being drawn (debug_menu::CurrentSceneTag), checked once a frame.
@@ -4939,7 +4941,19 @@ void main()
                         motionReplay->ReleaseDepthAfterGpuCompletion(texture->texture.get());
                     motionReplay->ReleaseCompletedThrough(s.motionSerial);
                 }
+                auto eraseAttachmentFramebuffers = [&](const RenderTexture* attachment) {
+                    if (!attachment) return;
+                    lastFramebuffer = nullptr;
+                    for (auto fb = framebuffers.begin(); fb != framebuffers.end();)
+                        if (fb->first.first == attachment || fb->first.second == attachment)
+                            fb = framebuffers.erase(fb);
+                        else
+                            ++fb;
+                };
                 for (const auto& texture : s.retiredTextures) {
+                    // The child dies with its parent even when the parent's image is pooled.
+                    if (texture->hdrSidecar)
+                        eraseAttachmentFramebuffers(texture->hdrSidecar->texture.get());
                     // A pooled image keeps its framebuffers for the next use.
                     if (ReturnPromotionImage(*texture)) continue;
                     if (nativeVulkan && texture && texture->texture && vk_object_trace::Permit()) {
@@ -4948,12 +4962,7 @@ void main()
                             i, vk_object_trace::Id(texture->allocationSerial), vk_object_trace::Id(image.vk),
                             vk_object_trace::Id(image.imageView), vk_object_trace::Id(s.temporalSerial), vk_object_trace::Id(s.srSubmissionSerial));
                     }
-                    lastFramebuffer = nullptr;
-                    for (auto fb = framebuffers.begin(); fb != framebuffers.end();)
-                        if (fb->first.first == texture->texture.get() || fb->first.second == texture->texture.get())
-                            fb = framebuffers.erase(fb);
-                        else
-                            ++fb;
+                    eraseAttachmentFramebuffers(texture->texture.get());
                 }
                 for (auto& cache : s.textureSetCache) cache.Clear();
                 s.retiredTextures.clear();
@@ -5876,7 +5885,20 @@ void main()
                 scenePrefetchEnabled = !getenv("LO_NO_PIPELINE_PREFETCH");
                 // Learning remains enabled when eager creation is skipped.
                 if (getenv("LO_NO_PIPELINE_PREPARE") || getenv("LO_NO_SHADER_PREPARE") ||
-                    settings::GetConfig().skipShaderPrebuild || video::ShaderPreparationSkipped()) return;
+                    (settings::GetConfig().skipShaderPrebuild && !reprepareRequested) ||
+                    video::ShaderPreparationSkipped()) return;
+                if (reprepareRequested) {
+                    reprepareRequested = gpu::shader_preparation::ConsumeNextStart();
+                    if (reprepareRequested) {
+                        // The installed shader pack or startup bundle already holds the
+                        // compiled binaries. Warm every known recipe with those inputs.
+                        synchronousPreparation = true;
+                        LOG_INFO("renderer: full known pipeline preparation requested from Settings");
+                    } else {
+                        LOG_WARNING("renderer: shader preparation request could not be consumed; using normal startup policy");
+                        if (settings::GetConfig().skipShaderPrebuild) return;
+                    }
+                }
                 if (!synchronousPreparation) {
                     QueueStartupPipelines(driverCache);
                     return;
@@ -5889,7 +5911,7 @@ void main()
                     std::vector<PipelineKey> wanted;
                     std::vector<std::pair<bool, uint64_t>> load;
                     for (const auto& [key, entry] : knownRecipes) {
-                        if (!PrebuildAtStartup(entry)) { ++deferred; continue; }
+                        if (!reprepareRequested && !PrebuildAtStartup(entry)) { ++deferred; continue; }
                         Shader* vs = nullptr;
                         Shader* ps = nullptr;
                         if (FindRecipeShaders(key, vs, ps, &load) == RecipeShaderState::Unavailable) { ++missingShaders; continue; }
@@ -6839,6 +6861,7 @@ void main()
 
             void PrepareKnownShaders()
             {
+                reprepareRequested = gpu::shader_preparation::PendingNextStart();
                 video::ResetShaderPreparationSkip();
                 // A process killed while writing a startup bundle leaves its temporary file.
                 if (!shaderCacheDir.empty())
@@ -6860,7 +6883,8 @@ void main()
                     ResetTimers();
                     return;
                 }
-                if (shaderCacheDir.empty() || getenv("LO_NO_SHADER_PREPARE") || settings::GetConfig().skipShaderPrebuild) {
+                if (shaderCacheDir.empty() || getenv("LO_NO_SHADER_PREPARE") ||
+                    (settings::GetConfig().skipShaderPrebuild && !reprepareRequested)) {
                     LOG_INFO("renderer: shader preparation skipped by configuration or environment");
                     return;
                 }
@@ -8915,7 +8939,8 @@ void main()
                 if (dred::Enabled()) tex->texture->setName(fmt::format("guest {:08x}", tex->guestAddress));
 
                 texBytes += upload.size();
-                uint64_t offset = Upload(upload.data(), upload.size(), 512);
+                const size_t keepFree = upload.size() + kUploadHeadroom <= kUploadRingSize ? kUploadHeadroom : 0;
+                uint64_t offset = Upload(upload.data(), upload.size(), 512, keepFree);
                 if (offset == UINT64_MAX)
                     return nullptr;
                 Transition(*tex, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
@@ -11402,6 +11427,7 @@ void main()
                     set2 = AcquireTextureSet(2, textureBindings[1], activeTextureSlots[1], textureSwapSlots);
                     set3 = AcquireTextureSet(3, textureBindings[2], activeTextureSlots[2], textureSwapSlots);
                 }
+                const uint64_t drawUploadGeneration = Gpu().uploadGeneration;
                 tBind0.AddTo(tBind);
                 render_batch::CpuTimer<> tIndex0(cpuTimingEnabled);
 
@@ -11581,6 +11607,15 @@ void main()
                         }
                     }
                     preparedIndexBuffer = uploadRing; // the ring of the slot now holding the data
+                }
+
+                // A rare large upload can change slots after acquiring this draw's sets.
+                if (Gpu().uploadGeneration != drawUploadGeneration) {
+                    ++drops.upload;
+                    static bool warned = false;
+                    if (!std::exchange(warned, true))
+                        LOG_WARNING("renderer: draw dropped after uploads changed GPU slots; descriptor sets belong to the previous slot");
+                    return;
                 }
 
                 // Record.
@@ -14857,8 +14892,12 @@ void main()
 
     void Draw(const DrawInfo& info)
     {
-        if (g_renderer)
+        if (g_renderer) {
+            // Includes resolve packets (RB_MODECONTROL == 6), so a native menu
+            // cannot overwrite the frontbuffer before the opening snapshot.
+            video::CaptureCalibrationSceneBeforeDraw();
             g_renderer->Draw(info);
+        }
     }
 
     bool OcclusionQueryEvent(uint32_t physicalAddress)
