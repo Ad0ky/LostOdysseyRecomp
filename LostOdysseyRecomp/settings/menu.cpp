@@ -1,5 +1,7 @@
 #include <os/log_collection.h>
+#if !defined(__SWITCH__)
 #include <os/steam_shortcut.h>
+#endif
 #include "menu.h"
 #include "menu_render.h"
 #include "menu_assets.h"
@@ -394,6 +396,7 @@ const wchar_t *Tr(const wchar_t *en, const wchar_t *zh)
 {
     return Translate(edit.uiLanguage, en, zh);
 }
+#if !LO_PLATFORM_SWITCH
 const wchar_t *SteamShortcutMessage(steam_shortcut::Status result)
 {
     switch (result)
@@ -414,6 +417,7 @@ const wchar_t *SteamShortcutMessage(steam_shortcut::Status result)
         return Tr(L"Could not add to Steam. Check the log for details.", L"無法加入 Steam。詳情請查看日誌。");
     }
 }
+#endif
 // Adapter and display names arrive as UTF-8.
 std::wstring Widen(std::string_view text)
 {
@@ -3939,6 +3943,7 @@ PPC_FUNC(sub_822F19B0)
 #endif
         status.clear();
     }
+#if !LO_PLATFORM_SWITCH
     if ((input & 0x1000) && tab == 3 && row == SystemAddToSteamRow && !SystemRowHidden(row))
     {
         const auto result = steam_shortcut::AddToSteam(FileSystem::GetGameRoot());
@@ -3949,6 +3954,7 @@ PPC_FUNC(sub_822F19B0)
             else LOG_WARNING("Add to Steam: {}", result.detail);
         }
     }
+#endif
     if ((input & 0x1000) && tab == 3 && row == SystemShaderBundleRow)
     {
         shaderBundlePrompt = true;

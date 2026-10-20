@@ -1,5 +1,7 @@
 #include <os/log_collection.h>
+#if !defined(__SWITCH__)
 #include <os/steam_shortcut.h>
+#endif
 #include <discord/presence.h>
 #include <stdafx.h>
 #include <cpu/guest_thread.h>
@@ -432,6 +434,7 @@ int main(int argc, char* argv[])
 #endif
     os::user_paths::Initialize(executableDirectory);
 #if !LO_PLATFORM_ANDROID
+#if !LO_PLATFORM_SWITCH
     // This host-only command reads original artwork from available game data,
     // then exits without an SDL window or GPU (bundled art remains a fallback).
     for (int i = 1; i < argc; ++i)
@@ -459,6 +462,7 @@ int main(int argc, char* argv[])
             if (!result.detail.empty()) std::fprintf(output, "%s\n", result.detail.c_str());
             return result.ok() ? 0 : 1;
         }
+#endif
     // --export-assets copies game files for mod authors, then exits. It runs
     // before the working-directory change (relative output folders), logs,
     // update check, mods, installer, window and GPU device.
