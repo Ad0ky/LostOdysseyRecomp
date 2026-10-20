@@ -16,6 +16,8 @@ namespace movie {
 #if !defined(__ANDROID__)
 bool GuestPlaying();
 #endif
+// Cutscene video decoded on the host (movie/movie_hooks.cpp, LO_NATIVE_MOVIES).
+bool NativeMoviesEnabled();
 // guestMovie is the FLO_MOVIE object, name the video's file name stem (mv_00v).
 // Resolves the mod asset and opens it on a decode thread; no-op without one.
 void StartReplacement(uint32_t guestMovie, std::string_view name);

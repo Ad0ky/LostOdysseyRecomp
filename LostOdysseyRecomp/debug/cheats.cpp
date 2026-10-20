@@ -106,10 +106,10 @@ void PollHostControls() {
         !host_ui::IsGamePaused() && !IsOverlayVisible() && !settings::IsOpen() &&
         !edit.editorRequested && !edit.editorApplied
 #if LO_PLATFORM_SWITCH
-        // Fast-forwarding a cutscene movie froze the picture for good on the
-        // Switch (new game intro, 2x): the game's own WMV player stopped
-        // handing frames to the render thread while its audio went on.
-        && !movie::GuestPlaying()
+        // With the game's own WMV decoder (LO_NATIVE_MOVIES=0), cutscene
+        // movies freeze on the Switch, and fast-forward makes it certain:
+        // keep it off during them. The native decoder handles both.
+        && (movie::NativeMoviesEnabled() || !movie::GuestPlaying())
 #endif
         ;
     const auto binding = fast_forward::GetStatus().button;
