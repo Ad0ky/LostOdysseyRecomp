@@ -253,6 +253,51 @@ static bool RetryWithSystemVulkanDriver(const char* stage)
 #endif
 }
 
+#if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME)
+// Mesa (statically linked NVK) only reports its own errors to a debug-utils
+// messenger; without one, a lost GPU leaves no reason anywhere. The
+// extension is not enabled on the instance, so the messenger is created
+// through Mesa's common entry point directly.
+extern "C" VKAPI_ATTR VkResult VKAPI_CALL vk_common_CreateDebugUtilsMessengerEXT(VkInstance instance,
+    const VkDebugUtilsMessengerCreateInfoEXT* createInfo, const VkAllocationCallbacks* allocator,
+    VkDebugUtilsMessengerEXT* messenger);
+
+static VKAPI_ATTR VkBool32 VKAPI_CALL SwitchDriverMessage(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
+    VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data, void*)
+{
+    if (!data || !data->pMessage)
+        return VK_FALSE;
+    // Performance hints would flood the log; errors and warnings are what a lost GPU leaves.
+    if (severity < VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT ||
+        (types & VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT))
+        return VK_FALSE;
+    static std::atomic<uint32_t> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 200)
+        return VK_FALSE;
+    std::fprintf(stderr, "[driver %s] %s\n",
+        severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT ? "error" : "warning", data->pMessage);
+    if (severity >= VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT)
+        LOG_ERROR("driver: {}", data->pMessage);
+    else
+        LOG_WARNING("driver: {}", data->pMessage);
+    return VK_FALSE;
+}
+
+static void ListenToSwitchDriver(VkInstance instance)
+{
+    static VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    if (!instance || messenger != VK_NULL_HANDLE)
+        return;
+    VkDebugUtilsMessengerCreateInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT;
+    info.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+    info.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT;
+    info.pfnUserCallback = SwitchDriverMessage;
+    const VkResult result = vk_common_CreateDebugUtilsMessengerEXT(instance, &info, nullptr, &messenger);
+    LOG_INFO("video: driver error messages {} (result {})", result == VK_SUCCESS ? "go to stderr.log" : "unavailable", int(result));
+}
+#endif
+
 #ifdef __ANDROID__
 // The GPU the last Vulkan attempt ran on, for the failure reason the GPU driver
 // page shows (it tells a Mali GPU no driver can help from one PanVK supports).
@@ -2634,6 +2679,7 @@ namespace gpu::video
             // builds (the LSFG backend is opened without low precision).
             if (gpu::lsfg::Enabled())
                 static_cast<plume::VulkanInterface*>(g_interface.get())->enableTimelineSemaphores = true;
+            ListenToSwitchDriver(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
 #endif
 #ifdef __ANDROID__
             LogVulkanPhysicalDevices(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
