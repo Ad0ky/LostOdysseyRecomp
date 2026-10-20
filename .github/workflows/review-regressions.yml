@@ -24,6 +24,9 @@ on:
       - 'LostOdysseyRecomp/modding/model_slot.h'
       - 'LostOdysseyRecomp/os/platform.h'
       - 'LostOdysseyRecomp/os/user_paths.h'
+      - 'LostOdysseyRecomp/os/steam_shortcut.*'
+      - 'LostOdysseyRecomp/os/steam_artwork.*'
+      - 'LostOdysseyRecomp/modding/asset_export.*'
       - 'LostOdysseyRecomp/settings/config.cpp'
       - 'LostOdysseyRecomp/updater/**'
       - 'packaging/linux/**'
@@ -31,6 +34,7 @@ on:
       - 'tools/capture_analysis/**'
       - 'tools/package_appimage.py'
       - 'tools/package_flatpak.py'
+      - 'tools/package_release.py'
       - 'tools/portable_shader_pack_payload.py'
       - 'tools/release/version.py'
       - 'tools/shader_analysis/**'
@@ -56,6 +60,9 @@ on:
       - 'LostOdysseyRecomp/modding/model_slot.h'
       - 'LostOdysseyRecomp/os/platform.h'
       - 'LostOdysseyRecomp/os/user_paths.h'
+      - 'LostOdysseyRecomp/os/steam_shortcut.*'
+      - 'LostOdysseyRecomp/os/steam_artwork.*'
+      - 'LostOdysseyRecomp/modding/asset_export.*'
       - 'LostOdysseyRecomp/settings/config.cpp'
       - 'LostOdysseyRecomp/updater/**'
       - 'packaging/linux/**'
@@ -63,6 +70,7 @@ on:
       - 'tools/capture_analysis/**'
       - 'tools/package_appimage.py'
       - 'tools/package_flatpak.py'
+      - 'tools/package_release.py'
       - 'tools/portable_shader_pack_payload.py'
       - 'tools/release/version.py'
       - 'tools/shader_analysis/**'
@@ -83,6 +91,8 @@ jobs:
         run: |
           git submodule update --init --depth 1 tools/XenonRecomp thirdparty/SDL
           git -C tools/XenonRecomp submodule update --init --depth 1 thirdparty/xxHash thirdparty/tomlplusplus
+          git submodule update --init --depth 1 tools/XenosRecomp
+          git -C tools/XenosRecomp submodule update --init --depth 1 thirdparty/smol-v
           SUDO=$(command -v sudo || true)
           $SUDO apt-get update
           $SUDO apt-get install -y --no-install-recommends cmake g++ python3
