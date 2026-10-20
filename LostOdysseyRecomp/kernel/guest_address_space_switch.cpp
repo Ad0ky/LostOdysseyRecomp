@@ -3,6 +3,7 @@
 #include "guest_address_space_layout.h"
 #include <switch.h>
 #include <malloc.h>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -44,6 +45,9 @@ std::mutex s_mutex;
 // committed together with A and never on their own.
 bool s_committed[kChunkCount]{};
 size_t s_committedBytes = 0;
+// Code-memory source of each committed chunk (under s_mutex), to map a view again (EnsureBacked).
+uintptr_t s_source[kChunkCount]{};
+RepairInfo s_repair{};
 
 bool ProcessMemorySyscallsAvailable()
 {
@@ -102,7 +106,7 @@ Handle OwnProcessHandle()
 
 // Backs [offset, offset + size) of the window with fresh zeroed memory and,
 // for the A view, maps the same pages at the C and E aliases.
-bool MapChunk(size_t offset, size_t size)
+bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
 {
     void* backing = memalign(kPage, size);
     if (!backing)
@@ -154,6 +158,8 @@ bool MapChunk(size_t offset, size_t size)
         }
     }
     // Mapped views are never released: guest memory lives for the whole run.
+    if (ok)
+        sourceOut = uintptr_t(source);
     return ok;
 }
 }
@@ -216,8 +222,10 @@ bool Commit(uint32_t address, uint32_t size)
             offset = kPage;
             length -= kPage;
         }
-        if (!MapChunk(offset, length))
+        uintptr_t source = 0;
+        if (!MapChunk(offset, length, source))
             return false;
+        s_source[chunk] = source;
         __atomic_store_n(&s_committed[chunk], true, __ATOMIC_RELEASE); // read without the lock by EnsureBacked
         s_committedBytes += kChunk;
     }
@@ -240,9 +248,64 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
     bool backed = true;
     for (uint64_t chunk = start / kChunk; chunk * kChunk < end; ++chunk)
         backed = backed && __atomic_load_n(&s_committed[chunk], __ATOMIC_ACQUIRE);
-    if (backed)
-        return Backing::AlreadyBacked;
-    return Commit(uint32_t(start), uint32_t(end - start)) ? Backing::NewlyBacked : Backing::Failed;
+    if (!backed)
+        return Commit(uint32_t(start), uint32_t(end - start)) ? Backing::NewlyBacked : Backing::Failed;
+
+    // Committed, so it should be mapped. Entering Uhra, reads of committed chunks still faulted
+    // (no backing was needed or failed, yet the page was not there): check with the kernel, and
+    // map a missing view again onto the chunk's own source (its C and E aliases keep the data).
+    Backing result = Backing::AlreadyBacked;
+    for (uint64_t chunk = start / kChunk; chunk * kChunk < end; ++chunk)
+    {
+        const uint64_t probe = std::max<uint64_t>(start, chunk * kChunk);
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&info, &pageInfo, uintptr_t(s_base + probe))))
+            continue;
+        if (info.type != MemType_Unmapped && (info.perm & Perm_R) != 0)
+            continue;
+
+        std::lock_guard lock(s_mutex);
+        RepairInfo repair{};
+        repair.address = uint32_t(probe);
+        repair.type = info.type;
+        repair.attribute = info.attr;
+        repair.permission = info.perm;
+        repair.regionStart = info.addr >= uintptr_t(s_base) ? uint64_t(info.addr - uintptr_t(s_base)) : ~0ull;
+        repair.regionSize = info.size;
+        // The same physical page through C, for comparison.
+        if (probe >= kStarts[1] && probe < kStarts[2])
+        {
+            MemoryInfo alias{};
+            if (R_SUCCEEDED(svcQueryMemory(&alias, &pageInfo, uintptr_t(s_base + probe - kStarts[1] + kStarts[2]))))
+            {
+                repair.aliasType = alias.type;
+                repair.aliasPermission = alias.perm;
+            }
+        }
+        size_t offset = size_t(chunk * kChunk);
+        size_t length = kChunk;
+        size_t sourceOffset = 0;
+        if (offset == 0)
+        {
+            offset = kPage;
+            length -= kPage;
+        }
+        const uintptr_t source = s_source[chunk];
+        repair.result = source ? svcMapProcessMemory(s_base + offset, s_process, source + sourceOffset, length) : 0xFFFFFFFFu;
+        repair.count = s_repair.count + 1;
+        s_repair = repair;
+        if (R_FAILED(repair.result))
+            return Backing::Failed;
+        result = Backing::Repaired;
+    }
+    return result;
+}
+
+RepairInfo LastRepair()
+{
+    std::lock_guard lock(s_mutex);
+    return s_repair;
 }
 
 size_t CommittedBytes()

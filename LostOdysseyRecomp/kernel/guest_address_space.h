@@ -61,12 +61,26 @@ size_t CommittedBytes();
 // (the desktop builds read zeros from such pages; the Switch would fault):
 // backs [address, address + size) with zeroed memory. C and E addresses are
 // committed through their A pages. Cheap when already backed.
-enum class Backing { Failed, AlreadyBacked, NewlyBacked };
+// Repaired: the chunk was committed but the kernel no longer had the page
+// mapped there; the view was mapped again (see LastRepair).
+enum class Backing { Failed, AlreadyBacked, NewlyBacked, Repaired };
 Backing EnsureBacked(uint32_t address, uint32_t size);
+struct RepairInfo
+{
+    uint32_t count;           // repairs so far
+    uint32_t address;         // guest address that was not mapped
+    uint32_t type, attribute, permission; // what svcQueryMemory reported there
+    uint64_t regionStart, regionSize;     // that memory block (guest offsets)
+    uint32_t aliasType, aliasPermission;  // the same page through C
+    uint32_t result;          // svcMapProcessMemory result of the repair
+};
+RepairInfo LastRepair();
+// Logs LastRepair() as an error (patches/unbacked_guest_reads.cpp); the first few only.
+void LogRepair(const char* who);
 #else
 // Desktop hosts commit on first touch.
 inline bool Commit(uint32_t, uint32_t) { return true; }
-enum class Backing { Failed, AlreadyBacked, NewlyBacked };
+enum class Backing { Failed, AlreadyBacked, NewlyBacked, Repaired };
 inline Backing EnsureBacked(uint32_t address, uint32_t) { return address >= 0x1000 ? Backing::AlreadyBacked : Backing::Failed; }
 #endif
 }

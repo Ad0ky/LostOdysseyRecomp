@@ -39,6 +39,12 @@ namespace os::switch_platform
     // every pthread gets; lower numbers run first).
     void SetCurrentThreadPriority(int priority);
 
+    // Appends to a file in the app folder through a file system session of this module's own, opened
+    // in Initialize: no newlib, no allocation and none of libnx's shared file system sessions, so it
+    // still works when the rest of the process's file access is stuck (crash handler, hang watchdog).
+    // False if the session is not available or a request failed.
+    bool RawAppend(const char* fileName, const char* data, size_t size);
+
     // Kernel handle of the calling thread, and its ideal core (0-2; allowed
     // cores stay 0-2). handle 0 means the calling thread.
     uint32_t CurrentThreadHandle();

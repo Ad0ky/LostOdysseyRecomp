@@ -1102,6 +1102,9 @@ namespace gpu
             const auto timingFlush = std::chrono::steady_clock::now();
             renderer::PreparePresent(frontbuffer);
             renderer::Flush();
+#if LO_PLATFORM_SWITCH
+            os::switch_cpu_profiler::Heartbeat();
+#endif
             const auto timingPace = std::chrono::steady_clock::now();
             // Load boost (cpu/render_fence.h): loading-screen frames are not
             // paced; vblanks come faster (VsyncMain) and only about 30 of them
