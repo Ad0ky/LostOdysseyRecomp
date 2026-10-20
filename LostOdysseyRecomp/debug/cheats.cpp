@@ -1,4 +1,5 @@
 #include <stdafx.h>
+#include <movie/movie_player.h>
 #include "cheats.h"
 #include "fast_forward.h"
 #include "menu_overlay.h"
@@ -103,7 +104,14 @@ void PollHostControls() {
         !(SDL_GetWindowFlags(focus) & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN)) &&
         !backgroundRun && !host_ui::IsStopping() &&
         !host_ui::IsGamePaused() && !IsOverlayVisible() && !settings::IsOpen() &&
-        !edit.editorRequested && !edit.editorApplied;
+        !edit.editorRequested && !edit.editorApplied
+#if LO_PLATFORM_SWITCH
+        // Fast-forwarding a cutscene movie froze the picture for good on the
+        // Switch (new game intro, 2x): the game's own WMV player stopped
+        // handing frames to the render thread while its audio went on.
+        && !movie::GuestPlaying()
+#endif
+        ;
     const auto binding = fast_forward::GetStatus().button;
     fast_forward::Buttons buttons;
     bool connected = false;

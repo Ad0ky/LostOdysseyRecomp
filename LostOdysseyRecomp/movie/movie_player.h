@@ -13,7 +13,7 @@
 namespace movie {
 // The native WMV lifecycle, whether or not a mod provides replacement video.
 // Read-only from any thread; contains no movie filename or scenario identifier.
-#if !defined(__ANDROID__) && !defined(__SWITCH__) && !defined(__NX__)
+#if !defined(__ANDROID__)
 bool GuestPlaying();
 #endif
 // guestMovie is the FLO_MOVIE object, name the video's file name stem (mv_00v).
