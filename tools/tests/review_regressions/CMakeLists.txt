@@ -36,6 +36,8 @@ target_include_directories(LoTextureContentTest PRIVATE "${LO_ROOT}/tools/XenonR
 lo_review_test(LoTextureLayoutTest texture_layout_test.cpp)
 lo_review_test(LoDriverPipelineCacheTest driver_pipeline_cache_test.cpp)
 lo_review_test(LoBcDecodeTest bc_decode_test.cpp)
+lo_review_test(LoAsfDemuxTest asf_demux_test.cpp "${LO_RUNTIME}/movie/asf_demux.cpp")
+lo_review_test(LoGuestClockOriginTest guest_clock_origin_test.cpp)
 lo_review_test(LoCpxDecodeTest cpx_decode_test.cpp)
 lo_review_test(LoModelSlotTest model_slot_test.cpp)
 lo_review_test(LoMenuAnimationsTest menu_animations_test.cpp)

@@ -283,11 +283,9 @@ void debug_menu::PollSceneLoads(uint8_t* base) {
     uint32_t pending = pendingScene;
     const uint32_t map = currentMapScene;
     if (pending >> 28 == gpu::pipeline_cache::kSceneBattle) {
-        if (CurrentBattle()) {
-            if (!battleStarted) { battleStarted = true; EndLoad(); }
-        } else if (battleStarted && map) {
-            pendingScene.compare_exchange_strong(pending, 0u);
-        }
+        const bool inBattle = CurrentBattle() != 0;
+        if (inBattle && !battleStarted) { battleStarted = true; EndLoad(); }
+        else if (battleStarted && !inBattle && map) pendingScene.compare_exchange_strong(pending, 0u);
     } else if (pending && map == pending) {
         pendingScene.compare_exchange_strong(pending, 0u);
         EndLoad();
@@ -308,6 +306,18 @@ bool debug_menu::CurrentLoad(std::string& what, uint64_t& startMs) {
     std::lock_guard lock(mutex);
     what = loadWhat;
     return true;
+}
+
+bool debug_menu::LoadProfileEnabled() {
+#if LO_PLATFORM_SWITCH
+    static const bool enabled = [] {
+        const char* value = getenv("LO_LOAD_PROFILE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
 }
 
 void debug_menu::SetSceneLoadListener(void (*listener)(uint32_t)) {

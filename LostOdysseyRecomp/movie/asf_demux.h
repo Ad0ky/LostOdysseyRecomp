@@ -42,7 +42,7 @@ private:
     bool ParseHeader(const std::vector<uint8_t>& header, int wantedStream);
     bool ParseStreamProperties(const uint8_t* object, size_t size, int wantedStream);
     bool ReadPacket();
-    void Deliver(uint32_t objectNumber, uint32_t objectSize, uint32_t offset, uint32_t presentationMs,
+    bool Deliver(uint32_t objectNumber, uint32_t objectSize, uint32_t offset, uint32_t presentationMs,
                  bool key, const uint8_t* data, size_t size);
 
     std::FILE* file_ = nullptr;

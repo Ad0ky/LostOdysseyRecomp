@@ -26,7 +26,9 @@ struct FileSystem
     // Name of the most recently opened game file, for the GPU heartbeat log.
     static std::string LastOpenedFile();
 
-    // Host file reads since the previous call ("" when there were none): count,
+    // Switch-only opt-in host read profile (LO_IO_PROFILE=1).
+    static bool ReadProfileEnabled();
+    // Host file reads since the previous call ("" when disabled or empty): count,
     // bytes, time spent in seek + read, the slowest read and the files read.
     static std::string TakeReadStatistics();
 

@@ -312,6 +312,8 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android: the game's own code runs a little faster.
 - Android: Import disc images opens Android's file picker. Picking one disc image is enough; the other discs in its folder come along. Disc images on SD cards and USB drives can now be imported.
 - Less CPU time and memory use: model data is no longer re-checked every frame, and large models no longer occasionally draw with outdated data.
+- Switch: handheld mode now uses a 540p scene by default and docked mode uses 720p; the Vulkan path also trims unused shader outputs to reduce GPU work.
+- Switch: optional native WMV movie decoding, controller letter/position layout, and diagnostic controls for loading, waits and file reads are available through `env.txt`.
 
 ### 简体中文
 
@@ -333,6 +335,8 @@ Brief release highlights, newest first. Dates are UTC. Technical validation is r
 - Android：游戏本身的代码运行稍快一些。
 - Android：Import disc images 改用 Android 的文件选择器，选一个光盘镜像即可，同一文件夹里的其他光盘会一起导入。SD 卡和 U 盘上的光盘镜像现在也能导入了。
 - CPU 和内存占用更少：不再每帧重新核对模型数据；大模型也不会再偶尔用旧数据绘制。
+- Switch：掌机模式默认使用 540p 场景，底座模式使用 720p；Vulkan 路径还会裁剪未使用的着色器输出，减少 GPU 工作量。
+- Switch：可通过 `env.txt` 选择实验性的原生 WMV 视频解码、手柄字母／位置布局，并启用加载、等待和文件读取诊断。
 
 ## [v0.9.22](https://github.com/freefrank/LostOdysseyRecomp/releases/tag/v0.9.22) — 2026-10-10
 

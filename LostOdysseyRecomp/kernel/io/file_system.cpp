@@ -25,47 +25,39 @@
 static std::mutex g_lastOpenedMutex;
 static std::string g_lastOpenedFile;
 
-// Host read timing for the periodic Switch log (FileSystem::TakeReadStatistics).
-// Switch only, with LO_LOAD_DIAGNOSTICS=1: nothing else reads it.
+// Host read timing for the opt-in periodic Switch log.
+#if LO_PLATFORM_SWITCH
 namespace read_stats
 {
-inline bool Enabled()
-{
-#if LO_PLATFORM_SWITCH
-    static const bool enabled = [] {
-        const char* value = getenv("LO_LOAD_DIAGNOSTICS");
-        return value && value[0] == '1';
-    }();
-    return enabled;
-#else
-    return false;
-#endif
-}
-std::atomic<uint64_t> calls{0}, bytes{0}, nanoseconds{0}, slowest{0}, underSize{0};
+std::atomic<uint64_t> calls{0}, bytes{0}, nanoseconds{0}, slowest{0}, smallReads{0};
 std::mutex filesMutex;
 std::string files; // file names read in this interval, comma-separated, deduplicated
 
-struct Scope
+bool Enabled()
 {
-    const std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    const std::FILE* file;
-    explicit Scope(const std::FILE* f) : file(f) {}
-    void Done(size_t read, const std::string& name)
-    {
-        const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - start).count());
-        calls.fetch_add(1, std::memory_order_relaxed);
-        bytes.fetch_add(read, std::memory_order_relaxed);
-        nanoseconds.fetch_add(ns, std::memory_order_relaxed);
-        if (read < 65536) underSize.fetch_add(1, std::memory_order_relaxed);
-        uint64_t previous = slowest.load(std::memory_order_relaxed);
-        while (ns > previous && !slowest.compare_exchange_weak(previous, ns, std::memory_order_relaxed)) {}
-        std::lock_guard lock(filesMutex);
-        if (files.size() < 400 && ("," + files + ",").find("," + name + ",") == std::string::npos)
-            files += files.empty() ? name : "," + name;
-    }
-};
+    static const bool enabled = [] {
+        const char* value = getenv("LO_IO_PROFILE");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
 }
+
+void Record(std::chrono::steady_clock::time_point start, size_t read, const std::string& name)
+{
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+    calls.fetch_add(1, std::memory_order_relaxed);
+    bytes.fetch_add(read, std::memory_order_relaxed);
+    nanoseconds.fetch_add(ns, std::memory_order_relaxed);
+    if (read < 65536) smallReads.fetch_add(1, std::memory_order_relaxed);
+    uint64_t previous = slowest.load(std::memory_order_relaxed);
+    while (ns > previous && !slowest.compare_exchange_weak(previous, ns, std::memory_order_relaxed)) {}
+    std::lock_guard lock(filesMutex);
+    if (files.size() < 400 && ("," + files + ",").find("," + name + ",") == std::string::npos)
+        files += files.empty() ? name : "," + name;
+}
+}
+#endif
 
 #ifdef LO_STORAGE_TESTING
 static std::atomic<file_system_test::Hook> g_ioTestHook{nullptr};
@@ -851,14 +843,25 @@ static uint32_t OpenFileHandle(be<uint32_t>* FileHandleOut, uint32_t DesiredAcce
     return STATUS_SUCCESS;
 }
 
+bool FileSystem::ReadProfileEnabled()
+{
+#if LO_PLATFORM_SWITCH
+    return read_stats::Enabled();
+#else
+    return false;
+#endif
+}
+
 std::string FileSystem::TakeReadStatistics()
 {
+#if LO_PLATFORM_SWITCH
+    if (!ReadProfileEnabled()) return {};
     using namespace read_stats;
     const uint64_t n = calls.exchange(0, std::memory_order_relaxed);
     const uint64_t b = bytes.exchange(0, std::memory_order_relaxed);
     const uint64_t ns = nanoseconds.exchange(0, std::memory_order_relaxed);
     const uint64_t worst = slowest.exchange(0, std::memory_order_relaxed);
-    const uint64_t smallReads = underSize.exchange(0, std::memory_order_relaxed);
+    const uint64_t smallCount = smallReads.exchange(0, std::memory_order_relaxed);
     std::string names;
     {
         std::lock_guard lock(filesMutex);
@@ -866,7 +869,10 @@ std::string FileSystem::TakeReadStatistics()
     }
     if (!n) return {};
     return fmt::format("{} reads ({} under 64 KiB), {:.1f} MiB, {:.0f} ms reading ({:.1f} MiB/s while reading), slowest {:.1f} ms; {}",
-        n, smallReads, b / 1048576.0, ns / 1e6, ns ? (b / 1048576.0) / (ns / 1e9) : 0.0, worst / 1e6, names);
+        n, smallCount, b / 1048576.0, ns / 1e6, ns ? (b / 1048576.0) / (ns / 1e9) : 0.0, worst / 1e6, names);
+#else
+    return {};
+#endif
 }
 
 std::string FileSystem::LastOpenedFile()
@@ -957,15 +963,19 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
         else if (Length)
         {
             clearerr(handle->file);
-            std::optional<read_stats::Scope> readScope;
-            if (read_stats::Enabled()) readScope.emplace(handle->file);
+#if LO_PLATFORM_SWITCH
+            const bool profileRead = FileSystem::ReadProfileEnabled();
+            const auto readStart = profileRead ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+#endif
             if (_fseeki64(handle->file, int64_t(offset), SEEK_SET) != 0)
                 status = FileIoError(errno);
             else
             {
                 read = fread(Buffer, 1, Length, handle->file);
-                if (readScope)
-                    readScope->Done(read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
+#if LO_PLATFORM_SWITCH
+                if (profileRead)
+                    read_stats::Record(readStart, read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
+#endif
                 if (ferror(handle->file))
                     status = FileIoError(errno);
                 else if (read == 0 && feof(handle->file))

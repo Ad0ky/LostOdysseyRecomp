@@ -16,7 +16,7 @@
 //   sub_82CE9248 / sub_82CE9FD8(pl)  pause / resume
 //   sub_82CF8140(pl)       the player's video pump thread (player vtable +144,
 //                          thread player+268): runs the guest WMV decoder
-// Set LO_NATIVE_MOVIES=0 to use the guest decoder alone.
+// Set LO_NATIVE_MOVIES=1 to opt into this experimental decoder.
 #include <stdafx.h>
 
 #if LO_HAS_WMV3_DECODER
@@ -58,7 +58,7 @@ bool Enabled()
 {
     static const bool enabled = [] {
         const char* value = std::getenv("LO_NATIVE_MOVIES");
-        return !(value && value[0] == '0');
+        return value && std::strcmp(value, "1") == 0;
     }();
     return enabled;
 }
@@ -83,6 +83,11 @@ struct Movie
     uint32_t shown = 0, late = 0;
     uint32_t lastPts = 0;
     bool loggedEnd = false;
+    bool failed = false;
+#if LO_PLATFORM_SWITCH
+    uint32_t guestVideoThread = 0;
+    int guestVideoPriority = -1;
+#endif
 };
 
 std::mutex g_mutex;
@@ -299,7 +304,16 @@ PPC_FUNC(sub_823F0FA8)
     const uint32_t player = ctx.r3.u32, desc = ctx.r4.u32;
     {
         std::lock_guard lock(g_mutex);
-        if (!g_movie || !player || g_movie->player != player)
+        if (g_movie && g_movie->player == player && !g_movie->failed && !g_movie->stream->LastError().empty())
+        {
+            g_movie->failed = true;
+#if LO_PLATFORM_SWITCH
+            if (g_movie->guestVideoThread && g_movie->guestVideoPriority >= 0)
+                os::switch_platform::SetThreadPriority(g_movie->guestVideoThread, g_movie->guestVideoPriority);
+#endif
+            LogEnd(*g_movie, "failed");
+        }
+        if (!g_movie || !player || g_movie->player != player || g_movie->failed)
         {
             // Not ours: stock behaviour.
             ctx.r3.u64 = player;
@@ -308,8 +322,10 @@ PPC_FUNC(sub_823F0FA8)
         }
     }
     {
-        PPC_STORE_U32(desc + 4, PPC_LOAD_U32(desc + 4) | 1); // never wait
+        const uint32_t flags = PPC_LOAD_U32(desc + 4);
+        PPC_STORE_U32(desc + 4, flags | 1); // never wait for this request
         __imp__sub_823F0FA8(ctx, base);
+        PPC_STORE_U32(desc + 4, flags);
         const uint32_t result = ctx.r3.u32;
         PPC_STORE_U32(desc + 8, 0); // never "late": the caller would loop
         if (int32_t(result) < 0 || result == kEndOfMovie)
@@ -415,8 +431,18 @@ PPC_FUNC(sub_82CF8140)
     }();
     if (lower && priority >= 0x2C && priority <= 0x3F)
     {
-        os::switch_platform::SetCurrentThreadPriority(priority);
-        LOG_NOTICE("native movie: guest video decoder thread priority {:#x}", priority);
+        std::lock_guard lock(g_mutex);
+        if (g_movie && !g_movie->failed && g_movie->player == ctx.r3.u32)
+        {
+            const int originalPriority = os::switch_platform::CurrentThreadPriority();
+            if (originalPriority >= 0)
+            {
+                g_movie->guestVideoThread = os::switch_platform::CurrentThreadHandle();
+                g_movie->guestVideoPriority = originalPriority;
+                os::switch_platform::SetCurrentThreadPriority(priority);
+                LOG_NOTICE("native movie: guest video decoder thread priority {:#x}", priority);
+            }
+        }
     }
 #else
     (void)lower;
