@@ -467,8 +467,24 @@ void AllowExit()
 
 void ExitNow()
 {
+    // An application must tell the applet manager it is leaving
+    // (ISelfController::Exit, as libnx's own application exit does) and then
+    // wait to be terminated. Ending the process without it left the screen
+    // frozen on the last frame (title Quit and Quit to Desktop, 2026-10-22).
+    // The libnx exit teardown is still skipped: it unmounted the SD card under
+    // game threads that were reading it.
+    os::logger::DrainForExit();
+    std::fflush(nullptr);
     appletUnlockExit();
-    ExitWithLog();
+    const Result rc = serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
+    if (R_SUCCEEDED(rc))
+    {
+        for (;;)
+            svcSleepThread(UINT64_MAX);
+    }
+    std::fprintf(stderr, "exit: applet Exit failed (0x%x), ending the process\n", rc);
+    svcExitProcess();
+    __builtin_unreachable();
 }
 
 void ShowError(const std::string& summary, const std::string& details)
