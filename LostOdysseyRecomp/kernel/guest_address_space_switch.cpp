@@ -265,6 +265,20 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
             continue;
         if (info.type != MemType_Unmapped && (info.perm & Perm_R) != 0)
             continue;
+        // Mapped but lent to an IPC request (an SD card read into guest memory):
+        // the kernel takes the pages' permissions until the reply. Wait for it
+        // (up to 2 s) instead of mapping over it.
+        if (info.type != MemType_Unmapped && (info.attr & MemAttr_IsIpcMapped) != 0)
+        {
+            for (int wait = 0; wait < 20000 && (info.attr & MemAttr_IsIpcMapped) != 0 && (info.perm & Perm_R) == 0; ++wait)
+            {
+                svcSleepThread(100'000);
+                if (R_FAILED(svcQueryMemory(&info, &pageInfo, uintptr_t(s_base + probe))))
+                    break;
+            }
+            if ((info.perm & Perm_R) != 0)
+                continue;
+        }
 
         std::lock_guard lock(s_mutex);
         RepairInfo repair{};

@@ -5,6 +5,7 @@
 #include "file_system_test.h"
 #include <cerrno>
 #include <cstdlib>
+#include <memory>
 #include <limits>
 #include <mutex>
 #include <cpu/guest_thread.h>
@@ -24,6 +25,58 @@
 
 static std::mutex g_lastOpenedMutex;
 static std::string g_lastOpenedFile;
+
+// Guest memory never goes to the file system as an IPC buffer on the Switch.
+// While Horizon serves an IPC request, the pages of its buffer have no
+// permissions for the process: any other thread touching them faults. The game
+// streams audio into buffers its XMA decoder and other threads read at the
+// same time (Uhra, the last dungeon of disc 2: faults at 0xA11C4000+, block
+// "ProcessMemory, IPC mapped, no access"). Reads and writes go through a host
+// buffer instead; the copy is small next to an SD card read.
+#if LO_PLATFORM_SWITCH
+namespace
+{
+constexpr size_t kBounceBytes = 1u << 20;
+uint8_t* BounceBuffer()
+{
+    thread_local std::unique_ptr<uint8_t[]> buffer(new uint8_t[kBounceBytes]);
+    return buffer.get();
+}
+}
+static size_t GuestFread(void* out, size_t size, std::FILE* file)
+{
+    uint8_t* bounce = BounceBuffer();
+    size_t total = 0;
+    while (total < size)
+    {
+        const size_t chunk = std::min(kBounceBytes, size - total);
+        const size_t read = std::fread(bounce, 1, chunk, file);
+        std::memcpy(static_cast<uint8_t*>(out) + total, bounce, read);
+        total += read;
+        if (read < chunk)
+            break;
+    }
+    return total;
+}
+static size_t GuestFwrite(const void* data, size_t size, std::FILE* file)
+{
+    uint8_t* bounce = BounceBuffer();
+    size_t total = 0;
+    while (total < size)
+    {
+        const size_t chunk = std::min(kBounceBytes, size - total);
+        std::memcpy(bounce, static_cast<const uint8_t*>(data) + total, chunk);
+        const size_t written = std::fwrite(bounce, 1, chunk, file);
+        total += written;
+        if (written < chunk)
+            break;
+    }
+    return total;
+}
+#else
+static size_t GuestFread(void* out, size_t size, std::FILE* file) { return std::fread(out, 1, size, file); }
+static size_t GuestFwrite(const void* data, size_t size, std::FILE* file) { return std::fwrite(data, 1, size, file); }
+#endif
 
 // Host read timing for the opt-in periodic Switch log.
 #if LO_PLATFORM_SWITCH
@@ -909,7 +962,7 @@ static uint32_t ReadWithRanges(FileHandle& handle, uint64_t offset, uint8_t* out
         clearerr(handle.file);
         if (_fseeki64(handle.file, int64_t(offset), SEEK_SET) != 0)
             return FileIoError(errno);
-        if (fread(out, 1, fromFile, handle.file) != fromFile)
+        if (GuestFread(out, fromFile, handle.file) != fromFile)
             return ferror(handle.file) ? FileIoError(errno) : STATUS_END_OF_FILE;
     }
     std::memset(out + fromFile, 0, length - fromFile);
@@ -971,7 +1024,7 @@ uint32_t NtReadFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, u
                 status = FileIoError(errno);
             else
             {
-                read = fread(Buffer, 1, Length, handle->file);
+                read = GuestFread(Buffer, Length, handle->file);
 #if LO_PLATFORM_SWITCH
                 if (profileRead)
                     read_stats::Record(readStart, read, handle->path.empty() ? std::string("?") : std::filesystem::path(handle->path).filename().string());
@@ -1046,7 +1099,7 @@ uint32_t NtWriteFile(uint32_t handleValue, uint32_t Event, uint32_t ApcRoutine, 
 
         trace.SetResolvedOffset(offset);
         const bool seekOk = _fseeki64(handle->file, int64_t(offset), SEEK_SET) == 0;
-        written = seekOk ? fwrite(Buffer, 1, Length, handle->file) : 0;
+        written = seekOk ? GuestFwrite(Buffer, Length, handle->file) : 0;
         const bool flushOk = fflush(handle->file) == 0;
         status = seekOk && written == Length && flushOk ? STATUS_SUCCESS : 0xC0000185u;
         handle->position = offset + written;
@@ -1554,7 +1607,7 @@ uint32_t NtReadFileScatter(uint32_t handleValue, uint32_t Event, uint32_t ApcRou
                         status = STATUS_INVALID_PARAMETER;
                         break;
                     }
-                    const size_t read = fread(g_memory.Translate(size_t(guestPtr)), 1, chunk, handle->file);
+                    const size_t read = GuestFread(g_memory.Translate(size_t(guestPtr)), chunk, handle->file);
                     gpu::guest_writes::Note(uint32_t(guestPtr), uint32_t(read));
                     total += uint32_t(read);
                     remaining -= chunk;
