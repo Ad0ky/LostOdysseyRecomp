@@ -24,7 +24,10 @@
 #include "codegen/nv50_ir_target_nvc0.h"
 
 // banjo-nx (2026-10-19): the per-thread GPR cap of the compile in progress (0: none).
-static thread_local int g_banjoGprCap = 0;
+// LostOdysseyRecomp (2026-10-27): not thread_local. Linked through plume_uam_localize.cmake's "ld -r", the TLS
+// access lost its offset (str w1, [x0, x0] off the thread pointer) and the first compile faulted on the console.
+// uam compiles on one thread only (uam_api.h), so a plain variable is the same.
+static int g_banjoGprCap = 0;
 extern "C" int nv50_ir_banjo_gpr_cap() { return g_banjoGprCap; }
 extern "C" void nv50_ir_set_banjo_gpr_cap(int cap) { g_banjoGprCap = cap; }
 

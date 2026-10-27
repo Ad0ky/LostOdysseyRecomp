@@ -867,6 +867,9 @@ namespace plume {
         imageHeapFree.push_back({0, ImageHeapCount});
         samplerHeapFree.push_back({0, SamplerHeapCount});
 
+        // LostOdysseyRecomp (2026-10-27): the application compiles its own shaders to SPIR-V for this device
+        // (gpu/shader/target_format.h reads the device's format; unset, it compiled DXIL).
+        capabilities.shaderFormat = RenderShaderFormat::SPIRV;
         capabilities.geometryShader = true;
         capabilities.descriptorIndexing = true;
         capabilities.scalarBlockLayout = false;

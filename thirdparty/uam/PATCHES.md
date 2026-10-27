@@ -60,3 +60,7 @@ Every change to upstream files is marked `SwitchWakerHD patch N`.
 Check: `uam_dksh_test` (`-DWWHD_UAM_TEST=ON`) compiles a directory of GLSL files in one process and
 compares the DKSH bytes with reference files written by the `uam` tool (target `uam_tool`), one
 process per shader.
+
+LostOdysseyRecomp (2026-10-27): `g_banjoGprCap` (`mesa-imported/codegen/nv50_ir_target_nvc0.cpp`) is a plain static,
+not `thread_local`: after plume_uam_localize.cmake's `ld -r`, its TLS access lost its offset and the first compile
+on the console wrote off the thread pointer. uam runs on one thread.
