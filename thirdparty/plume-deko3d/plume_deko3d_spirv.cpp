@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <set>
@@ -899,5 +900,116 @@ namespace plume {
             result.error = std::string("SPIRV-Cross: ") + e.what();
         }
         return result;
+    }
+
+    // ---- translation records
+
+    namespace {
+        uint64_t fnvMix(uint64_t h, const void *data, size_t size) {
+            const uint8_t *p = static_cast<const uint8_t *>(data);
+            for (size_t i = 0; i < size; i++) {
+                h ^= p[i];
+                h *= 0x100000001b3ull;
+            }
+            return h;
+        }
+        constexpr uint32_t kRecordMagic = 0x52544B44;  // "DKTR"
+    }
+
+    uint64_t Deko3DGlslKey(const std::string &glsl) {
+        return fnvMix(0xcbf29ce484222325ull, glsl.data(), glsl.size());
+    }
+
+    uint64_t Deko3DTranslationKey(const uint32_t *words, size_t wordCount, const Deko3DSpirvLayout &layout,
+                                  const Deko3DSpirvOptions &options) {
+        uint64_t h = 0x84222325cbf29ce4ull;
+        const uint32_t version = Deko3DTranslatorVersion;
+        h = fnvMix(h, &version, sizeof(version));
+        h = fnvMix(h, words, wordCount * sizeof(uint32_t));
+        for (const Deko3DSpirvLayout::Range &r : layout.ranges) {
+            const uint32_t v[6] = {r.set, r.binding, r.count, r.descriptorIndex, r.slot, uint32_t(r.kind)};
+            h = fnvMix(h, v, sizeof(v));
+        }
+        h = fnvMix(h, options.addressWindowMember.data(), options.addressWindowMember.size());
+        const uint32_t window[2] = {options.addressWindowSet, options.addressWindowBinding};
+        h = fnvMix(h, window, sizeof(window));
+        // Never equal to a GLSL key in practice; the salt keeps the two kinds of entry apart in one cache.
+        return h ^ 0x5452414E534C4154ull;
+    }
+
+    std::vector<uint8_t> Deko3DWriteTranslation(const Deko3DSpirvResult &r) {
+        std::vector<uint32_t> w;
+        const uint64_t key = Deko3DGlslKey(r.glsl);
+        // The specialization constants' defaults, as plume_deko3d reads them from the text.
+        std::vector<std::pair<uint32_t, uint32_t>> spec;
+        const std::string define = "#define SPIRV_CROSS_CONSTANT_ID_";
+        for (size_t p = r.glsl.find(define); p != std::string::npos; p = r.glsl.find(define, p + 1)) {
+            char *end = nullptr;
+            const unsigned long id = strtoul(r.glsl.c_str() + p + define.size(), &end, 10);
+            const unsigned long value = strtoul(end, nullptr, 0);
+            spec.push_back({uint32_t(id), uint32_t(value)});
+        }
+        w.push_back(kRecordMagic);
+        w.push_back(Deko3DTranslatorVersion);
+        w.push_back(uint32_t(key));
+        w.push_back(uint32_t(key >> 32));
+        w.push_back(r.uniformMask);
+        w.push_back(r.storageMask);
+        w.push_back(uint32_t(r.textures.size()));
+        w.push_back(uint32_t(r.pushWindows.size()));
+        w.push_back(uint32_t(r.vertexInputs.size()));
+        w.push_back(uint32_t(spec.size()));
+        for (const Deko3DSpirvTexture &t : r.textures) {
+            const uint32_t v[8] = {t.imageSet, t.imageIndex, uint32_t(t.samplerFrom), t.samplerSet, t.samplerIndex,
+                                   t.uniformSlot, t.uniformOffset, 0};
+            w.insert(w.end(), v, v + 8);
+        }
+        for (const auto &pw : r.pushWindows) {
+            w.push_back(pw.slot);
+            w.push_back(pw.pushOffset);
+        }
+        w.insert(w.end(), r.vertexInputs.begin(), r.vertexInputs.end());
+        for (const auto &[id, value] : spec) {
+            w.push_back(id);
+            w.push_back(value);
+        }
+        std::vector<uint8_t> bytes(w.size() * 4);
+        memcpy(bytes.data(), w.data(), bytes.size());
+        return bytes;
+    }
+
+    bool Deko3DReadTranslation(const std::vector<uint8_t> &bytes, Deko3DTranslationRecord &out) {
+        if (bytes.size() < 40 || bytes.size() % 4)
+            return false;
+        std::vector<uint32_t> w(bytes.size() / 4);
+        memcpy(w.data(), bytes.data(), bytes.size());
+        if (w[0] != kRecordMagic || w[1] != Deko3DTranslatorVersion)
+            return false;
+        const size_t textures = w[6], pushes = w[7], inputs = w[8], specs = w[9];
+        if (10 + textures * 8 + pushes * 2 + inputs + specs * 2 != w.size() || textures > 32 || pushes > Deko3DPushWindowCount)
+            return false;
+        out = {};
+        out.glslKey = uint64_t(w[2]) | (uint64_t(w[3]) << 32);
+        out.uniformMask = w[4];
+        out.storageMask = w[5];
+        size_t i = 10;
+        for (size_t k = 0; k < textures; k++, i += 8) {
+            Deko3DSpirvTexture t;
+            t.imageSet = w[i];
+            t.imageIndex = w[i + 1];
+            t.samplerFrom = Deko3DSpirvTexture::SamplerFrom(w[i + 2]);
+            t.samplerSet = w[i + 3];
+            t.samplerIndex = w[i + 4];
+            t.uniformSlot = w[i + 5];
+            t.uniformOffset = w[i + 6];
+            out.textures.push_back(t);
+        }
+        for (size_t k = 0; k < pushes; k++, i += 2)
+            out.pushWindows.push_back({w[i], w[i + 1]});
+        for (size_t k = 0; k < inputs; k++, i++)
+            out.vertexInputs.push_back(w[i]);
+        for (size_t k = 0; k < specs; k++, i += 2)
+            out.specDefaults.push_back({w[i], w[i + 1]});
+        return true;
     }
 }

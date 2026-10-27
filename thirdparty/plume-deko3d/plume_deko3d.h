@@ -41,7 +41,7 @@ namespace plume {
 
     // Counters for the renderer's reports.
     struct Deko3DStats {
-        std::atomic<uint64_t> shaderCompiles{0}, shaderCompileNs{0}, shaderCacheHits{0}, shaderCompileFailures{0}, shaderTranslateNs{0};
+        std::atomic<uint64_t> shaderCompiles{0}, shaderCompileNs{0}, shaderCacheHits{0}, shaderCompileFailures{0}, shaderTranslateNs{0}, translations{0}, translationHits{0};
         std::atomic<uint64_t> imageBytes{0}, bufferBytes{0}, codeBytes{0}, commandBytes{0};
         std::atomic<uint64_t> descriptorWrites{0}, pipelineBinds{0}, stateBinds{0}, draws{0};
         std::atomic<uint64_t> windowDraws{0}; // draws whose shaders read fetch data from memory (storage binding 15)
@@ -641,6 +641,8 @@ namespace plume {
         // LostOdysseyRecomp (2026-10-27): a SPIR-V shader's translation for this layout (null when it fails, logged);
         // a GLSL shader itself.
         const Deko3DShader *translated(const Deko3DShader *shader, const Deko3DPipelineLayout *layout);
+        bool loadByKey(const Deko3DShader *shader, uint64_t key, const DkShader *&out);
+        bool translationText(const Deko3DShader *shader);
         bool compile(DkStage stage, const std::string &source, std::vector<uint8_t> &dksh, std::string &log);
         bool loadCode(const std::vector<uint8_t> &dksh, DkShader &shader, const char *what);
         void compileWorker();

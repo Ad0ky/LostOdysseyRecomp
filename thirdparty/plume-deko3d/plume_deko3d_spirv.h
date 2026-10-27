@@ -92,4 +92,24 @@ namespace plume {
 
     Deko3DSpirvResult Deko3DTranslateSpirv(const uint32_t *words, size_t wordCount, Deko3DSpirvStage stage,
                                            const Deko3DSpirvLayout &layout, const Deko3DSpirvOptions &options);
+
+    // ---- translation records (2026-10-27): what a translation gives the back end besides the GLSL, kept in the
+    // DKSH cache under Deko3DTranslationKey so the console skips SPIRV-Cross for shaders the PC already translated.
+    // Changing the translation's output means changing Deko3DTranslatorVersion.
+    constexpr uint32_t Deko3DTranslatorVersion = 2;
+    // FNV-1a 64 of the GLSL text: the DKSH cache key of a variant (plume_deko3d's loadVariant).
+    uint64_t Deko3DGlslKey(const std::string &glsl);
+    // The cache key of a translation: the SPIR-V, the layout's numbering, the options and the translator version.
+    uint64_t Deko3DTranslationKey(const uint32_t *words, size_t wordCount, const Deko3DSpirvLayout &layout,
+                                  const Deko3DSpirvOptions &options);
+    struct Deko3DTranslationRecord {
+        uint64_t glslKey = 0;
+        uint32_t uniformMask = 0, storageMask = 0;
+        std::vector<Deko3DSpirvTexture> textures;
+        std::vector<Deko3DSpirvResult::PushWindow> pushWindows;
+        std::vector<uint32_t> vertexInputs;
+        std::vector<std::pair<uint32_t, uint32_t>> specDefaults;  // id, default value (SPIRV_CROSS_CONSTANT_ID_n)
+    };
+    std::vector<uint8_t> Deko3DWriteTranslation(const Deko3DSpirvResult &result);
+    bool Deko3DReadTranslation(const std::vector<uint8_t> &bytes, Deko3DTranslationRecord &record);
 }

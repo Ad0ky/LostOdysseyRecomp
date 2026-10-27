@@ -2,6 +2,8 @@
 //
 //   deko3d_shader_tool translate <shader.spv> [out.glsl]
 //       the GLSL the console makes from one of the game's SPIR-V shaders (vs_* / ps_* by file name)
+//   deko3d_shader_tool records <out.dkcache> < list-of-spv-files
+//       only the translation records (what the console needs to skip SPIRV-Cross), no compiles
 //   deko3d_shader_tool cache <out.dkcache> < list-of-spv-files
 //       translates and compiles (uam) every listed shader and appends its DKSH to the cache file the console reads
 //       (/switch/LostOdysseyRecomp/cache/deko3d_shaders.dkcache): records {'DKS1', size, key, DKSH}, key = FNV-1a 64
@@ -42,6 +44,15 @@ static bool ReadFile(const std::string &path, std::vector<uint32_t> &words) {
     words.resize(size_t(size) / 4);
     f.seekg(0);
     return bool(f.read(reinterpret_cast<char *>(words.data()), size));
+}
+
+static void WriteRecord(std::ofstream &out, uint64_t key, const std::vector<uint8_t> &data) {
+    const uint32_t magic = 0x31534B44; // "DKS1"
+    const uint32_t size = uint32_t(data.size());
+    out.write(reinterpret_cast<const char *>(&magic), 4);
+    out.write(reinterpret_cast<const char *>(&size), 4);
+    out.write(reinterpret_cast<const char *>(&key), 8);
+    out.write(reinterpret_cast<const char *>(data.data()), size);
 }
 
 static plume::Deko3DSpirvStage StageOf(const std::string &path) {
@@ -120,13 +131,9 @@ int main(int argc, char **argv) {
                 ++compileFailed;
                 continue;
             }
-            const uint32_t magic = 0x31534B44; // "DKS1"
-            const uint32_t size = uint32_t(c.dksh.size());
-            const uint64_t key = Fnv1a64(r.glsl.data(), r.glsl.size());
-            out.write(reinterpret_cast<const char *>(&magic), 4);
-            out.write(reinterpret_cast<const char *>(&size), 4);
-            out.write(reinterpret_cast<const char *>(&key), 8);
-            out.write(reinterpret_cast<const char *>(c.dksh.data()), size);
+            WriteRecord(out, Fnv1a64(r.glsl.data(), r.glsl.size()), c.dksh);
+            // The translation itself, so the console skips SPIRV-Cross for this shader.
+            WriteRecord(out, plume::Deko3DTranslationKey(words.data(), words.size(), layout, options), plume::Deko3DWriteTranslation(r));
             out.flush();
             std::printf("OK %s\n", path.c_str());
             std::fflush(stdout);
@@ -137,6 +144,31 @@ int main(int argc, char **argv) {
         }
         std::printf("done: %zu compiled, %zu not translated, %zu not compiled\n", ok, translateFailed, compileFailed);
         return translateFailed || compileFailed ? 1 : 0;
+    }
+    if (mode == "records") {
+        // Translation records only (no uam): for a cache made before records existed.
+        std::ofstream out(argv[2], std::ios::binary | std::ios::app);
+        std::string path;
+        size_t ok = 0, failed = 0;
+        while (std::getline(std::cin, path)) {
+            if (path.empty())
+                continue;
+            std::vector<uint32_t> words;
+            if (!ReadFile(path, words)) {
+                ++failed;
+                continue;
+            }
+            const auto r = plume::Deko3DTranslateSpirv(words.data(), words.size(), StageOf(path), layout, options);
+            if (!r.ok) {
+                std::printf("TRANSLATE-FAIL %s: %s\n", path.c_str(), r.error.c_str());
+                ++failed;
+                continue;
+            }
+            WriteRecord(out, plume::Deko3DTranslationKey(words.data(), words.size(), layout, options), plume::Deko3DWriteTranslation(r));
+            ++ok;
+        }
+        std::printf("done: %zu records, %zu failed\n", ok, failed);
+        return failed ? 1 : 0;
     }
     std::fprintf(stderr, "unknown mode %s\n", mode.c_str());
     return 2;

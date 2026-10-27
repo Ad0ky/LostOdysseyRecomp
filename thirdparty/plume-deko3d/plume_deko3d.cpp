@@ -1256,6 +1256,12 @@ namespace plume {
 
     struct Deko3DShaderImpl : Deko3DShader {
         std::vector<SpecDefault> specDefaults;
+        // LostOdysseyRecomp (2026-10-27): a translation read from the cache has no GLSL until a variant needs it
+        // (Deko3DDevice::translationText): its default variant's cache key, and what to translate it from.
+        uint64_t glslKey = 0;
+        const Deko3DShader *spirvSource = nullptr;
+        Deko3DSpirvLayout spirvLayout;
+        std::mutex textMutex;
         // Variants already looked up (spec values -> variant), so a pipeline does not hash the text again.
         std::mutex mutex;
         std::unordered_map<uint64_t, const DkShader *> known;
@@ -1376,8 +1382,39 @@ namespace plume {
                 }
             }
         }
+        // A translation the cache holds (the PC tool's, or one made on an earlier run): no SPIRV-Cross now.
+        const uint64_t recordKey = Deko3DTranslationKey(shader->spirv.data(), shader->spirv.size(), map, g_spirvOptions);
+        {
+            std::vector<uint8_t> bytes;
+            Deko3DTranslationRecord record;
+            if (g_cacheLookup && g_cacheLookup(recordKey, bytes) && Deko3DReadTranslation(bytes, record)) {
+                auto cached = std::make_unique<Deko3DShaderImpl>();
+                cached->device = this;
+                cached->stage = shader->stage;
+                cached->name = shader->name;
+                cached->glslKey = record.glslKey;
+                cached->spirvSource = shader;
+                cached->spirvLayout = map;
+                cached->usage.uboMask = record.uniformMask;
+                cached->usage.ssboMask = record.storageMask;
+                cached->usage.textureSources = std::move(record.textures);
+                cached->usage.pushWindows = std::move(record.pushWindows);
+                cached->usage.vertexInputs = std::move(record.vertexInputs);
+                for (const auto &[id, value] : record.specDefaults) {
+                    cached->specDefaults.push_back({id, value});
+                    cached->specIds.push_back(id);
+                }
+                g_deko3dStats.translationHits++;
+                const Deko3DShader *result = cached.get();
+                shader->translations[layout] = std::move(cached);
+                return result;
+            }
+        }
         const uint64_t t0 = armTicksToNs(armGetSystemTick());
         Deko3DSpirvResult r = Deko3DTranslateSpirv(shader->spirv.data(), shader->spirv.size(), shader->spirvStage, map, g_spirvOptions);
+        g_deko3dStats.translations++;
+        if (r.ok && g_cacheStore)
+            g_cacheStore(recordKey, Deko3DWriteTranslation(r));
         g_deko3dStats.shaderTranslateNs += armTicksToNs(armGetSystemTick()) - t0;
         std::unique_ptr<RenderShader> out;
         if (!r.ok) {
@@ -1586,6 +1623,48 @@ namespace plume {
         return true;
     }
 
+    // LostOdysseyRecomp (2026-10-27): a variant already loaded, or in the DKSH cache, by key (false: neither).
+    bool Deko3DDevice::loadByKey(const Deko3DShader *base, uint64_t key, const DkShader *&out) {
+        {
+            std::lock_guard<std::mutex> lock(variantMutex);
+            auto it = variants.find(key);
+            if (it != variants.end()) {
+                out = it->second->valid ? &it->second->shader : nullptr;
+                return true;
+            }
+        }
+        std::vector<uint8_t> dksh;
+        if (!g_cacheLookup || !g_cacheLookup(key, dksh))
+            return false;
+        g_deko3dStats.shaderCacheHits++;
+        auto fresh = std::make_unique<Deko3DShaderVariant>();
+        fresh->valid = loadCode(dksh, fresh->shader, base->name.c_str());
+        std::lock_guard<std::mutex> lock(variantMutex);
+        auto &slot = variants[key];
+        if (!slot)
+            slot = std::move(fresh);
+        out = slot->valid ? &slot->shader : nullptr;
+        return true;
+    }
+
+    // The GLSL of a translation read from the cache, made when a variant needs the text.
+    bool Deko3DDevice::translationText(const Deko3DShader *base) {
+        Deko3DShaderImpl *shader = const_cast<Deko3DShaderImpl *>(static_cast<const Deko3DShaderImpl *>(base));
+        std::lock_guard<std::mutex> lock(shader->textMutex);
+        if (!shader->glsl.empty())
+            return true;
+        const Deko3DShader *source = shader->spirvSource;
+        Deko3DSpirvResult r = Deko3DTranslateSpirv(source->spirv.data(), source->spirv.size(), source->spirvStage,
+                                                   shader->spirvLayout, g_spirvOptions);
+        g_deko3dStats.translations++;
+        if (!r.ok) {
+            logf("SPIR-V translation failed for %s: %s", shader->name.empty() ? "a shader" : shader->name.c_str(), r.error.c_str());
+            return false;
+        }
+        shader->glsl = std::move(r.glsl);
+        return true;
+    }
+
     const DkShader *Deko3DDevice::loadVariant(const Deko3DShader *base, const RenderSpecConstant *specConstants, uint32_t specConstantsCount) {
         Deko3DShaderImpl *shader = const_cast<Deko3DShaderImpl *>(static_cast<const Deko3DShaderImpl *>(base));
         // The constants this shader has whose value differs from its default, by id.
@@ -1608,6 +1687,20 @@ namespace plume {
             auto it = shader->known.find(specKey);
             if (it != shader->known.end())
                 return it->second;
+        }
+        // LostOdysseyRecomp (2026-10-27): a cached translation's default variant is looked up by its key alone; any
+        // other use needs the text, translated now.
+        if (shader->glsl.empty() && shader->spirvSource) {
+            if (defines.empty() && shader->glslKey) {
+                const DkShader *found = nullptr;
+                if (loadByKey(shader, shader->glslKey, found)) {
+                    std::lock_guard<std::mutex> lock(shader->mutex);
+                    shader->known[specKey] = found;
+                    return found;
+                }
+            }
+            if (!translationText(shader))
+                return nullptr;
         }
         // The variant's text: the GLSL with the constants defined after its first line (#version).
         std::string source;

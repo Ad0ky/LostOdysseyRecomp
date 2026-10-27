@@ -465,6 +465,8 @@ void AllowExit()
     appletUnlockExit();
 }
 
+extern "C" void __nx_win_exit(void) __attribute__((weak));
+
 void ExitNow()
 {
     // An application must tell the applet manager it is leaving
@@ -484,25 +486,50 @@ void ExitNow()
     std::fflush(stdout);
     std::fflush(stderr);
     mark("exit: logs flushed\n");
-    appletUnlockExit();
-    const Result rc = serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
-    std::snprintf(line, sizeof(line), "exit: applet Exit result 0x%x\n", rc);
-    mark(line);
-    if (R_SUCCEEDED(rc))
+    // libnx closes the default window (vi layer and display) before it sends Exit. Without it the Exit request
+    // never returned (exit.log of 2026-10-27 ends at "logs flushed"): close it as libnx does. The renderer has
+    // already destroyed its swap chain (video: shutdown stage=window-stop).
+    if (&__nx_win_exit)
     {
-        // The applet manager ends the process from here.
-        for (unsigned seconds = 1; seconds <= 10; ++seconds)
+        __nx_win_exit();
+        mark("exit: window closed\n");
+    }
+    appletUnlockExit();
+    // The request on its own thread, so a request that never returns cannot keep the process alive.
+    static std::atomic<int> requestState{0}; // 0 sent, 1 returned
+    static Result requestResult = 0;
+    static Thread requestThread;
+    const bool threaded = R_SUCCEEDED(threadCreate(&requestThread, [](void*) {
+        requestResult = serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
+        requestState.store(1, std::memory_order_release);
+        for (;;)
+            svcSleepThread(UINT64_MAX);
+    }, nullptr, nullptr, 0x4000, 0x2C, -2)) && R_SUCCEEDED(threadStart(&requestThread));
+    if (!threaded)
+    {
+        requestResult = serviceDispatch(appletGetServiceSession_SelfController(), 0);
+        requestState.store(1, std::memory_order_release);
+    }
+    bool reported = false;
+    for (unsigned tenths = 1; tenths <= 100; ++tenths)
+    {
+        svcSleepThread(100'000'000ull);
+        if (!reported && requestState.load(std::memory_order_acquire) == 1)
         {
-            svcSleepThread(1'000'000'000ull);
-            if (seconds == 1 || seconds == 3 || seconds == 10)
-            {
-                std::snprintf(line, sizeof(line), "exit: still running %u s after Exit\n", seconds);
-                mark(line);
-            }
+            std::snprintf(line, sizeof(line), "exit: applet Exit result 0x%x\n", requestResult);
+            mark(line);
+            reported = true;
+            if (R_FAILED(requestResult))
+                break;
+        }
+        if (tenths == 10 || tenths == 30 || tenths == 100)
+        {
+            std::snprintf(line, sizeof(line), "exit: still running %u s after the Exit request (%s)\n", tenths / 10,
+                          reported ? "answered" : "not answered");
+            mark(line);
         }
     }
     mark("exit: ending the process directly (svcExitProcess)\n");
-    std::fprintf(stderr, "exit: applet Exit result 0x%x, ending the process\n", rc);
     svcExitProcess();
     __builtin_unreachable();
 }
