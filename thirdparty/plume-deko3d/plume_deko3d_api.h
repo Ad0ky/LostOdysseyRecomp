@@ -24,4 +24,22 @@ namespace plume {
     // What the SPIR-V translation assumes (the address window), before shaders are made.
     void Deko3DSetSpirvOptions(const Deko3DSpirvOptions &options);
     std::unique_ptr<RenderInterface> CreateDeko3DInterface();
+
+    // LostOdysseyRecomp (2026-10-27): Deko3DOptions' GPU switches (plume_deko3d.h has what each does), before
+    // CreateDeko3DInterface. All off by default, as banjo-nx ships them.
+    struct Deko3DGpuOptions {
+        bool depthCompression = false;
+        bool zcull = false;
+        bool mergeBarriers = false;
+        bool leanBarriers = false;
+    };
+    void Deko3DSetGpuOptions(const Deko3DGpuOptions &options);
+
+    // The back end's running totals (Deko3DStats), for the renderer's per-frame report.
+    struct Deko3DCounters {
+        uint64_t draws = 0, pipelineBinds = 0, stateBinds = 0, descriptorWrites = 0;
+        uint64_t barriersPrimitives = 0, barriersFragments = 0, barriersFull = 0, barriersImageInvalidate = 0;
+        uint64_t copyBuffer = 0, copyUpload = 0, copyReadback = 0, copyImage = 0, copyResolve = 0, copyBlit = 0;
+    };
+    Deko3DCounters Deko3DReadCounters();
 }

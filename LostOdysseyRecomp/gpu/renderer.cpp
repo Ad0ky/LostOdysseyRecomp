@@ -94,6 +94,9 @@
 #include <os/thread_name.h>
 #include "color_qualification.h"
 #include "render_timing.h"
+#if defined(LO_SWITCH_DEKO3D)
+#include <plume_deko3d_api.h>
+#endif
 #include "gpu_busy.h"
 #include "render_batch_policy.h"
 #include "render_arena_policy.h"
@@ -15406,6 +15409,35 @@ void main()
                     r.tShaderLookup, r.tPipelineLookup, r.tSceneCopy};
                 render_timing::LogFrame(r.frame, cpu, r.gpuTiming, !r.debugCaptureDir.empty(),
                     r.resolveTraceRemaining || r.psTraceRemaining || GetHotCaptureEnvironment().geometryCaptureEnabled);
+#if defined(LO_SWITCH_DEKO3D)
+                if (video::IsDeko3d() && render_timing::Enabled())
+                {
+                    // The back end's work per frame, averaged over 150 frames: draws, binds, barriers by what they
+                    // wait for, and copy/2D-engine work (each of those fenced by full barriers).
+                    static plume::Deko3DCounters before{};
+                    static uint64_t beforeFrame = 0;
+                    if (r.frame >= beforeFrame + 150)
+                    {
+                        const plume::Deko3DCounters now = plume::Deko3DReadCounters();
+                        const double n = double(r.frame - beforeFrame);
+                        const auto per = [n](uint64_t a, uint64_t b) { return double(a - b) / n; };
+                        if (beforeFrame)
+                            LOG_INFO("deko3d frame work frame={} frames={:.0f} draws={:.1f} pipeline_binds={:.1f} state_binds={:.1f} "
+                                "descriptor_writes={:.1f} barriers_primitives={:.1f} barriers_fragments={:.1f} barriers_full={:.1f} "
+                                "image_invalidates={:.1f} copy_buffer={:.1f} copy_upload={:.1f} copy_readback={:.1f} copy_image={:.1f} "
+                                "copy_resolve={:.1f} copy_blit={:.1f}",
+                                r.frame, n, per(now.draws, before.draws), per(now.pipelineBinds, before.pipelineBinds),
+                                per(now.stateBinds, before.stateBinds), per(now.descriptorWrites, before.descriptorWrites),
+                                per(now.barriersPrimitives, before.barriersPrimitives), per(now.barriersFragments, before.barriersFragments),
+                                per(now.barriersFull, before.barriersFull), per(now.barriersImageInvalidate, before.barriersImageInvalidate),
+                                per(now.copyBuffer, before.copyBuffer), per(now.copyUpload, before.copyUpload),
+                                per(now.copyReadback, before.copyReadback), per(now.copyImage, before.copyImage),
+                                per(now.copyResolve, before.copyResolve), per(now.copyBlit, before.copyBlit));
+                        before = now;
+                        beforeFrame = r.frame;
+                    }
+                }
+#endif
                 r.gpuTiming.Reset();
                 if (!stats) r.ResetTimers();
             }

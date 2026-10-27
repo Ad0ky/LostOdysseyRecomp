@@ -262,6 +262,12 @@ built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the 
   `deko3d_shader_tool` is `tools/deko3d/deko3d_shader_tool.cpp` built for the PC with
   `thirdparty/plume-deko3d/plume_deko3d_spirv.cpp`, SPIRV-Cross and uam's `uamlib`. The pack only matches a game
   edition whose Vulkan pack it was made from.
+- GPU switches (`env.txt`, all off by default; `LO_DEKO3D_GPU_FAST=1` turns on all four and each `LO_DEKO3D_<NAME>=0/1`
+  overrides it): `LO_DEKO3D_DEPTH_COMPRESSION` (compressed depth targets), `LO_DEKO3D_ZCULL` (hierarchical depth
+  culling; another port saw depth-biased decals dropped with it), `LO_DEKO3D_MERGE_BARRIERS` (back-to-back barriers
+  become one), `LO_DEKO3D_LEAN_BARRIERS` (no texture-cache invalidation for a target that is only written next). The
+  runtime log's `video: deko3d GPU options` line shows what is on. With `LO_RENDER_TIMING=1`, a `deko3d frame work`
+  line every 150 frames gives the draws, binds, barriers and copies per frame.
 - Not on deko3d yet: host occlusion queries (`LO_ZPD_MODE` uses made-up counts), LSFG frame generation, the driver
   pipeline cache (not needed: no pipeline compiles).
 

@@ -84,6 +84,24 @@ namespace plume {
 
     Deko3DOptions g_deko3dOptions;
     void Deko3DSetOptions(const Deko3DOptions &options) { g_deko3dOptions = options; }
+    void Deko3DSetGpuOptions(const Deko3DGpuOptions &options) {
+        g_deko3dOptions.depthCompression = options.depthCompression;
+        g_deko3dOptions.zcull = options.zcull;
+        g_deko3dOptions.mergeBarriers = options.mergeBarriers;
+        g_deko3dOptions.leanBarriers = options.leanBarriers;
+    }
+    Deko3DCounters Deko3DReadCounters() {
+        const Deko3DStats &s = g_deko3dStats;
+        const auto r = [](const std::atomic<uint64_t> &v) { return v.load(std::memory_order_relaxed); };
+        Deko3DCounters c;
+        c.draws = r(s.draws); c.pipelineBinds = r(s.pipelineBinds); c.stateBinds = r(s.stateBinds);
+        c.descriptorWrites = r(s.descriptorWrites);
+        c.barriersPrimitives = r(s.barriersPrimitives); c.barriersFragments = r(s.barriersFragments);
+        c.barriersFull = r(s.barriersFull); c.barriersImageInvalidate = r(s.barriersImageInvalidate);
+        c.copyBuffer = r(s.copyBuffer); c.copyUpload = r(s.copyUpload); c.copyReadback = r(s.copyReadback);
+        c.copyImage = r(s.copyImage); c.copyResolve = r(s.copyResolve); c.copyBlit = r(s.copyBlit);
+        return c;
+    }
 
     static Deko3DShaderCacheLookup g_cacheLookup;
     static Deko3DShaderCacheStore g_cacheStore;

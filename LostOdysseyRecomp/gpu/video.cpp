@@ -454,6 +454,23 @@ namespace gpu::video
         {
             plume::SetDeko3DLogCallback([](const char* message) { LOG_INFO("deko3d: {}", message); });
             plume::Deko3DSetSpirvOptions(plume::Deko3DSpirvOptions{});
+            // GPU switches (env.txt), all off by default: LO_DEKO3D_GPU_FAST=1 turns on all four, and each
+            // LO_DEKO3D_<NAME>=0/1 overrides it.
+            {
+                const auto flag = [](const char* name, bool fallback) {
+                    const char* value = std::getenv(name);
+                    return value && *value ? std::strcmp(value, "0") != 0 : fallback;
+                };
+                const bool fast = flag("LO_DEKO3D_GPU_FAST", false);
+                plume::Deko3DGpuOptions gpu;
+                gpu.depthCompression = flag("LO_DEKO3D_DEPTH_COMPRESSION", fast);
+                gpu.zcull = flag("LO_DEKO3D_ZCULL", fast);
+                gpu.mergeBarriers = flag("LO_DEKO3D_MERGE_BARRIERS", fast);
+                gpu.leanBarriers = flag("LO_DEKO3D_LEAN_BARRIERS", fast);
+                plume::Deko3DSetGpuOptions(gpu);
+                LOG_NOTICE("video: deko3d GPU options: depth_compression={} zcull={} merge_barriers={} lean_barriers={}",
+                    gpu.depthCompression, gpu.zcull, gpu.mergeBarriers, gpu.leanBarriers);
+            }
             const std::filesystem::path root = LO_SWITCH_DATA_ROOT;
             lo::deko3d::InstallShaderCache(root / "shaders" / "deko3d_shaders.lodk", root / "cache" / "deko3d_runtime.dkcache");
             LOG_NOTICE("video: deko3d back end (LO_SWITCH_BACKEND=deko3d)");
