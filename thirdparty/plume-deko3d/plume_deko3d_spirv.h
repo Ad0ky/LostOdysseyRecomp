@@ -112,4 +112,20 @@ namespace plume {
     };
     std::vector<uint8_t> Deko3DWriteTranslation(const Deko3DSpirvResult &result);
     bool Deko3DReadTranslation(const std::vector<uint8_t> &bytes, Deko3DTranslationRecord &record);
+
+    // LostOdysseyRecomp (2026-10-27): the cache key of a specialized variant: the FNV-1a 64 key of the shader's
+    // default GLSL, then the variant's defines ("#define SPIRV_CROSS_CONSTANT_ID_<id> <value>u\n" for each constant
+    // that differs from its default, by id) hashed on. The PC tool writes pre-built variants under it.
+    inline uint64_t Deko3DVariantKey(uint64_t baseKey, const std::string &defines) {
+        uint64_t h = 0xcbf29ce484222325ull ^ baseKey;
+        for (unsigned i = 0; i < 8; i++) {
+            h ^= uint8_t(baseKey >> (8 * i));
+            h *= 0x100000001b3ull;
+        }
+        for (const char c : defines) {
+            h ^= uint8_t(c);
+            h *= 0x100000001b3ull;
+        }
+        return h ^ 0x564152494e543031ull;  // "VARINT01"
+    }
 }

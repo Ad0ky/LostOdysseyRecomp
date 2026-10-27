@@ -256,8 +256,15 @@ built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the 
   ```
   python tools/deko3d/extract_spirv.py portable_vk.lospv spv
   ls spv/*.spv | deko3d_shader_tool cache deko3d.dkcache
-  python tools/deko3d/pack_dkcache.py deko3d_shaders.lodk deko3d.dkcache
+  python tools/deko3d/recipe_variants.py spv pipelines_corpus.bin pipelines_vk12_1.bin > variants.txt
+  deko3d_shader_tool variants variants.dkcache < variants.txt
+  python tools/deko3d/pack_dkcache.py deko3d_shaders.lodk deko3d.dkcache variants.dkcache
   ```
+
+  Texture-info specialization runs on deko3d as on NVK: a pipeline gets variants whose texture fetches have their
+  format words as constants, so the per-fetch sign and swizzle decoding folds away (about half the code of the
+  heaviest pixel shaders). The `variants` step pre-builds those of the recorded recipes; any other is compiled on
+  the console in the background and kept in the runtime cache. `LO_TEXINFO_SPEC=0` turns it off.
 
   `deko3d_shader_tool` is `tools/deko3d/deko3d_shader_tool.cpp` built for the PC with
   `thirdparty/plume-deko3d/plume_deko3d_spirv.cpp`, SPIRV-Cross and uam's `uamlib`. The pack only matches a game

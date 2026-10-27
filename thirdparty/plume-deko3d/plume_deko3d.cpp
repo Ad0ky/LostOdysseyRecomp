@@ -1418,10 +1418,14 @@ namespace plume {
                 cached->usage.textureSources = std::move(record.textures);
                 cached->usage.pushWindows = std::move(record.pushWindows);
                 cached->usage.vertexInputs = std::move(record.vertexInputs);
-                for (const auto &[id, value] : record.specDefaults) {
+                for (const auto &[id, value] : record.specDefaults)
                     cached->specDefaults.push_back({id, value});
-                    cached->specIds.push_back(id);
-                }
+                // By id, as parseSpecDefaults orders them: a variant's defines (and its key) do not depend on where
+                // the shader came from.
+                std::sort(cached->specDefaults.begin(), cached->specDefaults.end(),
+                          [](const SpecDefault &a, const SpecDefault &b) { return a.id < b.id; });
+                for (const SpecDefault &d : cached->specDefaults)
+                    cached->specIds.push_back(d.id);
                 g_deko3dStats.translationHits++;
                 const Deko3DShader *result = cached.get();
                 shader->translations[layout] = std::move(cached);
@@ -1706,6 +1710,22 @@ namespace plume {
             if (it != shader->known.end())
                 return it->second;
         }
+        // LostOdysseyRecomp (2026-10-27): a specialized variant is also kept under the key of its default text and its
+        // defines (Deko3DVariantKey), so a cached translation finds it without the text (SPIRV-Cross on the console).
+        uint64_t variantKey = 0;
+        if (!defines.empty()) {
+            const uint64_t baseKey = shader->glslKey ? shader->glslKey
+                                     : !shader->glsl.empty() ? fnv1a64(shader->glsl.data(), shader->glsl.size()) : 0;
+            if (baseKey) {
+                variantKey = Deko3DVariantKey(baseKey, defines);
+                const DkShader *found = nullptr;
+                if (loadByKey(shader, variantKey, found)) {
+                    std::lock_guard<std::mutex> lock(shader->mutex);
+                    shader->known[specKey] = found;
+                    return found;
+                }
+            }
+        }
         // LostOdysseyRecomp (2026-10-27): a cached translation's default variant is looked up by its key alone; any
         // other use needs the text, translated now.
         if (shader->glsl.empty() && shader->spirvSource) {
@@ -1765,6 +1785,8 @@ namespace plume {
                         g_cacheStore(key, dksh);
                 }
             }
+            if (have && variantKey && g_cacheStore)
+                g_cacheStore(variantKey, dksh);  // LostOdysseyRecomp: found by its variant key next time
             auto fresh = std::make_unique<Deko3DShaderVariant>();
             if (have)
                 fresh->valid = loadCode(dksh, fresh->shader, shader->name.c_str());

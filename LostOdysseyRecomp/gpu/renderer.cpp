@@ -1015,7 +1015,7 @@ namespace gpu::renderer
             // parts instead of compiling the whole pipeline. A background thread builds
             // the parts for the shaders of known recipes (libraryPrecompile below).
             bool fastLinkPipelines = false;
-            // Texture-info specialization (Vulkan; LO_TEXINFO_SPEC=0 turns it off).
+            // Texture-info specialization (Vulkan and deko3d; LO_TEXINFO_SPEC=0 turns it off).
             bool texInfoSpecialization = false;
             struct SpecStats {
                 uint64_t textured = 0, specialised = 0; // draws since the last log
@@ -2693,7 +2693,8 @@ namespace gpu::renderer
                 queue = video::GetQueue();
                 vulkan = video::UsesSpirv();
                 nativeVulkan = video::IsVulkan();
-                texInfoSpecialization = nativeVulkan && !(getenv("LO_TEXINFO_SPEC") && std::string_view(getenv("LO_TEXINFO_SPEC")) == "0");
+                // deko3d too (2026-10-27): its generic shaders decode every fetch from the uniform words at run time.
+                texInfoSpecialization = (nativeVulkan || video::IsDeko3d()) && !(getenv("LO_TEXINFO_SPEC") && std::string_view(getenv("LO_TEXINFO_SPEC")) == "0");
 #if defined(LO_GPU_PLUME)
                 dlssController = video::GetDlssController();
 #if !defined(LO_RENDERER_P2_EMBEDDED_TEST)
