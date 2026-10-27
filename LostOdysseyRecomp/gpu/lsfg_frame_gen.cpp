@@ -5,6 +5,7 @@
 // synchronization. See lsfg_frame_gen.h.
 #include <stdafx.h>
 #include "lsfg_frame_gen.h"
+#include "video.h"
 
 #if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME)
 
@@ -490,7 +491,8 @@ bool Enabled()
         const char* value = std::getenv("LO_FRAMEGEN");
         return value && value[0] == '1';
     }();
-    return requested && !g_failed.load(std::memory_order_relaxed);
+    // LSFG runs on Vulkan only (its own device objects): never with deko3d.
+    return requested && !g_failed.load(std::memory_order_relaxed) && !gpu::video::IsDeko3d();
 }
 
 bool Present(plume::RenderSwapChain* swapChain, uint32_t imageIndex, plume::RenderCommandSemaphore* waitSemaphore,

@@ -92,6 +92,10 @@
 #if defined(LO_GPU_PLUME) || defined(LO_VIDEO_SUBMISSION_UNIT)
 #include <plume_render_interface.h>
 #include <plume_vulkan.h>
+#if defined(LO_SWITCH_DEKO3D)
+#include <plume_deko3d_api.h>
+#include "deko3d_shader_cache.h"
+#endif
 #ifdef _WIN32
 #include <plume_d3d12.h>
 #include "d3d12_dred.h"
@@ -439,6 +443,23 @@ namespace gpu::video
         // presents to the libnx window (VK_NN_vi_surface) directly. SDL still
         // owns the window object for events and sizing (nwindowSetDimensions).
         plume::RenderWindow PlumeWindow() { return nwindowGetDefault(); }
+#if defined(LO_SWITCH_DEKO3D)
+        // LO_SWITCH_BACKEND=deko3d: plume's deko3d back end instead of Mesa NVK (docs/SWITCH.md).
+        bool UseDeko3d()
+        {
+            const char* value = std::getenv("LO_SWITCH_BACKEND");
+            return value && backend::Equal(value, "deko3d");
+        }
+        std::unique_ptr<plume::RenderInterface> CreateDeko3dInterface()
+        {
+            plume::SetDeko3DLogCallback([](const char* message) { LOG_INFO("deko3d: {}", message); });
+            plume::Deko3DSetSpirvOptions(plume::Deko3DSpirvOptions{});
+            const std::filesystem::path root = LO_SWITCH_DATA_ROOT;
+            lo::deko3d::InstallShaderCache(root / "shaders" / "deko3d_shaders.lodk", root / "cache" / "deko3d_runtime.dkcache");
+            LOG_NOTICE("video: deko3d back end (LO_SWITCH_BACKEND=deko3d)");
+            return plume::CreateDeko3DInterface();
+        }
+#endif
         std::unique_ptr<plume::RenderInterface> CreatePlumeVulkanInterface(const plume::VulkanExtensionHooks& hooks)
         {
             // The instance needs no window; the swap chain takes PlumeWindow().
@@ -499,6 +520,10 @@ namespace gpu::video
         std::atomic<uint64_t> g_shaderProgress{0};
         std::atomic<bool> g_vulkan{false};
         std::atomic<bool> g_metal{false};
+        // LostOdysseyRecomp (2026-10-27): the Switch's deko3d back end (LO_SWITCH_BACKEND=deko3d): SPIR-V like Vulkan
+        // and Metal, but no Vulkan object behind any plume type. It takes Metal's backend-neutral submission paths.
+        std::atomic<bool> g_deko3d{false};
+        bool PortablePlume() { return g_metal.load(std::memory_order_relaxed) || g_deko3d.load(std::memory_order_relaxed); }
         std::atomic<uint64_t> g_deviceEpoch{0};
         constexpr uint64_t kProgressMask = (1ull << 28) - 1;
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
@@ -882,7 +907,7 @@ namespace gpu::video
             return submitted;
         }
 
-#if LO_PLATFORM_MACOS
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         // plume's Metal fence is a counting semaphore: each submission signals it
         // once and each wait consumes one signal. The runtime's waits assume an
         // idempotent fence (a completed Vulkan fence or D3D12 value stays
@@ -917,7 +942,7 @@ namespace gpu::video
                 if (rawResult) *rawResult = g_submissionState.Failure();
                 return false;
             }
-            if (!g_metal || !queue || !lists || !count) {
+            if (!PortablePlume() || !queue || !lists || !count) {
                 StopGpuWork(submission::VulkanState::InvalidState); return false;
             }
             for (uint32_t i = 0; i < count; ++i)
@@ -1038,8 +1063,8 @@ namespace gpu::video
             plume::RenderCommandSemaphore* const* signals, uint32_t signalCount,
             plume::RenderCommandFence* fence, uint64_t* serial, int32_t* rawResult)
         {
-#if LO_PLATFORM_MACOS
-            if (g_metal)
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
+            if (PortablePlume())
                 return SubmitMetal(lists, count, waits, waitCount, signals, signalCount,
                     fence, serial, rawResult);
 #endif
@@ -1126,7 +1151,7 @@ namespace gpu::video
         // prefers (Streamline DLSS-G guide 11.0); LO_HDR_FG=0 opts out.
         bool HdrFrameGenerationCompatible()
         {
-            const auto fg = frame_generation::ResolveSelection(g_metal ? backend::Backend::Metal :
+            const auto fg = frame_generation::ResolveSelection(PortablePlume() ? backend::Backend::Metal :
                 g_vulkan ? backend::Backend::Vulkan : backend::Backend::D3D12,
                 settings::GetConfig(), std::getenv("LO_FG_PROVIDER"), std::getenv("LO_FG_MODE"),
                 std::getenv("LO_FG_MULTIPLIER"), std::getenv("LO_FG_TARGET_FPS"), std::getenv("LO_DLSS_FG"));
@@ -1547,7 +1572,7 @@ namespace gpu::video
             result->swap = g_captureCopy.ticket.swap;
             result->deviceEpoch = g_captureCopy.ticket.deviceEpoch;
             result->presentAccepted = presented;
-            result->backend = g_vulkan ? "Vulkan" : g_metal ? "Metal" : "D3D12";
+            result->backend = g_vulkan ? "Vulkan" : g_deko3d ? "deko3d" : g_metal ? "Metal" : "D3D12";
             result->format = "R8G8B8A8_UNORM";
             result->available = false;
             if (!g_captureCopy.ticket.active)
@@ -1570,7 +1595,7 @@ namespace gpu::video
             }
             bool complete = false;
             // Metal's counted fence wait proves completion as Vulkan's fence does.
-            if (g_vulkan || g_metal)
+            if (g_vulkan || PortablePlume())
             {
                 complete = WaitForGpuFence(g_fence.get());
                 if (complete)
@@ -1657,7 +1682,7 @@ namespace gpu::video
             upscaling::BackendDeviceSnapshot snapshot;
             const bool vulkan = g_vulkan.load(std::memory_order_acquire);
             snapshot.backend = vulkan ? backend::Backend::Vulkan
-                : g_metal.load(std::memory_order_acquire) ? backend::Backend::Metal : backend::Backend::D3D12;
+                : PortablePlume() ? backend::Backend::Metal : backend::Backend::D3D12;
             snapshot.deviceEpoch = g_deviceEpoch.load(std::memory_order_acquire);
 #if defined(LO_GPU_PLUME) && !defined(LO_VIDEO_SUBMISSION_UNIT)
             snapshot.deviceReady = g_available && g_device != nullptr;
@@ -1694,7 +1719,7 @@ namespace gpu::video
         {
             upscaling::BackendDeviceSnapshot snapshot;
             snapshot.backend = g_vulkan.load(std::memory_order_acquire) ? backend::Backend::Vulkan
-                : g_metal.load(std::memory_order_acquire) ? backend::Backend::Metal : backend::Backend::D3D12;
+                : PortablePlume() ? backend::Backend::Metal : backend::Backend::D3D12;
             snapshot.deviceEpoch = g_deviceEpoch.load(std::memory_order_acquire);
             snapshot.deviceReady = false;
             snapshot.dlssAvailable = false;
@@ -1733,7 +1758,7 @@ namespace gpu::video
         const bool first = !g_stopReported.exchange(true);
         if (first)
             LOG_ERROR("video: native GPU work stopped backend={} raw_result={}; device restart required",
-                g_vulkan ? "Vulkan" : g_metal ? "Metal" : "D3D12", nativeResult);
+                g_vulkan ? "Vulkan" : g_deko3d ? "deko3d" : g_metal ? "Metal" : "D3D12", nativeResult);
         g_submissionState.Stop(nativeResult);
 #if defined(_WIN32) && !defined(LO_VIDEO_SUBMISSION_UNIT)
         if (first && !g_vulkan && g_device)
@@ -1755,9 +1780,9 @@ namespace gpu::video
     bool BeginGpuCommands(plume::RenderCommandList* list) {
         if (GpuWorkStopped()) return false;
         if (!list) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
-#if LO_PLATFORM_MACOS
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         // Metal command encoding reports no errors at record time.
-        if (g_metal) { list->begin(); return true; }
+        if (PortablePlume()) { list->begin(); return true; }
 #endif
         if (!g_vulkan) {
 #ifdef _WIN32
@@ -1783,8 +1808,8 @@ namespace gpu::video
     bool EndGpuCommands(plume::RenderCommandList* list) {
         if (GpuWorkStopped()) return false;
         if (!list) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
-#if LO_PLATFORM_MACOS
-        if (g_metal) { list->end(); return true; }
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume()) { list->end(); return true; }
 #endif
         if (!g_vulkan) {
 #ifdef _WIN32
@@ -1809,8 +1834,8 @@ namespace gpu::video
     bool WaitForGpuFence(plume::RenderCommandFence* fence) {
         auto* queueHolder = ActiveSubmissionQueue();
         if (!queueHolder || !fence) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
-#if LO_PLATFORM_MACOS
-        if (g_metal) {
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume()) {
             ConsumeMetalFenceSignals(queueHolder, fence);
             return g_submissionState.WaitSubmitted([] { return submission::VulkanState::Success; });
         }
@@ -1879,8 +1904,8 @@ namespace gpu::video
 #if !defined(LO_VIDEO_SUBMISSION_UNIT)
     void DrainGpuForShutdown() {
         if (!g_device) return;
-#if LO_PLATFORM_MACOS
-        if (g_metal) {
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume()) {
             // Every submission signalled a counted fence; consuming them all
             // proves completion.
             std::vector<plume::RenderCommandFence*> fences;
@@ -1968,8 +1993,8 @@ namespace gpu::video
         plume::RenderCommandFence* fence, uint64_t& submissionSerial, int32_t& rawResult,
         bool* executionMayBeInFlight)
     {
-#if LO_PLATFORM_MACOS
-        if (g_metal) {
+#if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume()) {
             if (executionMayBeInFlight) *executionMayBeInFlight = false;
             return SubmitMetal(lists, count, nullptr, 0, nullptr, 0, fence, &submissionSerial, &rawResult);
         }
@@ -2022,7 +2047,8 @@ namespace gpu::video
 
     bool IsVulkan() { return g_vulkan; }
     bool IsMetal() { return g_metal; }
-    bool UsesSpirv() { return g_vulkan || g_metal; }
+    bool UsesSpirv() { return g_vulkan || g_metal || g_deko3d; }
+    bool IsDeko3d() { return g_deko3d; }
     uint32_t LogicalOutputHeight()
     {
 #if !defined(_WIN32)
@@ -2667,19 +2693,30 @@ namespace gpu::video
             dlss::SetLogSink([](const char* line) { LOG_INFO("{}", line); });
             g_dlssController = std::make_unique<dlss::Controller>(DlssApplicationDataPath(), DlssRuntimePath());
             g_temporalUpscaler = std::make_unique<TemporalUpscaler>(*g_dlssController);
-            LoadCustomVulkanDriver();
-            g_interface = CreatePlumeVulkanInterface(g_dlssController->ExtensionHooks());
-            if (!g_interface && RetryWithSystemVulkanDriver("instance creation"))
+#if defined(LO_SWITCH_DEKO3D)
+            if (UseDeko3d()) {
+                g_vulkan.store(false);
+                g_deko3d.store(true);
+                g_interface = CreateDeko3dInterface();
+            } else
+#endif
+            {
+                LoadCustomVulkanDriver();
                 g_interface = CreatePlumeVulkanInterface(g_dlssController->ExtensionHooks());
+                if (!g_interface && RetryWithSystemVulkanDriver("instance creation"))
+                    g_interface = CreatePlumeVulkanInterface(g_dlssController->ExtensionHooks());
+            }
 #endif
             if (!g_interface) return "API/loader initialization failed";
 #if LO_PLATFORM_SWITCH && defined(LO_GPU_PLUME)
-            // LSFG frame generation (LO_FRAMEGEN=1) needs timeline semaphores.
-            // Only those: fp16/16-bit storage/subgroup control stay as in normal
-            // builds (the LSFG backend is opened without low precision).
-            if (gpu::lsfg::Enabled())
-                static_cast<plume::VulkanInterface*>(g_interface.get())->enableTimelineSemaphores = true;
-            ListenToSwitchDriver(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
+            if (g_vulkan) {
+                // LSFG frame generation (LO_FRAMEGEN=1) needs timeline semaphores.
+                // Only those: fp16/16-bit storage/subgroup control stay as in normal
+                // builds (the LSFG backend is opened without low precision).
+                if (gpu::lsfg::Enabled())
+                    static_cast<plume::VulkanInterface*>(g_interface.get())->enableTimelineSemaphores = true;
+                ListenToSwitchDriver(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
+            }
 #endif
 #ifdef __ANDROID__
             LogVulkanPhysicalDevices(static_cast<plume::VulkanInterface*>(g_interface.get())->instance);
@@ -2733,7 +2770,8 @@ namespace gpu::video
                     g_lastVulkanGpuName = description.name;
 #endif
                 }
-                return backend::Inspect(candidate, g_device.get());
+                // deko3d is checked as Metal is: SPIR-V without Vulkan objects behind the device.
+                return backend::Inspect(g_deko3d ? backend::Backend::Metal : candidate, g_device.get());
             };
             startupWatch.Step("device capability check");
             auto capabilities = openedDevice();
@@ -2764,11 +2802,11 @@ namespace gpu::video
                 g_activeGpuDeviceName = g_device ? g_device->getDescription().name : std::string{};
             }
             g_textureCompressionBC.store(capabilities.textureCompressionBC, std::memory_order_relaxed);
-            if (g_device && candidate == backend::Backend::Vulkan)
+            if (g_device && g_vulkan)
                 LOG_INFO("vulkan limits: sets={} samplers={} sampled_images={} storage_buffers={} push_constants={} bc={}",
                     capabilities.boundSets, capabilities.samplers, capabilities.sampledImages,
                     capabilities.storageBuffers, capabilities.pushConstants, capabilities.textureCompressionBC ? 1 : 0);
-            if (const auto missing = backend::Missing(candidate, capabilities); !missing.empty()) return missing;
+            if (const auto missing = backend::Missing(g_deko3d ? backend::Backend::Metal : candidate, capabilities); !missing.empty()) return missing;
             startupWatch.Step("DLSS/NGX capability probe");
             if (g_vulkan && g_dlssController) {
                 bool retainNgxForFg = false;
@@ -4139,7 +4177,7 @@ namespace gpu::video
             return true;
         }
         if (g_hdrSwapchainRefused == desired) return true;
-        const auto fg = frame_generation::ResolveSelection(g_metal ? backend::Backend::Metal :
+        const auto fg = frame_generation::ResolveSelection(PortablePlume() ? backend::Backend::Metal :
             g_vulkan ? backend::Backend::Vulkan : backend::Backend::D3D12,
             settings::GetConfig(), std::getenv("LO_FG_PROVIDER"), std::getenv("LO_FG_MODE"),
             std::getenv("LO_FG_MULTIPLIER"), std::getenv("LO_FG_TARGET_FPS"), std::getenv("LO_DLSS_FG"));
@@ -4759,7 +4797,7 @@ namespace gpu::video
         const uint32_t outputWidth = g_swapChain->getWidth(), outputHeight = g_swapChain->getHeight();
         if (overlay::Frame(mode, now, outputWidth, outputHeight)) {
             overlay::Sources sources;
-            sources.backend = g_metal ? "METAL" : g_vulkan ? "VULKAN" : "D3D12";
+            sources.backend = g_deko3d ? "DEKO3D" : g_metal ? "METAL" : g_vulkan ? "VULKAN" : "D3D12";
             using upscaling::TemporalConsumer;
             const auto consumer = plan.cpuSerial ? plan.consumer : TemporalConsumer::None;
             sources.upscaler = upscaling::IsDlssConsumer(consumer) ? "DLSS" : consumer == TemporalConsumer::FsrSr ? "FSR" :

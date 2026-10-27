@@ -180,6 +180,7 @@ Switch-specific options and diagnostics:
 
 | Variable | Default | Effect |
 |---|---|---|
+| `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | automatic | `540` or `720` forces the scene height; otherwise handheld uses 540 and docked uses 720 |
 | `LO_TRIM_VARYINGS` | `1` | Keeps only vertex outputs used by the paired fragment shader; set to `0` to disable the Switch Vulkan optimisation |
 | `LO_RT32` | off | Set to `1` to use 32-bit formats for the two 10-bit render-target classes; on Switch the 7e3 class uses `R11G11B10_FLOAT`, so its 2-bit alpha is read as 1 |
@@ -234,6 +235,35 @@ Delete the file to turn sampling off. Per-thread CPU shares are logged every
 | XMA audio | Xenia's FFmpeg fork with `thirdparty/ffmpeg-config/switch-aarch64` |
 | Graphics settings | `settings::Validate()` selects 540p handheld or 720p docked (override with `LO_SWITCH_RENDER_HEIGHT`), 1x shadow maps and no AA, AO, anisotropic filtering, upscaling, frame generation or HDR; `GraphicsRowHidden()` hides those rows |
 | Not on Switch | Updater, network downloads, importer, D3D12, DLSS/FSR/XeSS, frame generation, HDR |
+
+## deko3d back end (experimental)
+
+`LO_SWITCH_BACKEND=deko3d` in `env.txt` renders through deko3d, the Switch's own GPU API, instead of Mesa NVK. It is
+built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the CMake log says
+`LostOdysseyRecomp: deko3d back end`). NVK stays the default.
+
+- Back end: `thirdparty/plume-deko3d`, plume's deko3d back end from sa2-nx/banjo-nx, with LostOdysseyRecomp's changes:
+  shaders are taken as SPIR-V, descriptors live in two device-wide heaps, and texture handles come from the bound
+  descriptor sets.
+- Shaders: the Vulkan SPIR-V is translated to the GLSL that uam (deko3d's shader compiler, `thirdparty/uam`) takes,
+  per pipeline layout (`plume_deko3d_spirv.cpp`): texture and sampler pairs become combined handles (the sampler of a
+  Xenos texture fetch is chosen by `XeShared.xeSamplerIndex`), vertex arena pointers become storage buffer reads,
+  specialization constants become macros, and the vertex stage's y is flipped back.
+- DKSH cache: `shaders/deko3d_shaders.lodk` holds the game's shaders compiled on the PC; whatever is missing is
+  compiled on the console (about 0.1 s each) and kept in `cache/deko3d_runtime.dkcache`. To build the pack from the
+  Vulkan pack:
+
+  ```
+  python tools/deko3d/extract_spirv.py portable_vk.lospv spv
+  ls spv/*.spv | deko3d_shader_tool cache deko3d.dkcache
+  python tools/deko3d/pack_dkcache.py deko3d_shaders.lodk deko3d.dkcache
+  ```
+
+  `deko3d_shader_tool` is `tools/deko3d/deko3d_shader_tool.cpp` built for the PC with
+  `thirdparty/plume-deko3d/plume_deko3d_spirv.cpp`, SPIRV-Cross and uam's `uamlib`. The pack only matches a game
+  edition whose Vulkan pack it was made from.
+- Not on deko3d yet: host occlusion queries (`LO_ZPD_MODE` uses made-up counts), LSFG frame generation, the driver
+  pipeline cache (not needed: no pipeline compiles).
 
 ## Known gaps
 

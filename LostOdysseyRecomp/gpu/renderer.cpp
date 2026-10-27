@@ -590,7 +590,7 @@ namespace gpu::renderer
             // Vulkan types, which Metal must never reach.
             bool vulkan = false;
             bool nativeVulkan = false;
-            const char* BackendLabel() const { return nativeVulkan ? "Vulkan" : vulkan ? "Metal" : "D3D12"; }
+            const char* BackendLabel() const { return nativeVulkan ? "Vulkan" : video::IsDeko3d() ? "deko3d" : vulkan ? "Metal" : "D3D12"; }
             xenos::ShaderBinaryFormat binaryFormat = xenos::ShaderBinaryFormat::Dxil;
             RenderShaderFormat renderFormat = RenderShaderFormat::DXIL;
             float pointSizeLimit = 1.0e9f;
@@ -2894,9 +2894,11 @@ namespace gpu::renderer
 
                 staticSet0 = setBuilders[0].create(device);
                 if (!staticSet0) return InitFailure("vertex_fetch_set.create");
+                // deko3d: the shaders read the arena through this binding (their
+                // buffer_reference loads become storage buffer reads from its start).
                 for (uint32_t i = 0; i < (vulkan?1:kVertexFetchSlots); i++)
                     staticSet0->setBuffer(vfetchDescriptorBase + i, vertexArena.get(),
-                        vulkan ? 16 : gpu::render_arena::kVertexArenaSize);
+                        vulkan && !video::IsDeko3d() ? 16 : gpu::render_arena::kVertexArenaSize);
                 // SPIR-V shaders fetch vertices by device address; the slot's
                 // only reader is the occlusion counting shader.
                 if (occlusionCounting)

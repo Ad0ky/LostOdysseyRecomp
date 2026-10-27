@@ -33,6 +33,8 @@ namespace gpu::video
     // SPIR-V shaders and the Vulkan descriptor layout: Vulkan, and Metal (whose
     // plume backend translates SPIR-V to MSL).
     bool UsesSpirv();
+    // The Switch's deko3d back end (LO_SWITCH_BACKEND=deko3d): SPIR-V, translated to deko3d's GLSL per pipeline layout.
+    bool IsDeko3d();
     // The game window's height in points (logical pixels), or 0 when no window
     // exists. On Retina displays the drawable is larger than this.
     uint32_t LogicalOutputHeight();
