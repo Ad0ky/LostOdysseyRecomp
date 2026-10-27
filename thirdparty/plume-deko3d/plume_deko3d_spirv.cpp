@@ -853,14 +853,15 @@ namespace plume {
                     }
                     const std::string t = type, n = name;
                     std::string def;
+                    // Maxwell's FMNMX is IEEE 754 minNum/maxNum: it returns the operand that is not NaN, which is what
+                    // NMin/NMax/NClamp ask for, so the plain functions do (2026-10-27; written out with isnan, uam
+                    // emitted 5-11% more code in the vertex shaders).
                     if (id == 79) // NMin
-                        def = t + " " + n + "(" + t + " a, " + t + " b) { return mix(mix(min(a, b), a, isnan(b)), b, isnan(a)); }";
+                        def = t + " " + n + "(" + t + " a, " + t + " b) { return min(a, b); }";
                     else if (id == 80) // NMax
-                        def = t + " " + n + "(" + t + " a, " + t + " b) { return mix(mix(max(a, b), a, isnan(b)), b, isnan(a)); }";
-                    else if (id == 81) { // NClamp(x, lo, hi)
-                        def = t + " " + n + "(" + t + " x, " + t + " lo, " + t + " hi) { " + t + " m = mix(mix(max(x, lo), x, isnan(lo)), lo, isnan(x)); "
-                              "return mix(mix(min(m, hi), m, isnan(hi)), hi, isnan(m)); }";
-                    }
+                        def = t + " " + n + "(" + t + " a, " + t + " b) { return max(a, b); }";
+                    else if (id == 81) // NClamp(x, lo, hi)
+                        def = t + " " + n + "(" + t + " x, " + t + " lo, " + t + " hi) { return min(max(x, lo), hi); }";
                     else {
                         result.error = "GLSL.std.450 instruction " + std::to_string(id) + " through spirv_intrinsics";
                         return result;
@@ -876,6 +877,63 @@ namespace plume {
                 replaceAll(glsl, "layout(push_constant, binding = " + std::to_string(Deko3DPushUniformSlot) + ", std430)",
                            "layout(binding = " + std::to_string(Deko3DPushUniformSlot) + ", std140)");
                 replaceAll(glsl, "layout(push_constant, ", "layout(");
+            }
+
+            // ---- vertex outputs behind plume_deko3d's constant 905 (Deko3DOptions::vsOutputs, 2026-10-27): each plain
+            // "layout(location = N) out TYPE NAME;" is computed into a private copy and stored at the end of main only
+            // when bit N of the constant is set (default: all). A pipeline whose pixel shader reads fewer of them gets a
+            // variant that neither stores nor computes the rest; one without a pixel shader stores none.
+            if (stage == Deko3DSpirvStage::Vertex) {
+                struct Output {
+                    unsigned location;
+                    std::string type, name, decl;
+                };
+                std::vector<Output> outputs;
+                const std::string key = "\nlayout(location = ";
+                for (size_t p = glsl.find(key); p != std::string::npos; p = glsl.find(key, p + 1)) {
+                    unsigned location = 0;
+                    char type[32] = {}, name[128] = {};
+                    int consumed = 0;
+                    if (sscanf(glsl.c_str() + p + 1, "layout(location = %u) out %31s %127[A-Za-z0-9_];%n", &location, type, name,
+                               &consumed) == 3 && consumed > 0 && location < 32)
+                        outputs.push_back({location, type, name, glsl.substr(p + 1, size_t(consumed))});
+                }
+                const size_t mainAt = glsl.find("\nvoid main()\n{\n");
+                size_t mainEnd = std::string::npos;
+                if (mainAt != std::string::npos) {
+                    int depth = 0;
+                    for (size_t i = glsl.find('{', mainAt); i < glsl.size(); i++) {
+                        if (glsl[i] == '{')
+                            depth++;
+                        else if (glsl[i] == '}' && --depth == 0) {
+                            mainEnd = i;
+                            break;
+                        }
+                    }
+                }
+                if (!outputs.empty() && mainEnd != std::string::npos) {
+                    std::string body = glsl.substr(mainAt, mainEnd - mainAt);
+                    // (main returns nothing: every "return;" in it stores first)
+                    replaceAll(body, " return;", " { dkStoreOutputs(); return; }");
+                    std::string store = "\n#ifndef SPIRV_CROSS_CONSTANT_ID_905\n#define SPIRV_CROSS_CONSTANT_ID_905 4294967295u\n#endif\n"
+                                        "const uint dkVsOutputs = uint(SPIRV_CROSS_CONSTANT_ID_905);\n";
+                    std::string fn = "void dkStoreOutputs()\n{\n";
+                    for (const Output &o : outputs) {
+                        store += o.type + " dkOut_" + o.name + ";\n";
+                        fn += "    if ((dkVsOutputs & " + std::to_string(1u << o.location) + "u) != 0u)\n        " + o.name +
+                              " = dkOut_" + o.name + ";\n";
+                    }
+                    fn += "}\n";
+                    std::string head = glsl.substr(0, mainAt), tail = glsl.substr(mainEnd);
+                    for (const Output &o : outputs) {
+                        replaceWord(head, o.name, "dkOut_" + o.name);
+                        replaceWord(body, o.name, "dkOut_" + o.name);
+                        // the declaration keeps its name
+                        replaceAll(head, "layout(location = " + std::to_string(o.location) + ") out " + o.type + " dkOut_" + o.name + ";",
+                                   o.decl);
+                    }
+                    glsl = head + store + fn + body + "    dkStoreOutputs();\n" + tail;
+                }
             }
 
             // ---- what uam's GL 4.6 frontend names differently or lacks
@@ -937,6 +995,21 @@ namespace plume {
         return h ^ 0x5452414E534C4154ull;
     }
 
+    void Deko3DVaryingMasks(const std::string &glsl, uint32_t &inputMask, uint32_t &outputMask) {
+        inputMask = outputMask = 0;
+        const char *key = "\nlayout(location = ";
+        size_t p = 0;
+        while ((p = glsl.find(key, p)) != std::string::npos) {
+            p += strlen(key);
+            char *end = nullptr;
+            const unsigned long loc = strtoul(glsl.c_str() + p, &end, 10);
+            if (loc < 32 && end && strncmp(end, ") in ", 5) == 0)
+                inputMask |= 1u << loc;
+            else if (loc < 32 && end && strncmp(end, ") out ", 6) == 0)
+                outputMask |= 1u << loc;
+        }
+    }
+
     std::vector<uint8_t> Deko3DWriteTranslation(const Deko3DSpirvResult &r) {
         std::vector<uint32_t> w;
         const uint64_t key = Deko3DGlslKey(r.glsl);
@@ -959,6 +1032,10 @@ namespace plume {
         w.push_back(uint32_t(r.pushWindows.size()));
         w.push_back(uint32_t(r.vertexInputs.size()));
         w.push_back(uint32_t(spec.size()));
+        uint32_t inputMask = 0, outputMask = 0;
+        Deko3DVaryingMasks(r.glsl, inputMask, outputMask);
+        w.push_back(inputMask);
+        w.push_back(outputMask);
         for (const Deko3DSpirvTexture &t : r.textures) {
             const uint32_t v[8] = {t.imageSet, t.imageIndex, uint32_t(t.samplerFrom), t.samplerSet, t.samplerIndex,
                                    t.uniformSlot, t.uniformOffset, 0};
@@ -979,20 +1056,22 @@ namespace plume {
     }
 
     bool Deko3DReadTranslation(const std::vector<uint8_t> &bytes, Deko3DTranslationRecord &out) {
-        if (bytes.size() < 40 || bytes.size() % 4)
+        if (bytes.size() < 48 || bytes.size() % 4)
             return false;
         std::vector<uint32_t> w(bytes.size() / 4);
         memcpy(w.data(), bytes.data(), bytes.size());
         if (w[0] != kRecordMagic || w[1] != Deko3DTranslatorVersion)
             return false;
         const size_t textures = w[6], pushes = w[7], inputs = w[8], specs = w[9];
-        if (10 + textures * 8 + pushes * 2 + inputs + specs * 2 != w.size() || textures > 32 || pushes > Deko3DPushWindowCount)
+        if (12 + textures * 8 + pushes * 2 + inputs + specs * 2 != w.size() || textures > 32 || pushes > Deko3DPushWindowCount)
             return false;
         out = {};
         out.glslKey = uint64_t(w[2]) | (uint64_t(w[3]) << 32);
         out.uniformMask = w[4];
         out.storageMask = w[5];
-        size_t i = 10;
+        out.inputMask = w[10];
+        out.outputMask = w[11];
+        size_t i = 12;
         for (size_t k = 0; k < textures; k++, i += 8) {
             Deko3DSpirvTexture t;
             t.imageSet = w[i];

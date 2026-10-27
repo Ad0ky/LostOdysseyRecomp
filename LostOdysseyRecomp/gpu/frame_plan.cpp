@@ -5,6 +5,10 @@
 #include "gpu/guest_writes.h"
 #include "gpu/dlss_status_log.h"
 #include "gpu/video.h"
+#include "gpu/dynamic_resolution.h"
+#include "gpu/gpu_busy.h"
+#include <chrono>
+#include <cstdlib>
 #include <string_view>
 #include "settings/config.h"
 #include "kernel/memory.h"
@@ -103,6 +107,46 @@ namespace gpu::frame_plan
         }
     }
 
+    namespace
+    {
+        // LO_DYNAMIC_RESOLUTION=1 (env.txt): the render height follows the GPU's busy time (gpu/dynamic_resolution.h).
+        // LO_DYNAMIC_RESOLUTION_MIN=<rows> sets the lowest height (default 80% of the configured one). Only without
+        // an upscaler, which sizes its own input.
+        uint32_t DynamicHeight(uint32_t configured, const settings::Config& config)
+        {
+            static const bool enabled = [] {
+                const char* value = std::getenv("LO_DYNAMIC_RESOLUTION");
+                return value && *value && std::string_view(value) != "0";
+            }();
+            static const uint32_t minimumSetting = [] {
+                const char* value = std::getenv("LO_DYNAMIC_RESOLUTION_MIN");
+                return value && *value ? uint32_t(std::strtoul(value, nullptr, 10)) : 0u;
+            }();
+            static dynamic_resolution::Controller controller;
+            static bool announced = false;
+            if (!enabled || config.upscaler != upscaling::Upscaler::Off || !dynamic_resolution::Supports(configured)) {
+                gpu_busy::g_dynamicResolution.store(false, std::memory_order_relaxed);
+                return configured;
+            }
+            gpu_busy::g_dynamicResolution.store(true, std::memory_order_relaxed);
+            const uint32_t minimum = minimumSetting ? minimumSetting : dynamic_resolution::DefaultMinimum(configured);
+            const double budgetMs = 1000.0 / double(config.frameRate ? std::clamp(config.frameRate, 20u, 240u) : 30u);
+            const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            bool changed = false;
+            const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed);
+            if (!announced) {
+                announced = true;
+                LOG_NOTICE("dynamic resolution: on, {} to {} rows, GPU budget {:.1f} ms per frame", controller.minimum,
+                    configured, budgetMs);
+            }
+            if (changed)
+                LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, budget {:.1f} ms)", height,
+                    controller.lastBusyMs, budgetMs);
+            return height;
+        }
+    }
+
     upscaling::OutputRegion PlannedOutputRegion(resolution::Size drawableSize, const settings::Config& config)
     {
         const auto output = upscaling::ResolveOutputRegion(drawableSize, config.aspectRatio);
@@ -121,6 +165,7 @@ namespace gpu::frame_plan
         const auto output = readback ? upscaling::ResolveOutputRegion(drawableSize, config.aspectRatio) :
             PlannedOutputRegion(drawableSize, config);
         config.internalResolution = int(PlannedInternalResolution(config));
+        config.internalResolution = int(DynamicHeight(uint32_t(config.internalResolution), config));
         narrowTallView.store(aspect_ratio::NarrowsView(config.aspectRatio), std::memory_order_relaxed);
         const auto device = video::BackendDeviceState();
         std::optional<upscaling::OutputSizing> sizing;

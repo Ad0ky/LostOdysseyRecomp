@@ -96,7 +96,7 @@ namespace plume {
     // ---- translation records (2026-10-27): what a translation gives the back end besides the GLSL, kept in the
     // DKSH cache under Deko3DTranslationKey so the console skips SPIRV-Cross for shaders the PC already translated.
     // Changing the translation's output means changing Deko3DTranslatorVersion.
-    constexpr uint32_t Deko3DTranslatorVersion = 2;
+    constexpr uint32_t Deko3DTranslatorVersion = 3;  // 3 (2026-10-27): native min/max, constant 905, varying masks
     // FNV-1a 64 of the GLSL text: the DKSH cache key of a variant (plume_deko3d's loadVariant).
     uint64_t Deko3DGlslKey(const std::string &glsl);
     // The cache key of a translation: the SPIR-V, the layout's numbering, the options and the translator version.
@@ -109,7 +109,12 @@ namespace plume {
         std::vector<Deko3DSpirvResult::PushWindow> pushWindows;
         std::vector<uint32_t> vertexInputs;
         std::vector<std::pair<uint32_t, uint32_t>> specDefaults;  // id, default value (SPIRV_CROSS_CONSTANT_ID_n)
+        // The varying locations it declares ("layout(location = N) in / out" lines), as plume_deko3d reads them
+        // from the text (Deko3DShaderUsage::inputMask / outputMask).
+        uint32_t inputMask = 0, outputMask = 0;
     };
+    // The varying locations a translation's GLSL declares, as plume_deko3d's makeGlslShader reads them.
+    void Deko3DVaryingMasks(const std::string &glsl, uint32_t &inputMask, uint32_t &outputMask);
     std::vector<uint8_t> Deko3DWriteTranslation(const Deko3DSpirvResult &result);
     bool Deko3DReadTranslation(const std::vector<uint8_t> &bytes, Deko3DTranslationRecord &record);
 

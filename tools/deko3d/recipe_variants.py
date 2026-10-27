@@ -4,9 +4,12 @@
     python recipe_variants.py <spv dir> pipelines_corpus.bin [pipelines_vk12_1.bin ...] > variants.txt
     deko3d_shader_tool variants variants.dkcache < variants.txt
 
-Each output line is "<spv dir>/<vs_|ps_><hash>.spv <slot>=<word> ...": the words a recipe was drawn with (the
-renderer's texture-info specialization constants: constant id = fetch slot). Recipe files are
-gpu/pipeline_cache.h's format (file versions 1-3; only version 3 has texture-info words).
+Output lines:
+  "<spv dir>/<vs_|ps_><hash>.spv <slot>=<word> ...": the words a recipe was drawn with (the renderer's texture-info
+      specialization constants: constant id = fetch slot);
+  "vsout <vs.spv> <ps.spv | ->": every recipe's vertex shader with its pixel shader (or none), for the variant that
+      stores only the outputs that pixel shader reads (plume_deko3d's vsOutputs, constant 905).
+Recipe files are gpu/pipeline_cache.h's format (file versions 1-3; only version 3 has texture-info words).
 """
 import os
 import struct
@@ -47,6 +50,13 @@ def main():
     missing = set()
     for path in sys.argv[2:]:
         version, keys, infos = read(path)
+        for vs, ps in keys:
+            v = os.path.join(spv, f'vs_{vs:016x}.spv')
+            p = os.path.join(spv, f'ps_{ps:016x}.spv') if ps else '-'
+            if not os.path.exists(v) or (ps and not os.path.exists(p)):
+                missing.add(v if not os.path.exists(v) else p)
+                continue
+            lines.add(f'vsout {v} {p}')
         print(f'{path}: version {version}, {len(keys)} recipes, {sum(len(v) for v in infos.values())} texture-info entries',
               file=sys.stderr)
         for (vs, ps), entries in infos.items():

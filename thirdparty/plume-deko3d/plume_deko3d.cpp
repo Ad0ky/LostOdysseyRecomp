@@ -89,6 +89,7 @@ namespace plume {
         g_deko3dOptions.zcull = options.zcull;
         g_deko3dOptions.mergeBarriers = options.mergeBarriers;
         g_deko3dOptions.leanBarriers = options.leanBarriers;
+        g_deko3dOptions.vsOutputs = options.vsOutputs;
     }
     Deko3DCounters Deko3DReadCounters() {
         const Deko3DStats &s = g_deko3dStats;
@@ -1418,6 +1419,8 @@ namespace plume {
                 cached->usage.textureSources = std::move(record.textures);
                 cached->usage.pushWindows = std::move(record.pushWindows);
                 cached->usage.vertexInputs = std::move(record.vertexInputs);
+                cached->usage.inputMask = record.inputMask;    // LostOdysseyRecomp (2026-10-27): for constant 905
+                cached->usage.outputMask = record.outputMask;
                 for (const auto &[id, value] : record.specDefaults)
                     cached->specDefaults.push_back({id, value});
                 // By id, as parseSpecDefaults orders them: a variant's defines (and its key) do not depend on where

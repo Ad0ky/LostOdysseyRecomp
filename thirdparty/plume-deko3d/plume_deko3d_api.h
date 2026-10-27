@@ -32,6 +32,8 @@ namespace plume {
         bool zcull = false;
         bool mergeBarriers = false;
         bool leanBarriers = false;
+        // Vertex shaders store only the outputs the pipeline's pixel shader reads (the translator's constant 905).
+        bool vsOutputs = false;
     };
     void Deko3DSetGpuOptions(const Deko3DGpuOptions &options);
 

@@ -182,6 +182,8 @@ Switch-specific options and diagnostics:
 |---|---|---|
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | automatic | `540` or `720` forces the scene height; otherwise handheld uses 540 and docked uses 720 |
+| `LO_DYNAMIC_RESOLUTION` | off | `1`: the scene height follows the GPU's time per frame, in steps of 36 rows from the configured height (540 or 720) down to `LO_DYNAMIC_RESOLUTION_MIN` (default 80% of it: 432 or 576); the final pass scales it to the output as usual. The runtime log's `dynamic resolution:` lines show each change |
+| `LO_DYNAMIC_RESOLUTION_MIN` | 80% | The lowest scene height dynamic resolution uses (rows; 360 at the least) |
 | `LO_TRIM_VARYINGS` | `1` | Keeps only vertex outputs used by the paired fragment shader; set to `0` to disable the Switch Vulkan optimisation |
 | `LO_RT32` | off | Set to `1` to use 32-bit formats for the two 10-bit render-target classes; on Switch the 7e3 class uses `R11G11B10_FLOAT`, so its 2-bit alpha is read as 1 |
 | `LO_GUEST_AFFINITY` | off | Set to `1` to map Xbox guest thread affinity onto the Switch's three cores |
@@ -263,16 +265,19 @@ built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the 
 
   Texture-info specialization runs on deko3d as on NVK: a pipeline gets variants whose texture fetches have their
   format words as constants, so the per-fetch sign and swizzle decoding folds away (about half the code of the
-  heaviest pixel shaders). The `variants` step pre-builds those of the recorded recipes; any other is compiled on
-  the console in the background and kept in the runtime cache. `LO_TEXINFO_SPEC=0` turns it off.
+  heaviest pixel shaders). The `variants` step pre-builds those of the recorded recipes, and the vertex shaders of
+  every recipe with only the outputs its pixel shader reads (`LO_DEKO3D_VS_OUTPUTS`); any other variant is compiled
+  on the console in the background and kept in the runtime cache. `LO_TEXINFO_SPEC=0` turns specialization off.
 
   `deko3d_shader_tool` is `tools/deko3d/deko3d_shader_tool.cpp` built for the PC with
   `thirdparty/plume-deko3d/plume_deko3d_spirv.cpp`, SPIRV-Cross and uam's `uamlib`. The pack only matches a game
   edition whose Vulkan pack it was made from.
-- GPU switches (`env.txt`, all off by default; `LO_DEKO3D_GPU_FAST=1` turns on all four and each `LO_DEKO3D_<NAME>=0/1`
+- GPU switches (`env.txt`, all off by default; `LO_DEKO3D_GPU_FAST=1` turns them all on and each `LO_DEKO3D_<NAME>=0/1`
   overrides it): `LO_DEKO3D_DEPTH_COMPRESSION` (compressed depth targets), `LO_DEKO3D_ZCULL` (hierarchical depth
   culling; another port saw depth-biased decals dropped with it), `LO_DEKO3D_MERGE_BARRIERS` (back-to-back barriers
-  become one), `LO_DEKO3D_LEAN_BARRIERS` (no texture-cache invalidation for a target that is only written next). The
+  become one), `LO_DEKO3D_LEAN_BARRIERS` (no texture-cache invalidation for a target that is only written next),
+  `LO_DEKO3D_VS_OUTPUTS` (vertex shaders store only the outputs their pipeline's pixel shader reads, and none without
+  one: what `LO_TRIM_VARYINGS` does on NVK). The
   runtime log's `video: deko3d GPU options` line shows what is on. With `LO_RENDER_TIMING=1`, a `deko3d frame work`
   line every 150 frames gives the draws, binds, barriers and copies per frame.
 - Not on deko3d yet: host occlusion queries (`LO_ZPD_MODE` uses made-up counts), LSFG frame generation, the driver
