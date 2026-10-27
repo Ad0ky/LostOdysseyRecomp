@@ -3188,10 +3188,13 @@ namespace gpu::video
         Shutdown(); // Failed native/SDK drains terminate with EXIT_FAILURE.
         LOG_NOTICE("video: owner shutdown complete native_ngx_cleanup=complete streamline_cleanup=complete exit_code=0");
         os::shaderlog::CloseForExit();
-        std::fflush(nullptr);
 #if LO_PLATFORM_SWITCH
+        // Not fflush(nullptr): it locks every open file, game files included.
+        std::fflush(stdout);
+        std::fflush(stderr);
         os::switch_platform::ExitNow();
 #else
+        std::fflush(nullptr);
         (discord_rpc::Shutdown(), std::_Exit(EXIT_SUCCESS));
 #endif
     }

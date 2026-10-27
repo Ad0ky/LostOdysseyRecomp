@@ -6169,6 +6169,13 @@ void main()
             {
                 namespace dpc = gpu::driver_pipeline_cache;
                 const size_t previous = driverCacheBytes;
+#if LO_PLATFORM_SWITCH
+                // NVK's cache reaches about 200 MB with every pipeline built. Saving it
+                // again needs two more copies of that from a heap that is nearly full in
+                // late dungeons (bad_alloc in the disc 2 Grand Staff, 2026-10-27), and
+                // the exit save took 5 s. Once a cache file loaded or was written, keep it.
+                if (previous) return {};
+#endif
                 if (const size_t size = device->getPipelineCacheSize(); size && size <= previous) return {};
                 std::vector<uint8_t> data;
                 if (!device->getPipelineCacheData(data) || data.size() <= previous) return {};

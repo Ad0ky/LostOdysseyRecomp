@@ -473,16 +473,36 @@ void ExitNow()
     // frozen on the last frame (title Quit and Quit to Desktop, 2026-10-22).
     // The libnx exit teardown is still skipped: it unmounted the SD card under
     // game threads that were reading it.
+    // Each step goes to exit.log through the raw file session, so a quit that
+    // freezes shows how far it got (the runtime log stops before this).
+    auto mark = [](const char* text) { RawAppend("exit.log", text, std::strlen(text)); };
+    char line[96];
+    std::snprintf(line, sizeof(line), "exit: started (system tick %llu)\n", static_cast<unsigned long long>(armGetSystemTick()));
+    mark(line);
     os::logger::DrainForExit();
-    std::fflush(nullptr);
+    // Not fflush(nullptr): it locks every open file, game files included.
+    std::fflush(stdout);
+    std::fflush(stderr);
+    mark("exit: logs flushed\n");
     appletUnlockExit();
     const Result rc = serviceDispatch(appletGetServiceSession_SelfController(), 0); // Exit
+    std::snprintf(line, sizeof(line), "exit: applet Exit result 0x%x\n", rc);
+    mark(line);
     if (R_SUCCEEDED(rc))
     {
-        for (;;)
-            svcSleepThread(UINT64_MAX);
+        // The applet manager ends the process from here.
+        for (unsigned seconds = 1; seconds <= 10; ++seconds)
+        {
+            svcSleepThread(1'000'000'000ull);
+            if (seconds == 1 || seconds == 3 || seconds == 10)
+            {
+                std::snprintf(line, sizeof(line), "exit: still running %u s after Exit\n", seconds);
+                mark(line);
+            }
+        }
     }
-    std::fprintf(stderr, "exit: applet Exit failed (0x%x), ending the process\n", rc);
+    mark("exit: ending the process directly (svcExitProcess)\n");
+    std::fprintf(stderr, "exit: applet Exit result 0x%x, ending the process\n", rc);
     svcExitProcess();
     __builtin_unreachable();
 }
