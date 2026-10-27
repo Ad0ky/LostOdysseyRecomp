@@ -788,8 +788,10 @@ namespace plume {
                 {
                     size_t p;
                     while ((p = glsl.find("layout(buffer_reference")) != std::string::npos) {
-                        const size_t blockEnd = glsl.find("};", p);
-                        if (blockEnd == std::string::npos)
+                        // A forward declaration ("... buffer uintPointer;") or a block ("... { ... };").
+                        const size_t semicolon = glsl.find(';', p), brace = glsl.find('{', p);
+                        const size_t blockEnd = semicolon < brace ? semicolon - 1 : glsl.find("};", p);
+                        if (blockEnd == std::string::npos || semicolon == std::string::npos)
                             break;
                         size_t end = blockEnd + 2;
                         while (end < glsl.size() && glsl[end] == '\n')
