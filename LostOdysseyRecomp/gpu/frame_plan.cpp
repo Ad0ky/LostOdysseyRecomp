@@ -110,7 +110,8 @@ namespace gpu::frame_plan
     namespace
     {
         // LO_DYNAMIC_RESOLUTION=1 (env.txt): the render height follows the GPU's busy time (gpu/dynamic_resolution.h).
-        // LO_DYNAMIC_RESOLUTION_MIN=<rows> sets the lowest height (default 80% of the configured one). Only without
+        // LO_DYNAMIC_RESOLUTION_MIN=<rows> sets the lowest height (default 80% of the configured one) and
+        // LO_DYNAMIC_RESOLUTION_STEP=<rows> the step (a multiple of 9, default 36). Only without
         // an upscaler, which sizes its own input.
         uint32_t DynamicHeight(uint32_t configured, const settings::Config& config)
         {
@@ -121,6 +122,10 @@ namespace gpu::frame_plan
             static const uint32_t minimumSetting = [] {
                 const char* value = std::getenv("LO_DYNAMIC_RESOLUTION_MIN");
                 return value && *value ? uint32_t(std::strtoul(value, nullptr, 10)) : 0u;
+            }();
+            static const uint32_t step = [] {
+                const char* value = std::getenv("LO_DYNAMIC_RESOLUTION_STEP");
+                return value && *value ? uint32_t(std::strtoul(value, nullptr, 10)) : dynamic_resolution::Rung;
             }();
             static dynamic_resolution::Controller controller;
             static bool announced = false;
@@ -134,11 +139,11 @@ namespace gpu::frame_plan
             const uint64_t now = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
             bool changed = false;
-            const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed);
+            const uint32_t height = controller.Update(now, gpu_busy::Total(), configured, minimum, budgetMs, changed, step);
             if (!announced) {
                 announced = true;
-                LOG_NOTICE("dynamic resolution: on, {} to {} rows, GPU budget {:.1f} ms per frame", controller.minimum,
-                    configured, budgetMs);
+                LOG_NOTICE("dynamic resolution: on, {} to {} rows in steps of {}, GPU budget {:.1f} ms per frame",
+                    controller.minimum, configured, controller.step, budgetMs);
             }
             if (changed)
                 LOG_INFO("dynamic resolution: scene at {} rows (GPU {:.1f} ms per frame, budget {:.1f} ms)", height,
