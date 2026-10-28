@@ -941,6 +941,45 @@ namespace plume {
         }
     }
 
+    // LostOdysseyRecomp (2026-10-28): a copy rectangle cut to both images' level sizes. The copy and 2D engines write
+    // whatever they are given, so a rectangle past the end of the destination wrote into the image after it in the
+    // image heap: with the scene targets one or two rows taller than the textures resolved from them (dynamic
+    // resolution's 442-row target and 432-row textures), blocks and bands of other targets were overwritten. Vulkan
+    // requires copies in bounds; this makes deko3d's the same. False when nothing is left to copy.
+    // The first cuts, for the log (each one a copy that would have written out of bounds).
+    static void noteClip(uint32_t sx, uint32_t sy, uint32_t w, uint32_t h, uint32_t sw, uint32_t sh, uint32_t dx, uint32_t dy,
+                         uint32_t dw, uint32_t dh) {
+        static std::atomic<uint32_t> logged{0};
+        if (logged.fetch_add(1) < 16)
+            logf("copy cut to bounds: %ux%u from (%u, %u) of %ux%u to (%u, %u) of %ux%u", w, h, sx, sy, sw, sh, dx, dy, dw, dh);
+    }
+    static bool clipCopy(const Deko3DTexture *src, uint32_t srcMip, DkImageRect &s, const Deko3DTexture *dst, uint32_t dstMip,
+                         DkImageRect &d) {
+        const uint32_t sw = mipDim(src->desc.width, srcMip), sh = mipDim(src->desc.height, srcMip);
+        const uint32_t dw = mipDim(dst->desc.width, dstMip), dh = mipDim(dst->desc.height, dstMip);
+        if (s.x >= sw || s.y >= sh || d.x >= dw || d.y >= dh)
+            return false;
+        const uint32_t w = std::min({s.width, sw - s.x, dw - d.x});
+        const uint32_t h = std::min({s.height, sh - s.y, dh - d.y});
+        if (!w || !h)
+            return false;
+        if (w != s.width || h != s.height)
+            noteClip(s.x, s.y, s.width, s.height, sw, sh, d.x, d.y, dw, dh);
+        s.width = d.width = w;
+        s.height = d.height = h;
+        return true;
+    }
+    static bool clipToImage(const Deko3DTexture *t, uint32_t mip, DkImageRect &r) {
+        const uint32_t w = mipDim(t->desc.width, mip), h = mipDim(t->desc.height, mip);
+        if (r.x >= w || r.y >= h)
+            return false;
+        if (r.width > w - r.x || r.height > h - r.y)
+            noteClip(r.x, r.y, r.width, r.height, w, h, r.x, r.y, w, h);
+        r.width = std::min(r.width, w - r.x);
+        r.height = std::min(r.height, h - r.y);
+        return r.width && r.height;
+    }
+
     void Deko3DCommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLoc, const RenderTextureCopyLocation &srcLoc, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
 #if defined(PLUME_DEKO3D_GUARDS)
         if (g_traceCopies.fetch_add(1) < 60) {
@@ -972,7 +1011,9 @@ namespace plume {
             const DkCopyBuf src = {b->gpu + fp.offset, rowBytes, rowBytes * rows};
             DkImageView v = subresourceView(t, dstLoc.subresource.mipLevel, dstLoc.subresource.arrayIndex);
             const bool layered = t->type == DkImageType_3D;
-            const DkImageRect rect = {dstX, dstY, layered ? dstZ : 0, fp.width, fp.height, std::max<uint32_t>(fp.depth, 1)};
+            DkImageRect rect = {dstX, dstY, layered ? dstZ : 0, fp.width, fp.height, std::max<uint32_t>(fp.depth, 1)};
+            if (!clipToImage(t, dstLoc.subresource.mipLevel, rect))
+                return;
             flushBarriers();
             GetDeko3DStats().copyUpload.store(GetDeko3DStats().copyUpload.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
             dkCmdBufCopyBufferToImage(cmd, &src, &v, &rect, 0);
@@ -995,6 +1036,8 @@ namespace plume {
                         uint32_t(srcBox->bottom - srcBox->top), uint32_t(std::max(srcBox->back - srcBox->front, 1))};
             else
                 rect = {0, 0, 0, fp.width, fp.height, std::max<uint32_t>(fp.depth, 1)};
+            if (!clipToImage(t, srcLoc.subresource.mipLevel, rect))
+                return;
             // The copy engine finishes, and its writes leave the GPU's L2, before the CPU reads them (after a fence).
             flushBarriers();
             dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
@@ -1018,7 +1061,9 @@ namespace plume {
             else
                 srect = {0, 0, 0, mipDim(st->desc.width, srcLoc.subresource.mipLevel), mipDim(st->desc.height, srcLoc.subresource.mipLevel),
                          st->type == DkImageType_3D ? mipDim(st->desc.depth, srcLoc.subresource.mipLevel) : 1};
-            const DkImageRect drect = {dstX, dstY, dt->type == DkImageType_3D ? dstZ : 0, srect.width, srect.height, srect.depth};
+            DkImageRect drect = {dstX, dstY, dt->type == DkImageType_3D ? dstZ : 0, srect.width, srect.height, srect.depth};
+            if (!clipCopy(st, srcLoc.subresource.mipLevel, srect, dt, dstLoc.subresource.mipLevel, drect))
+                return;
             flushBarriers();
             GetDeko3DStats().copyImage.store(GetDeko3DStats().copyImage.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
             dkCmdBufCopyImage(cmd, &sv, &srect, &dv, &drect, 0);
@@ -1056,11 +1101,14 @@ namespace plume {
             for (uint32_t l = 0; l < layers; l++) {
                 DkImageView dv = subresourceView(dt, m, l);
                 DkImageView sv = subresourceView(st, m, l);
-                const DkImageRect r = {0, 0, 0, mipDim(st->desc.width, m), mipDim(st->desc.height, m),
-                                       st->type == DkImageType_3D ? mipDim(st->desc.depth, m) : 1};
+                DkImageRect r = {0, 0, 0, mipDim(st->desc.width, m), mipDim(st->desc.height, m),
+                                 st->type == DkImageType_3D ? mipDim(st->desc.depth, m) : 1};
+                DkImageRect rd = r;
+                if (!clipCopy(st, m, r, dt, m, rd))
+                    continue;
                 flushBarriers();
                 GetDeko3DStats().copyImage.store(GetDeko3DStats().copyImage.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
-                dkCmdBufCopyImage(cmd, &sv, &r, &dv, &r, 0);
+                dkCmdBufCopyImage(cmd, &sv, &r, &dv, &rd, 0);
             }
         }
         invalidateZcullAfterCopy(dt);
@@ -1071,6 +1119,11 @@ namespace plume {
         const Deko3DTexture *st = static_cast<const Deko3DTexture *>(src);
         if (!dt || !st || !dt->valid || !st->valid)
             return;
+        if (dt->desc.width != st->desc.width || dt->desc.height != st->desc.height) {
+            // (sizes differ: the region path, cut to both)
+            resolveTextureRegion(dst, 0, 0, src, nullptr, RenderResolveMode());
+            return;
+        }
         DkImageView dv = dt->defaultView();
         DkImageView sv = st->defaultView();
         flushBarriers();
@@ -1095,8 +1148,12 @@ namespace plume {
         DkImageView dv = dt->defaultView();
         DkImageView sv = st->defaultView();
         const RenderRect r = srcRect ? *srcRect : RenderRect(0, 0, int32_t(st->desc.width), int32_t(st->desc.height));
-        const DkImageRect srect = {uint32_t(r.left), uint32_t(r.top), 0, uint32_t(r.right - r.left), uint32_t(r.bottom - r.top), 1};
-        const DkImageRect drect = {dstX, dstY, 0, srect.width, srect.height, 1};
+        if (r.left < 0 || r.top < 0 || r.right <= r.left || r.bottom <= r.top)
+            return;
+        DkImageRect srect = {uint32_t(r.left), uint32_t(r.top), 0, uint32_t(r.right - r.left), uint32_t(r.bottom - r.top), 1};
+        DkImageRect drect = {dstX, dstY, 0, srect.width, srect.height, 1};
+        if (!clipCopy(st, 0, srect, dt, 0, drect))
+            return;
         flushBarriers();
         GetDeko3DStats().copyBlit.store(GetDeko3DStats().copyBlit.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);  // banjo-nx (2026-10-19)
         dkCmdBufBlitImage(cmd, &sv, &srect, &dv, &drect, DkBlitFlag_FilterLinear, 0);
