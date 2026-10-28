@@ -468,9 +468,11 @@ namespace gpu::video
                 gpu.mergeBarriers = flag("LO_DEKO3D_MERGE_BARRIERS", fast);
                 gpu.leanBarriers = flag("LO_DEKO3D_LEAN_BARRIERS", fast);
                 gpu.vsOutputs = flag("LO_DEKO3D_VS_OUTPUTS", fast);
+                gpu.colorCompression = flag("LO_DEKO3D_COLOR_COMPRESSION", true); // on unless =0
                 plume::Deko3DSetGpuOptions(gpu);
-                LOG_NOTICE("video: deko3d GPU options: depth_compression={} zcull={} merge_barriers={} lean_barriers={} vs_outputs={}",
-                    gpu.depthCompression, gpu.zcull, gpu.mergeBarriers, gpu.leanBarriers, gpu.vsOutputs);
+                LOG_NOTICE("video: deko3d GPU options: color_compression={} depth_compression={} zcull={} merge_barriers={} "
+                    "lean_barriers={} vs_outputs={}", gpu.colorCompression, gpu.depthCompression, gpu.zcull,
+                    gpu.mergeBarriers, gpu.leanBarriers, gpu.vsOutputs);
             }
             const std::filesystem::path root = LO_SWITCH_DATA_ROOT;
             lo::deko3d::InstallShaderCache(root / "shaders" / "deko3d_shaders.lodk", root / "cache" / "deko3d_runtime.dkcache");

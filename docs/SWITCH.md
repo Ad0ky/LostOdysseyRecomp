@@ -277,7 +277,9 @@ built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the 
   culling; another port saw depth-biased decals dropped with it), `LO_DEKO3D_MERGE_BARRIERS` (back-to-back barriers
   become one), `LO_DEKO3D_LEAN_BARRIERS` (no texture-cache invalidation for a target that is only written next),
   `LO_DEKO3D_VS_OUTPUTS` (vertex shaders store only the outputs their pipeline's pixel shader reads, and none without
-  one: what `LO_TRIM_VARYINGS` does on NVK). The
+  one: what `LO_TRIM_VARYINGS` does on NVK). `LO_DEKO3D_COLOR_COMPRESSION=0` turns off colour target compression
+  (on by default, not part of `LO_DEKO3D_GPU_FAST`); compressed targets get memory blocks of their own, since the
+  compression state of reused image memory showed as stripes after dynamic resolution resized the targets. The
   runtime log's `video: deko3d GPU options` line shows what is on. With `LO_RENDER_TIMING=1`, a `deko3d frame work`
   line every 150 frames gives the draws, binds, barriers and copies per frame.
 - Not on deko3d yet: host occlusion queries (`LO_ZPD_MODE` uses made-up counts), LSFG frame generation, the driver

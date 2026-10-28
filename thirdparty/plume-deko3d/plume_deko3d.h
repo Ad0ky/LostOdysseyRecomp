@@ -102,6 +102,7 @@ namespace plume {
         DkImageType type = DkImageType_2D;
         Deko3DImageAlloc alloc;
         bool ownsMemory = true;
+        bool ownsBlock = false;  // LostOdysseyRecomp (2026-10-28): its own memory block (compressed render targets)
         bool valid = false;
 
         Deko3DTexture(Deko3DDevice *device, const RenderTextureDesc &desc);
@@ -704,6 +705,8 @@ namespace plume {
     struct Deko3DOptions {
         bool depthCompression = false;
         bool zcull = false;
+        // LostOdysseyRecomp (2026-10-28): colour targets with hardware compression (on, as banjo-nx ships them).
+        bool colorCompression = true;
         // A pipeline's vertex shader gets specialization constant 905 (when it declares it), the locations its pixel
         // shader reads of the ones it writes (none without a pixel shader; not with a geometry shader): banjo-nx's
         // tools/deko3d_glsl_opt.py, pass vsout, drops the other outputs and what computes them.

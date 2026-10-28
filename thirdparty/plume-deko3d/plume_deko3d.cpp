@@ -90,6 +90,7 @@ namespace plume {
         g_deko3dOptions.mergeBarriers = options.mergeBarriers;
         g_deko3dOptions.leanBarriers = options.leanBarriers;
         g_deko3dOptions.vsOutputs = options.vsOutputs;
+        g_deko3dOptions.colorCompression = options.colorCompression;
     }
     Deko3DCounters Deko3DReadCounters() {
         const Deko3DStats &s = g_deko3dStats;
@@ -551,7 +552,7 @@ namespace plume {
             flags |= DkImageFlags_UsageRender;
             // Colour targets compressed; depth too with Deko3DOptions::depthCompression (SwitchWakerHD's defaults left it
             // off as not verified).
-            if (!depth || g_deko3dOptions.depthCompression)
+            if ((!depth && g_deko3dOptions.colorCompression) || (depth && g_deko3dOptions.depthCompression))
                 flags |= DkImageFlags_HwCompression;
         }
         if (desc.flags & (RenderTextureFlag::UNORDERED_ACCESS | RenderTextureFlag::STORAGE))
@@ -566,7 +567,22 @@ namespace plume {
         dkImageLayoutInitialize(&layout, &m);
         const uint64_t size = dkImageLayoutGetSize(&layout);
         const uint32_t alignment = dkImageLayoutGetAlignment(&layout);
-        if (size > 0xFFFFFFFFull || !device->imageAlloc(uint32_t(size), alignment, alloc)) {
+        // LostOdysseyRecomp (2026-10-28): a compressed render target gets a memory block of its own. The compression
+        // state of image heap memory outlives the image that used it: a target made in memory a target of another
+        // size used (dynamic resolution resizes the scene targets mid-scene) read back as stripes 4 pixels apart,
+        // which NVK (no compression on the Switch) never showed. A new block starts with clear compression state.
+        if ((flags & DkImageFlags_HwCompression) && size <= 0xFFFFFFFFull) {
+            DkMemBlock own = device->makeBlock(uint32_t(size), DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image,
+                                               "compressed render target");
+            if (own) {
+                alloc.block = own;
+                alloc.offset = 0;
+                alloc.size = uint32_t(alignUp64(size, DK_MEMBLOCK_ALIGNMENT));
+                alloc.chunk = -1;
+                ownsBlock = true;
+            }
+        }
+        if (!ownsBlock && (size > 0xFFFFFFFFull || !device->imageAlloc(uint32_t(size), alignment, alloc))) {
             logf("texture %ux%ux%u format %d: no memory for %" PRIu64 " bytes", desc.width, desc.height, desc.depth,
                  int(desc.format), size);
             return;
@@ -579,7 +595,10 @@ namespace plume {
     Deko3DTexture::~Deko3DTexture() {
         if (valid && ownsMemory) {
             g_deko3dStats.imageBytes -= alloc.size;
-            device->retire(alloc, nullptr);
+            if (ownsBlock)
+                device->retire({}, alloc.block);
+            else
+                device->retire(alloc, nullptr);
         }
     }
 
