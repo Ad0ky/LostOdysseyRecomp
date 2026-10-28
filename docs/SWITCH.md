@@ -4,14 +4,17 @@
 
 An experimental Nintendo Switch (homebrew) build of Lost Odyssey Recomp. It runs
 the same recompiled game code as the PC version on the console's Cortex-A57
-cores and renders with Vulkan on Mesa's NVK driver for the Tegra X1 GPU. The
+cores and renders with Vulkan on Mesa's NVK driver for the Tegra X1 GPU, or with
+deko3d, the Switch's own graphics API (`LO_SWITCH_BACKEND=deko3d`, what releases
+use; see "deko3d back end" below). Players: see [INSTALL-SWITCH.md](INSTALL-SWITCH.md). The
 Switch layer follows the Sonic Unleashed Switch ports
 ([NaGaa95/UnleashedRecomp-NX](https://github.com/NaGaa95/UnleashedRecomp-NX),
 [ChanseyIsTheBest/UnleashedRecomp-NX](https://github.com/ChanseyIsTheBest/UnleashedRecomp-NX)).
 
-> **Status: early.** The game runs on a console, but slowly: the GPU is the
-> limit, and battles stay well below 30 fps. Expect crashes and missing
-> features.
+> **Status: early.** The game runs on a console. The GPU is the limit: with
+> deko3d at stock clocks in handheld mode, battles and lighter areas hold
+> 30 fps and heavier field areas run at about 20–25 fps. Expect crashes and
+> missing features.
 
 The Switch build keeps the Xbox 360 image and its own effects (bloom, depth of
 field, motion blur, shadows). The scene defaults to 540p in handheld mode and
