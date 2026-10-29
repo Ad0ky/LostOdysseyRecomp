@@ -157,16 +157,36 @@ prints a Markdown table of every metric with its change. Changes over 3%
 The numbers every optimisation is compared with. Add a section per measured
 build; keep the older ones.
 
-### Baseline: `67e92592` plus this tooling (to be measured)
+### Baseline: `cde98786` (2026-10-29)
 
-Not measured yet: this section is filled by the first console run of the
-procedure above (handheld, release `env.txt`, 3 counted runs per row).
+Switch OLED, handheld, CPU 1020 / GPU 461 / memory 1331 MHz (the 460 MHz GPU
+configuration), release `env.txt` (deko3d, `LO_DEKO3D_GPU_FAST=1`, 960x540,
+dynamic resolution off, `LO_PIPELINE_PREBUILD=all`) plus the debug server and
+network log, settings frame rate 30. One warm-up run, then 3 counted runs;
+median (min to max). Raw results: `out/bench/20261029-175212/` on the machine
+that ran them.
 
-| Scenario | Target | FPS | p50 ms | p99 ms | 1% low | Late % | GPU ms | GPU % | Main % | Render % | Draws |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| disc1-ship | 30 | | | | | | | | | | |
-| disc1-ship | 60 | | | | | | | | | | |
-| disc2-forest | 30 | | | | | | | | | | |
-| disc2-forest | 60 | | | | | | | | | | |
-| numara | 30 | | | | | | | | | | |
-| numara | 60 | | | | | | | | | | |
+`new-game-battle`: the first battle's command menu (Kaim, Wohl Highlands),
+waiting for input. Reached from a new game with no save: START, New Game, B
+(settings screen), then START and BACK skip the opening movie.
+
+| Metric | Value |
+|---|---:|
+| FPS | 14.36 (14.25 to 14.36) |
+| Frame time p50 / p95 / p99 | 66.5 / 87.4 / 102.7 ms |
+| 1% low | 9.7 FPS |
+| GPU busy | 52.2 ms per frame (75% of the time) |
+| Render thread waiting for the game | 28.6 ms per frame |
+| Present | 6.8 ms per frame |
+| Draws (submitted) | 1,190 (1,220) per frame |
+| Pipeline binds / state binds / descriptor writes | 562 / 372 / 1,380 per frame |
+| Full barriers / uploads | 17.1 / 0.25 per frame |
+| Threads (% of one core) | Guest Main 93, GPU CmdProc 70, XMA Decoder 7 |
+
+Reading: the GPU alone needs 52 ms of a 33 ms frame, so at 960x540 the scene is
+GPU-bound first; at a frame of about 66 ms the GPU still idles a quarter of the
+time while the render thread waits 29 ms for the game's main thread (93%), so
+the game thread is the next limit. Runs agree within 1%.
+
+The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
+save slots on the console; not measured yet.
