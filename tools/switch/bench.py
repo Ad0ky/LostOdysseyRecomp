@@ -6,10 +6,14 @@ benchmark env.txt (LO_BENCH): it presses the scenario's buttons, waits for its
 scene, settles, measures a fixed number of frames, logs one "bench result" line,
 takes a screenshot and quits. This script writes that env.txt, collects the
 results over the network log (LO_NETLOG) or from copied runtime logs, and turns
-them into a report and an A/B comparison.
+them into a report and an A/B comparison. With the game's debug server on
+(docs/SWITCH.md, "Debug server"), --debug-server does all of it: it uploads
+env.txt and the save slot, restarts the game for each run, reads the results
+from the server's log stream and puts the console's own env.txt back.
 
     python3 tools/switch/bench.py env disc1-ship --out env.txt     # then copy env.txt to the SD card
     python3 tools/switch/bench.py watch 192.168.1.87 --runs 3      # start the game 3 times; results land in out/bench/
+    python3 tools/switch/bench.py env disc1-ship --debug-server 192.168.1.87 --runs 3   # no hands
     python3 tools/switch/bench.py parse runtime-*.log --json out/bench/manual.json
     python3 tools/switch/bench.py report out/bench/<run>/results.json --md
     python3 tools/switch/bench.py compare baseline.json candidate.json
@@ -162,8 +166,18 @@ def env_lines(settings: dict, args) -> list[str]:
 
 def cmd_env(args) -> None:
     settings = bench_settings(find_scenario(args.scenario))
+    if args.debug_server and args.ftp:
+        sys.exit("bench: --debug-server or --ftp, not both")
+    con = original = None
+    if args.debug_server:
+        con = debug_console(args.debug_server)
+        original = read_original_env(con)
+        # The game must keep running for the next restart, and its server must start with the bench env.txt.
+        args.no_exit = True
     base = Path(args.base).read_text(encoding="utf-8").splitlines() if args.base else []
     bench = env_lines(settings, args)
+    if con:
+        bench += debug_env_lines(original)
     keys = {line.split("=", 1)[0] for line in bench if "=" in line and not line.startswith("#")}
     # The bench lines win over the same keys in the base file.
     kept = [line for line in base if line.split("=", 1)[0].strip() not in keys]
@@ -173,12 +187,14 @@ def cmd_env(args) -> None:
     else:
         Path(args.out).write_text(text, encoding="utf-8")
         print(f"wrote {args.out} for '{settings['name']}'{f' at {args.fps} FPS' if args.fps else ''}: "
-              f"copy it to {DATA_ROOT}/env.txt")
-    if settings["save"]:
+              f"{'uploading it to the console' if con else f'copy it to {DATA_ROOT}/env.txt'}")
+    if settings["save"] and not con:
         print(f"the run loads save slot {settings['save']}: copy that folder (out/drive-city/save/{settings['save']}) to "
               f"{DATA_ROOT}/bench/save/{settings['save']}", file=sys.stderr)
     if args.ftp:
         upload(args, text, settings)
+    if con:
+        debug_server_runs(args, con, original, text, settings)
 
 
 def upload(args, text: str, settings: dict) -> None:
@@ -205,6 +221,160 @@ def upload(args, text: str, settings: dict) -> None:
                     with open(file, "rb") as f:
                         ftp.storbinary(f"STOR {target}/{file.name}", f)
             print(f"uploaded save slot {settings['save']} to {target}")
+
+
+# ---------------------------------------------------------------- debug server
+
+def debug_console(address: str):
+    """The game's debug server at IP[:PORT] (tools/switch/lo_debug.py), checked to be this game's."""
+    import lo_debug  # next to this file
+    host, _, port = address.partition(":")
+    con = lo_debug.Console(host, int(port or lo_debug.DEFAULT_PORT))
+    try:
+        con.check_game()
+    except (OSError, lo_debug.ServerError) as e:
+        sys.exit(f"bench: no debug server at {host}:{con.port}: {e}")
+    return con
+
+
+def read_original_env(con) -> bytes | None:
+    """The console's env.txt as it is (None: there is none), to put back after the runs."""
+    import lo_debug
+    try:
+        return con.get_bytes("env.txt")
+    except lo_debug.ServerError:
+        return None
+
+
+def debug_env_lines(original: bytes | None) -> list[str]:
+    """The debug server on for every run, with the console's own restart and port switches."""
+    lines = ["LO_DEBUG_SERVER=1"]
+    for line in (original or b"").decode("utf-8", "replace").splitlines():
+        key = line.split("=", 1)[0].strip()
+        if key in ("LO_DEBUG_RESTART", "LO_DEBUG_PORT") and not line.lstrip().startswith("#"):
+            lines.append(line.strip())
+    return lines
+
+
+def restart_game(con, state: dict) -> None:
+    """Starts the game again and waits for its new session; asks the player to when restart is off (title takeover)."""
+    import lo_debug
+    if not state.get("by_hand"):
+        try:
+            con.restart()
+            return
+        except lo_debug.ServerError as e:
+            print(f"restart refused: {e}")
+            state["by_hand"] = True
+    before = con.session()
+    print("close the game on the console (HOME, then X) and start it again; waiting...", flush=True)
+    if not con.wait(3600, other_than=before):
+        raise SystemExit("bench: the game did not start again within an hour")
+
+
+def read_run(con, raw, seconds: float) -> list[str]:
+    """The running session's log from its start (the server keeps it) until its 'bench done' line."""
+    import lo_debug
+    conn = lo_debug.Conn(con.host, con.port)
+    try:
+        conn.sock.sendall(b"log all\n")
+        ok, _ = conn.header()
+        if not ok:
+            raise SystemExit("bench: the debug server refused the log stream")
+        conn.sock.settimeout(1.0)
+        session, pending, end = [], conn.buf, time.time() + seconds
+        conn.buf = b""
+        while time.time() < end:
+            *lines, pending = pending.split(b"\n")
+            for line in lines:
+                raw.write(line + b"\n")
+                text = line.decode("utf-8", "replace")
+                session.append(text)
+                if any(key in text for key in ("bench:", "bench done", "auto input:", "build:")):
+                    print(text, flush=True)
+                if DONE_RE.search(text):
+                    raw.flush()
+                    return session
+            try:
+                data = conn.sock.recv(65536)
+            except socket.timeout:
+                continue
+            if not data:
+                print("the log stream closed before the result (the game quit or crashed: lo_debug.py lastlog)")
+                break
+            pending += data
+        else:
+            print(f"no result within {seconds:.0f} s")
+        raw.flush()
+        return session
+    finally:
+        conn.close()
+
+
+def debug_server_runs(args, con, original: bytes | None, text: str, settings: dict) -> None:
+    """Uploads the run's env.txt and save slot, restarts the game for each run and collects the results."""
+    import lo_debug
+    con.put_bytes(text.encode(), "env.txt", quiet=True)
+    print(f"uploaded env.txt to {con.host}:{con.port}")
+    try:
+        if settings["save"]:
+            source = Path(args.saves) / settings["save"]
+            if not source.is_dir():
+                sys.exit(f"bench: save folder {source} not found")
+            target = f"bench/save/{settings['save']}"
+            for part in ("bench", "bench/save", target):
+                con.command("mkdir", part)
+            for file in sorted(source.iterdir()):
+                if file.is_file():
+                    con.put_bytes(file.read_bytes(), f"{target}/{file.name}", quiet=True)
+            print(f"uploaded save slot {settings['save']} to {target}")
+        out = Path(args.results_out) / datetime.now().strftime("%Y%m%d-%H%M%S")
+        out.mkdir(parents=True, exist_ok=True)
+        frames = args.frames or settings["frames"]
+        seconds = settings["timeout"] + settings["settle"] / 15 + frames / 15 + 120
+        runs: list[dict] = []
+        state: dict = {}
+        wanted = args.runs + args.warmup
+        with open(out / "log.txt", "ab") as raw:
+            for attempt in range(1, wanted + 1):
+                print(f"--- run {attempt} of {wanted} ({args.warmup} warm-up) {time.strftime('%H:%M:%S')}")
+                restart_game(con, state)
+                found = parse_lines(read_run(con, raw, seconds), f"debug server run {attempt}")
+                if not found:
+                    print(f"run {attempt}: no result")
+                    continue
+                run = found[-1]
+                if attempt <= args.warmup:
+                    run["warmup"] = True  # shader caches and the background pipeline build warm up here
+                    print("(warm-up run, not counted)")
+                runs.append(run)
+                print_run(run)
+                time.sleep(3)  # its screenshot and the log reach the card before the next restart
+        finish(runs, out)
+    finally:
+        if args.keep_env:
+            print("left the benchmark env.txt on the console (--keep-env)")
+        else:
+            restore_env(con, original)
+
+
+def restore_env(con, original: bytes | None) -> None:
+    import lo_debug
+    try:
+        if original is None:
+            con.command("rm", "env.txt")
+        else:
+            con.put_bytes(original, "env.txt", quiet=True)
+        print("put the console's own env.txt back" if original is not None else "removed the benchmark env.txt "
+              "(the console had none)")
+    except (OSError, lo_debug.ServerError) as e:
+        print(f"bench: could not restore env.txt ({e}); put it back by hand: {DATA_ROOT}/env.txt", file=sys.stderr)
+        return
+    # Not waited for: the console's own env.txt may leave the debug server off.
+    try:
+        print(con.text("restart", timeout=10.0))
+    except (OSError, lo_debug.ServerError) as e:
+        print(f"not restarted ({e}): start the game again to use its own env.txt")
 
 
 # ---------------------------------------------------------------- logs
@@ -333,6 +503,13 @@ def cmd_watch(args) -> None:
         if len(runs) < wanted:
             time.sleep(2)
     raw.close()
+    finish(runs, out)
+
+
+def finish(runs: list[dict], out: Path) -> None:
+    if not runs:
+        print("bench: no results")
+        return
     write_results(runs, out / "results.json")
     print_report(runs)
     (out / "report.md").write_text(markdown_report(runs), encoding="utf-8")
@@ -486,7 +663,15 @@ def main() -> None:
     p.add_argument("--ftp", help="upload to an FTP server on the console: HOST[:PORT] (default port 5000)")
     p.add_argument("--ftp-user")
     p.add_argument("--ftp-password")
-    p.add_argument("--saves", default=str(REPO_ROOT / "out/drive-city/save"), help="where the scenario save slots are (for --ftp)")
+    p.add_argument("--saves", default=str(REPO_ROOT / "out/drive-city/save"),
+                   help="where the scenario save slots are (for --ftp and --debug-server)")
+    p.add_argument("--debug-server", metavar="IP[:PORT]",
+                   help="the game's debug server (default port 6543): upload, restart for each run, collect the results, "
+                        "put env.txt back")
+    p.add_argument("--runs", type=int, default=3, help="with --debug-server: results to count")
+    p.add_argument("--warmup", type=int, default=1, help="with --debug-server: runs before those, kept but not counted")
+    p.add_argument("--results-out", default=str(DEFAULT_OUT), help="with --debug-server: where the results go")
+    p.add_argument("--keep-env", action="store_true", help="with --debug-server: leave the benchmark env.txt on the console")
     p.set_defaults(func=cmd_env)
 
     p = sub.add_parser("watch", help="collect results from the console's network log")

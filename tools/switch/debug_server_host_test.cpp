@@ -2,7 +2,9 @@
 // without a console. The server core and the PNG writer are the Switch build's own files
 // (LostOdysseyRecomp/os/switch/debug_server_core.cpp, ppm_png.cpp); the game's commands (debug_commands.cpp, which
 // needs libnx and the game) are stand-ins here with the same names, arguments and replies, and the log is a made-up
-// game's: a line per frame with the timing lines tools/scenario.py reads, draws rising once the scene "loads".
+// game's: a line per frame with the timing lines tools/scenario.py reads, draws rising once the scene "loads". With
+// LO_BENCH in the folder's env.txt (read at start, as the game does) it also logs a made-up "bench result", "bench env"
+// and "bench done" for tools/switch/bench.py --debug-server, and quits after them with LO_BENCH_EXIT=1.
 //
 // Build and run from the repository root (macOS or Linux):
 //   M=tools/XenosRecomp/thirdparty/smol-v/testing/external/miniz; S=LostOdysseyRecomp/os/switch
@@ -11,7 +13,8 @@
 //       out/miniz.o -o out/debug_server_host_test
 //   out/debug_server_host_test out/fake-sd 6543 &      # an empty folder plays the app folder; 127.0.0.1 only
 //   python3 tools/switch/lo_debug.py --host 127.0.0.1 info
-// Options after the port: frames per second of the fake game (default 120), and the frame its scene loads at (300).
+// Options after the port: frames per second of the fake game (default 120), the frame its scene loads at (300), and
+// "takeover" to refuse restart without force as a title-takeover console does.
 #include "debug_server_core.h"
 #include "ppm_png.h"
 
@@ -22,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -34,6 +39,8 @@ char** g_argv = nullptr;
 uint64_t g_session = 0;
 std::atomic<uint32_t> g_frame{0};
 std::atomic<uint32_t> g_inputs{0};
+bool g_takeover = false;
+std::map<std::string, std::string> g_env; // env.txt's KEY=VALUE lines
 
 // The network log's history (os/switch/netlog.cpp): the last 1-2 MiB, Read as it does.
 std::mutex g_logMutex;
@@ -66,13 +73,78 @@ double Seconds()
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
+void ReadEnv()
+{
+    std::ifstream f(g_root + "/env.txt");
+    for (std::string line; std::getline(f, line);)
+    {
+        const size_t eq = line.find('=');
+        if (line.empty() || line[0] == '#' || eq == std::string::npos)
+            continue;
+        std::string value = line.substr(eq + 1);
+        while (!value.empty() && (value.back() == '\r' || value.back() == ' '))
+            value.pop_back();
+        g_env[line.substr(0, eq)] = value;
+    }
+}
+
+uint32_t EnvNumber(const char* key, uint32_t fallback)
+{
+    const auto it = g_env.find(key);
+    return it == g_env.end() ? fallback : uint32_t(std::strtoul(it->second.c_str(), nullptr, 10));
+}
+
+// LO_BENCH's lines (debug/perf_stats.cpp FinishBench), with made-up figures.
+void BenchResult(const std::string& name, uint32_t frames, uint32_t startSwap, uint32_t endSwap, double seconds)
+{
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[%9.3f t0001] [note]  bench result: name=%s status=ok frames=%u seconds=%.2f "
+        "start_swap=%u end_swap=%u fps=%.2f ms_mean=33.40 ms_p50=33.30 ms_p90=33.40 ms_p95=34.10 ms_p99=40.00 "
+        "ms_max=41.20 ms_stdev=1.10 low1_fps=25.00 late_pct=2.0 target_fps=30 hitches=0 loading=0 pace_ms=10.%02u "
+        "present_ms=0.40 cp_idle_ms=5.00 gpu_ms=%.2f gpu_pct=40.0 draws=%u gpu_draws=880 pipeline_binds=120.0 "
+        "scene=host-test threads=main:%.0f,render:55 mode=handheld cpu_mhz=1020 gpu_mhz=460 mem_mhz=1331 map=-",
+        Seconds(), name.c_str(), frames, seconds, startSwap, endSwap, frames / seconds, unsigned(g_session % 100),
+        12.0 + double(g_session % 7) / 10.0, 900 + endSwap % 17, 80.0 + double(g_session % 9));
+    Log(line);
+    std::string env;
+    for (const auto& [key, value] : g_env)
+        if (key.rfind("LO_", 0) == 0)
+            env += " " + key + "=" + value;
+    std::snprintf(line, sizeof(line), "[%9.3f t0001] [note]  bench env:%s", Seconds(), env.c_str());
+    Log(line);
+    std::snprintf(line, sizeof(line), "[%9.3f t0001] [note]  bench done: name=%s status=ok", Seconds(), name.c_str());
+    Log(line);
+}
+
 void Game(int fps, uint32_t sceneFrame)
 {
+    const std::string bench = g_env.count("LO_BENCH") ? g_env["LO_BENCH"] : "";
+    const uint32_t startDraws = EnvNumber("LO_BENCH_START_DRAWS", 1), settle = EnvNumber("LO_BENCH_SETTLE", 150),
+                   measured = EnvNumber("LO_BENCH_FRAMES", 600);
+    uint32_t startSwap = 0;
+    double startSeconds = 0;
     for (uint32_t frame = 1;; frame++)
     {
         std::this_thread::sleep_for(std::chrono::microseconds(1000000 / fps));
         g_frame = frame;
         const uint32_t draws = frame < sceneFrame ? 40 : 900 + frame % 17;
+        if (!bench.empty())
+        {
+            if (!startSwap && draws >= startDraws)
+                startSwap = frame + settle, Log("[note]  bench: " + bench + " reached its scene at swap " + std::to_string(frame));
+            if (startSwap && frame == startSwap)
+                startSeconds = Seconds();
+            if (startSwap && frame == startSwap + measured)
+            {
+                BenchResult(bench, measured, startSwap, frame, Seconds() - startSeconds);
+                if (EnvNumber("LO_BENCH_EXIT", 0))
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // the log reaches the stream
+                    debugsrv::stop();
+                    std::_Exit(0);
+                }
+            }
+        }
         char line[256];
         std::snprintf(line, sizeof(line), "[%9.3f t0001] [info]  render timing frame=%u draws=%u gpu_queue_batches_elapsed_ms=%.2f",
             Seconds(), frame, draws, 12.0 + frame % 5);
@@ -153,13 +225,19 @@ int main(int argc, char** argv)
     g_port = argc > 2 ? std::atoi(argv[2]) : 6543;
     const int fps = argc > 3 ? std::atoi(argv[3]) : 120;
     const uint32_t sceneFrame = argc > 4 ? uint32_t(std::atoi(argv[4])) : 300;
+    g_takeover = argc > 5 && std::strcmp(argv[5], "takeover") == 0;
+    ReadEnv();
     g_session = uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
     debugsrv::add_command("info", "info                   (host test) build, session, frame", Info);
     debugsrv::add_command("shot", "shot [ppm]             (host test) a gradient", Shot);
     for (const char* name : { "input", "press", "hold", "release", "stick" })
         debugsrv::add_command(name, (std::string(name) + "                  (host test) logged").c_str(),
             [name](const debugsrv::Args& a) { return Record(name, a); });
-    debugsrv::add_command("restart", "restart [force]        (host test) the program starts again", [](const debugsrv::Args&) {
+    debugsrv::add_command("restart", "restart [force]        (host test) the program starts again", [](const debugsrv::Args& a) {
+        if (g_takeover && (a.empty() || a[0] != "force"))
+            return debugsrv::err("restart is off: this looks like title takeover (program 0100000000001000), where it "
+                "would start the game that was taken over. From a HOME-menu forwarder: LO_DEBUG_RESTART=1 in env.txt, or "
+                "\"restart force\". Otherwise start the game again by hand.");
         debugsrv::Reply r = debugsrv::ok("restarting: the program starts again");
         r.after = [] {
             debugsrv::stop();
@@ -178,6 +256,7 @@ int main(int argc, char** argv)
     config.log = [](const char* line) { std::fprintf(stderr, "%s\n", line); Log(line); };
     config.readLog = Read;
     Log("[debug] host test session starting");
+    Log("[   0.000 t0001] [note]  build: source=host-test revision=host-test pointer_bits=64");
     for (int attempt = 0; !debugsrv::start(config); attempt++)
     {
         if (attempt == 50)
