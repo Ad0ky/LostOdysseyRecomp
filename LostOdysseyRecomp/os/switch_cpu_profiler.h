@@ -18,12 +18,25 @@
 // registered thread every 2 ms, reads where it is (program counter) and resumes it; every 30 seconds
 // it writes the hottest code addresses of each thread to stderr.log, as offsets into the executable
 // that tools/switch-cpu-profile.py turns into function names (recompiled game functions included).
+//
+// Lost Odyssey: LO_CPU_PROFILE_SAMPLES=1 (or a comma-separated list of thread names, e.g.
+// "Guest Main,GPU CmdProc") also keeps every sample of those threads, with the host LR and, for guest
+// threads, the guest call chain (return addresses from the PowerPC back chain), and appends them to
+// cpu-samples.bin in the app folder at each report. tools/switch/switch-cpu-profile.py --samples reads it.
 namespace os::switch_cpu_profiler
 {
     // The name is copied (up to 47 characters).
     void RegisterCurrentThread(const char* name);
     void RegisterCurrentThreadWithAddress(const char* prefix, uint32_t guestAddress);
     void UnregisterCurrentThread();
+
+    // The calling (registered) thread runs guest code: where its PPCContext pointer lives (the thread_local
+    // g_ppcContext, which GuestToHostFunction swaps), the offsets of r1 and lr in a PPCContext (lrOffset
+    // UINT32_MAX: no lr), guest memory's base and the guest stack's [low, high) guest addresses. With
+    // LO_CPU_PROFILE_SAMPLES the sampler then walks the guest stack's back chain at each sample (below).
+    void SetCurrentThreadGuestStack(void* const* contextSlot, uint32_t r1Offset, uint32_t lrOffset,
+        const uint8_t* memoryBase, uint32_t stackLow, uint32_t stackHigh);
+    void ClearCurrentThreadGuestStack();
 
     // Starts the per-thread accounting, and the sampler when asked ([Switch] SwitchCpuProfiler).
     void Start(bool sampler);
