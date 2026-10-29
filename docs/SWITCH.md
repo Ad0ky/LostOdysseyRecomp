@@ -209,7 +209,7 @@ Switch-specific options and diagnostics:
 | `LO_WAIT_PROFILE` | off | Set to `1` to log guest waits of at least 1 ms every 10 seconds |
 | `LO_PERF_INTERVAL` | `10` | Seconds between `perf:` lines (below); `0` turns off the `perf:` and `hitch:` lines |
 | `LO_PERF_GPU` | `1` | `0`: no GPU timestamps for the `perf:` line (its GPU figures then read `-` unless the Detailed overlay or dynamic resolution measures them) |
-| `LO_PERF_HITCH_MS` | 2× target | A `hitch:` line for every frame longer than this (ms), outside loading screens |
+| `LO_PERF_HITCH_MS` | 2× target and 2× recent median | A `hitch:` line for every frame longer than this (ms), outside loading screens. By default a frame must be over twice the target and twice the median of the last 64 frames, so a scene that is slow throughout gives no lines |
 | `LO_PERF_HITCHES` | `300` | `hitch:` lines per session |
 | `LO_BENCH` and `LO_BENCH_*` | off | A benchmark run: see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md) (`tools/switch/bench.py` writes these) |
 | `LO_AUTO_BUTTONS` | off | Scripted presses: `a@900` at a presented frame, `a@30s` at seconds since launch (letters: `s a b x y`, `u d l r` d-pad, `k` back, `L R` shoulders) |

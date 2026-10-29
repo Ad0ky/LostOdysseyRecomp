@@ -543,7 +543,8 @@ void Present(const PresentSample& sample)
             os::DetachThread(std::thread(MonitorMain));
         LOG_NOTICE("perf stats: {}, GPU timing {}{}",
             perf ? fmt::format("perf lines every {} s, hitch lines over {}", config.intervalSeconds,
-                       config.hitchMs > 0 ? fmt::format("{:.0f} ms", config.hitchMs) : std::string("twice the target frame time"))
+                       config.hitchMs > 0 ? fmt::format("{:.0f} ms", config.hitchMs)
+                                         : std::string("twice the target and twice the recent median frame time"))
                  : std::string("perf and hitch lines off"),
             config.gpu ? "on" : "off", bench ? fmt::format("; benchmark run '{}'", GetBench().name) : std::string());
     });
@@ -558,7 +559,26 @@ void Present(const PresentSample& sample)
     }
     const float intervalMs = std::chrono::duration<float, std::milli>(now - last).count();
     last = now;
-    const double threshold = config.hitchMs > 0 ? config.hitchMs : 2.0 * TargetMs(sample.targetFps);
+    // A hitch stands out from the frames around it: over twice the target and over twice the median of the last
+    // 64 frames outside loading screens. A scene that runs at 15 fps throughout has slow frames, not hitches.
+    static float recent[64] = {};
+    static uint32_t recentCount = 0, recentNext = 0;
+    static float recentMedian = 0;
+    if (!sample.loading)
+    {
+        recent[recentNext] = intervalMs;
+        recentNext = (recentNext + 1) % 64;
+        recentCount = std::min<uint32_t>(recentCount + 1, 64);
+        if (recentNext % 16 == 0)
+        {
+            float sorted[64];
+            std::copy(recent, recent + recentCount, sorted);
+            std::nth_element(sorted, sorted + recentCount / 2, sorted + recentCount);
+            recentMedian = sorted[recentCount / 2];
+        }
+    }
+    const double threshold = config.hitchMs > 0 ? config.hitchMs
+        : std::max(2.0 * TargetMs(sample.targetFps), 2.0 * double(recentMedian));
     // The first frames (logos, the first shaders) are not worth a line each.
     const bool hitch = !sample.loading && sample.swap > 60 && intervalMs > threshold;
     if (perf)
@@ -579,11 +599,12 @@ void Present(const PresentSample& sample)
         ++hitchesLogged;
         const uint64_t gpuNs = current.gpuBusyNs - previous.gpuBusyNs;
         LOG_NOTICE("hitch: swap={} frame_ms={:.1f} target_ms={:.1f} {} cp_idle_ms={:.1f} pace_ms={:.1f} present_ms={:.1f}"
-            " draws={}{} ({} of {})",
+            " draws={}{} median_ms={:.1f} ({} of {})",
             sample.swap, intervalMs, TargetMs(sample.targetFps),
             gpuNs ? fmt::format("gpu_ms={:.1f}", Ms(gpuNs)) : std::string("gpu_ms=-"),
             Ms(current.cpIdleNs - previous.cpIdleNs), Ms(sample.sleepNs), Ms(sample.presentNs),
-            g_lastDraws.load(std::memory_order_relaxed), BackendWork(previous, current, 1.0), hitchesLogged, config.hitchLimit);
+            g_lastDraws.load(std::memory_order_relaxed), BackendWork(previous, current, 1.0), recentMedian, hitchesLogged,
+            config.hitchLimit);
     }
     previous = current;
     if (bench)

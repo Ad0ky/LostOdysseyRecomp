@@ -60,6 +60,7 @@ HITCH_RE = re.compile(r"\[note\]\s+hitch: (.*)$")
 OPTION_RE = re.compile(r"\[note\]\s+option: (.*)$")
 # The fields of an option line that describe it rather than name an option.
 OPTION_META = {"frame", "source", "applies", "env", "saved", "env_wins", "overrides_env", "built"}
+SHOT_RE = re.compile(r"bench screenshot at swap \d+ -> (\S+) \((ok|failed)\)")
 INPUT_RE = re.compile(r"auto input: '(.)' at swap (\d+), ([0-9.]+) s")
 
 # The figures a report and a comparison show, and which way is better.
@@ -275,8 +276,9 @@ def restart_game(con, state: dict) -> None:
         raise SystemExit("bench: the game did not start again within an hour")
 
 
-def read_run(con, raw, seconds: float) -> list[str]:
-    """The running session's log from its start (the server keeps it) until its 'bench done' line."""
+def read_run(con, raw, seconds: float, shot: bool = False) -> list[str]:
+    """The running session's log from its start (the server keeps it) until its 'bench done' line, and with shot
+    until its screenshot is on the card: a restart before that loses it (the PPM is written after a GPU readback)."""
     import lo_debug
     conn = lo_debug.Conn(con.host, con.port)
     try:
@@ -295,7 +297,12 @@ def read_run(con, raw, seconds: float) -> list[str]:
                 session.append(text)
                 if any(key in text for key in ("bench:", "bench done", "auto input:", "build:")):
                     print(text, flush=True)
-                if DONE_RE.search(text):
+                if (m := DONE_RE.search(text)) and not (shot and m.group(2) == "ok"):
+                    raw.flush()
+                    return session
+                if m:
+                    end = min(end, time.time() + 60)  # the screenshot line follows within seconds
+                if SHOT_RE.search(text):
                     raw.flush()
                     return session
             try:
@@ -342,23 +349,68 @@ def debug_server_runs(args, con, original: bytes | None, text: str, settings: di
             for attempt in range(1, wanted + 1):
                 print(f"--- run {attempt} of {wanted} ({args.warmup} warm-up) {time.strftime('%H:%M:%S')}")
                 restart_game(con, state)
-                found = parse_lines(read_run(con, raw, seconds), f"debug server run {attempt}")
+                session = read_run(con, raw, seconds, shot=not args.no_shot)
+                found = parse_lines(session, f"debug server run {attempt}")
                 if not found:
                     print(f"run {attempt}: no result")
                     continue
                 run = found[-1]
+                fetch_shot(con, session, out / f"run{attempt}.png", run)
                 if attempt <= args.warmup:
                     run["warmup"] = True  # shader caches and the background pipeline build warm up here
                     print("(warm-up run, not counted)")
                 runs.append(run)
                 print_run(run)
-                time.sleep(3)  # its screenshot and the log reach the card before the next restart
+                time.sleep(2)  # the log writer's last lines reach the card before the next restart
         finish(runs, out)
     finally:
         if args.keep_env:
             print("left the benchmark env.txt on the console (--keep-env)")
         else:
             restore_env(con, original)
+
+
+def ppm_to_png(ppm: bytes) -> bytes:
+    """A binary PPM (P6, 8 bits) as an uncompressed-filter PNG."""
+    import struct
+    import zlib
+    fields, offset = [], 0
+    while len(fields) < 4:  # magic, width, height, maximum; '#' comments allowed
+        while ppm[offset:offset + 1].isspace():
+            offset += 1
+        if ppm[offset:offset + 1] == b"#":
+            offset = ppm.index(b"\n", offset) + 1
+            continue
+        start = offset
+        while not ppm[offset:offset + 1].isspace():
+            offset += 1
+        fields.append(ppm[start:offset])
+    offset += 1
+    width, height = int(fields[1]), int(fields[2])
+    pixels = ppm[offset:offset + width * height * 3]
+    rows = b"".join(b"\x00" + pixels[y * width * 3:(y + 1) * width * 3] for y in range(height))
+    chunk = lambda kind, data: (struct.pack(">I", len(data)) + kind + data +
+                                struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) +
+            chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+
+def fetch_shot(con, session: list[str], target: Path, run: dict) -> None:
+    """Copies the run's screenshot into the results as a PNG and deletes it from the card."""
+    shots = [m for line in session if (m := SHOT_RE.search(line))]
+    if not shots:
+        return
+    path, status = shots[-1].group(1), shots[-1].group(2)
+    if status != "ok":
+        print(f"the console could not save the screenshot ({path})")
+        return
+    try:
+        target.write_bytes(ppm_to_png(con.get_bytes(path)))
+        con.command("rm", path)
+        run["screenshot"] = str(target)
+        print(f"screenshot: {target}")
+    except Exception as error:  # the result counts without its screenshot
+        print(f"could not fetch the screenshot {path}: {error}")
 
 
 def restore_env(con, original: bytes | None) -> None:

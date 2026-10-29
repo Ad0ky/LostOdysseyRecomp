@@ -1222,7 +1222,8 @@ namespace gpu
                     }
                 }
                 // A benchmark run's screenshot (LO_BENCH_SHOT), named like a requested one.
-                const bool requestedShot = requestedShots != 0 || perf_stats::TakeBenchScreenshot();
+                const bool benchShot = perf_stats::TakeBenchScreenshot();
+                const bool requestedShot = requestedShots != 0 || benchShot;
                 if (requestedShots) --requestedShots;
                 if (requestedShot || (shotSwap && swaps >= shotSwap && swaps < shotSwap + shotCount) || (shotEvery && (swaps % shotEvery) == 0))
                 {
@@ -1232,7 +1233,12 @@ namespace gpu
                         size_t dot = path.rfind('.');
                         path = path.substr(0, dot) + fmt::format("_{}", swaps) + (dot == std::string::npos ? "" : path.substr(dot));
                     }
-                    LOG_INFO("screenshot at swap {} -> {} ({})", swaps, path, video::SaveScreenshot(path.c_str()) ? "ok" : "failed");
+                    const bool saved = video::SaveScreenshot(path.c_str());
+                    // A benchmark's screenshot is always logged: tools/switch/bench.py waits for it before the next run.
+                    if (benchShot)
+                        LOG_NOTICE("bench screenshot at swap {} -> {} ({})", swaps, path, saved ? "ok" : "failed");
+                    else
+                        LOG_INFO("screenshot at swap {} -> {} ({})", swaps, path, saved ? "ok" : "failed");
                 }
                 // The debug server's "shot": the frame just presented, to the file it names.
                 if (const char* debugShot = nullptr; os::debug_server::TakeShotRequest(debugShot))

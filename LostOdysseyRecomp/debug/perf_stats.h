@@ -7,7 +7,7 @@
 // perf:   every LO_PERF_INTERVAL seconds (Switch: 10 by default, elsewhere off): frame time percentiles, where the
 //         frame went (pacing sleep, present, command processor idle), GPU busy time, draws and back-end work per
 //         frame, per-thread CPU, scene size, docked/handheld, clocks and the map. Written by a thread of its own.
-// hitch:  a frame over twice the target frame time outside loading screens (the first LO_PERF_HITCHES, 300), with
+// hitch:  a frame over twice the target frame time and twice the recent median outside loading screens (the first LO_PERF_HITCHES, 300), with
 //         what that frame did: GPU time, shader compiles and translations, texture uploads, idle and pacing.
 // bench:  LO_BENCH=<name> measures a fixed number of frames once a scene is reached and logs one "bench result"
 //         line (tools/switch/bench.py writes the env.txt and reads the result).
