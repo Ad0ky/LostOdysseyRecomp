@@ -1109,6 +1109,28 @@ static inline const wchar_t *Translate(uint32_t language, const wchar_t *en, con
          L"MetalFX が失敗。設定変更か再起動で再試行。",
          L"MetalFX 실패. 업스케일러를 바꾸거나 재시작해 다시 시도.",
          L"MetalFX 失败。请更改超分设置或重启后重试。"},
+        // System → Debug (the Switch): settings/menu.cpp's Debug page.
+        {L"Debug", L"デバッグ", L"디버그", L"调试"},
+        {L"A/B switches for benchmark runs. Each change is logged with its frame number.", L"ベンチマーク用の A/B スイッチ。変更はフレーム番号とともにログに記録されます。", L"벤치마크용 A/B 스위치. 변경할 때마다 프레임 번호와 함께 로그에 기록됩니다.", L"基准测试用的 A/B 开关。每次更改都会连同帧编号写入日志。"},
+        {L"Applies at once", L"すぐに適用", L"즉시 적용", L"立即生效"},
+        {L"Applies at the next start", L"次回起動時に適用", L"다음 시작 시 적용", L"下次启动时生效"},
+        {L"deko3d: merge barriers", L"deko3d：バリアの統合", L"deko3d: 배리어 병합", L"deko3d：合并屏障"},
+        {L"deko3d: lean barriers", L"deko3d：軽量バリア", L"deko3d: 경량 배리어", L"deko3d：精简屏障"},
+        {L"deko3d: depth compression", L"deko3d：深度圧縮", L"deko3d: 깊이 압축", L"deko3d：深度压缩"},
+        {L"deko3d: colour compression", L"deko3d：カラー圧縮", L"deko3d: 색상 압축", L"deko3d：颜色压缩"},
+        {L"deko3d: vertex output trimming", L"deko3d：頂点出力の削減", L"deko3d: 버텍스 출력 축소", L"deko3d：顶点输出精简"},
+        {L"Debug server", L"デバッグサーバー", L"디버그 서버", L"调试服务器"},
+        {L"Shows FPS, or detailed load, over the game. Applies and saves at once.", L"ゲーム画面に FPS または詳細な負荷を表示。すぐに適用・保存します。", L"게임 화면에 FPS 또는 상세 부하를 표시합니다. 즉시 적용 및 저장됩니다.", L"在游戏画面上显示 FPS 或详细负载。立即应用并保存。"},
+        {L"Back-to-back GPU barriers become one. Applies from the next frame.", L"連続する GPU バリアを 1 つにまとめます。次のフレームから適用。", L"연속된 GPU 배리어를 하나로 합칩니다. 다음 프레임부터 적용됩니다.", L"连续的 GPU 屏障合并为一个。从下一帧起生效。"},
+        {L"Barriers before a write keep the texture cache. Applies from the next frame.", L"書き込み前のバリアでテクスチャキャッシュを保持。次のフレームから適用。", L"쓰기 전 배리어가 텍스처 캐시를 유지합니다. 다음 프레임부터 적용됩니다.", L"写入前的屏障保留纹理缓存。从下一帧起生效。"},
+        {L"Hierarchical depth culling. It can drop decals. Applies at the next start.", L"階層型デプスカリング。デカールが消えることがあります。次回起動時に適用。", L"계층적 깊이 컬링. 데칼이 사라질 수 있습니다. 다음 시작 시 적용됩니다.", L"分层深度剔除，可能丢失贴花。下次启动时生效。"},
+        {L"Hardware compression for depth buffers. Applies at the next start.", L"深度バッファをハードウェア圧縮。次回起動時に適用。", L"깊이 버퍼에 하드웨어 압축을 사용합니다. 다음 시작 시 적용됩니다.", L"深度缓冲区使用硬件压缩。下次启动时生效。"},
+        {L"Hardware compression for colour render targets, on by default. Applies at the next start.", L"カラーレンダーターゲットをハードウェア圧縮（既定でオン）。次回起動時に適用。", L"색상 렌더 타깃에 하드웨어 압축을 사용합니다(기본값 켜짐). 다음 시작 시 적용됩니다.", L"颜色渲染目标使用硬件压缩，默认开启。下次启动时生效。"},
+        {L"Vertex shaders write only what the pixel shader reads. Applies at the next start.", L"頂点シェーダーはピクセルシェーダーが読む出力だけを書きます。次回起動時に適用。", L"버텍스 셰이더가 픽셀 셰이더가 읽는 출력만 씁니다. 다음 시작 시 적용됩니다.", L"顶点着色器只输出像素着色器读取的值。下次启动时生效。"},
+        {L"Not in this build yet: the choice is only saved for the next start.", L"このビルドには未搭載。次回起動用に保存のみ行います。", L"이 빌드에는 아직 없습니다. 다음 시작용으로 저장만 합니다.", L"此版本尚未提供：仅保存供下次启动使用。"},
+        {L"Each change is logged with the frame it took effect at.", L"変更は適用されたフレーム番号とともにログに記録されます。", L"변경 사항은 적용된 프레임 번호와 함께 로그에 기록됩니다.", L"每次更改都会连同生效的帧编号写入日志。"},
+        {L"Only with the deko3d back end (LO_SWITCH_BACKEND=deko3d in env.txt).", L"deko3d バックエンドでのみ有効（env.txt の LO_SWITCH_BACKEND=deko3d）。", L"deko3d 백엔드에서만 사용 (env.txt의 LO_SWITCH_BACKEND=deko3d).", L"仅适用于 deko3d 后端（env.txt 中的 LO_SWITCH_BACKEND=deko3d）。"},
+        {L"Running now:", L"現在の値：", L"현재 값:", L"当前运行："},
     };
     for (const auto &entry : entries)
         if (std::wstring_view(en) == entry.key)

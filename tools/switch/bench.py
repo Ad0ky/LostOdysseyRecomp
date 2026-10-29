@@ -53,6 +53,9 @@ ENV_RE = re.compile(r"bench env:(.*)$")
 BUILD_RE = re.compile(r"build: source=(\S+) revision=(\S+)")
 PERF_RE = re.compile(r"\[ *([0-9.]+) t[0-9a-f]+\] \[note\]\s+perf: (.*)$")
 HITCH_RE = re.compile(r"\[note\]\s+hitch: (.*)$")
+OPTION_RE = re.compile(r"\[note\]\s+option: (.*)$")
+# The fields of an option line that describe it rather than name an option.
+OPTION_META = {"frame", "source", "applies", "env", "saved", "env_wins", "overrides_env", "built"}
 INPUT_RE = re.compile(r"auto input: '(.)' at swap (\d+), ([0-9.]+) s")
 
 # The figures a report and a comparison show, and which way is better.
@@ -231,12 +234,14 @@ def parse_fields(text: str) -> dict:
 
 def parse_lines(lines, source: str) -> list[dict]:
     """Every bench result in a log, with the build it came from, its env and the perf lines it overlaps."""
-    runs, build, perf, hitches, inputs = [], None, [], [], []
+    runs, build, perf, hitches, inputs, options = [], None, [], [], [], []
     current = None
     for line in lines:
         if m := BUILD_RE.search(line):
             build = m.group(2)
-            perf, hitches, inputs = [], [], []
+            perf, hitches, inputs, options = [], [], [], []
+        elif m := OPTION_RE.search(line):
+            options.append(parse_fields(m.group(1)))
         elif m := INPUT_RE.search(line):
             inputs.append({"button": m.group(1), "swap": int(m.group(2)), "seconds": float(m.group(3))})
         elif m := PERF_RE.search(line):
@@ -246,10 +251,28 @@ def parse_lines(lines, source: str) -> list[dict]:
         elif m := RESULT_RE.search(line):
             current = {"source": source, "build": build, **parse_fields(m.group(1)),
                        "inputs": inputs, "perf": perf[-6:], "hitch_lines": hitches[-50:]}
+            current["options"], current["option_changes"] = options_during(options, current)
             runs.append(current)
         elif (m := ENV_RE.search(line)) and current is not None:
             current["env"] = dict(token.split("=", 1) for token in m.group(1).split() if "=" in token)
     return runs
+
+
+def options_during(lines: list[dict], run: dict) -> tuple[dict, list[dict]]:
+    """The options (Debug page, env.txt; "option:" lines) in effect when the run started measuring, and the changes
+    that took effect while it measured. A line's frame is the first presented frame that runs with its value."""
+    start, end = run.get("start_swap"), run.get("end_swap")
+    at_start, changes = {}, []
+    for fields in lines:
+        frame = fields.get("frame")
+        if fields.get("applies") == "next_start" or not isinstance(frame, int):
+            continue
+        values = {k: v for k, v in fields.items() if k not in OPTION_META}
+        if not isinstance(start, int) or frame <= start + 1:
+            at_start.update(values)
+        elif not isinstance(end, int) or frame <= end:
+            changes.append({"frame": frame, **values})
+    return at_start, changes
 
 
 def cmd_parse(args) -> None:
@@ -307,7 +330,7 @@ def cmd_watch(args) -> None:
                     for line in lines:
                         text = line.decode("utf-8", "replace")
                         session.append(text)
-                        if any(key in text for key in ("bench:", "bench done", "auto input:", "build:")) or \
+                        if any(key in text for key in ("bench:", "bench done", "auto input:", "build:", "option:")) or \
                                 (args.verbose and ("perf:" in text or "hitch:" in text)):
                             print(text, flush=True)
                         if DONE_RE.search(text):
@@ -353,6 +376,8 @@ def print_run(run: dict) -> None:
     print(f"result {run.get('name')} [{run.get('status')}]: {fmt(run.get('fps'), 2)} FPS, p99 {fmt(run.get('ms_p99'))} ms, "
           f"GPU {fmt(run.get('gpu_ms'))} ms/frame, {fmt(run.get('draws'), 0)} draws, {run.get('mode', '?')} "
           f"GPU {fmt(run.get('gpu_mhz'), 0)} MHz", flush=True)
+    for change in run.get("option_changes", []):
+        print(f"  warning: an option changed while it measured: {change}", flush=True)
 
 
 def group(runs: list[dict]) -> dict[str, list[dict]]:
@@ -460,6 +485,13 @@ def comparability(a: dict, b: dict) -> list[str]:
     for key in ("mode", "scene", "target_fps", "gpu_mhz", "mem_mhz"):
         if a.get(key) != b.get(key):
             warnings.append(f"{key} differs ({a.get(key)} vs {b.get(key)})")
+    oa, ob = a.get("options", {}), b.get("options", {})
+    for key in sorted(set(oa) | set(ob)):
+        if oa.get(key) != ob.get(key):
+            warnings.append(f"option {key} differs ({oa.get(key)} vs {ob.get(key)})")
+    for side, run in (("baseline", a), ("candidate", b)):
+        if run.get("option_changes"):
+            warnings.append(f"an option changed during the {side} run")
     ea, eb = a.get("env", {}), b.get("env", {})
     for key in sorted(set(ea) | set(eb)):
         if key.startswith("LO_BENCH") or key in ("LO_NETLOG", "LO_SCREENSHOT_PATH"):

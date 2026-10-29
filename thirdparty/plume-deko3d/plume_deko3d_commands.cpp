@@ -236,6 +236,9 @@ namespace plume {
             pendingBarrier = true;
             return;
         }
+        // LostOdysseyRecomp (2026-10-29): one held while mergeBarriers was on (it changes while the game runs) goes
+        // first; emitBarrier would drop it.
+        flushBarriers();
         emitBarrier(mode, invalidate);
     }
 

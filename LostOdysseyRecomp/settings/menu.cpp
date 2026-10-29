@@ -27,6 +27,9 @@
 #include <apu/audio.h>
 #include <updater/shader_pack_download.h>
 #include <hid/hid.h>
+#if LO_PLATFORM_SWITCH
+#include <debug/debug_options.h>
+#endif
 #if !LO_PLATFORM_ANDROID && !defined(__SWITCH__) && !defined(__NX__) && (defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
 #include <discord/presence.h>
 #endif
@@ -153,6 +156,10 @@ std::vector<achievements_page::Item> achievementItems;
 std::vector<std::shared_ptr<const menu_assets::Image>> achievementIcons;
 int achievementsFocus = 0;
 std::wstring achievementSummary;
+// Debug page (System → Debug, the Switch only). Every row applies and saves at
+// once and is logged with its frame (debug/debug_options.h).
+std::atomic<bool> debugOpen{false};
+int debugFocus = DebugOverlayRow;
 // Controls page (Gameplay → Controls). The layouts stay unsaved until Save;
 // Button prompts and Vibration save at once, as they did on the tab. The page
 // navigates with the default layouts (FilterInput), so a layout that leaves a
@@ -516,6 +523,111 @@ void CycleAchievementNotifications(int delta)
     saved.achievementSound = edit.achievementSound;
     if (!SaveConfig(saved)) status = Tr(L"Could not save settings.", L"無法儲存設定。");
 }
+#if LO_PLATFORM_SWITCH
+bool DebugTitle(int r) { return r == DebugLiveTitle || r == DebugNextStartTitle; }
+// The deko3d option a Debug page row switches, or Count.
+debug_options::Deko3d DebugDeko3d(int r)
+{
+    using Deko3d = debug_options::Deko3d;
+    switch (r)
+    {
+    case DebugMergeBarriersRow: return Deko3d::MergeBarriers;
+    case DebugLeanBarriersRow: return Deko3d::LeanBarriers;
+    case DebugZcullRow: return Deko3d::Zcull;
+    case DebugDepthCompressionRow: return Deko3d::DepthCompression;
+    case DebugColorCompressionRow: return Deko3d::ColorCompression;
+    case DebugVsOutputsRow: return Deko3d::VsOutputs;
+    default: return Deko3d::Count;
+    }
+}
+void OpenDebugPage()
+{
+    debugFocus = DebugOverlayRow;
+    status.clear();
+    debugOpen = true;
+    LOG_INFO("settings: debug page opened");
+}
+void CloseDebugPage()
+{
+    debugOpen = false;
+    status.clear();
+}
+// A, Left or Right on a Debug page row: applied, saved and logged at once,
+// without unsaved edits from the tabs.
+void ChangeDebugOption(int delta)
+{
+    bool saved = true;
+    if (debugFocus == DebugOverlayRow)
+    {
+        const uint32_t mode = uint32_t((int(std::min(edit.performanceOverlay, 2u)) + 3 + delta) % 3);
+        Config config = GetConfig();
+        config.performanceOverlay = mode;
+        saved = SaveConfig(config);
+        if (saved)
+        {
+            edit.performanceOverlay = mode;
+            debug_options::LogPerformanceOverlay(mode);
+        }
+    }
+    else if (debugFocus == DebugServerRow)
+        saved = debug_options::SetDebugServer(!GetConfig().debug.debugServer);
+    else if (const auto option = DebugDeko3d(debugFocus);
+             option != debug_options::Deko3d::Count && debug_options::Deko3dActive())
+        saved = debug_options::Set(option, !debug_options::Saved(option));
+    if (!saved) status = Tr(L"Could not save settings.", L"無法儲存設定。");
+}
+// Help for the focused Debug page row (line 1); line 2 says what the GPU runs
+// with now, and whether env.txt set it.
+std::pair<std::wstring, std::wstring> DebugHelp()
+{
+    std::wstring help;
+    switch (debugFocus)
+    {
+    case DebugOverlayRow:
+        help = Tr(L"Shows FPS, or detailed load, over the game. Applies and saves at once.",
+                  L"在遊戲畫面上顯示 FPS 或詳細負載。立即套用並儲存。");
+        break;
+    case DebugMergeBarriersRow:
+        help = Tr(L"Back-to-back GPU barriers become one. Applies from the next frame.",
+                  L"連續的 GPU 屏障合併為一個。從下一個影格起生效。");
+        break;
+    case DebugLeanBarriersRow:
+        help = Tr(L"Barriers before a write keep the texture cache. Applies from the next frame.",
+                  L"寫入前的屏障保留紋理快取。從下一個影格起生效。");
+        break;
+    case DebugZcullRow:
+        help = Tr(L"Hierarchical depth culling. It can drop decals. Applies at the next start.",
+                  L"階層式深度剔除，可能遺漏貼花。下次啟動時生效。");
+        break;
+    case DebugDepthCompressionRow:
+        help = Tr(L"Hardware compression for depth buffers. Applies at the next start.",
+                  L"深度緩衝區使用硬體壓縮。下次啟動時生效。");
+        break;
+    case DebugColorCompressionRow:
+        help = Tr(L"Hardware compression for colour render targets, on by default. Applies at the next start.",
+                  L"色彩渲染目標使用硬體壓縮，預設開啟。下次啟動時生效。");
+        break;
+    case DebugVsOutputsRow:
+        help = Tr(L"Vertex shaders write only what the pixel shader reads. Applies at the next start.",
+                  L"頂點著色器只輸出像素著色器讀取的值。下次啟動時生效。");
+        break;
+    case DebugServerRow:
+        help = Tr(L"Not in this build yet: the choice is only saved for the next start.",
+                  L"此版本尚未提供：僅儲存供下次啟動使用。");
+        break;
+    }
+    const auto option = DebugDeko3d(debugFocus);
+    if (option == debug_options::Deko3d::Count)
+        return {help, Tr(L"Each change is logged with the frame it took effect at.", L"每次變更都會連同生效的影格編號寫入日誌。")};
+    if (!debug_options::Deko3dActive())
+        return {help, Tr(L"Only with the deko3d back end (LO_SWITCH_BACKEND=deko3d in env.txt).",
+                         L"僅適用於 deko3d 後端（env.txt 中的 LO_SWITCH_BACKEND=deko3d）。")};
+    std::wstring running = std::wstring(Tr(L"Running now:", L"目前執行：")) + L" " +
+                           (debug_options::Running(option) ? Tr(L"On", L"開") : Tr(L"Off", L"關"));
+    if (const char *env = debug_options::ForcedBy(option)) running += L"   (env.txt: " + Widen(env) + L")";
+    return {help, running};
+}
+#endif
 // An achievement entry: icon, name, one line of text, then gamerscore and, once
 // earned, the date. A locked secret shows neither its name, text nor icon.
 Row AchievementRow(const achievements_page::Item &item, std::shared_ptr<const menu_assets::Image> icon)
@@ -1149,6 +1261,9 @@ std::wstring DlssNotice()
 }
 bool SystemRowHidden(int r)
 {
+#if !LO_PLATFORM_SWITCH
+    if (r == SystemDebugRow) return true;
+#endif
 #if LO_PLATFORM_ANDROID || defined(__SWITCH__) || defined(__NX__) || !(defined(_WIN32) || defined(__linux__) || defined(__APPLE__))
     return r == SystemDiscordStatusRow || r == SystemAddToSteamRow;
 #else
@@ -1282,7 +1397,8 @@ void Publish(uint8_t *base, uint32_t config)
     apu::SetTestSignal(speakerTest);
     Snapshot next;
     next.tab = tab;
-    next.row = modsOpen ? modsFocus : controlsOpen ? controlsFocus : achievementsOpen ? achievementsFocus : row;
+    next.row = modsOpen ? modsFocus : controlsOpen ? controlsFocus : achievementsOpen ? achievementsFocus
+             : debugOpen ? debugFocus : row;
     next.speakerLayout = speakerTest;
     next.speakerRear = int(edit.audioMatrixRear);
     next.language = edit.uiLanguage;
@@ -1359,6 +1475,37 @@ void Publish(uint8_t *base, uint32_t config)
         for (size_t i = 0; i < achievementItems.size(); ++i)
             next.rows[size_t(AchievementsFirstRow) + i] = AchievementRow(achievementItems[i], achievementIcons[i]);
     }
+#if LO_PLATFORM_SWITCH
+    else if (debugOpen)
+    {
+        next.pageTitle = Tr(L"Debug", L"除錯");
+        next.keyLegend = (flags & 0x02000000)
+            ? Tr(L"B / Left / Right: change     A: back", L"B / 左 / 右：變更     A：返回")
+            : Tr(L"A / Left / Right: change     B: back", L"A / 左 / 右：變更     B：返回");
+        next.rows.resize(size_t(DebugRowCount));
+        auto title = [&](const wchar_t *en, const wchar_t *zh) {
+            Row header{Tr(en, zh), {}, false, {}, 0};
+            header.header = true;
+            return header;
+        };
+        next.rows[DebugLiveTitle] = title(L"Applies at once", L"立即生效");
+        next.rows[DebugOverlayRow] = makeChoices(L"Performance overlay", L"效能資訊",
+            {Tr(L"Off", L"關"), L"FPS", Tr(L"Detailed", L"詳細")}, std::min(edit.performanceOverlay, 2u));
+        // The saved values; the help line says what runs now. Off the deko3d back end they do nothing.
+        const bool deko3d = debug_options::Deko3dActive();
+        auto deko3dRow = [&](int r, const wchar_t *en, const wchar_t *zh) {
+            next.rows[size_t(r)] = makeChoices(en, zh, onOff(), debug_options::Saved(DebugDeko3d(r)) ? 0 : 1, deko3d);
+        };
+        deko3dRow(DebugMergeBarriersRow, L"deko3d: merge barriers", L"deko3d：合併屏障");
+        deko3dRow(DebugLeanBarriersRow, L"deko3d: lean barriers", L"deko3d：精簡屏障");
+        next.rows[DebugNextStartTitle] = title(L"Applies at the next start", L"下次啟動時生效");
+        deko3dRow(DebugZcullRow, L"deko3d: Zcull", L"deko3d：Zcull");
+        deko3dRow(DebugDepthCompressionRow, L"deko3d: depth compression", L"deko3d：深度壓縮");
+        deko3dRow(DebugColorCompressionRow, L"deko3d: colour compression", L"deko3d：色彩壓縮");
+        deko3dRow(DebugVsOutputsRow, L"deko3d: vertex output trimming", L"deko3d：頂點輸出精簡");
+        next.rows[DebugServerRow] = makeChoices(L"Debug server", L"除錯伺服器", onOff(), GetConfig().debug.debugServer ? 0 : 1);
+    }
+#endif
     else if (controlsOpen)
     {
         next.pageTitle = Tr(L"Controls", L"按鍵設定");
@@ -1657,6 +1804,9 @@ void Publish(uint8_t *base, uint32_t config)
         addChoices(L"Discord status", L"Discord 狀態", onOff(), edit.discordStatus ? 0 : 1);
         next.rows.back().hidden = SystemRowHidden(SystemDiscordStatusRow);
         addChoices(L"Debug log", L"除錯日誌", onOff(), edit.debugLog ? 0 : 1);
+        addAction(L"Debug", L"除錯", Tr(L"Open", L"開啟"));
+        next.rows.back().pageEntry = true;
+        next.rows.back().hidden = SystemRowHidden(SystemDebugRow);
         if (achievementSummary.empty()) RefreshAchievementSummary();
         addAction(L"Achievements", L"成就", achievementSummary.c_str());
         next.rows.back().pageEntry = true;
@@ -1677,7 +1827,7 @@ void Publish(uint8_t *base, uint32_t config)
     // so returning to a long list restores its position.
     if (tab >= 0 && tab < MenuTabCount)
     {
-        static int scrollByTab[MenuTabCount] = {}, modsScroll = 0, controlsScroll = 0, achievementsScroll = 0;
+        static int scrollByTab[MenuTabCount] = {}, modsScroll = 0, controlsScroll = 0, achievementsScroll = 0, debugScroll = 0;
         int visibleCount = 0, visibleFocus = 0;
         for (size_t i = 0; i < next.rows.size(); ++i)
         {
@@ -1685,7 +1835,8 @@ void Publish(uint8_t *base, uint32_t config)
             if (int(i) <= next.row) visibleFocus = visibleCount;
             ++visibleCount;
         }
-        int &scroll = modsOpen ? modsScroll : controlsOpen ? controlsScroll : achievementsOpen ? achievementsScroll : scrollByTab[tab];
+        int &scroll = modsOpen ? modsScroll : controlsOpen ? controlsScroll : achievementsOpen ? achievementsScroll
+                    : debugOpen ? debugScroll : scrollByTab[tab];
         const int visibleRows = VisibleRowCount(tab, !next.pageTitle.empty());
         scroll = std::clamp(scroll, 0, std::max(0, visibleCount - visibleRows));
         if (visibleFocus < scroll) scroll = visibleFocus;
@@ -1713,6 +1864,11 @@ void Publish(uint8_t *base, uint32_t config)
     if (tab == 3 && row == SystemDebugLogRow)
         next.help = Tr(L"Writes detailed logs in logs/ to help diagnose problems. On by default. Applies when saved.",
                        L"在 logs/ 寫入詳細日誌，協助診斷問題。預設開啟，儲存後生效。");
+#if LO_PLATFORM_SWITCH
+    if (tab == 3 && row == SystemDebugRow)
+        next.help = Tr(L"A/B switches for benchmark runs. Each change is logged with its frame number.",
+                       L"效能測試用的 A/B 開關。每次變更都會連同影格編號寫入日誌。");
+#endif
     if (tab == 3 && row == SystemAchievementsRow)
         next.help = Tr(L"Your achievements, and whether a notification shows when you unlock one.",
                        L"查看你的成就，並設定解鎖時是否顯示通知。");
@@ -2019,6 +2175,13 @@ void Publish(uint8_t *base, uint32_t config)
     }
     else if (achievementsOpen)
         next.help = AchievementsHelp();
+#if LO_PLATFORM_SWITCH
+    else if (debugOpen)
+    {
+        pageHelp = DebugHelp();
+        next.help = pageHelp.first;
+    }
+#endif
     if (!status.empty()) next.help = status;
     if (restartPrompt)
     {
@@ -2132,7 +2295,7 @@ void Publish(uint8_t *base, uint32_t config)
         : tab == 2 ? (row == int(GraphicsRow::FrameGeneration) ||
         row == int(GraphicsRow::FrameGenerationMultiplier) ? FgNotice() : DlssNotice()) : std::wstring{};
 #endif
-    if (modsOpen || controlsOpen) next.notice = std::move(pageHelp.second);
+    if (modsOpen || controlsOpen || debugOpen) next.notice = std::move(pageHelp.second);
     std::lock_guard lock(snapshotMutex);
     // Presentation may have published availability while this snapshot was built.
     next.calibration.sceneAvailable = calibrationSceneAvailable.load(std::memory_order_relaxed);
@@ -2240,7 +2403,7 @@ bool CalibrationKey(uint32_t key)
     // Escape also leaves the Mods page; Enter stays Start there (jump to Save).
     // On the Controls page Enter confirms like A, so it starts a capture.
     const bool brightnessKey = ((brightnessOpen.load() || nrOpen.load() || controlsOpen.load()) && (key == 13 || key == 27)) ||
-                               ((modsOpen.load() || achievementsOpen.load()) && key == 27);
+                               ((modsOpen.load() || achievementsOpen.load() || debugOpen.load()) && key == 27);
     if (!brightnessKey && (!calibrationOpen.load() || !(key == 8 || key == 13 || key == 27 || (key >= '0' && key <= '9'))))
         return false;
     std::lock_guard lock(calibrationKeyMutex);
@@ -2637,6 +2800,7 @@ PPC_FUNC(sub_822F19B0)
         achievementItems.clear();
         achievementIcons.clear();
         RefreshAchievementSummary();
+        debugOpen = false;
         controlsOpen = false;
         controlsDiscardPrompt = false;
         EndCapture();
@@ -2682,6 +2846,7 @@ PPC_FUNC(sub_822F19B0)
     {
         if (modsOpen) modsFocus = selected;
         else if (achievementsOpen) achievementsFocus = selected;
+        else if (debugOpen) debugFocus = selected;
         else if (controlsOpen)
         {
             // A capture keeps its row; a section title is never focused.
@@ -2707,6 +2872,7 @@ PPC_FUNC(sub_822F19B0)
         nrOpen = false;
         modsOpen = false;
         achievementsOpen = false;
+        debugOpen = false;
         controlsOpen = false;
         controlsDiscardPrompt = false;
         EndCapture();
@@ -3388,6 +3554,29 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+#if LO_PLATFORM_SWITCH
+    if (debugOpen.load())
+    {
+        std::vector<uint32_t> keys;
+        {
+            std::lock_guard lock(calibrationKeyMutex);
+            keys.swap(calibrationKeys);
+        }
+        // B, Back (keyboard Backspace) and Escape leave the page.
+        const bool back = (input & 0x2020) != 0 || std::find(keys.begin(), keys.end(), 27u) != keys.end();
+        if (input & 0x331f) status.clear();
+        // The titles are never focused.
+        if (input & 1)
+            do { debugFocus = (debugFocus + DebugRowCount - 1) % DebugRowCount; } while (DebugTitle(debugFocus));
+        if (input & 2)
+            do { debugFocus = (debugFocus + 1) % DebugRowCount; } while (DebugTitle(debugFocus));
+        if (back) CloseDebugPage();
+        else if (!DebugTitle(debugFocus) && (input & 0x100c))
+            ChangeDebugOption((input & 4) ? -1 : 1);
+        Publish(base, config);
+        return;
+    }
+#endif
     if (controlsOpen.load())
     {
         std::vector<uint32_t> keys;
@@ -3998,6 +4187,11 @@ PPC_FUNC(sub_822F19B0)
         else
         {
             graphics = GetConfig();
+#if LO_PLATFORM_SWITCH
+            // The Debug page's overlay row, saved from here: logged the same way.
+            if (graphics.performanceOverlay != previousDisplay.performanceOverlay)
+                debug_options::LogPerformanceOverlay(graphics.performanceOverlay);
+#endif
             graphics.uiLanguage = edit.uiLanguage;
             graphics.gameLanguage = edit.gameLanguage;
             graphics.gameLanguagePack = edit.gameLanguagePack;
@@ -4052,6 +4246,14 @@ PPC_FUNC(sub_822F19B0)
         Publish(base, config);
         return;
     }
+#if LO_PLATFORM_SWITCH
+    if ((input & 0x1000) && !(input & 0x2000) && tab == 3 && row == SystemDebugRow)
+    {
+        OpenDebugPage();
+        Publish(base, config);
+        return;
+    }
+#endif
     if ((input & 0x1000) && !(input & 0x2000) && tab == 3 && row == SystemAchievementsRow)
     {
         OpenAchievementsPage();

@@ -92,6 +92,10 @@ namespace plume {
         g_deko3dOptions.vsOutputs = options.vsOutputs;
         g_deko3dOptions.colorCompression = options.colorCompression;
     }
+    void Deko3DSetBarrierOptions(bool mergeBarriers, bool leanBarriers) {
+        g_deko3dOptions.mergeBarriers = mergeBarriers;
+        g_deko3dOptions.leanBarriers = leanBarriers;
+    }
     Deko3DCounters Deko3DReadCounters() {
         const Deko3DStats &s = g_deko3dStats;
         const auto r = [](const std::atomic<uint64_t> &v) { return v.load(std::memory_order_relaxed); };

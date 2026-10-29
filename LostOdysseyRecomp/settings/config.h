@@ -80,6 +80,23 @@ inline constexpr uint32_t AudioOutputSurround = 1;
 inline constexpr uint32_t AudioOutputMatrix = 2;
 // DLSS 5 Neural Rendering runs at most this many passes after DLSS.
 inline constexpr uint32_t DlssNeuralRenderingMaxPasses = 4;
+// System → Debug on the Switch (debug/debug_options.h): A/B switches for benchmark runs, saved on their own
+// (SaveDebugOptions), never through another save. Read and written on the Switch only. The deko3d fields are
+// plume's Deko3DGpuOptions (plume_deko3d_api.h); env.txt's LO_DEKO3D_* win over them at start.
+struct DebugOptions
+{
+    // Applied between frames on the render thread.
+    bool deko3dMergeBarriers = false;
+    bool deko3dLeanBarriers = false;
+    // Read when the device and its render targets and pipelines are made: applied at the next start.
+    bool deko3dZcull = false;
+    bool deko3dDepthCompression = false;
+    bool deko3dColorCompression = true;
+    bool deko3dVsOutputs = false;
+    // The debug server of issue #10, at the next start (not in the build yet).
+    bool debugServer = false;
+    bool operator==(const DebugOptions &) const = default;
+};
 
 struct Config
 {
@@ -193,6 +210,7 @@ struct Config
     uint32_t fastForwardRate = 2;
     bool fastForwardKeepAudioPitch = true;
     uint32_t menuAnimationRate = 1; // Debug-only camp-menu transitions: 1 Normal, 2 Fast, 4 Faster.
+    DebugOptions debug;
     bool operator==(const Config &) const = default;
 };
 Config GetConfig();
@@ -205,6 +223,7 @@ bool SaveEncounterRate(EncounterRate rate);
 bool SaveBattleExpDouble(bool enabled);
 bool SaveFastForward(bool enabled, uint32_t mode, uint32_t rate, bool keepAudioPitch, uint32_t button);
 bool SaveMenuAnimationRate(uint32_t rate);
+bool SaveDebugOptions(const DebugOptions &options);
 // Cheap, thread-safe read for the camp-menu tween hook.
 uint32_t MenuAnimationRate();
 bool SaveAudioOutput(uint32_t output);

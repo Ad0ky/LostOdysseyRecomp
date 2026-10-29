@@ -96,6 +96,7 @@
 #include "render_timing.h"
 #if defined(LO_SWITCH_DEKO3D)
 #include <plume_deko3d_api.h>
+#include <debug/debug_options.h>
 #endif
 #include "gpu_busy.h"
 #include <debug/perf_stats.h>
@@ -15289,6 +15290,10 @@ void main()
             static const bool stats = getenv("LO_GPU_STATS") != nullptr;
             static auto lastFrame = std::chrono::steady_clock::now();
             if (!g_renderer->Flush()) return;
+#if defined(LO_SWITCH_DEKO3D)
+            // Debug page switches that change while the game runs: between frames, where no list is recorded.
+            if (video::IsDeko3d()) debug_options::ApplyPending();
+#endif
             g_renderer->PublishDlssFrameOutcome();
             g_renderer->CollectTextureReplacements();
             g_renderer->ReportReplacementCost();
