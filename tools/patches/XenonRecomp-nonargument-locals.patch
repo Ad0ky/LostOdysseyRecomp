@@ -1,0 +1,207 @@
+diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
+index 86309dc..c091a87 100644
+--- a/XenonRecomp/recompiler.cpp
++++ b/XenonRecomp/recompiler.cpp
+@@ -268,6 +268,9 @@ bool Recompiler::Recompile(
+     // TODO: we could cache these formats in an array
+     auto r = [&](size_t index)
+         {
++            // LostOdysseyRecomp: the save/restore helpers take r11 and r12 from their caller (see printFunctionCall).
++            if (inSaveRestoreHelper && (index == 11 || index == 12))
++                return fmt::format("ctx.r{}", index);
+             if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
+                 (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+             {
+@@ -369,6 +372,16 @@ bool Recompiler::Recompile(
+             return *(data + 1) == c_eieio;
+         };
+ 
++    // LostOdysseyRecomp: with non_argument_as_local, r0, r2, r11 and r12 still pass between functions in places
++    // (13,000 exception funclets start with "addi r31,r12,-N"; the save/restore helpers take r11/r12): a marker
++    // before every call becomes, once the function's locals are known, stores of those locals to ctx (see the end of
++    // Recompile(const Function&)), and the locals start from ctx.
++    auto printNonArgumentFlush = [&]()
++        {
++            if (config.nonArgumentRegistersAsLocalVariables && !inSaveRestoreHelper)
++                out += NonArgumentFlushMarker;
++        };
++
+     auto printFunctionCall = [&](uint32_t address)
+         {
+             if (address == config.longJmpAddress)
+@@ -394,6 +407,9 @@ bool Recompiler::Recompile(
+                     }
+                     else
+                     {
++                        // LostOdysseyRecomp: the callee may read r0, r2, r11 or r12 from its caller (the save/restore
++                        // helpers take their addresses in r11/r12, the exception funclets their frame in r12).
++                        printNonArgumentFlush();
+                         println("\t{}(ctx, base);", targetSymbol->name);
+                     }
+                 }
+@@ -638,6 +654,7 @@ bool Recompiler::Recompile(
+         }
+         else
+         {
++            printNonArgumentFlush();
+             println("\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
+             println("\treturn;");
+         }
+@@ -646,6 +663,7 @@ bool Recompiler::Recompile(
+     case PPC_INST_BCTRL:
+         if (!config.skipLr)
+             println("\tctx.lr = 0x{:X};", base + 4);
++        printNonArgumentFlush();
+         println("\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
+         csrState = CSRState::Unknown; // the call could change it
+         break;
+@@ -722,6 +740,7 @@ bool Recompiler::Recompile(
+         println("\t{}.u32 = uint32_t(ctx.lr) & ~3u;", temp());
+         if (!config.skipLr)
+             println("\tctx.lr = 0x{:X};", base + 4);
++        printNonArgumentFlush();
+         println("\tPPC_CALL_INDIRECT_FUNC({}.u32);", temp());
+         csrState = CSRState::Unknown; // the call could change it
+         break;
+@@ -740,6 +759,7 @@ bool Recompiler::Recompile(
+ 
+     case PPC_INST_BNECTR:
+         println("\tif (!{}.eq) {{", cr(insn.operands[0]));
++        printNonArgumentFlush();
+         println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
+         println("\t\treturn;");
+         println("\t}}");
+@@ -2622,6 +2642,7 @@ bool Recompiler::Recompile(const Function& fn)
+     {
+         name = fmt::format("sub_{}", fn.base);
+     }
++    inSaveRestoreHelper = name.rfind("__save", 0) == 0 || name.rfind("__rest", 0) == 0;
+ 
+ #ifdef XENON_RECOMP_USE_ALIAS
+     println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
+@@ -2707,11 +2728,24 @@ bool Recompiler::Recompile(const Function& fn)
+             println("\tPPCCRRegister cr{}{{}};", i);
+     }
+ 
++    std::string nonArgumentFlush;
+     for (size_t i = 0; i < 32; i++)
+     {
+-        if (localVariables.r[i])
++        if (!localVariables.r[i])
++            continue;
++        // LostOdysseyRecomp: non-argument registers start with the caller's value (a dead load when the function
++        // writes them first) and go back to ctx before every call (NonArgumentFlushMarker).
++        if (config.nonArgumentRegistersAsLocalVariables && !inSaveRestoreHelper && (i == 0 || i == 2 || i == 11 || i == 12))
++        {
++            println("\tPPCRegister r{} = ctx.r{};", i, i);
++            nonArgumentFlush += fmt::format("\tctx.r{}.u64 = r{}.u64;\n", i, i);
++        }
++        else
+             println("\tPPCRegister r{}{{}};", i);
+     }
++    for (size_t at = tempString.find(NonArgumentFlushMarker); at != std::string::npos;
++         at = tempString.find(NonArgumentFlushMarker, at + nonArgumentFlush.size()))
++        tempString.replace(at, NonArgumentFlushMarker.size(), nonArgumentFlush);
+ 
+     for (size_t i = 0; i < 32; i++)
+     {
+diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
+index 8242db5..6585e00 100644
+--- a/XenonRecomp/recompiler.h
++++ b/XenonRecomp/recompiler.h
+@@ -34,6 +34,12 @@ struct Recompiler
+     std::string out;
+     size_t cppFileIndex = 0;
+     RecompilerConfig config;
++    // LostOdysseyRecomp: the function being recompiled is one of the compiler's register save/restore helpers
++    // (__savegprlr_*, __restgprlr_*, __savefpr_*, __restfpr_*, __savevmx_*, __restvmx_*). They take their addresses
++    // in r11 and r12 from the caller, so with non_argument_as_local those two are read from ctx there.
++    bool inSaveRestoreHelper = false;
++    // LostOdysseyRecomp: placed before every call; replaced with stores of the non-argument locals to ctx.
++    static constexpr std::string_view NonArgumentFlushMarker = "\t/*@@non-argument flush@@*/\n";
+ 
+     bool LoadConfig(const std::string_view& configFilePath);
+ 
+diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
+index 4b0fa08..1451851 100644
+--- a/XenonUtils/ppc_context.h
++++ b/XenonUtils/ppc_context.h
+@@ -366,13 +366,11 @@ struct PPCFPSCRRegister
+ struct alignas(0x40) PPCContext
+ {
+     PPCRegister r3;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCRegister r0;
+-#endif
+     PPCRegister r1;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCRegister r2;
+-#endif
+     PPCRegister r4;
+     PPCRegister r5;
+     PPCRegister r6;
+@@ -380,10 +378,9 @@ struct alignas(0x40) PPCContext
+     PPCRegister r8;
+     PPCRegister r9;
+     PPCRegister r10;
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCRegister r11;
+     PPCRegister r12;
+-#endif
+     PPCRegister r13;
+ #ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCRegister r14;
+@@ -412,16 +409,14 @@ struct alignas(0x40) PPCContext
+ #ifndef PPC_CONFIG_CTR_AS_LOCAL
+     PPCRegister ctr;
+ #endif
+-#ifndef PPC_CONFIG_XER_AS_LOCAL
++    // LostOdysseyRecomp: kept with xer_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCXERRegister xer;
+-#endif
+-#ifndef PPC_CONFIG_RESERVED_AS_LOCAL
++    // LostOdysseyRecomp: kept with reserved_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCRegister reserved;
+-#endif
+ #ifndef PPC_CONFIG_SKIP_MSR
+     uint32_t msr = 0x200A000;
+ #endif
+-#ifndef PPC_CONFIG_CR_AS_LOCAL
++    // LostOdysseyRecomp: kept with cr_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCCRRegister cr0;
+     PPCCRRegister cr1;
+     PPCCRRegister cr2;
+@@ -430,12 +425,10 @@ struct alignas(0x40) PPCContext
+     PPCCRRegister cr5;
+     PPCCRRegister cr6;
+     PPCCRRegister cr7;
+-#endif
+     PPCFPSCRRegister fpscr;
+ 
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCRegister f0;
+-#endif
+     PPCRegister f1;
+     PPCRegister f2;
+     PPCRegister f3;
+@@ -504,7 +497,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v30;
+     PPCVRegister v31;
+ #endif
+-#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
+     PPCVRegister v32;
+     PPCVRegister v33;
+     PPCVRegister v34;
+@@ -537,7 +530,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v61;
+     PPCVRegister v62;
+     PPCVRegister v63;
+-#endif
+ #ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+     PPCVRegister v64;
+     PPCVRegister v65;

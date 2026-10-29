@@ -10,10 +10,10 @@ switch_table_file_path = "switch_tables.toml"
 skip_lr = false
 skip_msr = false
 ctr_as_local = false
-xer_as_local = false
-reserved_as_local = false
-cr_as_local = false
-non_argument_as_local = false
+xer_as_local = true
+reserved_as_local = true
+cr_as_local = true
+non_argument_as_local = true
 non_volatile_as_local = false
 
 # 编译器生成的寄存器保存/恢复函数，用 XenonAnalyse 或 Ghidra 搜索

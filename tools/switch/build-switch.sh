@@ -78,7 +78,7 @@ apply_chain() { # <dir> <patch>...
 }
 P="$root/tools/patches"
 log "Patches"
-apply_chain tools/XenonRecomp "$P/XenonRecomp-lostodyssey.patch" "$P/XenonRecomp-switch.patch"
+apply_chain tools/XenonRecomp "$P/XenonRecomp-lostodyssey.patch" "$P/XenonRecomp-switch.patch" "$P/XenonRecomp-nonargument-locals.patch"
 apply_chain thirdparty/plume "$P/plume-lostodyssey.patch" "$P/plume-sdl3.patch" "$P/plume-switch.patch" "$P/plume-switch-perf.patch"
 apply_chain thirdparty/plume/contrib/volk "$P/volk-switch.patch"
 apply_chain thirdparty/SDL-switch "$P/sdl-switch-no-egl.patch" "$P/sdl-switch-audio-priority.patch"
