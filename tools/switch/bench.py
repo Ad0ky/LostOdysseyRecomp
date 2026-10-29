@@ -409,6 +409,11 @@ def fetch_shot(con, session: list[str], target: Path, run: dict) -> None:
     if status != "ok":
         print(f"the console could not save the screenshot ({path})")
         return
+    # A relative path is the game's working directory's: config/ on the console (main.cpp), not the app folder.
+    if not path.startswith("/") and not path.startswith("sdmc:"):
+        path = f"config/{path}"
+    elif path.startswith("sdmc:/switch/LostOdysseyRecomp/"):
+        path = path[len("sdmc:/switch/LostOdysseyRecomp/"):]
     try:
         target.write_bytes(ppm_to_png(con.get_bytes(path)))
         con.command("rm", path)
