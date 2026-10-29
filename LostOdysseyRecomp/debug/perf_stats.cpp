@@ -267,6 +267,8 @@ struct Window
 };
 std::mutex g_windowMutex;
 Window g_window;
+std::mutex g_lastLineMutex;
+std::string g_lastLine; // the last perf: line, for the debug server's info
 
 void MonitorMain()
 {
@@ -316,12 +318,17 @@ void MonitorMain()
         console += ConsoleText();
 #endif
         const double perFrame = std::max(1.0, frames);
-        LOG_NOTICE("perf: fps={:.1f} frames={} {} target_fps={} loading={} hitches={} pace_ms={:.1f} present_ms={:.1f}"
+        std::string line = fmt::format("perf: fps={:.1f} frames={} {} target_fps={} loading={} hitches={} pace_ms={:.1f} present_ms={:.1f}"
             " cp_idle_ms={:.1f} {} draws={:.0f}{} scene={}{} map={}",
             frames / seconds, window.frames, times, window.targetFps, window.loadingFrames, window.hitches,
             Ms(window.sleepNs) / perFrame, Ms(window.presentNs) / perFrame,
             Ms(after.cpIdleNs - before.cpIdleNs) / perFrame, gpu, double(after.draws - before.draws) / perFrame,
             BackendWork(before, after, frames), SceneText(), console, MapText());
+        LOG_NOTICE("{}", line);
+        {
+            std::lock_guard lock(g_lastLineMutex);
+            g_lastLine = std::move(line);
+        }
         before = after;
     }
 }
@@ -597,6 +604,14 @@ void FrameDraws(uint32_t draws)
 void SceneSize(uint32_t width, uint32_t height)
 {
     g_sceneSize.store(uint64_t(width) << 32 | height, std::memory_order_relaxed);
+}
+
+std::string MapName() { return MapText(); }
+
+std::string LastPerfLine()
+{
+    std::lock_guard lock(g_lastLineMutex);
+    return g_lastLine;
 }
 
 uint64_t TotalDraws()

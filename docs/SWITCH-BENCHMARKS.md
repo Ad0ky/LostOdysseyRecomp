@@ -79,6 +79,42 @@ Start the game four times (one warm-up, three counted). Each run quits by
 itself after its result. The results, the raw log and a Markdown report go to
 `out/bench/<date>/`. Restore the normal `env.txt` when done.
 
+### With the debug server
+
+When the game runs its debug server (`LO_DEBUG_SERVER=1`, see
+[SWITCH.md](SWITCH.md), "Debug server"), one command does all of the above:
+
+```bash
+python3 tools/switch/bench.py env disc1-ship --debug-server <console IP> --runs 3
+```
+
+It keeps a copy of the console's `env.txt`, uploads the benchmark one (with
+`LO_DEBUG_SERVER=1`, the console's own `LO_DEBUG_RESTART`/`LO_DEBUG_PORT`, and
+without `LO_BENCH_EXIT`: the game stays up for the next restart) and the save
+slot (`--saves`), each checked by CRC32. Then, for each run (`--warmup`, default
+1, plus `--runs`), it restarts the game, reads the session's log from the server
+until `bench done`, and moves on. The raw log (`log.txt`), `results.json` and
+`report.md` go to `out/bench/<date>/` (`--results-out`). Last, it puts the
+console's `env.txt` back (or removes the benchmark one if there was none) and
+restarts the game once more without waiting for it; `--keep-env` leaves the
+benchmark `env.txt` in place. A Ctrl-C or a failed run still restores it.
+
+Through title takeover the server refuses `restart` (it would start the game
+that was taken over). `bench.py` then asks to close the game and start it again
+by hand for each run, and waits for the new session.
+The port defaults to 6543 (`--debug-server <IP>:<port>` for another one).
+
+Tested only against the host stand-in, `tools/switch/debug_server_host_test.cpp`
+(build line at its top; it listens on 127.0.0.1). With `LO_BENCH` in its
+folder's `env.txt` it logs made-up `bench result`/`bench env`/`bench done`
+lines once its scene "loads", and `takeover` after its other options makes it
+refuse `restart`:
+
+```bash
+out/debug_server_host_test out/fake-sd 6543 &
+python3 tools/switch/bench.py env disc1-ship --debug-server 127.0.0.1 --runs 3 --frames 120 --saves <a folder with user15/>
+```
+
 The same scenario at 60 FPS (`--fps 60`, `LO_FPS=60`) shows headroom that the
 30 FPS cap hides: at 30, a faster build only shows as more pacing sleep.
 Each scenario is measured at both.

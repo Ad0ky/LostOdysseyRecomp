@@ -18,6 +18,7 @@
 #include <cpu/guest_thread.h>
 #include <kernel/memory.h>
 #include <kernel/function.h>
+#include <os/debug_server.h>
 #include <os/logger.h>
 #include <os/thread_name.h>
 #include <os/host_scheduling.h>
@@ -1232,6 +1233,13 @@ namespace gpu
                         path = path.substr(0, dot) + fmt::format("_{}", swaps) + (dot == std::string::npos ? "" : path.substr(dot));
                     }
                     LOG_INFO("screenshot at swap {} -> {} ({})", swaps, path, video::SaveScreenshot(path.c_str()) ? "ok" : "failed");
+                }
+                // The debug server's "shot": the frame just presented, to the file it names.
+                if (const char* debugShot = nullptr; os::debug_server::TakeShotRequest(debugShot))
+                {
+                    const bool saved = video::SaveScreenshot(debugShot);
+                    LOG_INFO("debug server screenshot at swap {} -> {} ({})", swaps, debugShot, saved ? "ok" : "failed");
+                    os::debug_server::ShotDone(swaps, saved);
                 }
             }
             if (g_gpuStats)

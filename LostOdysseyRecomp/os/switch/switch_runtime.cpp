@@ -2,6 +2,7 @@
 // Parts follow UnleashedRecomp-NX (os/switch/runtime_switch.cpp, crash_switch.cpp).
 #include <os/platform.h>
 #if LO_PLATFORM_SWITCH
+#include <os/debug_server.h>
 #include <os/netlog.h>
 #include <os/switch_platform.h>
 #include <os/switch_cpu_profiler.h>
@@ -452,7 +453,9 @@ void Initialize(const std::filesystem::path& dataRoot)
         }
         std::fclose(env);
     }
-    os::netlog::Start(std::getenv("LO_NETLOG"));
+    // The network log (LO_NETLOG) and the debug server (LO_DEBUG_SERVER, settings.ini debug_server) share one
+    // socket service setup; both stay off, and cost nothing, unless turned on.
+    os::debug_server::StartNetwork(dataRoot.string().c_str());
 
     appletSetFocusHandlingMode(AppletFocusHandlingMode_NoSuspend);
     appletSetAutoSleepDisabled(true);

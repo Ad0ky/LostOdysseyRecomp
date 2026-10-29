@@ -11,6 +11,7 @@ extern std::atomic<uint32_t> g_presentedSwaps;
 #include <debug/menu_overlay.h>
 #include <debug/frame_timing.h>
 #include <debug/perf_stats.h>
+#include <os/debug_server.h>
 #include "test_input_pulse.h"
 #include "controller_prompts.h"
 #include "face_buttons.h"
@@ -606,50 +607,66 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
     uint64_t traceInputTick = 0;
     bool traceInputPending = false, traceInputActive = false;
     static const char* const testInputFile = getenv("LO_TEST_INPUT_FILE");
-    if (const char* path = testInputFile)
+    // The debug server's "input" sends the same lines over the network (tools/scenario.py --switch).
+    const bool remoteInput = os::debug_server::Running();
+    if (testInputFile || remoteInput)
     {
         static unsigned lastSerial = 0, pollsLeft = 0, buttons = 0, pollCount = 0;
         static TestInputPulse tickPulse;
         const uint64_t tick = inputTicks ? frame_timing::InputTick() : 0;
         static int leftX = 0, leftY = 0, leftTrigger = 0, rightTrigger = 0;
         static int rightX = 0, rightY = 0;
-        if (++pollCount % 12 == 0)
+        char line[160];
+        // A line from the server is new each time; the file's, once its serial changes.
+        bool fromServer = remoteInput && os::debug_server::TakeTestInput(line, sizeof(line));
+        bool haveLine = fromServer;
+        if (!haveLine && testInputFile && ++pollCount % 12 == 0)
         {
-            if (FILE* file = fopen(path, "r"))
+            if (FILE* file = fopen(testInputFile, "r"))
             {
-                unsigned serial = 0, mask = 0, duration = 0;
-                int x = 0, y = 0, lt = 0, rt = 0, rx = 0, ry = 0;
-                const int fields = fscanf(file, "%u %x %d %d %u %d %d %d %d",
-                    &serial, &mask, &x, &y, &duration, &lt, &rt, &rx, &ry);
-                const bool valid = fields == 5 || fields == 7 || fields == 9;
+                haveLine = fgets(line, sizeof(line), file) != nullptr;
                 fclose(file);
-                if (valid && serial != lastSerial)
-                {
-                    lastSerial = serial;
-                    buttons = mask & 0xffff;
-                    leftX = std::clamp(x, -32768, 32767);
-                    leftY = std::clamp(y, -32768, 32767);
-                    leftTrigger = std::clamp(lt, 0, 255);
-                    rightTrigger = std::clamp(rt, 0, 255);
-                    rightX = std::clamp(rx, -32768, 32767);
-                    rightY = std::clamp(ry, -32768, 32767);
-                    pollsLeft = std::min(duration, 6000u);
-                    if (inputTicks) tickPulse.Set(tick, pollsLeft);
-                    LOG_INFO("background test input: serial={} buttons={:#x} stick={},{} polls={} triggers={},{} right_stick={},{}",
-                        serial, buttons, leftX, leftY, pollsLeft, leftTrigger, rightTrigger, rightX, rightY);
-                    if (inputTicks)
-                        LOG_INFO("test input accepted: serial={} controller=0 tick={} start={} ticks={} mode=engine_tick",
-                            serial, tick, tickPulse.start, tickPulse.duration);
-                }
             }
         }
-        // Test trigger state releases at the pulse boundary, including a
-        // zero-duration command; never leave the prior RT value latched.
-        gp.bLeftTrigger = 0;
-        gp.bRightTrigger = 0;
-        gp.sThumbRX = 0;
-        gp.sThumbRY = 0;
+        if (haveLine)
+        {
+            unsigned serial = 0, mask = 0, duration = 0;
+            int x = 0, y = 0, lt = 0, rt = 0, rx = 0, ry = 0;
+            const int fields = sscanf(line, "%u %x %d %d %u %d %d %d %d",
+                &serial, &mask, &x, &y, &duration, &lt, &rt, &rx, &ry);
+            const bool valid = fields == 5 || fields == 7 || fields == 9;
+            if (valid && (fromServer || serial != lastSerial))
+            {
+                lastSerial = serial;
+                buttons = mask & 0xffff;
+                leftX = std::clamp(x, -32768, 32767);
+                leftY = std::clamp(y, -32768, 32767);
+                leftTrigger = std::clamp(lt, 0, 255);
+                rightTrigger = std::clamp(rt, 0, 255);
+                rightX = std::clamp(rx, -32768, 32767);
+                rightY = std::clamp(ry, -32768, 32767);
+                pollsLeft = std::min(duration, 6000u);
+                if (inputTicks) tickPulse.Set(tick, pollsLeft);
+                LOG_INFO("{} test input: serial={} buttons={:#x} stick={},{} polls={} triggers={},{} right_stick={},{}",
+                    fromServer ? "debug server" : "background", serial, buttons, leftX, leftY, pollsLeft, leftTrigger,
+                    rightTrigger, rightX, rightY);
+                if (inputTicks)
+                    LOG_INFO("test input accepted: serial={} controller=0 tick={} start={} ticks={} mode=engine_tick",
+                        serial, tick, tickPulse.start, tickPulse.duration);
+            }
+        }
         const bool active = inputTicks ? tickPulse.Active(tick) : pollsLeft != 0;
+        // Test trigger state releases at the pulse boundary, including a
+        // zero-duration command; never leave the prior RT value latched. With
+        // the file the test owns the triggers and right stick; with the server
+        // alone only while a pulse runs (the controller stays usable).
+        if (testInputFile || active)
+        {
+            gp.bLeftTrigger = 0;
+            gp.bRightTrigger = 0;
+            gp.sThumbRX = 0;
+            gp.sThumbRY = 0;
+        }
         if (active)
         {
             if (!inputTicks) --pollsLeft;
@@ -666,6 +683,17 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
         traceInputTick = tick;
         traceInputPending = inputTicks && tickPulse.Pending(tick);
         traceInputActive = active;
+    }
+
+    // The debug server's "press", "hold" and "stick", as from the controller.
+    if (os::debug_server::Held held; os::debug_server::HeldInput(held))
+    {
+        gp.wButtons |= held.buttons;
+        defaultButtons |= held.buttons;
+        gp.bLeftTrigger = std::max(gp.bLeftTrigger, held.leftTrigger);
+        gp.bRightTrigger = std::max(gp.bRightTrigger, held.rightTrigger);
+        if (held.stick[0]) { gp.sThumbLX = held.x[0]; gp.sThumbLY = held.y[0]; }
+        if (held.stick[1]) { gp.sThumbRX = held.x[1]; gp.sThumbRY = held.y[1]; }
     }
 
     // Chord detection & host overlay input:
