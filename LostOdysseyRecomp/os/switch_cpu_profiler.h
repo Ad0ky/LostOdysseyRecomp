@@ -40,6 +40,19 @@ namespace os::switch_cpu_profiler
     };
     size_t CopyThreads(ThreadInfo* out, size_t capacity);
 
+    // Every registered thread's CPU time so far (kernel ticks) and the system tick it was read at, for callers that
+    // keep their own windows (debug/perf_stats.cpp). Leaves AppendThreadCpuUsage's window alone. wait=false gives up
+    // (returns 0) while the sampler holds the thread list.
+    struct ThreadTime
+    {
+        uint32_t handle;
+        uint64_t ticks;
+        char name[48];
+    };
+    size_t SampleThreadTicks(ThreadTime* out, size_t capacity, uint64_t& systemTick, bool wait);
+    // System ticks per second (the kernel's thread tick counts use the same clock).
+    uint64_t TickFrequency();
+
     // The calling thread's registered name, for a crash report: false (and `out` untouched) when it has none or the
     // thread list is locked at the moment (the crash handler cannot wait for it).
     bool TryGetCurrentThreadName(char* out, size_t size);

@@ -10,6 +10,7 @@ extern std::atomic<uint32_t> g_presentedSwaps;
 #include <settings/menu.h>
 #include <debug/menu_overlay.h>
 #include <debug/frame_timing.h>
+#include <debug/perf_stats.h>
 #include "test_input_pulse.h"
 #include "controller_prompts.h"
 #include "face_buttons.h"
@@ -473,6 +474,8 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
     //   LO_AUTO_BUTTONS=a@1250,s@1500   swap-stamped form: each entry pulses its
     //                                   button for 20 polls starting at that swap
     //                                   (LO_AUTO_START not needed).
+    //   LO_AUTO_BUTTONS=s@10s,a@30.5s   the same at seconds since launch (a
+    //                                   scenario's timeline); both forms mix.
     {
         static const uint32_t autoStartSwap = getenv("LO_AUTO_START") ? strtoul(getenv("LO_AUTO_START"), nullptr, 10) : 0;
         static const char* seq = getenv("LO_AUTO_BUTTONS") ? getenv("LO_AUTO_BUTTONS") : "s";
@@ -487,7 +490,7 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
         if (stamped)
         {
             // Parse once: "<letter>@<swap>" entries separated by commas.
-            struct Entry { char button; uint32_t swap; };
+            struct Entry { char button; double at; bool seconds; };
             static std::vector<Entry> entries = [] {
                 std::vector<Entry> v;
                 for (const char* p = seq; *p;)
@@ -495,20 +498,30 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
                     while (*p == ',' || *p == ' ') p++;
                     if (!*p) break;
                     char b = *p++;
-                    uint32_t at = 0;
-                    if (*p == '@') at = strtoul(p + 1, const_cast<char**>(&p), 10);
-                    v.push_back({ b, at });
+                    double at = 0;
+                    bool seconds = false;
+                    if (*p == '@')
+                    {
+                        at = strtod(p + 1, const_cast<char**>(&p));
+                        seconds = *p == 's';
+                    }
+                    v.push_back({ b, at, seconds });
                     while (*p && *p != ',') p++;
                 }
                 return v;
             }();
             static size_t index = 0;
             static uint32_t polls = 0;
-            if (index < entries.size() && swaps >= entries[index].swap)
+            const auto due = [&](const Entry& entry) {
+                return entry.seconds ? os::logger::ElapsedSeconds() >= entry.at : double(swaps) >= entry.at;
+            };
+            if (index < entries.size() && due(entries[index]))
             {
                 if (polls == 0)
                 {
-                    LOG_INFO("auto input: '{}' at swap {} ({} polls since the previous press)", entries[index].button, swaps, totalPolls - pollsAtLastPress);
+                    // Notice: a console run reads these to retune its stamps (tools/switch/bench.py).
+                    LOG_NOTICE("auto input: '{}' at swap {}, {:.1f} s ({} polls since the previous press)", entries[index].button, swaps,
+                        os::logger::ElapsedSeconds(), totalPolls - pollsAtLastPress);
                     pollsAtLastPress = totalPolls;
                 }
                 pressed = entries[index].button;
@@ -566,6 +579,13 @@ uint32_t hid::GetState(uint32_t dwUserIndex, XAMINPUT_STATE* pState)
         {
             gp.sThumbLX = int16_t(std::clamp(replay.x, -32768, 32767));
             gp.sThumbLY = int16_t(std::clamp(replay.y, -32768, 32767));
+        }
+        // A benchmark run's stick (LO_BENCH_STICK), from its scene until its measurement ends.
+        int16_t benchX = 0, benchY = 0;
+        if (perf_stats::BenchStick(benchX, benchY))
+        {
+            gp.sThumbLX = benchX;
+            gp.sThumbLY = benchY;
         }
     }
 

@@ -7,6 +7,7 @@
 #include "gpu/video.h"
 #include "gpu/dynamic_resolution.h"
 #include "gpu/gpu_busy.h"
+#include <debug/perf_stats.h>
 #include <chrono>
 #include <cstdlib>
 #include <string_view>
@@ -181,6 +182,7 @@ namespace gpu::frame_plan
             config.upscaler, config.dlssQuality, output, device, sizing ? &*sizing : nullptr,
             readback, dlssInputProbe,
             config.fsrQuality});
+        perf_stats::SceneSize(cpuPlan.width, cpuPlan.height);
         const auto identity = StatusIdentityOf(cpuPlan);
         const bool planChanged = identity != loggedStatusPlan;
         loggedStatusPlan = identity;

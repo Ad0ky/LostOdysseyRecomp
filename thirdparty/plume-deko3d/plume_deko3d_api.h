@@ -44,6 +44,8 @@ namespace plume {
         uint64_t draws = 0, pipelineBinds = 0, stateBinds = 0, descriptorWrites = 0;
         uint64_t barriersPrimitives = 0, barriersFragments = 0, barriersFull = 0, barriersImageInvalidate = 0;
         uint64_t copyBuffer = 0, copyUpload = 0, copyReadback = 0, copyImage = 0, copyResolve = 0, copyBlit = 0;
+        // Shader work on the console, on any thread: uam compiles and SPIR-V translations, and their time.
+        uint64_t shaderCompiles = 0, shaderCompileNs = 0, translations = 0, translateNs = 0;
     };
     Deko3DCounters Deko3DReadCounters();
 }

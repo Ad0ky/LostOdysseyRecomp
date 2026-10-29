@@ -492,6 +492,13 @@ int main(int argc, char* argv[])
         {
             if (!logOverride)
             {
+#if LO_PLATFORM_SWITCH
+                // The previous session's stderr, crash, hang and exit reports go next to its runtime log, so the
+                // app folder holds this session's and logs/ keeps them paired with the session they belong to.
+                const std::filesystem::path dataRoot(LO_SWITCH_DATA_ROOT);
+                os::logger::ArchiveSessionFiles(logPath, {{dataRoot / "stderr.previous.log", "stderr"},
+                    {dataRoot / "crash.log", "crash"}, {dataRoot / "hang.log", "hang"}, {dataRoot / "exit.log", "exit"}});
+#endif
                 os::logger::PruneDefaultLogs(logPath);
                 sessionLog = logPath;
             }

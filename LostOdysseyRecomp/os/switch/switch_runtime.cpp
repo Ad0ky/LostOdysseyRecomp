@@ -581,6 +581,38 @@ std::string MemorySummary()
     return text;
 }
 
+void HeapUsage(uint64_t& used, uint64_t& limit)
+{
+    const struct mallinfo heap = mallinfo();
+    used = uint64_t(heap.uordblks);
+    limit = uint64_t(fake_heap_end - fake_heap_start);
+}
+
+bool ReadClockRates(uint32_t& cpuHz, uint32_t& gpuHz, uint32_t& memoryHz)
+{
+    cpuHz = gpuHz = memoryHz = 0;
+    if (R_FAILED(clkrstInitialize()))
+        return false;
+    bool ok = true;
+    const auto read = [&ok](PcvModuleId module, uint32_t& hz) {
+        ClkrstSession session{};
+        u32 rate = 0;
+        if (R_SUCCEEDED(clkrstOpenSession(&session, module, 3)))
+        {
+            ok &= R_SUCCEEDED(clkrstGetClockRate(&session, &rate));
+            clkrstCloseSession(&session);
+        }
+        else
+            ok = false;
+        hz = rate;
+    };
+    read(PcvModuleId_CpuBus, cpuHz);
+    read(PcvModuleId_GPU, gpuHz);
+    read(PcvModuleId_EMC, memoryHz);
+    clkrstExit();
+    return ok;
+}
+
 uint32_t CurrentThreadHandle()
 {
     return threadGetCurHandle();

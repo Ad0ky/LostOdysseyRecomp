@@ -14,6 +14,7 @@
 #include "render_timing.h"
 #include "shader_identity.h"
 #include <debug/frame_timing.h>
+#include <debug/perf_stats.h>
 #include <cpu/guest_thread.h>
 #include <kernel/memory.h>
 #include <kernel/function.h>
@@ -720,7 +721,9 @@ namespace gpu
             if (writePtr == 0xBAADF00D || m_readPtrIndex == writePtr || m_primaryBufferSize == 0)
             {
                 g_workerStage.store("idle/event pump", std::memory_order_relaxed);
-                if (timingEnabled && !timingIdle)
+                // Measured always: the perf line's cp_idle (debug/perf_stats.h) is time the game left the GPU
+                // thread without work, which tells a game-thread-bound scene from a render-thread-bound one.
+                if (!timingIdle)
                 {
                     idleStart = std::chrono::steady_clock::now();
                     timingIdle = true;
@@ -753,8 +756,10 @@ namespace gpu
             }
             if (timingIdle)
             {
-                frame_timing::CpIdle(std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - idleStart).count());
+                const auto idle = std::chrono::steady_clock::now() - idleStart;
+                if (timingEnabled)
+                    frame_timing::CpIdle(std::chrono::duration<double, std::milli>(idle).count());
+                perf_stats::CpIdle(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(idle).count()));
                 timingIdle = false;
             }
 
@@ -1119,6 +1124,7 @@ namespace gpu
                 : video::GetFramePacingTarget(GetFrameRateTarget());
             const bool timingEnabled = frame_timing::Enabled();
             frame_timing::PacingSample pacing;
+            uint64_t pacingSleepNs = 0;
             {
                 static FramePacer pacer;
                 static OutputFramePacer outputPacer;
@@ -1129,11 +1135,12 @@ namespace gpu
                     : video::GetDynamicFgOutputPacing(GetFrameRateTarget());
                 const auto outputDeadline = outputPacer.Schedule(timingPace, output.outputFps, output.actualPresents);
                 const auto deadline = std::max(nativeDeadline, outputDeadline);
-                const auto sleepStart = timingEnabled ? std::chrono::steady_clock::now() : timingPace;
+                const auto sleepStart = std::chrono::steady_clock::now();
                 pacingWait.Until(deadline);
+                const auto wake = std::chrono::steady_clock::now();
+                pacingSleepNs = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(wake - sleepStart).count());
                 if (timingEnabled)
                 {
-                    const auto wake = std::chrono::steady_clock::now();
                     pacing.requestedMs = std::max(0.0, std::chrono::duration<double, std::milli>(deadline - sleepStart).count());
                     pacing.actualMs = std::chrono::duration<double, std::milli>(wake - sleepStart).count();
                     // A past deadline requests no sleep; its call overhead must
@@ -1165,6 +1172,9 @@ namespace gpu
             g_workerStage.store("window event pump", std::memory_order_relaxed);
             video::PumpEvents();
             g_completedSwaps = swaps;
+            perf_stats::Present({swaps, fpsCap, pacingSleepNs,
+                uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - timingPresent).count()),
+                loadBoost || loading::Active()});
             static double previousSwapLogMs = 0, previousSwapPostMs = 0;
             if (timingEnabled)
             {
@@ -1210,8 +1220,9 @@ namespace gpu
                         LOG_INFO("screenshot request {}: {} frames starting at swap {}", serial, requestedShots, swaps);
                     }
                 }
-                const bool requestedShot = requestedShots != 0;
-                if (requestedShot) --requestedShots;
+                // A benchmark run's screenshot (LO_BENCH_SHOT), named like a requested one.
+                const bool requestedShot = requestedShots != 0 || perf_stats::TakeBenchScreenshot();
+                if (requestedShots) --requestedShots;
                 if (requestedShot || (shotSwap && swaps >= shotSwap && swaps < shotSwap + shotCount) || (shotEvery && (swaps % shotEvery) == 0))
                 {
                     std::string path = getenv("LO_SCREENSHOT_PATH") ? getenv("LO_SCREENSHOT_PATH") : "screenshot.ppm";

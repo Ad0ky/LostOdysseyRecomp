@@ -7,7 +7,9 @@
 // the Steam Deck's MangoHud bar. FPS: a corner block with the frame rate and
 // frame time. Detailed: a strip across the top with the upscaler and its
 // resolution, the backend with FPS, frame time and a frame-time graph, frame
-// generation's presented FPS, and the process CPU and GPU load. Values are
+// generation's presented FPS, and the process CPU and GPU load (on the Switch:
+// the game's main thread and the render thread, each as a share of one core,
+// draws per frame and the GPU clock). Values are
 // averaged over about half a second and the image is redrawn only then.
 // Presentation thread only.
 namespace ui::performance_overlay {

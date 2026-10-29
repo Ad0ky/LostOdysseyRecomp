@@ -102,6 +102,8 @@ namespace plume {
         c.barriersFull = r(s.barriersFull); c.barriersImageInvalidate = r(s.barriersImageInvalidate);
         c.copyBuffer = r(s.copyBuffer); c.copyUpload = r(s.copyUpload); c.copyReadback = r(s.copyReadback);
         c.copyImage = r(s.copyImage); c.copyResolve = r(s.copyResolve); c.copyBlit = r(s.copyBlit);
+        c.shaderCompiles = r(s.shaderCompiles); c.shaderCompileNs = r(s.shaderCompileNs);
+        c.translations = r(s.translations); c.translateNs = r(s.shaderTranslateNs);
         return c;
     }
 

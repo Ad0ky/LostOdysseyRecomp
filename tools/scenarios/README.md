@@ -70,6 +70,11 @@ game_time_ratio = [0.95, 1.05]  # game seconds per real second (needs
 max_errors = 0       # [error] log lines allowed
 ```
 
+On the Switch, `tools/switch/bench.py` runs the same files as benchmarks (see
+[docs/SWITCH-BENCHMARKS.md](../../docs/SWITCH-BENCHMARKS.md)). A `[switch]` table
+overrides what differs on the console: `buttons` (frame stamps, or seconds as `a@30s`),
+`start_draws`, `start_swap`, `stick`, `settle`, `frames` and `timeout`.
+
 A run fails on a crash report, an early exit, a guest bug check, a disc failure, a
 shader compile failure, error lines above `max_errors`, unfinished steps, or a missed
 draw/FPS target.

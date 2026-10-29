@@ -860,6 +860,32 @@ size_t os::switch_cpu_profiler::CopyThreads(ThreadInfo* out, size_t capacity)
     return count;
 }
 
+size_t os::switch_cpu_profiler::SampleThreadTicks(ThreadTime* out, size_t capacity, uint64_t& systemTick, bool wait)
+{
+    if (wait)
+        mutexLock(&g_slotsMutex);
+    else if (!mutexTryLock(&g_slotsMutex))
+        return 0;
+    size_t count = 0;
+    systemTick = armGetSystemTick();
+    for (const ThreadSlot& thread : g_slots)
+    {
+        if (!thread.active || count == capacity)
+            continue;
+        out[count].handle = thread.handle;
+        out[count].ticks = ThreadTicks(thread.handle);
+        memcpy(out[count].name, thread.name, sizeof(out[count].name));
+        count++;
+    }
+    mutexUnlock(&g_slotsMutex);
+    return count;
+}
+
+uint64_t os::switch_cpu_profiler::TickFrequency()
+{
+    return armGetSystemTickFreq();
+}
+
 bool os::switch_cpu_profiler::TryGetCurrentThreadName(char* out, size_t size)
 {
     if (size == 0 || !mutexTryLock(&g_slotsMutex))

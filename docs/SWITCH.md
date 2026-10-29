@@ -161,12 +161,19 @@ a machine without devkitPro. See the comment at the top of that file.
 
 In `sdmc:/switch/LostOdysseyRecomp/`:
 
-- `state/logs/runtime-*.log`: the runtime log.
-- `stderr.log`: renderer, Mesa and NVK diagnostics (`stderr.previous.log` is
-  the run before).
+- `state/logs/runtime-*.log`: the runtime log, one per session. The newest 10
+  sessions are kept.
+- `stderr.log`: renderer, Mesa and NVK diagnostics of the current (or last)
+  session.
 - `crash.log`: written on a CPU exception, with registers and a host
   backtrace. Addresses marked `elf+0x…` resolve with
   `aarch64-none-elf-addr2line -e LostOdysseyRecomp.elf 0x…`.
+- `hang.log`: every thread's position when frames stopped (CPU profile on, below).
+
+At the next start, the previous session's `stderr`, `crash`, `hang` and `exit`
+files move to `state/logs/` as `stderr-<n>.log`, `crash-<n>.log`, … with the
+number of that session's `runtime-<n>.log`, and are kept and removed with it.
+The files in the app folder are always the last session's.
 
 ### Diagnostics switches (env.txt)
 
@@ -200,6 +207,12 @@ Switch-specific options and diagnostics:
 | `LO_IO_PROFILE` | off | Set to `1` to log periodic game-file read statistics |
 | `LO_LOAD_PROFILE` | off | Set to `1` to log thread dumps during long scene or battle loads |
 | `LO_WAIT_PROFILE` | off | Set to `1` to log guest waits of at least 1 ms every 10 seconds |
+| `LO_PERF_INTERVAL` | `10` | Seconds between `perf:` lines (below); `0` turns off the `perf:` and `hitch:` lines |
+| `LO_PERF_GPU` | `1` | `0`: no GPU timestamps for the `perf:` line (its GPU figures then read `-` unless the Detailed overlay or dynamic resolution measures them) |
+| `LO_PERF_HITCH_MS` | 2× target | A `hitch:` line for every frame longer than this (ms), outside loading screens |
+| `LO_PERF_HITCHES` | `300` | `hitch:` lines per session |
+| `LO_BENCH` and `LO_BENCH_*` | off | A benchmark run: see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md) (`tools/switch/bench.py` writes these) |
+| `LO_AUTO_BUTTONS` | off | Scripted presses: `a@900` at a presented frame, `a@30s` at seconds since launch (letters: `s a b x y`, `u d l r` d-pad, `k` back, `L R` shoulders) |
 
 The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
 written at least once a second; warnings and errors are written at once.
@@ -214,6 +227,51 @@ megabyte. On a PC in the same network:
     python tools/switch/netlog.py <console IP> --out netlog.txt
 
 It reconnects by itself, so it can be started before the game.
+
+### Performance log
+
+Every session logs a `perf:` line every 10 seconds and a `hitch:` line for each
+long frame, with no `env.txt` needed. They use counters the renderer keeps
+anyway and are written by a thread of their own, so they cost the game nothing
+measurable.
+
+```
+perf: fps=27.4 frames=274 ms_p50=33.4 ms_p95=41.0 ms_p99=58.0 ms_max=66.1 target_fps=30 loading=0 hitches=0
+      pace_ms=0.4 present_ms=0.9 cp_idle_ms=1.2 gpu_ms=31.2 gpu_pct=85 draws=2900 gpu_draws=2480
+      pipeline_binds=310.0 state_binds=220.0 descriptor_writes=950.0 barriers_full=14.0 barriers_other=41.0
+      uploads=0.40 copies=7.0 compiles=0 compile_ms=0.0 translations=0 translate_ms=0.0 scene=960x540
+      cpu_total_pct=190 threads=Guest_Main:93.0,GPU_CmdProc:78.0,... mode=handheld cpu_mhz=1020 gpu_mhz=461
+      mem_mhz=1331 heap_mib=1210/3290 map=...
+```
+
+(one line in the log). Frame times are the time between presented frames;
+`ms_*` leave loading-screen frames out (`loading` counts them). Per frame:
+`pace_ms` is the frame limiter's sleep, `present_ms` the present,
+`cp_idle_ms` the time the render thread had nothing to do because the game had
+not sent the next commands yet, `gpu_ms` the GPU's busy time. `threads` are the
+busiest threads as a share of one core (100 = never waits). Reading it:
+
+- `pace_ms` well above 0: the frame was done early; the scene holds its target.
+- `gpu_pct` near 100 with the render thread below about 90%: GPU-bound. Fewer
+  barriers, binds and pixels help.
+- `GPU_CmdProc` near 100 with `cp_idle_ms` near 0: the render thread is the
+  limit (command translation and recording).
+- `cp_idle_ms` large and `Guest_Main` (or another guest thread) near 100: the
+  game's own code is the limit.
+
+`hitch:` lines give a long frame's time and what happened during it: GPU time,
+`compiles` and `compile_ms` (shaders compiled on the console; about 0.1 s
+each), `translations`, `uploads` (texture uploads) and idle and present time:
+
+```
+hitch: swap=4123 frame_ms=148.2 target_ms=33.3 gpu_ms=34.0 cp_idle_ms=0.3 pace_ms=0.0 present_ms=1.1 draws=2900
+       ... compiles=1 compile_ms=104.2 translations=1 translate_ms=3.0 ... (12 of 300)
+```
+
+The Detailed performance overlay (Settings → Graphics → Performance overlay)
+shows the same split live: `MAIN` and `RENDER` are the game's main thread and
+the render thread as a share of one core, then GPU load and clock, and draws per
+frame.
 
 ### CPU profile
 

@@ -98,6 +98,7 @@
 #include <plume_deko3d_api.h>
 #endif
 #include "gpu_busy.h"
+#include <debug/perf_stats.h>
 #include "render_batch_policy.h"
 #include "render_arena_policy.h"
 #include "resolve_copy_policy.h"
@@ -13866,6 +13867,7 @@ void main()
                     ExportFgUiCapture(fgUiCapture);
                 OcclusionFrameEnd();
                 if (record_timing::Enabled()) recordTiming.EndFrame(frame);
+                perf_stats::FrameDraws(drawsThisFrame);
                 ++frame; drawsThisFrame = 0; drops = {};
             }
             frame_generation::ResolveIdentity FgIdentity(const ResolvedSurface& rs) const

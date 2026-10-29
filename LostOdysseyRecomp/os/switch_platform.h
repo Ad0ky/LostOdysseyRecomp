@@ -30,6 +30,12 @@ namespace os::switch_platform
 
     // Process memory and thread usage, for failure logs ("used/total MiB ...").
     std::string MemorySummary();
+    // Bytes of newlib's heap in use and the most it can grow to (MemorySummary's "heap in use").
+    void HeapUsage(uint64_t& used, uint64_t& limit);
+
+    // The CPU, GPU and memory clocks right now, in Hz (clkrst). A few IPC calls each time: not for every frame.
+    // False (the ones not read left at 0) when clkrst is not available.
+    bool ReadClockRates(uint32_t& cpuHz, uint32_t& gpuHz, uint32_t& memoryHz);
 
     // Handheld only: asks apm for GPU 460.8 MHz with the memory clock kept at
     // 1331.2 MHz (configuration 0x92220008, what commercial games use; from
