@@ -7,6 +7,7 @@
 #endif
 #include <debug/fast_forward.h>
 #include <atomic>
+#include <gpu/dynamic_resolution.h>
 #include <gpu/frame_rate.h>
 #include <gpu/loading_pacing.h>
 #include <filesystem>
@@ -152,11 +153,13 @@ Config Validate(Config value)
     // gains about a third in battle) and at the Xbox 360's 720p when docked,
     // where the GPU clocks higher; the final pass scales to the 720p output.
     // main.cpp re-applies this when the console is docked or undocked.
-    // LO_SWITCH_RENDER_HEIGHT=540 or 720 (env.txt) forces one of them.
+    // LO_SWITCH_RENDER_HEIGHT=540 or 720 (env.txt) forces one of them; any other
+    // height dynamic resolution renders at (360 to 1071 rows, a multiple of 9: 360,
+    // 450, 504, ...) forces that, for measuring how a scene's cost follows its pixels.
     {
         const char* height = std::getenv("LO_SWITCH_RENDER_HEIGHT");
-        if (height && std::strcmp(height, "540") == 0) value.internalResolution = 540;
-        else if (height && std::strcmp(height, "720") == 0) value.internalResolution = 720;
+        const uint32_t rows = height && *height ? uint32_t(std::strtoul(height, nullptr, 10)) : 0;
+        if (rows == 540 || rows == 720 || gpu::dynamic_resolution::IsDynamicHeight(rows)) value.internalResolution = int(rows);
         else value.internalResolution = os::switch_platform::IsDocked() ? 720 : 540;
     }
     value.shadowResolution = 1;

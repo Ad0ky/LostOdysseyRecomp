@@ -161,6 +161,11 @@ def env_lines(settings: dict, args) -> list[str]:
         lines.append("LO_BENCH_EXIT=1")
     if args.fps:
         lines.append(f"LO_FPS={args.fps}")
+    for setting in args.set:
+        # An A/B switch for this run (bench.py compare warns when two results' LO_* settings differ).
+        if "=" not in setting:
+            sys.exit(f"bench: --set {setting}: KEY=VALUE expected")
+        lines.append(setting)
     if settings["save"]:
         # The run's own save folder: the player's slots are never read or written.
         lines.append(f"LO_SAVE_DIR={DATA_ROOT}/bench/save")
@@ -741,6 +746,8 @@ def main() -> None:
     p.add_argument("--frames", type=int, help="frames measured (default: the scenario's hold time at the target)")
     p.add_argument("--fps", type=int, help="frame rate target (LO_FPS); 60 measures headroom a 30 FPS cap hides")
     p.add_argument("--manual", action="store_true", help="no scripted presses: load the save by hand, the run starts at the scene")
+    p.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                   help="an extra env.txt setting for this run, over the base's (repeatable): an A/B switch")
     p.add_argument("--no-shot", action="store_true", help="no screenshot after the measurement")
     p.add_argument("--no-exit", action="store_true", help="keep the game running after the result")
     p.add_argument("--netlog-port", type=int, default=NETLOG_PORT)
