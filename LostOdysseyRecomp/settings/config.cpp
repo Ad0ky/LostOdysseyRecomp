@@ -366,6 +366,22 @@ Config Read()
             value.fastForwardKeepAudioPitch = number == 1;
         else if (key == "menu_animation_rate")
             value.menuAnimationRate = number;
+#if LO_PLATFORM_SWITCH
+        else if (key == "debug_deko3d_merge_barriers" && number <= 1)
+            value.debug.deko3dMergeBarriers = number == 1;
+        else if (key == "debug_deko3d_lean_barriers" && number <= 1)
+            value.debug.deko3dLeanBarriers = number == 1;
+        else if (key == "debug_deko3d_zcull" && number <= 1)
+            value.debug.deko3dZcull = number == 1;
+        else if (key == "debug_deko3d_depth_compression" && number <= 1)
+            value.debug.deko3dDepthCompression = number == 1;
+        else if (key == "debug_deko3d_color_compression" && number <= 1)
+            value.debug.deko3dColorCompression = number == 1;
+        else if (key == "debug_deko3d_vs_outputs" && number <= 1)
+            value.debug.deko3dVsOutputs = number == 1;
+        else if (key == "debug_server" && number <= 1)
+            value.debug.debugServer = number == 1;
+#endif
         else if (key == "audio_output")
             value.audioOutput = number;
         else if (key == "audio_matrix_rear")
@@ -465,6 +481,7 @@ void PreviewConfig(const Config &value)
     merged.battleExpDouble = Current().battleExpDouble;
     CopyFastForward(merged, Current());
     merged.menuAnimationRate = Current().menuAnimationRate;
+    merged.debug = Current().debug;
     merged.audioOutput = Current().audioOutput;
     Current() = merged;
     gpu::loading::SetMode(merged.loadingTransitions);
@@ -557,6 +574,16 @@ static bool WriteConfig(const Config &value)
            << "\nfast_forward_rate=" << value.fastForwardRate
            << "\nfast_forward_keep_pitch=" << (value.fastForwardKeepAudioPitch ? 1 : 0)
            << "\nmenu_animation_rate=" << value.menuAnimationRate << '\n';
+#if LO_PLATFORM_SWITCH
+    const auto &debug = value.debug;
+    output << "debug_deko3d_merge_barriers=" << (debug.deko3dMergeBarriers ? 1 : 0)
+           << "\ndebug_deko3d_lean_barriers=" << (debug.deko3dLeanBarriers ? 1 : 0)
+           << "\ndebug_deko3d_zcull=" << (debug.deko3dZcull ? 1 : 0)
+           << "\ndebug_deko3d_depth_compression=" << (debug.deko3dDepthCompression ? 1 : 0)
+           << "\ndebug_deko3d_color_compression=" << (debug.deko3dColorCompression ? 1 : 0)
+           << "\ndebug_deko3d_vs_outputs=" << (debug.deko3dVsOutputs ? 1 : 0)
+           << "\ndebug_server=" << (debug.debugServer ? 1 : 0) << '\n';
+#endif
     output.flush();
     if (!output)
         return false;
@@ -585,6 +612,7 @@ bool SaveConfig(const Config &requested)
     value.battleExpDouble = Current().battleExpDouble;
     CopyFastForward(value, Current());
     value.menuAnimationRate = Current().menuAnimationRate;
+    value.debug = Current().debug;
     value.audioOutput = Current().audioOutput;
     if (!WriteConfig(value)) return false;
     Current() = value;
@@ -688,6 +716,16 @@ bool SaveMenuAnimationRate(uint32_t rate)
     if (!WriteConfig(persisted)) return false;
     Current().menuAnimationRate = persisted.menuAnimationRate;
     menuAnimationRate.store(persisted.menuAnimationRate, std::memory_order_relaxed);
+    return true;
+}
+bool SaveDebugOptions(const DebugOptions &options)
+{
+    std::lock_guard lock(mutex);
+    // Merge with the persisted settings, not a pending graphics preview.
+    auto persisted = Read();
+    persisted.debug = options;
+    if (!WriteConfig(persisted)) return false;
+    Current().debug = options;
     return true;
 }
 uint32_t MenuAnimationRate()

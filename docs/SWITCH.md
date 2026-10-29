@@ -362,6 +362,58 @@ shows the same split live: `MAIN` and `RENDER` are the game's main thread and
 the render thread as a share of one core, then GPU load and clock, and draws per
 frame.
 
+### Debug page
+
+Settings → System → Debug (on the Switch only) holds switches for A/B tests.
+Each one is applied and saved at once (in `settings.ini`), and every change is
+logged with the presented frame it took effect at, so a log or a benchmark run
+shows exactly when each setting was on:
+
+```
+option: frame=1 deko3d_merge_barriers=0 source=settings
+option: frame=1 deko3d_zcull=1 source=env.txt env=LO_DEKO3D_ZCULL saved=0 (env.txt wins over the Debug page)
+option: frame=4810 deko3d_merge_barriers=1 source=menu
+option: frame=5233 deko3d_depth_compression=1 source=menu applies=next_start
+option: frame=6020 performance_overlay=2 source=menu
+```
+
+`frame` is the first presented frame (the `swap` of the `hitch:` lines) that
+runs with the value. At start the deko3d back end logs one `source=settings` or
+`source=env.txt` line per option, and the overlay mode; `applies=next_start`
+marks a change that is saved but not running yet.
+
+| Row | Applies | Log key | env.txt |
+|---|---|---|---|
+| Performance overlay (Off / FPS / Detailed) | at once | `performance_overlay` | |
+| deko3d: merge barriers | from the next frame | `deko3d_merge_barriers` | `LO_DEKO3D_MERGE_BARRIERS` |
+| deko3d: lean barriers | from the next frame | `deko3d_lean_barriers` | `LO_DEKO3D_LEAN_BARRIERS` |
+| deko3d: Zcull | next start | `deko3d_zcull` | `LO_DEKO3D_ZCULL` |
+| deko3d: depth compression | next start | `deko3d_depth_compression` | `LO_DEKO3D_DEPTH_COMPRESSION` |
+| deko3d: colour compression | next start | `deko3d_color_compression` | `LO_DEKO3D_COLOR_COMPRESSION` |
+| deko3d: vertex output trimming | next start | `deko3d_vs_outputs` | `LO_DEKO3D_VS_OUTPUTS` |
+| Debug server | next start | `debug_server` | |
+
+The two barrier switches are read for each barrier, so the render thread
+changes them between frames. The other deko3d switches are read when the GPU
+queue (Zcull), a render target (compression) or a pipeline (vertex outputs) is
+made; changing them mid-game would leave old and new targets and pipelines
+mixed, so they wait for the next start. The deko3d rows need the deko3d back
+end (`LO_SWITCH_BACKEND=deko3d`); the help line under each one says what runs
+now and whether env.txt set it. The debug server (issue #10) is not in the
+build yet: its row only saves the choice.
+
+env.txt stays the way to script runs: an option set there (`LO_DEKO3D_<NAME>`,
+or `LO_DEKO3D_GPU_FAST` for all but colour compression) wins over the Debug
+page at start, and its `option:` line says so. Changing that option on the page
+later in the session still applies (live rows) and the line says
+`overrides_env=<variable>`; a next-start row says `env_wins=<variable>`, since
+env.txt will win again. `tools/switch/bench.py` records the options in effect
+when a run started measuring (`options` in its JSON), warns when one changed
+while it measured, and `compare` warns when the two runs had different options.
+
+Untested on hardware: the page, the barrier switches changed mid-game and the
+log lines were only built, not run on a console.
+
 ### CPU profile
 
 Put `LO_CPU_PROFILE=1` in env.txt (or create an empty file named
@@ -430,8 +482,9 @@ built when devkitPro's deko3d library is installed (`dkp-pacman -S deko3d`; the 
   `LO_DEKO3D_VS_OUTPUTS` (vertex shaders store only the outputs their pipeline's pixel shader reads, and none without
   one: what `LO_TRIM_VARYINGS` does on NVK). `LO_DEKO3D_COLOR_COMPRESSION=0` turns off colour target compression
   (on by default, not part of `LO_DEKO3D_GPU_FAST`); compressed targets get memory blocks of their own, since the
-  compression state of reused image memory showed as stripes after dynamic resolution resized the targets. The
-  runtime log's `video: deko3d GPU options` line shows what is on. With `LO_RENDER_TIMING=1`, a `deko3d frame work`
+  compression state of reused image memory showed as stripes after dynamic resolution resized the targets. Without
+  these lines the values saved on the Debug page (Settings → System → Debug, "Debug page" above) apply. The
+  runtime log's `video: deko3d GPU options` line and its `option:` lines show what is on. With `LO_RENDER_TIMING=1`, a `deko3d frame work`
   line every 150 frames gives the draws, binds, barriers and copies per frame.
 - Not on deko3d yet: host occlusion queries (`LO_ZPD_MODE` uses made-up counts), LSFG frame generation, the driver
   pipeline cache (not needed: no pipeline compiles).

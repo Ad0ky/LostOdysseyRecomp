@@ -38,6 +38,9 @@ namespace plume {
         bool colorCompression = true;
     };
     void Deko3DSetGpuOptions(const Deko3DGpuOptions &options);
+    // LostOdysseyRecomp (2026-10-29): the two switches read per barrier, changed while the game runs (the Debug page).
+    // Call it on the thread that records the command lists, between them.
+    void Deko3DSetBarrierOptions(bool mergeBarriers, bool leanBarriers);
 
     // The back end's running totals (Deko3DStats), for the renderer's per-frame report.
     struct Deko3DCounters {
