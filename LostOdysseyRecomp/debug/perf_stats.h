@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 
 // Performance lines every player's log carries, and fixed-window benchmark runs (docs/SWITCH.md, "Performance log").
 //
@@ -35,6 +36,11 @@ void SceneSize(uint32_t width, uint32_t height);
 // For the performance overlay: draws since the start, and the GPU clock the perf line last read (MHz; 0 unknown).
 uint64_t TotalDraws();
 uint32_t GpuClockMhz();
+
+// For the debug server's info: the map's name as one word ("-" when there is none) and the last perf: line (empty
+// before the first). Any thread.
+std::string MapName();
+std::string LastPerfLine();
 
 // Benchmark run hooks. BenchStick: the left stick position while a run holds it (LO_BENCH_STICK), from the input
 // thread. TakeBenchScreenshot: true once, on the frame a run asks for its screenshot (LO_BENCH_SHOT).

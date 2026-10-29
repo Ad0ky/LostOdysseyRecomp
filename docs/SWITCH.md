@@ -213,6 +213,8 @@ Switch-specific options and diagnostics:
 | `LO_PERF_HITCHES` | `300` | `hitch:` lines per session |
 | `LO_BENCH` and `LO_BENCH_*` | off | A benchmark run: see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md) (`tools/switch/bench.py` writes these) |
 | `LO_AUTO_BUTTONS` | off | Scripted presses: `a@900` at a presented frame, `a@30s` at seconds since launch (letters: `s a b x y`, `u d l r` d-pad, `k` back, `L R` shoulders) |
+| `LO_DEBUG_SERVER` | off | `1` (or a port) starts the debug server (below) at this start; `0` keeps it off whatever the settings say |
+| `LO_DEBUG_RESTART` | automatic | `1`: the debug server's `restart` works here (a HOME-menu forwarder whose ID starts with `01`); `0`: never |
 
 The runtime log (`state/logs/runtime-*.log`) is buffered on the console and
 written at least once a second; warnings and errors are written at once.
@@ -227,6 +229,93 @@ megabyte. On a PC in the same network:
     python tools/switch/netlog.py <console IP> --out netlog.txt
 
 It reconnects by itself, so it can be started before the game.
+
+### Debug server
+
+A TCP port (6543) on the console for a PC on the same network: build and frame
+info, the log as it is written, screenshots, controller input, the app
+folder's files, and deploying a new NRO. It is off unless turned on, and never
+on in a fresh install: `LO_DEBUG_SERVER=1` in env.txt, or `debug_server=1` in
+`config/settings.ini` (the settings menu's Debug section), read at the next
+start. There is no password: use it on your own network only. At start
+`stderr.log` (and the network log) says
+`[debug] server listening on <ip>:6543, turned on by env.txt`.
+
+The client is `tools/switch/lo_debug.py`. Give it the console's address with
+`--host`, `LO_SWITCH_HOST=<ip>`, or the first line of `out/switch-host.txt`.
+
+| Command | What it does |
+|---|---|
+| `info` | build, session, frame, map, docked/handheld, CPU/GPU/memory clocks, memory and threads, battery, program ID, address, the last `perf:` line |
+| `log [--all] [--save F] [--grep RE] [--seconds N]` | the log and stderr as they are written; `--all` starts with what the console keeps (the session's last 1-2 MiB) |
+| `logtext [OUT]`, `lastlog [LOCAL] [--current]`, `logs` | the kept text; the previous session's `runtime-*.log` (`--current`: the running one's kept text, since its file is open); the list |
+| `shot [OUT.png] [--ppm]` | the next presented frame, through the same capture as `LO_SCREENSHOT_REQUEST`; a PNG made on the console, or the PPM as saved |
+| `press A [B ...] [ms]`, `hold`, `release [buttons]`, `stick L\|R x y [ms]` | buttons and sticks for the game, as from the controller (120 ms presses by default; `A+B` together; sticks -1..1, y up; `stick L 0 0` lets go) |
+| `input <serial> <mask> <x> <y> <polls> [lt rt [rx ry]]` | one `LO_TEST_INPUT_FILE` line (what `scenario.py` writes) |
+| `get`, `put`, `ls`, `rm`, `mkdir` | files; paths are relative to `sdmc:/switch/LostOdysseyRecomp`, or start with `/` for the card's root (read only: writes stay in the app folder; `put` writes `<path>.part`, then renames it) |
+| `env [KEY=VALUE ...] [--unset KEY] [--restart]` | show or change env.txt |
+| `crashes [--fetch DIR]` | `crash.log`, `hang.log`, the kept `crash-*.log` and Atmosphère's reports |
+| `deploy [NRO] [--no-restart]` | uploads `out/switch/LostOdysseyRecomp.nro`, checks its CRC32, restarts the game and waits for the new session |
+| `restart [--force]`, `wait`, `ping`, `help`, `raw CMD ...` | |
+
+Button names are the game's (Xbox 360) buttons, as in `tools/scenario.py`:
+`A B X Y LB RB LT RT START BACK UP DOWN LEFT RIGHT LS RS`, with the Switch
+names `L R ZL ZR PLUS MINUS` as aliases. Input enters where `LO_TEST_INPUT_FILE`
+does (`hid/hid.cpp`), so it reaches the game but not the host settings menu.
+
+`restart` (and `deploy`) start the program again with `appletRestartProgram`.
+That only brings the game back from a **HOME-menu forwarder**. Through title
+takeover the program is the game that was taken over (an ID starting with
+`01`), so restarting would start that game: there `restart` refuses and
+`deploy` uploads only; start the game again by hand. A forwarder whose ID
+starts with `01` needs `LO_DEBUG_RESTART=1` (or `restart --force`).
+
+A typical loop:
+
+```
+tools/switch/lo_debug.py env LO_DEKO3D_GPU_FAST=0 --restart     # an A/B switch, then a fresh start
+tools/switch/lo_debug.py log --save out/session.log --grep "perf:|hitch:" &
+tools/switch/lo_debug.py press START && sleep 20 && tools/switch/lo_debug.py shot
+```
+
+#### Scenarios and regression runs on the console
+
+`tools/scenario.py run <scenario.toml> --switch <ip>` and
+`tools/regression.py run --switch <ip>` run the PC scenarios on the console.
+For each scenario the client writes the console's env.txt (the console's own
+lines kept; the scenario's `buttons`, `[env]`, `LO_FRAME_TIMING`,
+`LO_RENDER_TIMING`, `LO_DEBUG_LOG` and the debug server added; a `[settings]`
+`frame_rate` becomes `LO_FPS`, other `[settings]` are not applied), uploads the
+save slot to `scenario/save/` (`LO_SAVE_DIR`: the player's saves are never
+touched), restarts the game, streams its log into the run folder and sends the
+steps' input and screenshots (`input`, `shot --ppm`) over the network. Then it
+puts env.txt back and restarts again. A `[switch]` table's `buttons` replace
+the scenario's frame stamps, which may need retuning for the console's loads.
+Console runs and their baseline live in `out/regression/switch/`, apart from
+the PC's (`regression.py compare --switch`, `accept --switch`). Without a
+forwarder the script asks you to start the game by hand each time.
+
+#### What it costs
+
+Off, nothing is set up: the input and screenshot hooks cost one or two relaxed
+atomic loads per poll or frame, and the log is not kept unless the network log
+is on. On, the socket service's buffers come out of the same heap as
+guest memory: libnx sizes them as `sb_efficiency × (TCP send + receive maximum
++ UDP buffers)`, 4 × 308 KiB = 1.2 MiB with the server's 128 KiB windows (the
+network log alone keeps its 2 × 184 KiB = 368 KiB; libnx's default would be
+2.2 MiB). The two share one `socketInitialize`, with one socket service session
+per thread that can wait in it (listener, 4 connections, the network log's 2).
+Each open connection has a thread with a 128 KiB stack, freed when it closes;
+the log stream reads the network log's kept text (1-2 MiB, kept while either
+runs) instead of a copy of its own.
+The server's threads run at priority 0x2B like the network log's (above the
+game, mostly asleep); `shot` compresses its PNG below the game's threads.
+
+The server core (`os/switch/debug_server_core.*`) and the client come from
+[SwitchWakerHD](https://github.com/centollOS/SwitchWakerHD)'s debug server and
+keep its MPL-2.0 notice. `tools/switch/debug_server_host_test.cpp` runs the
+same core on a computer with stand-in game commands, for testing the client
+and the scenario runs without a console (build line at its top).
 
 ### Performance log
 
