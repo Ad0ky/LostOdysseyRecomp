@@ -426,6 +426,31 @@ on the PC, with the `.elf` of the same build:
 Delete the file to turn sampling off. Per-thread CPU shares are logged every
 30 s either way (`switch: ... CPU ...` lines).
 
+The `[cpu profile]` blocks only list each thread's 150 hottest 16-byte code
+lines and no callers; a game thread whose time is spread over many functions
+(Guest Main in a battle: about half its samples) is not fully covered. For the
+whole picture add `LO_CPU_PROFILE_SAMPLES=1`, or a comma-separated list of
+thread names (`LO_CPU_PROFILE_SAMPLES=Guest Main,GPU CmdProc`): every sample
+of those threads, with the host LR and, for guest threads, the guest call
+chain read from the PowerPC back chain on the guest stack, is appended to
+`cpu-samples.bin` in the app folder at each report (`[cpu samples]` lines say
+how much; about 4 MiB per 30 s for the three busy threads of a battle, written
+in about 0.2 s during which nothing is sampled). Delete the file before a run
+(it keeps every session; the script reads the last one), then:
+
+    tools/switch/lo_debug.py get cpu-samples.bin out/cpu-samples.bin
+    python tools/switch/switch-cpu-profile.py --samples out/cpu-samples.bin --from 130 --to 300 \
+        --folded out/folded.txt --elf out/switch/LostOdysseyRecomp.elf
+
+It prints, per thread, self time per function with each one's callers and,
+for guest threads, inclusive time per guest function. `--from`/`--to` are
+seconds since the sampler started (about the game's start); `--folded` writes
+the stacks for `flamegraph.pl`. The chain's first entry is the guest LR, then
+each frame's saved LR. A sample in a function's prologue (between its LR save
+and its `stwu`), or one taken while the compiled code holds r1 in a register
+rather than in the PPCContext, can miss the immediate caller; that is a few
+instructions per call, so it shifts little time.
+
 ## How the port works
 
 | Area | Switch implementation |
