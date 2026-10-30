@@ -203,5 +203,15 @@ threads to their own cores gains under 1%.
 **Since the baseline:** build `71aa681b` (CR, XER, reservation and non-argument registers
 as locals) reads 15.4–15.5 FPS in the same scene, from logs rather than a benchmark run.
 
+**After non-volatile locals (build `e7318b77` plus the helper fix), short readings, not a benchmark run:**
+
+| Render height | FPS | Frame p50 | GPU busy | Render thread waiting for the game | Guest Main |
+|---|---:|---:|---:|---:|---:|
+| 540 | about 15.6 | about 64 ms | 53.8 ms | about 3 ms | 73% |
+| 360 | 17-20 | 50-58 ms | 32 ms | 15-19 ms | 92% |
+
+The main thread's limit moved from about 66 ms to about 52 ms per frame. At 540 rows the
+GPU is now the limit: 54 ms just misses the 50 ms vsync step, so frames sit near 66.7 ms.
+
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.
