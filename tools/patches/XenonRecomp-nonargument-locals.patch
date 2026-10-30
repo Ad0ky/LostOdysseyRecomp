@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index 86309dc..58490fe 100644
+index 86309dc..0f747e5 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -268,8 +268,11 @@ bool Recompiler::Recompile(
@@ -99,7 +99,7 @@ index 86309dc..58490fe 100644
          println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
          println("\t\treturn;");
          println("\t}}");
-@@ -2622,6 +2642,12 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2622,6 +2642,13 @@ bool Recompiler::Recompile(const Function& fn)
      {
          name = fmt::format("sub_{}", fn.base);
      }
@@ -107,12 +107,13 @@ index 86309dc..58490fe 100644
 +    // LostOdysseyRecomp: non_volatile_in_context lists functions that share non-volatile registers with a caller or
 +    // callee or with host code (__finally blocks, hand-written codecs, setjmp, hooks reading the caller's r27-r31):
 +    // they keep them in ctx, and keep calling the save/restore helpers, as with the option off.
-+    nonVolatileLocalsHere = config.nonVolatileRegistersAsLocalVariables &&
++    // The helpers themselves work on ctx: the functions that still call them keep their registers there.
++    nonVolatileLocalsHere = config.nonVolatileRegistersAsLocalVariables && !inSaveRestoreHelper &&
 +        config.nonVolatileInContext.find(fn.base) == config.nonVolatileInContext.end();
  
  #ifdef XENON_RECOMP_USE_ALIAS
      println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
-@@ -2707,11 +2733,24 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2707,11 +2734,24 @@ bool Recompiler::Recompile(const Function& fn)
              println("\tPPCCRRegister cr{}{{}};", i);
      }
  

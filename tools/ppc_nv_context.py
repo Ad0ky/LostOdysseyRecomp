@@ -6,7 +6,8 @@ LostOdysseyRecompLib/config/LostOdysseyRecomp.toml, and generating again applies
 A function goes on the list when, on some path from its entry, it reads a non-volatile register or CTR before
 writing it (compiler __finally blocks read their parent's registers; hand-written codecs pass values in r14-r31 and
 v14-v127), when it calls such a function, when it calls setjmp, or when a host hook reads its registers.
-Stores to the stack frame (saving the caller's value) don't count as reads.
+Stores below the stack pointer (prologue saves of the caller's value) don't count as reads; anything else does,
+because listing too many functions only costs a little speed, and missing one corrupts the game.
 """
 import argparse
 import bisect
@@ -30,7 +31,7 @@ REG = r"(?:r(?:1[4-9]|2\d|3[01])|f(?:1[4-9]|2\d|3[01])|v(?:1[4-9]|2\d|3[01]|6[4-
 TOKEN = re.compile(rf"(?<![\w.])({REG})(?=\.|\b)")
 ASSIGN = re.compile(rf"^({REG})\.\w+(?:\[[^\]]*\])?\s*=(?!=)\s*(.*)$")
 STORE = re.compile(rf"^(?:simde)?_mm\w*_store\w*\(\(?[^,]*?\b({REG})\.\w+[^,]*,\s*(.*)$")
-STACK_SAVE = re.compile(r"PPC_STORE_U(32|64)\(ctx\.r1\.u32 \+ -?\d+, (r|f)\d+\.\w+\);")
+STACK_SAVE = re.compile(r"PPC_STORE_U(32|64)\(ctx\.r1\.u32 \+ -\d+, (r|f)\d+\.\w+\);")
 NOP = re.compile(r"(r\d+)\.u64 = \1\.u64;$")
 LABEL = re.compile(r"^loc_([0-9A-F]+):")
 GOTO = re.compile(r"goto loc_([0-9A-F]+);")
