@@ -188,5 +188,20 @@ GPU-bound first; at a frame of about 66 ms the GPU still idles a quarter of the
 time while the render thread waits 29 ms for the game's main thread (93%), so
 the game thread is the next limit. Runs agree within 1%.
 
+**What limits the scene (540 against 360 rows, build `893ac83c`, same scene and draws):**
+
+| Render height | FPS | Frame p50 | GPU busy | Render thread waiting for the game | Guest Main |
+|---|---:|---:|---:|---:|---:|
+| 540 | 14.39 | 66.5 ms | 52.0 ms (75%) | 28.4 ms | 93% |
+| 360 | 14.62 | 66.6 ms | 31.8 ms (46%) | 31.8 ms | 93% |
+
+At 360 rows the GPU fits inside 33 ms and the frame doesn't change, so this scene is
+limited by the game's main thread first. At 540 rows the GPU's 52 ms is the next limit:
+it caps the scene near 19 FPS however fast the CPU gets. Pinning the three busiest
+threads to their own cores gains under 1%.
+
+**Since the baseline:** build `71aa681b` (CR, XER, reservation and non-argument registers
+as locals) reads 15.4–15.5 FPS in the same scene, from logs rather than a benchmark run.
+
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.

@@ -1,8 +1,8 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index 86309dc..c091a87 100644
+index 86309dc..58490fe 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
-@@ -268,6 +268,9 @@ bool Recompiler::Recompile(
+@@ -268,8 +268,11 @@ bool Recompiler::Recompile(
      // TODO: we could cache these formats in an array
      auto r = [&](size_t index)
          {
@@ -10,8 +10,29 @@ index 86309dc..c091a87 100644
 +            if (inSaveRestoreHelper && (index == 11 || index == 12))
 +                return fmt::format("ctx.r{}", index);
              if ((config.nonArgumentRegistersAsLocalVariables && (index == 0 || index == 2 || index == 11 || index == 12)) || 
-                 (config.nonVolatileRegistersAsLocalVariables && index >= 14))
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++                (nonVolatileLocalsHere && index >= 14))
              {
+                 localVariables.r[index] = true;
+                 return fmt::format("r{}", index);
+@@ -280,7 +283,7 @@ bool Recompiler::Recompile(
+     auto f = [&](size_t index)
+         {
+             if ((config.nonArgumentRegistersAsLocalVariables && index == 0) ||
+-                (config.nonVolatileRegistersAsLocalVariables && index >= 14))
++                (nonVolatileLocalsHere && index >= 14))
+             {
+                 localVariables.f[index] = true;
+                 return fmt::format("f{}", index);
+@@ -291,7 +294,7 @@ bool Recompiler::Recompile(
+     auto v = [&](size_t index)
+         {
+             if ((config.nonArgumentRegistersAsLocalVariables && (index >= 32 && index <= 63)) ||
+-                (config.nonVolatileRegistersAsLocalVariables && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
++                (nonVolatileLocalsHere && ((index >= 14 && index <= 31) || (index >= 64 && index <= 127))))
+             {
+                 localVariables.v[index] = true;
+                 return fmt::format("v{}", index);
 @@ -369,6 +372,16 @@ bool Recompiler::Recompile(
              return *(data + 1) == c_eieio;
          };
@@ -29,7 +50,14 @@ index 86309dc..c091a87 100644
      auto printFunctionCall = [&](uint32_t address)
          {
              if (address == config.longJmpAddress)
-@@ -394,6 +407,9 @@ bool Recompiler::Recompile(
+@@ -388,12 +401,15 @@ bool Recompiler::Recompile(
+ 
+                 if (targetSymbol != image.symbols.end() && targetSymbol->address == address && targetSymbol->type == Symbol_Function)
+                 {
+-                    if (config.nonVolatileRegistersAsLocalVariables && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
++                    if (nonVolatileLocalsHere && (targetSymbol->name.find("__rest") == 0 || targetSymbol->name.find("__save") == 0))
+                     {
+                         // print nothing
                      }
                      else
                      {
@@ -71,15 +99,20 @@ index 86309dc..c091a87 100644
          println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
          println("\t\treturn;");
          println("\t}}");
-@@ -2622,6 +2642,7 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2622,6 +2642,12 @@ bool Recompiler::Recompile(const Function& fn)
      {
          name = fmt::format("sub_{}", fn.base);
      }
 +    inSaveRestoreHelper = name.rfind("__save", 0) == 0 || name.rfind("__rest", 0) == 0;
++    // LostOdysseyRecomp: non_volatile_in_context lists functions that share non-volatile registers with a caller or
++    // callee or with host code (__finally blocks, hand-written codecs, setjmp, hooks reading the caller's r27-r31):
++    // they keep them in ctx, and keep calling the save/restore helpers, as with the option off.
++    nonVolatileLocalsHere = config.nonVolatileRegistersAsLocalVariables &&
++        config.nonVolatileInContext.find(fn.base) == config.nonVolatileInContext.end();
  
  #ifdef XENON_RECOMP_USE_ALIAS
      println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
-@@ -2707,11 +2728,24 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2707,11 +2733,24 @@ bool Recompiler::Recompile(const Function& fn)
              println("\tPPCCRRegister cr{}{{}};", i);
      }
  
@@ -106,10 +139,10 @@ index 86309dc..c091a87 100644
      for (size_t i = 0; i < 32; i++)
      {
 diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
-index 8242db5..6585e00 100644
+index 8242db5..d9adddb 100644
 --- a/XenonRecomp/recompiler.h
 +++ b/XenonRecomp/recompiler.h
-@@ -34,6 +34,12 @@ struct Recompiler
+@@ -34,6 +34,14 @@ struct Recompiler
      std::string out;
      size_t cppFileIndex = 0;
      RecompilerConfig config;
@@ -117,13 +150,48 @@ index 8242db5..6585e00 100644
 +    // (__savegprlr_*, __restgprlr_*, __savefpr_*, __restfpr_*, __savevmx_*, __restvmx_*). They take their addresses
 +    // in r11 and r12 from the caller, so with non_argument_as_local those two are read from ctx there.
 +    bool inSaveRestoreHelper = false;
++    // LostOdysseyRecomp: non_volatile_as_local applies to the function being recompiled (non_volatile_in_context).
++    bool nonVolatileLocalsHere = false;
 +    // LostOdysseyRecomp: placed before every call; replaced with stores of the non-argument locals to ctx.
 +    static constexpr std::string_view NonArgumentFlushMarker = "\t/*@@non-argument flush@@*/\n";
  
      bool LoadConfig(const std::string_view& configFilePath);
  
+diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
+index 81330a4..df1f271 100644
+--- a/XenonRecomp/recompiler_config.cpp
++++ b/XenonRecomp/recompiler_config.cpp
+@@ -26,6 +26,9 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+         crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
+         nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
+         nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
++        if (auto list = main["non_volatile_in_context"].as_array())
++            for (auto& entry : *list)
++                nonVolatileInContext.emplace(uint32_t(entry.value_or<int64_t>(0)));
+ 
+         restGpr14Address = main["restgprlr_14_address"].value_or(0u);
+         saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
+diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
+index 534e503..a13b948 100644
+--- a/XenonRecomp/recompiler_config.h
++++ b/XenonRecomp/recompiler_config.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <unordered_set>
+ 
+ struct RecompilerSwitchTable
+ {
+@@ -39,6 +40,8 @@ struct RecompilerConfig
+     bool crRegistersAsLocalVariables = false;
+     bool nonArgumentRegistersAsLocalVariables = false;
+     bool nonVolatileRegistersAsLocalVariables = false;
++    // LostOdysseyRecomp: functions that keep non-volatile registers in ctx with the option on.
++    std::unordered_set<uint32_t> nonVolatileInContext;
+     uint32_t restGpr14Address = 0;
+     uint32_t saveGpr14Address = 0;
+     uint32_t restFpr14Address = 0;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 4b0fa08..1451851 100644
+index 4b0fa08..323a183 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
 @@ -366,13 +366,11 @@ struct PPCFPSCRRegister
@@ -142,7 +210,7 @@ index 4b0fa08..1451851 100644
      PPCRegister r4;
      PPCRegister r5;
      PPCRegister r6;
-@@ -380,10 +378,9 @@ struct alignas(0x40) PPCContext
+@@ -380,12 +378,11 @@ struct alignas(0x40) PPCContext
      PPCRegister r8;
      PPCRegister r9;
      PPCRegister r10;
@@ -152,12 +220,24 @@ index 4b0fa08..1451851 100644
      PPCRegister r12;
 -#endif
      PPCRegister r13;
- #ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_volatile_as_local (a stable layout for host code)
      PPCRegister r14;
-@@ -412,16 +409,14 @@ struct alignas(0x40) PPCContext
- #ifndef PPC_CONFIG_CTR_AS_LOCAL
-     PPCRegister ctr;
+     PPCRegister r15;
+     PPCRegister r16;
+@@ -404,24 +401,20 @@ struct alignas(0x40) PPCContext
+     PPCRegister r29;
+     PPCRegister r30;
+     PPCRegister r31;
+-#endif
+ 
+ #ifndef PPC_CONFIG_SKIP_LR
+     uint64_t lr;
  #endif
+-#ifndef PPC_CONFIG_CTR_AS_LOCAL
++    // LostOdysseyRecomp: kept with ctr_as_local (a stable layout for host code)
+     PPCRegister ctr;
+-#endif
 -#ifndef PPC_CONFIG_XER_AS_LOCAL
 +    // LostOdysseyRecomp: kept with xer_as_local (callers pass some through ctx; a stable layout for host code)
      PPCXERRegister xer;
@@ -174,7 +254,7 @@ index 4b0fa08..1451851 100644
      PPCCRRegister cr0;
      PPCCRRegister cr1;
      PPCCRRegister cr2;
-@@ -430,12 +425,10 @@ struct alignas(0x40) PPCContext
+@@ -430,12 +423,10 @@ struct alignas(0x40) PPCContext
      PPCCRRegister cr5;
      PPCCRRegister cr6;
      PPCCRRegister cr7;
@@ -188,20 +268,57 @@ index 4b0fa08..1451851 100644
      PPCRegister f1;
      PPCRegister f2;
      PPCRegister f3;
-@@ -504,7 +497,7 @@ struct alignas(0x40) PPCContext
+@@ -449,7 +440,7 @@ struct alignas(0x40) PPCContext
+     PPCRegister f11;
+     PPCRegister f12;
+     PPCRegister f13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_volatile_as_local (a stable layout for host code)
+     PPCRegister f14;
+     PPCRegister f15;
+     PPCRegister f16;
+@@ -468,7 +459,6 @@ struct alignas(0x40) PPCContext
+     PPCRegister f29;
+     PPCRegister f30;
+     PPCRegister f31;
+-#endif
+ 
+     PPCVRegister v0;
+     PPCVRegister v1;
+@@ -484,7 +474,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v11;
+     PPCVRegister v12;
+     PPCVRegister v13;
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_volatile_as_local (a stable layout for host code)
+     PPCVRegister v14;
+     PPCVRegister v15;
+     PPCVRegister v16;
+@@ -503,8 +493,7 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v29;
      PPCVRegister v30;
      PPCVRegister v31;
- #endif
+-#endif
 -#ifndef PPC_CONFIG_NON_ARGUMENT_AS_LOCAL
 +    // LostOdysseyRecomp: kept with non_argument_as_local (callers pass some through ctx; a stable layout for host code)
      PPCVRegister v32;
      PPCVRegister v33;
      PPCVRegister v34;
-@@ -537,7 +530,6 @@ struct alignas(0x40) PPCContext
+@@ -537,8 +526,7 @@ struct alignas(0x40) PPCContext
      PPCVRegister v61;
      PPCVRegister v62;
      PPCVRegister v63;
 -#endif
- #ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
+-#ifndef PPC_CONFIG_NON_VOLATILE_AS_LOCAL
++    // LostOdysseyRecomp: kept with non_volatile_as_local (a stable layout for host code)
      PPCVRegister v64;
      PPCVRegister v65;
+     PPCVRegister v66;
+@@ -603,7 +591,6 @@ struct alignas(0x40) PPCContext
+     PPCVRegister v125;
+     PPCVRegister v126;
+     PPCVRegister v127;
+-#endif
+ };
+ 
+ inline uint8_t VectorMaskL[] =
