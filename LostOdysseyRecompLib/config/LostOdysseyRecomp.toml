@@ -16,6 +16,7 @@ cr_as_local = true
 non_argument_as_local = true
 non_volatile_as_local = true
 argument_as_local = true
+fast_memory = true
 # Functions that keep non-volatile registers in ctx: generate with this list empty, then run tools/ppc_nv_context.py.
 non_volatile_in_context = [
     0x8237D258, 0x8238ACC8, 0x823ACCB0, 0x823AD544, 0x823ADE28, 0x823AE0BC, 0x823CE960, 0x827CCF80,

@@ -1,5 +1,5 @@
 diff --git a/XenonRecomp/recompiler.cpp b/XenonRecomp/recompiler.cpp
-index 86309dc..4ad93e9 100644
+index 86309dc..7c878e5 100644
 --- a/XenonRecomp/recompiler.cpp
 +++ b/XenonRecomp/recompiler.cpp
 @@ -268,8 +268,16 @@ bool Recompiler::Recompile(
@@ -110,7 +110,7 @@ index 86309dc..4ad93e9 100644
          println("\t\tPPC_CALL_INDIRECT_FUNC({}.u32 & ~3u);", ctr());
          println("\t\treturn;");
          println("\t}}");
-@@ -2524,6 +2554,70 @@ bool Recompiler::Recompile(
+@@ -2524,6 +2554,130 @@ bool Recompiler::Recompile(
      return true;
  }
  
@@ -178,10 +178,70 @@ index 86309dc..4ad93e9 100644
 +    body = std::move(result);
 +}
 +
++// LostOdysseyRecomp: fast_memory turns PPC_LOAD_*/PPC_STORE_* into their non-volatile forms, except in a loop that
++// loads memory with no store, call or fence: that is a wait on another thread, and without volatile the compiler
++// could move the load out of the loop and never see the value change.
++void Recompiler::UseFastMemory(std::string& body)
++{
++    std::vector<std::string_view> lines;
++    for (size_t at = 0; at < body.size();)
++    {
++        size_t end = body.find('\n', at);
++        end = end == std::string::npos ? body.size() : end + 1;
++        lines.emplace_back(body.data() + at, end - at);
++        at = end;
++    }
++    std::unordered_map<std::string, size_t> labels;
++    for (size_t i = 0; i < lines.size(); i++)
++        if (lines[i].rfind("loc_", 0) == 0)
++            labels.emplace(std::string(lines[i].substr(0, lines[i].find(':'))), i);
++
++    std::vector<bool> keep(lines.size(), false);
++    for (size_t i = 0; i < lines.size(); i++)
++    {
++        const size_t go = lines[i].find("goto loc_");
++        if (go == std::string_view::npos)
++            continue;
++        const std::string_view rest = lines[i].substr(go + 5);
++        const auto label = labels.find(std::string(rest.substr(0, rest.find(';'))));
++        if (label == labels.end() || label->second > i)
++            continue;
++        bool waits = true;
++        for (size_t j = label->second; j <= i && waits; j++)
++        {
++            const std::string_view line = lines[j];
++            if (line.find("// ") != std::string_view::npos && line.find_first_not_of('\t') == line.find("// "))
++                continue;
++            if (line.find("_STORE") != std::string_view::npos || line.find("(ctx, base);") != std::string_view::npos ||
++                line.find("PPC_CALL_INDIRECT_FUNC") != std::string_view::npos || line.find("atomic_thread_fence") != std::string_view::npos)
++                waits = false;
++        }
++        if (waits)
++            for (size_t j = label->second; j <= i; j++)
++                keep[j] = true;
++    }
++
++    std::string result;
++    result.reserve(body.size() + body.size() / 8);
++    for (size_t i = 0; i < lines.size(); i++)
++    {
++        std::string line(lines[i]);
++        if (!keep[i])
++            for (const char* name : { "PPC_LOAD_U", "PPC_STORE_U" })
++            {
++                const std::string fast = std::string("PPC_FAST_") + (name + 4);
++                for (size_t at = line.find(name); at != std::string::npos; at = line.find(name, at + fast.size()))
++                    line.replace(at, strlen(name), fast);
++            }
++        result += line;
++    }
++    body = std::move(result);
++}
++
  bool Recompiler::Recompile(const Function& fn)
  {
      auto base = fn.base;
-@@ -2622,6 +2716,15 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2622,6 +2776,15 @@ bool Recompiler::Recompile(const Function& fn)
      {
          name = fmt::format("sub_{}", fn.base);
      }
@@ -197,7 +257,7 @@ index 86309dc..4ad93e9 100644
  
  #ifdef XENON_RECOMP_USE_ALIAS
      println("__attribute__((alias(\"__imp__{}\"))) PPC_WEAK_FUNC({});", name, name);
-@@ -2707,15 +2810,32 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2707,15 +2870,32 @@ bool Recompiler::Recompile(const Function& fn)
              println("\tPPCCRRegister cr{}{{}};", i);
      }
  
@@ -232,17 +292,19 @@ index 86309dc..4ad93e9 100644
              println("\tPPCRegister f{}{{}};", i);
      }
  
-@@ -2737,6 +2857,8 @@ bool Recompiler::Recompile(const Function& fn)
+@@ -2737,6 +2917,10 @@ bool Recompiler::Recompile(const Function& fn)
      if (localVariables.ea)
          println("\tuint32_t ea{{}};");
  
++    if (config.fastMemory && nonVolatileLocalsHere)
++        UseFastMemory(tempString);
 +    if (argumentLocalsHere)
 +        CacheArgumentRegisters(tempString, localVariables);
      out += tempString;
  
      return allRecompiled;
 diff --git a/XenonRecomp/recompiler.h b/XenonRecomp/recompiler.h
-index 8242db5..fbddca6 100644
+index 8242db5..1342c7a 100644
 --- a/XenonRecomp/recompiler.h
 +++ b/XenonRecomp/recompiler.h
 @@ -34,6 +34,16 @@ struct Recompiler
@@ -262,23 +324,25 @@ index 8242db5..fbddca6 100644
  
      bool LoadConfig(const std::string_view& configFilePath);
  
-@@ -63,6 +73,7 @@ struct Recompiler
+@@ -63,6 +73,8 @@ struct Recompiler
          CSRState& csrState);
  
      bool Recompile(const Function& fn);
 +    void CacheArgumentRegisters(std::string& body, const RecompilerLocalVariables& locals);
++    void UseFastMemory(std::string& body);
  
      void Recompile(const std::filesystem::path& headerFilePath);
  
 diff --git a/XenonRecomp/recompiler_config.cpp b/XenonRecomp/recompiler_config.cpp
-index 81330a4..9a3e4cd 100644
+index 81330a4..97b75f5 100644
 --- a/XenonRecomp/recompiler_config.cpp
 +++ b/XenonRecomp/recompiler_config.cpp
-@@ -26,6 +26,10 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
+@@ -26,6 +26,11 @@ void RecompilerConfig::Load(const std::string_view& configFilePath)
          crRegistersAsLocalVariables = main["cr_as_local"].value_or(false);
          nonArgumentRegistersAsLocalVariables = main["non_argument_as_local"].value_or(false);
          nonVolatileRegistersAsLocalVariables = main["non_volatile_as_local"].value_or(false);
 +        argumentRegistersAsLocalVariables = main["argument_as_local"].value_or(false);
++        fastMemory = main["fast_memory"].value_or(false);
 +        if (auto list = main["non_volatile_in_context"].as_array())
 +            for (auto& entry : *list)
 +                nonVolatileInContext.emplace(uint32_t(entry.value_or<int64_t>(0)));
@@ -286,7 +350,7 @@ index 81330a4..9a3e4cd 100644
          restGpr14Address = main["restgprlr_14_address"].value_or(0u);
          saveGpr14Address = main["savegprlr_14_address"].value_or(0u);
 diff --git a/XenonRecomp/recompiler_config.h b/XenonRecomp/recompiler_config.h
-index 534e503..588899a 100644
+index 534e503..843b3eb 100644
 --- a/XenonRecomp/recompiler_config.h
 +++ b/XenonRecomp/recompiler_config.h
 @@ -1,4 +1,5 @@
@@ -295,22 +359,46 @@ index 534e503..588899a 100644
  
  struct RecompilerSwitchTable
  {
-@@ -39,6 +40,10 @@ struct RecompilerConfig
+@@ -39,6 +40,12 @@ struct RecompilerConfig
      bool crRegistersAsLocalVariables = false;
      bool nonArgumentRegistersAsLocalVariables = false;
      bool nonVolatileRegistersAsLocalVariables = false;
 +    // LostOdysseyRecomp: cache the argument registers and r1 in locals (see Recompiler::argumentLocalsHere).
 +    bool argumentRegistersAsLocalVariables = false;
++    // LostOdysseyRecomp: guest memory without volatile, except waits on memory (Recompiler::UseFastMemory).
++    bool fastMemory = false;
 +    // LostOdysseyRecomp: functions that keep non-volatile registers in ctx with the option on.
 +    std::unordered_set<uint32_t> nonVolatileInContext;
      uint32_t restGpr14Address = 0;
      uint32_t saveGpr14Address = 0;
      uint32_t restFpr14Address = 0;
 diff --git a/XenonUtils/ppc_context.h b/XenonUtils/ppc_context.h
-index 4b0fa08..323a183 100644
+index 4b0fa08..83d9a86 100644
 --- a/XenonUtils/ppc_context.h
 +++ b/XenonUtils/ppc_context.h
-@@ -366,13 +366,11 @@ struct PPCFPSCRRegister
+@@ -73,6 +73,21 @@ static inline uint64_t PPCRotateLeft64(uint64_t value, unsigned int shift) noexc
+ // These are currently unused. However, MMIO loads could possibly be handled statically with some profiling and a fallback.
+ // The fallback would be a runtime exception handler which will intercept reads from MMIO regions 
+ // and log the PC for compiling to static code later.
++// LostOdysseyRecomp (fast_memory): guest memory without volatile, so the compiler can merge and reorder accesses
++// between fences. Guest code may be unaligned and aliases everything, as PowerPC allows; loops that wait on memory keep
++// the volatile macros, as do hardware registers (PPC_MM_*) and reservations.
++typedef uint16_t __attribute__((aligned(1), may_alias)) PPCFastU16;
++typedef uint32_t __attribute__((aligned(1), may_alias)) PPCFastU32;
++typedef uint64_t __attribute__((aligned(1), may_alias)) PPCFastU64;
++#define PPC_FAST_LOAD_U8(x) (*(uint8_t*)(base + uint32_t(x)))
++#define PPC_FAST_LOAD_U16(x) __builtin_bswap16(*(PPCFastU16*)(base + uint32_t(x)))
++#define PPC_FAST_LOAD_U32(x) __builtin_bswap32(*(PPCFastU32*)(base + uint32_t(x)))
++#define PPC_FAST_LOAD_U64(x) __builtin_bswap64(*(PPCFastU64*)(base + uint32_t(x)))
++#define PPC_FAST_STORE_U8(x, y) *(uint8_t*)(base + uint32_t(x)) = (y)
++#define PPC_FAST_STORE_U16(x, y) *(PPCFastU16*)(base + uint32_t(x)) = __builtin_bswap16(y)
++#define PPC_FAST_STORE_U32(x, y) *(PPCFastU32*)(base + uint32_t(x)) = __builtin_bswap32(y)
++#define PPC_FAST_STORE_U64(x, y) *(PPCFastU64*)(base + uint32_t(x)) = __builtin_bswap64(y)
++
+ #ifndef PPC_MM_LOAD_U8
+ #define PPC_MM_LOAD_U8(x)  PPC_LOAD_U8 (x)
+ #endif
+@@ -366,13 +381,11 @@ struct PPCFPSCRRegister
  struct alignas(0x40) PPCContext
  {
      PPCRegister r3;
@@ -326,7 +414,7 @@ index 4b0fa08..323a183 100644
      PPCRegister r4;
      PPCRegister r5;
      PPCRegister r6;
-@@ -380,12 +378,11 @@ struct alignas(0x40) PPCContext
+@@ -380,12 +393,11 @@ struct alignas(0x40) PPCContext
      PPCRegister r8;
      PPCRegister r9;
      PPCRegister r10;
@@ -341,7 +429,7 @@ index 4b0fa08..323a183 100644
      PPCRegister r14;
      PPCRegister r15;
      PPCRegister r16;
-@@ -404,24 +401,20 @@ struct alignas(0x40) PPCContext
+@@ -404,24 +416,20 @@ struct alignas(0x40) PPCContext
      PPCRegister r29;
      PPCRegister r30;
      PPCRegister r31;
@@ -370,7 +458,7 @@ index 4b0fa08..323a183 100644
      PPCCRRegister cr0;
      PPCCRRegister cr1;
      PPCCRRegister cr2;
-@@ -430,12 +423,10 @@ struct alignas(0x40) PPCContext
+@@ -430,12 +438,10 @@ struct alignas(0x40) PPCContext
      PPCCRRegister cr5;
      PPCCRRegister cr6;
      PPCCRRegister cr7;
@@ -384,7 +472,7 @@ index 4b0fa08..323a183 100644
      PPCRegister f1;
      PPCRegister f2;
      PPCRegister f3;
-@@ -449,7 +440,7 @@ struct alignas(0x40) PPCContext
+@@ -449,7 +455,7 @@ struct alignas(0x40) PPCContext
      PPCRegister f11;
      PPCRegister f12;
      PPCRegister f13;
@@ -393,7 +481,7 @@ index 4b0fa08..323a183 100644
      PPCRegister f14;
      PPCRegister f15;
      PPCRegister f16;
-@@ -468,7 +459,6 @@ struct alignas(0x40) PPCContext
+@@ -468,7 +474,6 @@ struct alignas(0x40) PPCContext
      PPCRegister f29;
      PPCRegister f30;
      PPCRegister f31;
@@ -401,7 +489,7 @@ index 4b0fa08..323a183 100644
  
      PPCVRegister v0;
      PPCVRegister v1;
-@@ -484,7 +474,7 @@ struct alignas(0x40) PPCContext
+@@ -484,7 +489,7 @@ struct alignas(0x40) PPCContext
      PPCVRegister v11;
      PPCVRegister v12;
      PPCVRegister v13;
@@ -410,7 +498,7 @@ index 4b0fa08..323a183 100644
      PPCVRegister v14;
      PPCVRegister v15;
      PPCVRegister v16;
-@@ -503,8 +493,7 @@ struct alignas(0x40) PPCContext
+@@ -503,8 +508,7 @@ struct alignas(0x40) PPCContext
      PPCVRegister v29;
      PPCVRegister v30;
      PPCVRegister v31;
@@ -420,7 +508,7 @@ index 4b0fa08..323a183 100644
      PPCVRegister v32;
      PPCVRegister v33;
      PPCVRegister v34;
-@@ -537,8 +526,7 @@ struct alignas(0x40) PPCContext
+@@ -537,8 +541,7 @@ struct alignas(0x40) PPCContext
      PPCVRegister v61;
      PPCVRegister v62;
      PPCVRegister v63;
@@ -430,7 +518,7 @@ index 4b0fa08..323a183 100644
      PPCVRegister v64;
      PPCVRegister v65;
      PPCVRegister v66;
-@@ -603,7 +591,6 @@ struct alignas(0x40) PPCContext
+@@ -603,7 +606,6 @@ struct alignas(0x40) PPCContext
      PPCVRegister v125;
      PPCVRegister v126;
      PPCVRegister v127;
