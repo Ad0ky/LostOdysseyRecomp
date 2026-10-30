@@ -265,3 +265,14 @@ code, alternated runs at 360 rows: 22.08 / 21.87 / 22.5 FPS ordered, 22.1 / 22.2
 `sub_822B8D68` and its decoders, under `LO_NATIVE_BONES` (`=2` runs native and recompiled code together and logs differences:
 0 of 9.2 million live calls in the first battle). Alternated short runs at 360 rows: 22.78 / 22.97 / 22.88 FPS against
 22.18 / 22.22 on the previous build, about +3%. Rotation formats 2, 3 and 5 stay on the recompiled code.
+
+## Reading the profile: `svcSignalProcessWideKey` is not call cost
+
+In the first battle at 360 rows it takes 15.9% of `GPU CmdProc`'s samples and 7.9% of `Guest Main`'s, yet a `--wrap` counter on
+`pthread_cond_broadcast` and `pthread_cond_signal` found about 4,100 calls per second across all threads, about 0.25% of a core
+at 600 ns each. Those samples are mostly threads off-CPU. Don't rank syscall samples as work. `GPU CmdProc` shares its core
+with the XMA and audio threads, and all three cores are nearly full (277% of 300%).
+
+Other candidates ruled out by reading the costs: `CapturedShader::Load`'s compare (about 1.2% of `GPU CmdProc`, and it guards
+against the guest changing shader code) and float mode switches (2.3 points of the 26.5% of `Guest Main` checked are in
+functions that switch modes at all). `GPU CmdProc`'s real time is flat.
