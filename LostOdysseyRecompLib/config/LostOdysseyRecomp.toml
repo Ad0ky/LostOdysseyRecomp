@@ -192,6 +192,28 @@ invalid_instructions = [
     { data = 0x47000202, size = 4 },
 ]
 
+# Native bone-matrix loops (cpu/guest_bone_math.cpp). They return false with LO_NATIVE_BONES=0.
+[[midasm_hook]]
+name = "NativeComposeBone"
+address = 0x822B9A14
+registers = ["r23", "r24", "r27"]
+after_instruction = false
+jump_address_on_true = 0x822B9B80
+
+[[midasm_hook]]
+name = "NativeSkinningMatricesMaster"
+address = 0x822C3ED8
+registers = ["r27", "r28", "r29", "r30", "r31"]
+after_instruction = false
+jump_address_on_true = 0x822C42CC
+
+[[midasm_hook]]
+name = "NativeSkinningMatricesOwn"
+address = 0x822C40F0
+registers = ["r27", "r28", "r29", "r30"]
+after_instruction = false
+jump_address_on_true = 0x822C42CC
+
 [[midasm_hook]]
 name = "HorPlusViewProjection"
 address = 0x82301DA0

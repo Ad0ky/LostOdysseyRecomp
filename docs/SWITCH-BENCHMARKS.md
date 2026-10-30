@@ -245,3 +245,9 @@ Tried without gain in this scene: `LO_RT32=1`, `-O2` for the game code, depth of
 motion blur off and Dynamic shadows Low. Bloom off saves about 1 ms and Dynamic shadows off
 about 5 ms of GPU time.
 
+
+## Native bone matrices (`LO_NATIVE_BONES`)
+
+Short A/B in the first battle at 360 rows, same build, 6 `perf:` lines per run (not a full benchmark): 21.7 and 21.78 FPS with
+`cpu/guest_bone_math.cpp`, 20.58 and 20.7 with `LO_NATIVE_BONES=0`, so about +5% (2.5 ms per frame). Skinning looks correct
+in a battle screenshot. On by default; `LO_NATIVE_BONES=0` keeps the recompiled loops.
