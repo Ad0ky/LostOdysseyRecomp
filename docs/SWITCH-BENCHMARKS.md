@@ -259,3 +259,9 @@ build. This compares two builds on short runs, so treat the +2% as approximate.
 
 The 2,374 functions sampled on the three busy threads, placed at the start of `.text` with `--section-ordering-file`, same
 code, alternated runs at 360 rows: 22.08 / 21.87 / 22.5 FPS ordered, 22.1 / 22.27 not. Not adopted.
+
+## Native animation key decoding
+
+`sub_822B8D68` and its decoders, under `LO_NATIVE_BONES` (`=2` runs native and recompiled code together and logs differences:
+0 of 9.2 million live calls in the first battle). Alternated short runs at 360 rows: 22.78 / 22.97 / 22.88 FPS against
+22.18 / 22.22 on the previous build, about +3%. Rotation formats 2, 3 and 5 stay on the recompiled code.
