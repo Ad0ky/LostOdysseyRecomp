@@ -215,5 +215,9 @@ The main thread's limit moved from about 66 ms to about 52 ms per frame. At 540 
 rows the GPU sets the frame: frame time is about GPU busy time plus 11 ms, with no sign of
 a vsync step, so each millisecond of GPU time saved shows up until the CPU limit.
 
+Most of those 11 ms are the final scaling pass, which the GPU busy figure leaves out. With
+`scaling_quality=0` (bilinear, not bicubic) at 540 rows: 16.6-18.1 FPS, frame 55-59 ms, GPU
+busy unchanged at about 53 ms, and the main thread back at 84-91%.
+
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.
