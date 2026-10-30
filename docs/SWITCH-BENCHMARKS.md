@@ -225,3 +225,23 @@ at 540 rows (frame 53-57 ms) and about 19.9 FPS at 360 rows (p50 48.7 ms, agains
 
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.
+
+### Milestone 1: `e079c587` (2026-10-30)
+
+Recompiler register locals and non-volatile guest memory (#5), bilinear scaling. Same
+console, scene and method as the baseline: one warm-up and 3 counted runs per row.
+The 540-row row uses the release `env.txt`.
+
+| Render height | FPS | p50 | p99 | GPU busy | Render thread idle | Guest Main | CmdProc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 540 | 17.94 (17.85-18.01) | 55.8 ms | 69.8 ms | 52.8 ms | 4.8 ms | 81% | 69% |
+| 360 | 20.51 (20.29-20.61) | 47.2 ms | 75.0 ms | 32.2 ms | 10.3 ms | 91% | 84% |
+
+Against the baseline, 540 rows gained 25% (14.36 to 17.94 FPS) and the CPU limit moved
+from about 66 ms to about 47 ms. At 540 rows the GPU sets the frame. At 360 rows the three
+cores are nearly full (282% of 300%). Only this scene has been measured.
+
+Tried without gain in this scene: `LO_RT32=1`, `-O2` for the game code, depth of field off,
+motion blur off and Dynamic shadows Low. Bloom off saves about 1 ms and Dynamic shadows off
+about 5 ms of GPU time.
+
