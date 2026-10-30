@@ -251,3 +251,6 @@ about 5 ms of GPU time.
 Short A/B in the first battle at 360 rows, same build, 6 `perf:` lines per run (not a full benchmark): 21.7 and 21.78 FPS with
 `cpu/guest_bone_math.cpp`, 20.58 and 20.7 with `LO_NATIVE_BONES=0`, so about +5% (2.5 ms per frame). Skinning looks correct
 in a battle screenshot. On by default; `LO_NATIVE_BONES=0` keeps the recompiled loops.
+
+Adding native quaternion slerp and normalize (same switch): 22.08 and 22.17 FPS, compared with about 21.74 on the previous
+build. This compares two builds on short runs, so treat the +2% as approximate.

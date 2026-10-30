@@ -5,6 +5,7 @@
 // The mid-asm hooks return true when they did the work; LO_NATIVE_BONES=0 keeps the recompiled loops, for A/B runs.
 #include <stdafx.h>
 #include <kernel/memory.h>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 
@@ -158,6 +159,72 @@ bool NativeSkinningMatricesOwn(PPCRegister& r27, PPCRegister& r28, PPCRegister& 
 
     SkinningMatrices(r27, r29, r30, r28.u32, 0);
     return true;
+}
+
+extern "C" PPC_FUNC(__imp__sub_822B9630);
+extern "C" PPC_FUNC(__imp__sub_822B9778);
+
+// FQuat::Slerp, shortest path: r3 = out, r4 = a, r5 = b, f1 = alpha. The guest goes through its double-precision
+// sin (sub_822A2FE0, called three times) and acos.
+PPC_FUNC(sub_822B9630)
+{
+    if (!NativeBonesEnabled())
+    {
+        __imp__sub_822B9630(ctx, base);
+        return;
+    }
+
+    constexpr float kLinearAbove = 0.9999f; // the guest's threshold at 0x82000D80
+    const float32x4_t a = LoadRow(base + ctx.r4.u32);
+    const float32x4_t b = LoadRow(base + ctx.r5.u32);
+    const float alpha = float(ctx.f1.f64);
+    const float dot = vaddvq_f32(vmulq_f32(a, b));
+    const float cosOmega = std::fabs(dot);
+
+    float scaleA = 1.0f - alpha;
+    float scaleB = alpha;
+    if (cosOmega < kLinearAbove)
+    {
+        const float omega = acosf(cosOmega);
+        const float invSin = 1.0f / sinf(omega);
+        scaleA = sinf(scaleA * omega) * invSin;
+        scaleB = sinf(omega * alpha) * invSin;
+    }
+    if (dot < 0.0f)
+        scaleB = -scaleB;
+
+    StoreRow(base + ctx.r3.u32, vmlaq_n_f32(vmulq_n_f32(b, scaleB), a, scaleA));
+}
+
+// FQuat::Normalize: r3 = quaternion. Returns 1 if it scaled it, 0 if already unit or set to identity (too small).
+PPC_FUNC(sub_822B9778)
+{
+    if (!NativeBonesEnabled())
+    {
+        __imp__sub_822B9778(ctx, base);
+        return;
+    }
+
+    constexpr float kEpsilon = 1e-5f; // the guest's constant at 0x82000D90
+    uint8_t* quat = base + ctx.r3.u32;
+    const float32x4_t q = LoadRow(quat);
+    const float lengthSquared = vaddvq_f32(vmulq_f32(q, q));
+
+    if (lengthSquared < kEpsilon)
+    {
+        const float identity[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        StoreRow(quat, vld1q_f32(identity));
+        ctx.r3.u64 = 0;
+    }
+    else if (std::fabs(lengthSquared - 1.0f) < kEpsilon)
+    {
+        ctx.r3.u64 = 0;
+    }
+    else
+    {
+        StoreRow(quat, vmulq_n_f32(q, 1.0f / sqrtf(lengthSquared)));
+        ctx.r3.u64 = 1;
+    }
 }
 
 #else
