@@ -20,6 +20,9 @@
 #include <kernel/function.h>
 #include <os/debug_server.h>
 #include <os/logger.h>
+#if LO_PLATFORM_SWITCH
+#include <os/switch_cpu_profiler.h>
+#endif
 #include <os/thread_name.h>
 #include <os/host_scheduling.h>
 #include <os/shader_log.h>
@@ -702,6 +705,9 @@ namespace gpu
         bool timingIdle = false;
         while (m_running)
         {
+#if LO_PLATFORM_SWITCH
+            os::switch_cpu_profiler::NoteCore();
+#endif
             uint32_t writePtr = m_writePtrIndex.load();
 
             // The write pointer is also visible in the MMIO window when the

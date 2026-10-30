@@ -169,6 +169,9 @@ struct WaitScope
     std::chrono::steady_clock::time_point start_;
     WaitScope(const char* what, uint32_t object) : st(CurrentWaitState()), what_(what), object_(object)
     {
+#if LO_PLATFORM_SWITCH
+        os::switch_cpu_profiler::NoteCore();
+#endif
         if (WaitProfileOn())
             start_ = std::chrono::steady_clock::now();
         st.what = what;

@@ -45,6 +45,13 @@ namespace os::switch_cpu_profiler
     // for the sampler: while it holds the thread list, the entries are left out of this report.
     void AppendThreadCpuUsage(std::string& out);
 
+    // LO_THREAD_PLACEMENT=1: where threads run. NoteCore (called from each thread's wait paths, at most every 2 ms, one
+    // relaxed test when off) counts the core it finds the thread on; AppendThreadPlacement gives, since the previous
+    // call, each core's idle share and, for threads above 1% CPU, priority, ideal core, allowed mask, those counts
+    // and how often the core changed between two of them. Leaves AppendThreadCpuUsage's window alone.
+    void NoteCore();
+    void AppendThreadPlacement(std::string& out);
+
     // The registered threads (kernel handle and name), for the stall watchdog. Returns how many were copied.
     struct ThreadInfo
     {

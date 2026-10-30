@@ -62,6 +62,14 @@ namespace
         void* const volatile* guestContext = nullptr;
         uint32_t stackLow = 0;
         uint32_t stackHigh = 0;
+        // LO_THREAD_PLACEMENT: what the thread saw at NoteCore, and the counts at the previous placement report.
+        uint32_t coreHits[4]{};
+        uint32_t coreMoves = 0;
+        int8_t lastCore = -1;
+        uint32_t reportedHits[4]{};
+        uint32_t reportedMoves = 0;
+        uint64_t placementTicks = 0;
+        bool coreRuleApplied = false;
     };
 
     // cpu-samples.bin: one chunk per report window, a RawChunk, then RawName per sampled thread, then the
@@ -919,6 +927,12 @@ void os::switch_cpu_profiler::RegisterCurrentThread(const char* name)
         thread.sampleTicks = thread.usageTicks;
         thread.raw = RawWanted(thread.name);
         thread.guestContext = nullptr;
+        memset(thread.coreHits, 0, sizeof(thread.coreHits));
+        memset(thread.reportedHits, 0, sizeof(thread.reportedHits));
+        thread.coreMoves = thread.reportedMoves = 0;
+        thread.lastCore = -1;
+        thread.coreRuleApplied = false;
+        thread.placementTicks = thread.usageTicks;
         thread.active = true;
     }
     mutexUnlock(&g_slotsMutex);
@@ -974,10 +988,87 @@ void os::switch_cpu_profiler::ClearCurrentThreadGuestStack()
     mutexUnlock(&g_slotsMutex);
 }
 
+namespace
+{
+    // LO_THREAD_PLACEMENT. The kernel gives a core's idle time only to a thread running on that core, so
+    // one small thread is pinned to each.
+    constexpr uint64_t NOTE_CORE_INTERVAL_TICKS = 19'200'000 / 500;   // 2 ms
+
+    bool g_placementEnabled = false;
+    Thread g_coreIdleThreads[4];
+    std::atomic<uint64_t> g_coreIdleTicks[4]{};
+    std::atomic<uint64_t> g_coreIdleReadAt[4]{};
+    uint64_t g_reportedIdleTicks[4]{};
+    uint64_t g_reportedIdleReadAt[4]{};
+    uint64_t g_placementWindowStart = 0;
+
+    // LO_THREAD_CORES=name=core:mask,...: experiments with thread placement, needing LO_THREAD_PLACEMENT. Applied at a
+    // report to a thread of that name above 50% CPU, which picks the render thread among its namesakes.
+    constexpr double CORE_RULE_MIN_PERCENT = 50.0;
+
+    void ApplyCoreRule(ThreadSlot& thread, double percent)
+    {
+        const char* rules = getenv("LO_THREAD_CORES");
+        if (!rules || thread.coreRuleApplied || percent < CORE_RULE_MIN_PERCENT)
+            return;
+
+        const size_t length = strlen(thread.name);
+        for (const char* rule = rules; *rule;)
+        {
+            const char* end = strchr(rule, ',');
+            int core = -1;
+            unsigned mask = 0;
+            if (strncmp(rule, thread.name, length) == 0 && rule[length] == '=' &&
+                sscanf(rule + length + 1, "%d:%x", &core, &mask) == 2)
+            {
+                const Result rc = svcSetThreadCoreMask(thread.handle, core, mask);
+                thread.coreRuleApplied = true;
+                fprintf(stderr, "thread placement: %s -> core %d mask 0x%x (0x%x)\n", thread.name, core, mask, rc);
+                return;
+            }
+            if (!end)
+                break;
+            rule = end + 1;
+        }
+    }
+
+    void CoreIdleThread(void* argument)
+    {
+        const size_t core = reinterpret_cast<size_t>(argument);
+        for (;;)
+        {
+            uint64_t ticks = 0;
+            if (R_SUCCEEDED(svcGetInfo(&ticks, InfoType_IdleTickCount, INVALID_HANDLE, UINT64_MAX)))
+            {
+                g_coreIdleTicks[core].store(ticks, std::memory_order_relaxed);
+                g_coreIdleReadAt[core].store(armGetSystemTick(), std::memory_order_relaxed);
+            }
+            svcSleepThread(1'000'000'000);
+        }
+    }
+
+    void StartPlacementLog()
+    {
+        g_placementEnabled = true;
+        g_placementWindowStart = armGetSystemTick();
+        for (size_t core = 0; core < 4; core++)
+        {
+            // Above the audio pump, like the sampler: a read takes microseconds, once a second.
+            const Result rc = threadCreate(&g_coreIdleThreads[core], CoreIdleThread, reinterpret_cast<void*>(core),
+                nullptr, 0x2000, 0x1D, int(core));
+            if (R_FAILED(rc) || R_FAILED(threadStart(&g_coreIdleThreads[core])))
+                fprintf(stderr, "thread placement: no idle reader on core %zu (0x%x)\n", core, rc);
+        }
+    }
+}
+
 void os::switch_cpu_profiler::Start(bool sampler)
 {
     g_usageWindowStart = armGetSystemTick();
     FindModule();
+
+    if (const char* placement = getenv("LO_THREAD_PLACEMENT"); placement && placement[0] == '1')
+        StartPlacementLog();
 
     if (!sampler || g_samplerStarted)
         return;
@@ -1056,6 +1147,101 @@ void os::switch_cpu_profiler::AppendThreadCpuUsage(std::string& out)
             continue;
 
         snprintf(entry, sizeof(entry), "%s%s %.1f%%", out.empty() || out.back() == ' ' ? "" : ", ", thread.name, percent);
+        out += entry;
+    }
+    mutexUnlock(&g_slotsMutex);
+}
+
+void os::switch_cpu_profiler::NoteCore()
+{
+    if (!g_placementEnabled)
+        return;
+
+    // Per thread: the slot stays this thread's until it exits, so it needs looking up once.
+    static thread_local int slot = -1;
+    static thread_local uint64_t nextTick = 0;
+    const uint64_t now = armGetSystemTick();
+    if (now < nextTick)
+        return;
+    nextTick = now + NOTE_CORE_INTERVAL_TICKS;
+
+    if (slot < 0)
+    {
+        if (!mutexTryLock(&g_slotsMutex))
+            return;
+        slot = FindSlot(threadGetCurHandle());
+        mutexUnlock(&g_slotsMutex);
+        if (slot < 0)
+            return;
+    }
+
+    ThreadSlot& thread = g_slots[slot];
+    const int core = int(svcGetCurrentProcessorNumber()) & 3;
+    thread.coreHits[core]++;
+    if (thread.lastCore >= 0 && thread.lastCore != core)
+        thread.coreMoves++;
+    thread.lastCore = int8_t(core);
+}
+
+void os::switch_cpu_profiler::AppendThreadPlacement(std::string& out)
+{
+    if (!g_placementEnabled || !mutexTryLock(&g_slotsMutex))
+        return;
+
+    const uint64_t now = armGetSystemTick();
+    const uint64_t window = now - g_placementWindowStart;
+    g_placementWindowStart = now;
+
+    char entry[160];
+    out += "idle";
+    for (size_t core = 0; core < 4; core++)
+    {
+        const uint64_t idle = g_coreIdleTicks[core].load(std::memory_order_relaxed);
+        const uint64_t readAt = g_coreIdleReadAt[core].load(std::memory_order_relaxed);
+        if (readAt == 0)
+            snprintf(entry, sizeof(entry), " c%zu n/a", core);
+        else if (g_reportedIdleReadAt[core] == 0 || readAt == g_reportedIdleReadAt[core])
+            snprintf(entry, sizeof(entry), " c%zu ?", core);
+        else
+            snprintf(entry, sizeof(entry), " c%zu %.1f%%", core,
+                100.0 * double(idle - g_reportedIdleTicks[core]) / double(readAt - g_reportedIdleReadAt[core]));
+        out += entry;
+        g_reportedIdleTicks[core] = idle;
+        g_reportedIdleReadAt[core] = readAt;
+    }
+
+    for (size_t i = 0; i < MAX_THREADS; i++)
+    {
+        ThreadSlot& thread = g_slots[i];
+        if (!thread.active)
+            continue;
+
+        const uint64_t ticks = ThreadTicks(thread.handle);
+        const uint64_t used = ticks >= thread.placementTicks ? ticks - thread.placementTicks : 0;
+        thread.placementTicks = ticks;
+        uint32_t hits[4];
+        uint32_t total = 0;
+        for (size_t core = 0; core < 4; core++)
+        {
+            hits[core] = thread.coreHits[core] - thread.reportedHits[core];
+            thread.reportedHits[core] = thread.coreHits[core];
+            total += hits[core];
+        }
+        const uint32_t moves = thread.coreMoves - thread.reportedMoves;
+        thread.reportedMoves = thread.coreMoves;
+
+        const double percent = window ? 100.0 * double(used) / double(window) : 0.0;
+        if (percent < 1.0)
+            continue;
+
+        s32 ideal = -1;
+        u64 mask = 0;
+        s32 priority = -1;
+        svcGetThreadCoreMask(&ideal, &mask, thread.handle);
+        svcGetThreadPriority(&priority, thread.handle);
+        ApplyCoreRule(thread, percent);
+        snprintf(entry, sizeof(entry), " | #%zu %s cpu %.1f%% prio 0x%x ideal %d mask 0x%llx seen c0/1/2/3 %u/%u/%u/%u moves %u",
+            i, thread.name, percent, unsigned(priority), int(ideal), (unsigned long long)mask, hits[0], hits[1], hits[2], hits[3], moves);
         out += entry;
     }
     mutexUnlock(&g_slotsMutex);

@@ -289,6 +289,10 @@ static int RunGuest(uint32_t entry)
             os::switch_cpu_profiler::AppendThreadCpuUsage(cpu);
             LOG_INFO("switch: {}, guest committed {} MiB; CPU {}", os::switch_platform::MemorySummary(),
                      GuestAddressSpace::CommittedBytes() >> 20, cpu);
+            std::string placement;
+            os::switch_cpu_profiler::AppendThreadPlacement(placement);
+            if (!placement.empty())
+                LOG_INFO("switch: placement {}", placement);
         }
     }));
 #endif
