@@ -139,7 +139,12 @@ struct Config
     uint32_t hdrPaperWhiteNits = 203; // Content reference white; Metal maps this to the system SDR white.
     bool hdrPeakAutomatic = true; // Follow the active display's reported peak when available.
     uint32_t hdrPeakNits = 1000; // Manual peak retained independently of automatic mode.
+#if defined(__SWITCH__)
+    // Bilinear on the console: bicubic's final pass took about 7 ms per frame in the first battle (Switch OLED, handheld).
+    uint32_t scalingQuality = 0;
+#else
     uint32_t scalingQuality = 1; // 0 bilinear, 1 bicubic spatial resampling, ScalingMetalFx (macOS).
+#endif
     bool expandRgbRange = false; // Expand game image RGB 16-235 to 0-255 at presentation.
     // Player picture adjustment, applied to the game image after Expanded RGB
     // range: black level (-20..20, 0 = unchanged) and gamma in hundredths

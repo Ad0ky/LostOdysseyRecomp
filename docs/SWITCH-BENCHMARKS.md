@@ -219,5 +219,9 @@ Most of those 11 ms are the final scaling pass, which the GPU busy figure leaves
 `scaling_quality=0` (bilinear, not bicubic) at 540 rows: 16.6-18.1 FPS, frame 55-59 ms, GPU
 busy unchanged at about 53 ms, and the main thread back at 84-91%.
 
+**With argument registers as locals and bilinear scaling, short readings:** about 17.8 FPS
+at 540 rows (frame 53-57 ms) and about 19.9 FPS at 360 rows (p50 48.7 ms, against about
+18.6 FPS and 52.4 ms before; that older run used bicubic scaling).
+
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.
