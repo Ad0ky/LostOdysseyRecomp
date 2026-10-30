@@ -254,3 +254,8 @@ in a battle screenshot. On by default; `LO_NATIVE_BONES=0` keeps the recompiled 
 
 Adding native quaternion slerp and normalize (same switch): 22.08 and 22.17 FPS, compared with about 21.74 on the previous
 build. This compares two builds on short runs, so treat the +2% as approximate.
+
+## Hot-function ordering: no gain
+
+The 2,374 functions sampled on the three busy threads, placed at the start of `.text` with `--section-ordering-file`, same
+code, alternated runs at 360 rows: 22.08 / 21.87 / 22.5 FPS ordered, 22.1 / 22.27 not. Not adopted.
