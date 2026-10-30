@@ -208,10 +208,12 @@ as locals) reads 15.4–15.5 FPS in the same scene, from logs rather than a benc
 | Render height | FPS | Frame p50 | GPU busy | Render thread waiting for the game | Guest Main |
 |---|---:|---:|---:|---:|---:|
 | 540 | about 15.6 | about 64 ms | 53.8 ms | about 3 ms | 73% |
+| 504 | about 17 | about 59 ms | 48 ms | 3-12 ms | 79-90% |
 | 360 | 17-20 | 50-58 ms | 32 ms | 15-19 ms | 92% |
 
-The main thread's limit moved from about 66 ms to about 52 ms per frame. At 540 rows the
-GPU is now the limit: 54 ms just misses the 50 ms vsync step, so frames sit near 66.7 ms.
+The main thread's limit moved from about 66 ms to about 52 ms per frame. At 540 and 504
+rows the GPU sets the frame: frame time is about GPU busy time plus 11 ms, with no sign of
+a vsync step, so each millisecond of GPU time saved shows up until the CPU limit.
 
 The scenarios with saves (`disc1-ship`, `disc2-forest`, `numara`) need their
 save slots on the console; not measured yet.

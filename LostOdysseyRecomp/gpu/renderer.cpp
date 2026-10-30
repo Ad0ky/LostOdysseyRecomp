@@ -13869,6 +13869,15 @@ void main()
                 OcclusionFrameEnd();
                 if (record_timing::Enabled()) recordTiming.EndFrame(frame);
                 perf_stats::FrameDraws(drawsThisFrame);
+#if defined(LO_SWITCH_DEKO3D)
+                // LO_DEKO3D_BARRIER_TRACE=<n>: every barrier of one frame in n (plume_deko3d_api.h).
+                static const uint64_t barrierTraceEvery = [] {
+                    const char* value = std::getenv("LO_DEKO3D_BARRIER_TRACE");
+                    return value ? std::strtoull(value, nullptr, 10) : 0ull;
+                }();
+                if (barrierTraceEvery)
+                    plume::Deko3DBarrierTrace((frame + 1) % barrierTraceEvery == 0);
+#endif
                 ++frame; drawsThisFrame = 0; drops = {};
             }
             frame_generation::ResolveIdentity FgIdentity(const ResolvedSurface& rs) const

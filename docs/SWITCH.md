@@ -200,6 +200,7 @@ Switch-specific options and diagnostics:
 | `LO_GUEST_AFFINITY` | off | Set to `1` to map Xbox guest thread affinity onto the Switch's three cores |
 | `LO_THREAD_PLACEMENT` | off | Set to `1` to log every 30 s (`switch: placement`) each core's idle share and, per thread above 1% CPU, its priority, ideal core, allowed mask, and the cores it was seen on |
 | `LO_THREAD_CORES` | off | With `LO_THREAD_PLACEMENT=1`: `name=core:hexmask,...` sets the ideal core and allowed mask of a thread of that name once a report finds it above 50% CPU, for placement experiments |
+| `LO_DEKO3D_BARRIER_TRACE` | off | Set to `<n>`: every barrier of one frame in n goes to the log (`barrier trace:`), with what it waits for, its textures and the caller's address relative to `Deko3DBarrierTrace` |
 | `LO_SWITCH_BUTTONS` | letter layout | Set to `position` to use the physical positional A/B/X/Y layout |
 | `LO_ZPD_MODE` | host queries | Set to `xenia` for made-up occlusion query counts instead of host queries |
 | `LO_SKIP_NOOP_DRAWS` | `1` | Set to `0` to draw the draws that write no colour, depth or stencil |

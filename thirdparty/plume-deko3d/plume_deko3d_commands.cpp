@@ -183,6 +183,11 @@ namespace plume {
         }
     }
 
+    // LostOdysseyRecomp (2026-10-30): LO_DEKO3D_BARRIER_TRACE; addresses are relative to this function (nm gives its
+    // address in the ELF).
+    static std::atomic<bool> g_barrierTrace{false};
+    void Deko3DBarrierTrace(bool on) { g_barrierTrace.store(on, std::memory_order_relaxed); }
+
     void Deko3DCommandList::barriers(RenderBarrierStages stages, const RenderBufferBarrier *bufferBarriers, uint32_t bufferBarriersCount, const RenderTextureBarrier *textureBarriers, uint32_t textureBarriersCount) {
         // Image layouts do not exist in deko3d: a barrier is an ordering of the GPU's work and an invalidation of its
         // caches. Rendering and compute before sampling: Fragments / Primitives with the texture cache dropped
@@ -190,6 +195,18 @@ namespace plume {
         uint32_t invalidate = 0;
         DkBarrier mode = DkBarrier_None;
         bool copy = (stages & RenderBarrierStage::COPY) != 0;
+        if (g_barrierTrace.load(std::memory_order_relaxed)) {
+            const int64_t caller = int64_t(reinterpret_cast<intptr_t>(__builtin_return_address(0))) -
+                int64_t(reinterpret_cast<intptr_t>(&Deko3DBarrierTrace));
+            const size_t used = strlen(barrierTrace);
+            int n = snprintf(barrierTrace + used, sizeof(barrierTrace) - used, "%sret=%+lld stages=%u buf=%u tex=", used ? " | " : "",
+                static_cast<long long>(caller), uint32_t(stages), bufferBarriersCount);
+            for (uint32_t i = 0; i < textureBarriersCount && n > 0 && used + size_t(n) < sizeof(barrierTrace) - 24; i++) {
+                const Deko3DTexture *t = static_cast<const Deko3DTexture *>(textureBarriers[i].texture);
+                n += snprintf(barrierTrace + used + n, sizeof(barrierTrace) - used - n, "%ux%u:%u,", t ? t->desc.width : 0, t ? t->desc.height : 0,
+                    uint32_t(textureBarriers[i].layout));
+            }
+        }
         for (uint32_t i = 0; i < textureBarriersCount; i++) {
             switch (textureBarriers[i].layout) {
             case RenderTextureLayout::SHADER_READ:
@@ -251,6 +268,11 @@ namespace plume {
             if (invalidate & DkInvalidateFlags_Image)
                 bump(st.barriersImageInvalidate);
         }
+        if (g_barrierTrace.load(std::memory_order_relaxed)) {
+            logf("barrier trace: mode=%s invalidate=%#x draws=%u %s", mode == DkBarrier_Full ? "full" : mode == DkBarrier_Fragments ? "fragments" : "primitives",
+                invalidate, uint32_t(statDraws), barrierTrace);
+        }
+        barrierTrace[0] = 0;
         dkCmdBufBarrier(cmd, mode, invalidate);
         pendingBarrier = false;
         pendingBarrierMode = DkBarrier_None;

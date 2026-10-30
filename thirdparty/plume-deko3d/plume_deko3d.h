@@ -440,6 +440,7 @@ namespace plume {
         DkBarrier pendingBarrierMode = DkBarrier_None;
         uint32_t pendingBarrierInvalidate = 0;
         bool pendingBarrier = false;
+        char barrierTrace[192] = {};  // LostOdysseyRecomp: what the barrier about to be emitted came from
         // banjo-nx (2026-10-19, render-thread proposal 13): per-draw counters of this list, added to the totals at end()
         // (no atomic read-modify-write per draw: the A57 has no LSE).
         uint64_t statDraws = 0, statWindowDraws = 0;

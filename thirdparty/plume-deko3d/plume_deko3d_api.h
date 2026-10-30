@@ -51,4 +51,8 @@ namespace plume {
         uint64_t shaderCompiles = 0, shaderCompileNs = 0, translations = 0, translateNs = 0;
     };
     Deko3DCounters Deko3DReadCounters();
+
+    // LO_DEKO3D_BARRIER_TRACE: while on, every barrier that reaches the GPU is logged with what it waits for, its
+    // textures, the draws recorded so far in the list and the caller (LostOdysseyRecomp, 2026-10-30).
+    void Deko3DBarrierTrace(bool on);
 }
