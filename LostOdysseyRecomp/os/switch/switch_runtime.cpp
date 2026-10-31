@@ -272,6 +272,7 @@ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx)
 namespace
 {
 constexpr u32 kHandheldGpu460Memory1331 = 0x92220008;
+constexpr u32 kHandheldGpu460Memory1600 = 0x92220007;
 Thread g_apmThread;
 
 bool ReadClocks(u32& gpuHz, u32& memoryHz)
@@ -322,9 +323,12 @@ void ApmThreadMain(void*)
         std::fprintf(stderr, "[apm] Unable to read clocks through clkrst; clocks unchanged.\n");
         return;
     }
-    if (R_FAILED(apmSetPerformanceConfiguration(mode, kHandheldGpu460Memory1331)))
+    const char* memorySetting = std::getenv("LO_HANDHELD_MEMORY");
+    const bool memory1600 = memorySetting && std::strcmp(memorySetting, "1600") == 0;
+    const u32 configuration = memory1600 ? kHandheldGpu460Memory1600 : kHandheldGpu460Memory1331;
+    if (R_FAILED(apmSetPerformanceConfiguration(mode, configuration)))
     {
-        std::fprintf(stderr, "[apm] Configuration 0x%08X is not available on this firmware.\n", kHandheldGpu460Memory1331);
+        std::fprintf(stderr, "[apm] Configuration 0x%08X is not available on this firmware.\n", configuration);
         return;
     }
     u32 gpuAfter = 0, memoryAfter = 0;
@@ -337,7 +341,8 @@ void ApmThreadMain(void*)
             memoryStable = false;
             break;
         }
-        const u32 delta = memoryAfter > memoryBefore ? memoryAfter - memoryBefore : memoryBefore - memoryAfter;
+        // The 1600 MHz configuration raises the memory clock; it must not fall.
+        const u32 delta = memoryAfter > memoryBefore ? (memory1600 ? 0 : memoryAfter - memoryBefore) : memoryBefore - memoryAfter;
         if (delta > 20000000)
         {
             memoryStable = false;
@@ -349,11 +354,11 @@ void ApmThreadMain(void*)
         if (hasOriginal)
             apmSetPerformanceConfiguration(mode, original);
         std::fprintf(stderr, "[apm] 0x%08X changed the memory clock (%.1f -> %.1f MHz); reverted to 0x%08X.\n",
-            kHandheldGpu460Memory1331, memoryBefore / 1e6, memoryAfter / 1e6, original);
+            configuration, memoryBefore / 1e6, memoryAfter / 1e6, original);
         return;
     }
-    std::fprintf(stderr, "[apm] GPU %.1f -> %.1f MHz, memory stays at %.1f MHz (configuration 0x%08X).\n",
-        gpuBefore / 1e6, gpuAfter / 1e6, memoryAfter / 1e6, kHandheldGpu460Memory1331);
+    std::fprintf(stderr, "[apm] GPU %.1f -> %.1f MHz, memory %.1f -> %.1f MHz (configuration 0x%08X).\n",
+        gpuBefore / 1e6, gpuAfter / 1e6, memoryBefore / 1e6, memoryAfter / 1e6, configuration);
 }
 }
 
