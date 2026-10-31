@@ -286,3 +286,18 @@ off, no guest kill, no depth export. Early and late tests only differ when a pix
 
 Short runs in the first battle at 540 rows: 21.78 / 21.65 FPS, 18.05 with `LO_DEKO3D_EARLY_Z=0`, about +20%. GPU busy 41.5 ms
 against 53 ms. 47 of the first 64 pixel shaders can't discard. Checking 64 shaders took about 25 ms in total.
+
+## Milestone 2 (`9fb1b237`, full benchmark, 1 warm-up + 3 counted runs)
+
+| First battle | Baseline | Milestone 1 | Milestone 2 |
+|---|---:|---:|---:|
+| FPS at 540 rows | 14.36 | 17.94 | **21.63** |
+| Median frame at 540 rows | 66.5 ms | 55.8 ms | 44.4 ms |
+| 1% low at 540 rows | | 14.32 | 15.90 |
+| GPU busy at 540 rows | 52 ms | 52.8 ms | 41.7 ms |
+| FPS at 360 rows | 14.6 | 20.51 | **22.88** |
+| 1% low at 360 rows | | 13.34 | 16.76 |
+
+540 rows is now within about 6% of the 360-row CPU limit, so the GPU and the CPU cap the frame about equally. Longest frame at
+540 rows: 91 ms against 81.2 ms, from one hitch in the runs, so it needs watching.
+
