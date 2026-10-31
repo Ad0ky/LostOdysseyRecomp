@@ -1665,6 +1665,29 @@ namespace plume {
             logf("shader %s: %u bytes of DKSH are not valid", what, size);
             return false;
         }
+        // LostOdysseyRecomp (2026-10-31): deko3d copies the program header into the DkShader at initialization, and
+        // the header's early_fragment_tests goes to the GPU at each bind. A patched copy of the control section gives
+        // a second DkShader on the same code. DKSH: control_sz at byte 8, programs_off at 16; a program's type at 0,
+        // its early_fragment_tests at 25. Fragment programs have type 1.
+        {
+            uint32_t controlSize = 0, programsOff = 0, type = 0;
+            memcpy(&controlSize, dksh.data() + 8, 4);
+            memcpy(&programsOff, dksh.data() + 16, 4);
+            if (controlSize <= size && uint64_t(programsOff) + 64 <= controlSize) {
+                memcpy(&type, dksh.data() + programsOff, 4);
+                if (type == 1 && !dksh[programsOff + 25]) {
+                    std::vector<uint8_t> control(dksh.begin(), dksh.begin() + controlSize);
+                    control[programsOff + 25] = 1;
+                    DkShaderMaker early;
+                    dkShaderMakerDefaults(&early, cb.first, at + controlSize);
+                    early.control = control.data();
+                    auto twin = std::make_unique<DkShader>();
+                    dkShaderInitialize(twin.get(), &early);
+                    if (dkShaderIsValid(twin.get()))
+                        earlyFragmentShaders[&shader] = std::move(twin);
+                }
+            }
+        }
         cb.second = at + size;
         g_deko3dStats.codeBytes += size;
         // Command lists invalidate the GPU's shader cache before their next draw (deko3d does it only at a queue
@@ -1998,6 +2021,11 @@ namespace plume {
             }
             p->shaders[p->shaderCount++] = s;
             p->stageShaders[i] = s;  // banjo-nx (2026-10-19)
+            if (i == 2) {
+                std::lock_guard<std::mutex> lock(codeMutex);
+                auto twin = earlyFragmentShaders.find(s);
+                p->earlyFragment = twin != earlyFragmentShaders.end() ? twin->second.get() : nullptr;
+            }
             p->stageMask |= 1u << dkStages[i];
             p->uboMask[i] = stages[i]->usage.uboMask;
             p->ssboMask[i] = stages[i]->usage.ssboMask;

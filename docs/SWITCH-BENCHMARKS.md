@@ -276,3 +276,13 @@ with the XMA and audio threads, and all three cores are nearly full (277% of 300
 Other candidates ruled out by reading the costs: `CapturedShader::Load`'s compare (about 1.2% of `GPU CmdProc`, and it guards
 against the guest changing shader code) and float mode switches (2.3 points of the 26.5% of `Guest Main` checked are in
 functions that switch modes at all). `GPU CmdProc`'s real time is flat.
+
+## Early depth test: the largest GPU gain so far
+
+Every translated pixel shader contains the alpha test's `discard`, in a branch decided at run time, so the GPU tested depth
+after shading on every draw and shaded hidden pixels. Each fragment shader now has a second `DkShader` on the same code with
+`early_fragment_tests` set in its program header, and a draw uses it when no discard or depth write is possible: alpha test
+off, no guest kill, no depth export. Early and late tests only differ when a pixel is discarded, so the image is the same.
+
+Short runs in the first battle at 540 rows: 21.78 / 21.65 FPS, 18.05 with `LO_DEKO3D_EARLY_Z=0`, about +20%. GPU busy 41.5 ms
+against 53 ms. 47 of the first 64 pixel shaders can't discard. Checking 64 shaders took about 25 ms in total.

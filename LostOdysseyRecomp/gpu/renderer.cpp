@@ -582,6 +582,10 @@ namespace gpu::renderer
             // Rect-list variant (shader/rect_list_hlsl.h), built on first use.
             std::unique_ptr<RenderShader> rectList;
             bool rectListFailed = false;
+            // Pixel shaders: whether the shader can discard or write depth with the alpha test off. Until checked
+            // (deko3d only) it counts as yes.
+            bool mayDiscard = true;
+            bool discardChecked = false;
         };
 
         using PipelineKey = gpu::pipeline_cache::Key;
@@ -7422,6 +7426,26 @@ void main()
 
             std::unique_ptr<position_evidence::Collection> positionEvidence;
 
+            // The translator writes guest kill instructions as clip(), and its only other discard is the alpha test.
+            // The shader pack keeps no source, so a pixel shader is translated once to look.
+            void CheckShaderDiscard(Shader& entry, const uint32_t* words, uint32_t count)
+            {
+                entry.discardChecked = true;
+                std::vector<uint32_t> swapped(count);
+                for (uint32_t i = 0; i < count; ++i) swapped[i] = ByteSwap(words[i]);
+                const auto start = std::chrono::steady_clock::now();
+                const auto translated = xenos::TranslateShader(swapped.data(), count, true, uboConstants);
+                entry.mayDiscard = translated.writesDepth || !translated.errors.empty() ||
+                    translated.hlsl.find("clip(") != std::string::npos;
+                static uint32_t checked, withDiscard;
+                static std::chrono::nanoseconds spent{};
+                spent += std::chrono::steady_clock::now() - start;
+                withDiscard += entry.mayDiscard;
+                if ((++checked & 63) == 0)
+                    LOG_INFO("renderer: {} pixel shaders checked for discard, {} can, {} ms", checked, withDiscard,
+                        std::chrono::duration_cast<std::chrono::milliseconds>(spent).count());
+            }
+
             Shader* GetShader(bool pixel, const uint32_t* words, uint32_t count, uint64_t hash)
             {
                 if (debugShaderSources && !debugCaptureDir.empty())
@@ -7439,6 +7463,7 @@ void main()
                 }
                 if (it != cache.end() && !it->second.valid && !it->second.retry.Ready()) return nullptr;
                 if (it != cache.end() && it->second.valid) {
+                    if (pixel && !it->second.discardChecked && video::IsDeko3d()) CheckShaderDiscard(it->second, words, count);
                     // LO_SHADER_HLSL_DIR also covers shaders that came from the portable
                     // pack (no HLSL was generated for them): translate once to write it.
                     if (static const char* hlslDir = getenv("LO_SHADER_HLSL_DIR"); hlslDir && it->second.info.hlsl.empty()) {
@@ -11841,6 +11866,15 @@ void main()
                 RenderPipeline* const genericPipeline = pipeline;
                 if (texInfoSpecialization) pipeline = SpecialisedPipeline(vs, ps, pipeline, shared.textureInfo);
                 RenderPipeline* countingPipeline = OcclusionCountingPending() ? CountingPipeline(key, vs, ps) : nullptr;
+                // With no discard possible on this draw, depth tested before the shader gives the same image and
+                // doesn't shade hidden pixels. On a Tegra X1 a shader that can discard otherwise tests after it.
+                static const bool earlyDepth = video::IsDeko3d() && !(getenv("LO_DEKO3D_EARLY_Z") && getenv("LO_DEKO3D_EARLY_Z")[0] == '0');
+                struct EarlyFragmentScope
+                {
+                    RenderCommandList* list;
+                    ~EarlyFragmentScope() { if (list) plume::Deko3DSetEarlyFragmentTests(list, false); }
+                } earlyFragmentScope{ earlyDepth && ps && !ps->mayDiscard && !(shared.flags & 1) ? commandList : nullptr };
+                if (earlyFragmentScope.list) plume::Deko3DSetEarlyFragmentTests(commandList, true);
                 commandList->setPipeline(countingPipeline ? countingPipeline : pipeline);
                 if (auto* sample = recordProbe.Sample()) NoteRecordPipeline(*sample, key, genericPipeline, pipeline);
                 // The command list keeps the constant for later rebinds of this

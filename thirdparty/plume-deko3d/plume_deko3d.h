@@ -277,6 +277,7 @@ namespace plume {
         // absent), so a bind does not ask deko3d, and a hash of each group of the fixed-function state, so a bind
         // after a pipeline of other state sends only the groups that differ (kStateGroups, Deko3DCommandList).
         const DkShader *stageShaders[3] = {};
+        const DkShader *earlyFragment = nullptr;  // stageShaders[2] with early fragment tests (LostOdysseyRecomp)
         uint64_t groupHash[9] = {};
     };
 
@@ -340,6 +341,8 @@ namespace plume {
         const Deko3DComputePipeline *computePipeline = nullptr;
         uint64_t boundStateHash = 0;
         const DkShader *boundShaders[3] = {};
+        bool earlyFragmentTests = false;  // Deko3DSetEarlyFragmentTests
+        void bindFragmentVariant();
         // banjo-nx (2026-10-19): the groups of fixed-function state as last bound (Deko3DGraphicsPipeline::groupHash;
         // 0: unknown). The dynamic depth bias and stencil reference make theirs unknown.
         uint64_t boundGroups[9] = {};
@@ -513,6 +516,8 @@ namespace plume {
 
         // Shader code: blocks, bump allocated.
         std::mutex codeMutex;
+        // A fragment shader to the same code with early fragment tests (guarded by codeMutex).
+        std::unordered_map<const DkShader *, std::unique_ptr<DkShader>> earlyFragmentShaders;
         std::vector<std::pair<DkMemBlock, uint32_t>> codeBlocks; // block, used
         std::atomic<uint64_t> codeEpoch{1}; // advances with each code load (command lists invalidate the shader cache)
         std::unordered_map<uint64_t, std::unique_ptr<Deko3DShaderVariant>> variants; // by variant source hash

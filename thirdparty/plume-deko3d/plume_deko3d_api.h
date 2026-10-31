@@ -42,6 +42,11 @@ namespace plume {
     // Call it on the thread that records the command lists, between them.
     void Deko3DSetBarrierOptions(bool mergeBarriers, bool leanBarriers);
 
+    // LostOdysseyRecomp (2026-10-31): whether the list's next draws may test depth before their fragment shader. Only
+    // for a shader that will not discard or write depth on those draws: the image is then the same, and hidden pixels
+    // aren't shaded. Stays until changed.
+    void Deko3DSetEarlyFragmentTests(RenderCommandList *list, bool allowed);
+
     // The back end's running totals (Deko3DStats), for the renderer's per-frame report.
     struct Deko3DCounters {
         uint64_t draws = 0, pipelineBinds = 0, stateBinds = 0, descriptorWrites = 0;

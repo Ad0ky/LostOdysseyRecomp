@@ -110,6 +110,7 @@ namespace plume {
         computePipeline = nullptr;
         boundStateHash = 0;
         boundShaders[0] = boundShaders[1] = boundShaders[2] = nullptr;
+        earlyFragmentTests = false;
         std::fill(std::begin(boundGroups), std::end(boundGroups), 0);
         graphicsLayout = computeLayout = nullptr;
         boundImageSet = boundSamplerSet = 0;
@@ -503,6 +504,7 @@ namespace plume {
         bindGraphicsBuffers();
         if (graphicsPipeline->boundTextures)
             bindTextures();
+        bindFragmentVariant();
         flushBarriers();
         dkCmdBufDraw(cmd, graphicsPipeline->primitive, vertexCount, instanceCount, startVertex, startInstance);
         ++statDraws;
@@ -517,9 +519,25 @@ namespace plume {
         bindGraphicsBuffers();
         if (graphicsPipeline->boundTextures)
             bindTextures();
+        bindFragmentVariant();
         flushBarriers();
         dkCmdBufDrawIndexed(cmd, graphicsPipeline->primitive, indexCount, instanceCount, startIndex, baseVertex, startInstance);
         ++statDraws;
+    }
+
+    void Deko3DCommandList::bindFragmentVariant() {
+        const DkShader *early = graphicsPipeline->earlyFragment;
+        if (!early)
+            return;
+        const DkShader *want = earlyFragmentTests ? early : graphicsPipeline->stageShaders[2];
+        if (want != boundShaders[2]) {
+            dkCmdBufBindShaders(cmd, DkStageFlag_Fragment, &want, 1);
+            boundShaders[2] = want;
+        }
+    }
+
+    void Deko3DSetEarlyFragmentTests(RenderCommandList *list, bool allowed) {
+        static_cast<Deko3DCommandList *>(list)->earlyFragmentTests = allowed;
     }
 
     void Deko3DCommandList::setPipeline(const RenderPipeline *pipeline) {
@@ -547,7 +565,9 @@ namespace plume {
         bump(GetDeko3DStats().pipelineBinds);
         // Shaders: rebound when any stage differs (absent stages are disabled by the bind).
         const DkShader *const *want = p->stageShaders;  // banjo-nx: kept at creation
-        if (want[0] != boundShaders[0] || want[1] != boundShaders[1] || want[2] != boundShaders[2]) {
+        // The early variant of this pipeline's fragment shader counts as bound: the draw picks between the two.
+        const bool fragmentBound = want[2] == boundShaders[2] || (p->earlyFragment && p->earlyFragment == boundShaders[2]);
+        if (want[0] != boundShaders[0] || want[1] != boundShaders[1] || !fragmentBound) {
             dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, p->shaders, p->shaderCount);
             boundShaders[0] = want[0];
             boundShaders[1] = want[1];
