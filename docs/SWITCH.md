@@ -17,8 +17,8 @@ Switch layer follows the Sonic Unleashed Switch ports
 > missing features.
 
 The Switch build keeps the Xbox 360 image and its own effects (bloom, depth of
-field, motion blur, shadows). The scene defaults to 540p in handheld mode and
-720p when docked; see [Graphics menu](#graphics-menu) for the Switch's own
+field, motion blur, shadows). The scene defaults to 540p in handheld and docked
+mode (720p docked is not yet measured with deko3d, issue #25); see [Graphics menu](#graphics-menu) for the Switch's own
 resolution and FSR rows. The PC additions are off and hidden in the Graphics
 menu: anti-aliasing, ambient occlusion, anisotropic filtering, shadow
 resolution, the PC upscalers (DLSS, FSR 3.1, XeSS, MetalFX), DLSS neural
@@ -89,9 +89,9 @@ the rows they set show their value greyed out.
 
 | Row | Choices | Default | env.txt that wins |
 |---|---|---|---|
-| Render resolution (Maximum resolution with dynamic resolution on) | Auto, 360p, 432p, 504p, 540p, 576p, 648p, 720p | Auto: 540p handheld, 720p docked | `LO_SWITCH_RENDER_HEIGHT` |
+| Render resolution (Maximum resolution with dynamic resolution on) | Auto, 360p, 432p, 504p, 540p, 576p, 648p, 720p | Auto: 540p, handheld and docked | `LO_SWITCH_RENDER_HEIGHT` |
 | Dynamic resolution | On, Off | Off | `LO_DYNAMIC_RESOLUTION` |
-| Minimum resolution (shown with dynamic resolution) | Auto, then the heights up to the maximum | Auto: 80% of the maximum (432p, 576p) | `LO_DYNAMIC_RESOLUTION_MIN` |
+| Minimum resolution (shown with dynamic resolution) | Auto, then the heights up to the maximum | Auto: 80% of the maximum (432p at 540p) | `LO_DYNAMIC_RESOLUTION_MIN` |
 | FSR | On, Off | Off (bilinear) | `LO_SWITCH_UPSCALER` |
 | FSR sharpness (shown with FSR) | Off, 1% to 100% | 88% (RCAS 0.24 stops) | `LO_SWITCH_RCAS_STOPS` |
 
@@ -249,7 +249,7 @@ Switch-specific options and diagnostics:
 | Variable | Default | Effect |
 |---|---|---|
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
-| `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, handheld uses 540 and docked uses 720 |
+| `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, both modes use 540 |
 | `LO_DYNAMIC_RESOLUTION` | Graphics menu (off) | `0` or `1` wins over Graphics → Dynamic resolution. `1`: the scene height follows the GPU's time per frame, in steps of 36 rows from the configured height (540 or 720) down to `LO_DYNAMIC_RESOLUTION_MIN` (default 80% of it: 432 or 576); the final pass scales it to the output as usual. The runtime log's `dynamic resolution:` lines show each change |
 | `LO_DYNAMIC_RESOLUTION_MIN` | Graphics menu (80%) | The lowest scene height dynamic resolution uses (rows; 360 at the least), over Graphics → Minimum resolution |
 | `LO_DYNAMIC_RESOLUTION_STEP` | `36` | Rows per dynamic resolution step (a multiple of 9, so 16:9 widths stay whole; `90` gives 540, 450, 360) |
@@ -544,7 +544,7 @@ instructions per call, so it shifts little time.
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
 | Window, input, audio | devkitPro's SDL 3.4 fork (`thirdparty/SDL-switch`), built without EGL (`tools/patches/sdl-switch-no-egl.patch`) |
 | XMA audio | Xenia's FFmpeg fork with `thirdparty/ffmpeg-config/switch-aarch64` |
-| Graphics settings | `settings::Validate()` selects the current mode's Render resolution (Auto: 540p handheld, 720p docked; override with `LO_SWITCH_RENDER_HEIGHT`), 1x shadow maps and no AA, AO, anisotropic filtering, PC upscalers, frame generation or HDR; `GraphicsRowHidden()` shows only the rows that apply (see [Graphics menu](#graphics-menu)) |
+| Graphics settings | `settings::Validate()` selects the current mode's Render resolution (Auto: 540p in both modes; override with `LO_SWITCH_RENDER_HEIGHT`), 1x shadow maps and no AA, AO, anisotropic filtering, PC upscalers, frame generation or HDR; `GraphicsRowHidden()` shows only the rows that apply (see [Graphics menu](#graphics-menu)) |
 | Not on Switch | Updater, network downloads, importer, D3D12, DLSS/FSR/XeSS, frame generation, HDR |
 
 ## deko3d back end (experimental)
