@@ -105,10 +105,50 @@ Handle OwnProcessHandle()
     return receive.received;
 }
 
-// Backs [offset, offset + size) of the window with fresh zeroed memory and,
-// for the A view, maps the same pages at the C and E aliases.
-bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
+// Appends the kernel's memory blocks over [address, address + size) to the failure detail:
+// "start-end tTYPE aATTR pPERM, ..." (window offsets as +x). Reports whether all of it is free
+// and whether a kernel thread-local page is among the blocks.
+void AppendBlocks(const char* label, uintptr_t address, size_t size, bool* allFree, bool* threadLocal)
 {
+    AppendFailureDetail("%s [", label);
+    const uintptr_t window = uintptr_t(s_base);
+    const uintptr_t end = address + size;
+    bool unmapped = true;
+    bool first = true;
+    for (uintptr_t at = address; at < end;)
+    {
+        MemoryInfo block{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&block, &pageInfo, at)) || block.size == 0 || block.addr + block.size <= at)
+        {
+            AppendFailureDetail("%squery failed at %#llx", first ? "" : ", ", (unsigned long long)at);
+            unmapped = false;
+            break;
+        }
+        const uintptr_t blockEnd = std::min<uintptr_t>(end, block.addr + block.size);
+        const uint32_t type = block.type & MemState_Type;
+        if (type != MemType_Unmapped || block.attr != 0)
+            unmapped = false;
+        if (type == MemType_ThreadLocal && threadLocal)
+            *threadLocal = true;
+        const bool inside = window && at >= window && at - window < kSize;
+        const uintptr_t bias = inside ? window : 0;
+        AppendFailureDetail("%s%s%#llx-%#llx t%x a%x p%x", first ? "" : ", ", inside ? "+" : "",
+            (unsigned long long)(at - bias), (unsigned long long)(blockEnd - bias), type, block.attr, block.perm);
+        first = false;
+        at = blockEnd;
+    }
+    AppendFailureDetail("]");
+    if (allFree)
+        *allFree = unmapped;
+}
+
+// One try at backing [offset, offset + size) of the window with fresh zeroed memory and, for the A view, mapping the
+// same pages at the C and E aliases. On failure nothing it mapped is left behind (unless undoing it failed, which the
+// detail says), and retry says whether another try with a new source can work.
+bool MapChunkOnce(size_t offset, size_t size, uintptr_t& sourceOut, int round, bool& retry)
+{
+    retry = false;
     void* backing = memalign(kPage, size);
     if (!backing)
     {
@@ -150,16 +190,34 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
     if (!source)
     {
         RecordFailure(FailureOperation::CreateBacking, rc, -1, source, size, offset);
+        AppendFailureDetail("no code-memory source after %d tries (round %d)", kMapAttempts, round + 1);
         free(backing);
         return false;
     }
 
+    struct View
+    {
+        size_t destination, sourceOffset, length;
+    };
+    View mapped[3]{};
+    int mappedCount = 0;
     auto map = [&](size_t destination, size_t sourceOffset, size_t length, int32_t view) {
-        rc = svcMapProcessMemory(s_base + destination, s_process,
-            uintptr_t(source) + sourceOffset, length);
-        if (R_FAILED(rc))
-            RecordFailure(FailureOperation::MapView, rc, view, s_base + destination, length, offset);
-        return R_SUCCEEDED(rc);
+        rc = svcMapProcessMemory(s_base + destination, s_process, uintptr_t(source) + sourceOffset, length);
+        if (R_SUCCEEDED(rc))
+        {
+            mapped[mappedCount++] = { destination, sourceOffset, length };
+            return true;
+        }
+        // Usually rc 0xd401 (InvalidCurrentMemory): the destination is not free or the source is not mappable.
+        RecordFailure(FailureOperation::MapView, rc, view, s_base + destination, length, offset);
+        AppendFailureDetail("round %d: ", round + 1);
+        bool destinationFree = false, threadLocal = false;
+        AppendBlocks("destination", uintptr_t(s_base + destination), length, &destinationFree, &threadLocal);
+        AppendBlocks("; source", uintptr_t(source) + sourceOffset, length, nullptr, nullptr);
+        if (threadLocal)
+            AppendFailureDetail("; a kernel thread-local page is in the guest window");
+        retry = destinationFree;
+        return false;
     };
 
     bool ok = map(offset, 0, size, offset < kStarts[1] ? 0 : 1);
@@ -175,10 +233,106 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
             ok = map(kStarts[3] + physical + skip - kPage, skip, size - skip, 3);
         }
     }
-    // Mapped views are never released: guest memory lives for the whole run.
+    // Once all views are mapped they are never released: guest memory lives for the whole run.
     if (ok)
+    {
         sourceOut = uintptr_t(source);
-    return ok;
+        return true;
+    }
+
+    // Undo this try, so the chunk is either fully mapped or not at all and a later commit can map it.
+    // A source still mapped somewhere keeps its backing locked: then neither is released (2 MiB lost, not reused).
+    bool released = true;
+    for (int view = mappedCount - 1; view >= 0; --view)
+    {
+        const Result undo = svcUnmapProcessMemory(s_base + mapped[view].destination, s_process,
+            uintptr_t(source) + mapped[view].sourceOffset, mapped[view].length);
+        if (R_FAILED(undo))
+        {
+            AppendFailureDetail("; unmapping +%#zx rc %#x: chunk left partly mapped", mapped[view].destination, undo);
+            released = false;
+        }
+    }
+    if (released)
+    {
+        const Result undo = svcUnmapProcessCodeMemory(s_process, uintptr_t(source), uintptr_t(backing), size);
+        if (R_SUCCEEDED(undo))
+            free(backing);
+        else
+            AppendFailureDetail("; releasing the source rc %#x: source and backing kept", undo);
+    }
+    if (!released)
+        retry = false; // a view of this chunk is still mapped: another source cannot go there
+    return false;
+}
+
+// Backs [offset, offset + size) of the window (see MapChunkOnce). When the kernel refused a view although its
+// destination was free, the source was the problem: try again with a new one.
+bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
+{
+    constexpr int kRounds = 4;
+    for (int round = 0; round < kRounds; ++round)
+    {
+        bool retry = false;
+        if (MapChunkOnce(offset, size, sourceOut, round, retry))
+        {
+            if (round > 0)
+            {
+                std::fprintf(stderr, "guest memory: chunk %#zx mapped on round %d after: %s\n", offset, round + 1,
+                    GetFailureInfo().detail);
+                ClearFailure();
+            }
+            return true;
+        }
+        if (!retry)
+            return false;
+    }
+    return false;
+}
+
+// Horizon places each thread-local page (TLS of 8 threads, mapped by svcCreateThread when the existing ones are full,
+// unmapped when all 8 exit) at a random free address of the process's kernel map region (Atmosphere
+// kern_k_page_table_base.cpp: GetRegionAddress(ThreadLocal), MapPages, FindFreeArea). No svcGetInfo reports that
+// region, so libnx's virtmemFindAslr can put the guest window inside it, and the kernel knows nothing of virtmem
+// reservations: every uncommitted chunk of the window is free memory to it. A thread-local page placed there makes the
+// later commit of that chunk fail (svcMapProcessMemory 0xd401) and the game aborts with "out of guest virtual memory".
+// Where the region is depends on the address space the title running hbloader was created with (InitializeForProcess):
+// - 36-bit (ASLR region 0x8000000-0x1000000000, 64 GiB): the code region, the small map 0x8000000-0x80000000
+//   (AddressSmallMap36Start/End). Fixed, 2 GiB.
+// - 39-bit (ASLR region 512 GiB): 64 GiB (AddressMemoryRegionSmall39Size) at a random place, apart from the heap, alias
+//   and stack regions. Every thread-local page lies inside it, so it lies within kKernelMapSize of them all.
+// The window is placed outside that range.
+constexpr uint64_t kKernelMapSize = 64ull << 30;
+constexpr uintptr_t kSmallMap36Start = 0x8000000;
+constexpr uintptr_t kSmallMap36End = 0x80000000;
+constexpr uint64_t kAddressSpace36End = 1ull << 36;
+
+PlacementInfo s_placement{};
+
+void FindThreadLocalPages(PlacementInfo& placement)
+{
+    placement.tlsLow = UINTPTR_MAX;
+    placement.tlsHigh = 0;
+    uintptr_t at = 0;
+    for (int blocks = 0; blocks < 0x10000; ++blocks)
+    {
+        MemoryInfo info{};
+        u32 pageInfo = 0;
+        if (R_FAILED(svcQueryMemory(&info, &pageInfo, at)) || info.size == 0)
+            break;
+        if ((info.type & MemState_Type) == MemType_ThreadLocal)
+        {
+            placement.tlsLow = std::min<uintptr_t>(placement.tlsLow, info.addr);
+            placement.tlsHigh = std::max<uintptr_t>(placement.tlsHigh, info.addr + info.size);
+            placement.tlsPages += uint32_t(info.size / kPage);
+        }
+        const uintptr_t next = info.addr + info.size;
+        if (next <= at)
+            break; // the last block reaches the end of the address space
+        at = next;
+    }
+    if (placement.tlsPages == 0)
+        placement.tlsLow = 0;
 }
 }
 
@@ -198,8 +352,46 @@ uint8_t* Allocate()
         return nullptr;
     }
 
+    PlacementInfo placement{};
+    u64 aslrStart = 0, aslrSize = 0;
+    if (R_SUCCEEDED(svcGetInfo(&aslrStart, InfoType_AslrRegionAddress, CUR_PROCESS_HANDLE, 0)) &&
+        R_SUCCEEDED(svcGetInfo(&aslrSize, InfoType_AslrRegionSize, CUR_PROCESS_HANDLE, 0)))
+    {
+        placement.aslrStart = uintptr_t(aslrStart);
+        placement.aslrEnd = uintptr_t(aslrStart + aslrSize);
+    }
+    // The main thread has one, so there is always a page to go by.
+    FindThreadLocalPages(placement);
+    if (placement.aslrEnd != 0 && placement.aslrEnd <= kAddressSpace36End)
+    {
+        placement.addressBits = 36;
+        placement.avoidStart = kSmallMap36Start;
+        placement.avoidEnd = kSmallMap36End;
+        // A thread-local page outside it would mean another layout: keep those out too.
+        if (placement.tlsPages != 0)
+        {
+            placement.avoidStart = std::min<uintptr_t>(placement.avoidStart, placement.tlsLow);
+            placement.avoidEnd = std::max<uintptr_t>(placement.avoidEnd, placement.tlsHigh);
+        }
+    }
+    else if (placement.tlsPages != 0)
+    {
+        placement.addressBits = 39;
+        placement.avoidStart = std::min<uintptr_t>(placement.tlsLow,
+            placement.tlsHigh > kKernelMapSize ? placement.tlsHigh - kKernelMapSize : 0);
+        placement.avoidEnd = std::max<uintptr_t>(placement.tlsHigh, placement.tlsLow + kKernelMapSize);
+    }
+
     virtmemLock();
+    VirtmemReservation* avoid = placement.avoidEnd > placement.avoidStart
+        ? virtmemAddReservation(reinterpret_cast<void*>(placement.avoidStart), placement.avoidEnd - placement.avoidStart)
+        : nullptr;
     s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
+    placement.avoided = s_base && avoid;
+    if (avoid)
+        virtmemRemoveReservation(avoid);
+    if (!s_base)
+        s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk)); // logged: placement.avoided is false
     if (s_base)
         s_reservation = virtmemAddReservation(s_base, kSize);
     virtmemUnlock();
@@ -209,8 +401,15 @@ uint8_t* Allocate()
         s_base = nullptr;
         return nullptr;
     }
+    placement.base = uintptr_t(s_base);
+    s_placement = placement;
     // The guest null page stays unmapped: chunk 0 is committed from 0x1000.
     return s_base;
+}
+
+PlacementInfo Placement()
+{
+    return s_placement;
 }
 
 void Release(uint8_t* base)
