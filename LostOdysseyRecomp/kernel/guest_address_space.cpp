@@ -2,6 +2,9 @@
 #include <os/platform.h>
 #include <cstddef>
 #include <cerrno>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,6 +21,17 @@ static constinit FailureInfo failure{};
 
 FailureInfo GetFailureInfo() { return failure; }
 void ClearFailure() { failure = {}; }
+
+void AppendFailureDetail(const char* format, ...)
+{
+    const size_t used = std::strlen(failure.detail);
+    if (used + 1 >= sizeof(failure.detail))
+        return;
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(failure.detail + used, sizeof(failure.detail) - used, format, args);
+    va_end(args);
+}
 
 const char* FailureOperationName(FailureOperation operation)
 {
