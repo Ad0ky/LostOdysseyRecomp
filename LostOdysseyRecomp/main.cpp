@@ -255,10 +255,20 @@ static int RunGuest(uint32_t entry)
         const uint64_t windowEnd = placement.base + 0x100000000ull;
         const bool overlaps = placement.base < placement.avoidEnd && windowEnd > placement.avoidStart;
         LOG_NOTICE("switch: guest window {:#x}-{:#x} ({}-bit address space), {} the kernel map range {:#x}-{:#x} ({} "
-                 "thread-local pages {:#x}-{:#x}; ASLR {:#x}-{:#x})", placement.base, windowEnd, placement.addressBits,
+                 "thread-local pages {:#x}-{:#x}; ASLR {:#x}-{:#x}); 2 MiB blocks {}", placement.base, windowEnd, placement.addressBits,
                  placement.avoided ? "clear of" : overlaps ? "placed without avoiding (overlaps)" : "placed without avoiding (clear of)",
                  placement.avoidStart, placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh,
-                 placement.aslrStart, placement.aslrEnd);
+                 placement.aslrStart, placement.aslrEnd, placement.blocks ? "on" : "off (LO_GUEST_BLOCKS=0)");
+        // LO_TLB_TEST=N: N seconds in, log what a TLB miss costs in guest memory and the NRO's code (a few ms).
+        if (const char* tlb = getenv("LO_TLB_TEST"); tlb && std::atoi(tlb) > 0)
+        {
+            const int seconds = std::atoi(tlb);
+            os::DetachThread(std::thread([seconds] {
+                os::SetCurrentThreadName("TLB Test");
+                std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                GuestAddressSpace::LatencyTest([](const char* line) { LOG_INFO("switch: {}", line); });
+            }));
+        }
     }
     // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
     // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
