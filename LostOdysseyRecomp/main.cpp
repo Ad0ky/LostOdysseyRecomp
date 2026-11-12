@@ -266,7 +266,7 @@ static int RunGuest(uint32_t entry)
             os::DetachThread(std::thread([seconds] {
                 os::SetCurrentThreadName("TLB Test");
                 std::this_thread::sleep_for(std::chrono::seconds(seconds));
-                GuestAddressSpace::LatencyTest([](const char* line) { LOG_INFO("switch: {}", line); });
+                GuestAddressSpace::LatencyTest([](const char* line) { LOG_NOTICE("switch: {}", line); });
             }));
         }
     }
