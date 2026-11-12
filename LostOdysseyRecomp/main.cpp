@@ -249,19 +249,16 @@ static int RunGuest(uint32_t entry)
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
     {
-        // The kernel puts thread-local pages anywhere free in its hidden 64 GiB kernel map region; the window is kept
-        // out of the range that region can cover (guest_address_space_switch.cpp).
+        // The kernel puts thread-local pages anywhere free in its kernel map region (2 GiB fixed in a 36-bit process,
+        // 64 GiB placed at random in a 39-bit one); the window is kept out of it (guest_address_space_switch.cpp).
         const auto placement = GuestAddressSpace::Placement();
-        if (placement.avoided)
-            LOG_INFO("switch: guest window {:#x}-{:#x}, clear of the kernel map range {:#x}-{:#x} ({} thread-local pages "
-                     "{:#x}-{:#x}; ASLR {:#x}-{:#x})", placement.base, placement.base + 0x100000000ull, placement.avoidStart,
-                     placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh, placement.aslrStart,
-                     placement.aslrEnd);
-        else
-            LOG_WARNING("switch: guest window {:#x}-{:#x} may overlap the kernel map range {:#x}-{:#x} ({} thread-local "
-                        "pages; ASLR {:#x}-{:#x}): a new thread can take guest addresses", placement.base,
-                        placement.base + 0x100000000ull, placement.avoidStart, placement.avoidEnd, placement.tlsPages,
-                        placement.aslrStart, placement.aslrEnd);
+        const uint64_t windowEnd = placement.base + 0x100000000ull;
+        const bool overlaps = placement.base < placement.avoidEnd && windowEnd > placement.avoidStart;
+        LOG_INFO("switch: guest window {:#x}-{:#x} ({}-bit address space), {} the kernel map range {:#x}-{:#x} ({} "
+                 "thread-local pages {:#x}-{:#x}; ASLR {:#x}-{:#x})", placement.base, windowEnd, placement.addressBits,
+                 placement.avoided ? "clear of" : overlaps ? "placed without avoiding (overlaps)" : "placed without avoiding (clear of)",
+                 placement.avoidStart, placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh,
+                 placement.aslrStart, placement.aslrEnd);
     }
     // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
     // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;

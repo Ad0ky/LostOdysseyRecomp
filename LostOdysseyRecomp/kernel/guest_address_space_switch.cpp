@@ -291,15 +291,21 @@ bool MapChunk(size_t offset, size_t size, uintptr_t& sourceOut)
 }
 
 // Horizon places each thread-local page (TLS of 8 threads, mapped by svcCreateThread when the existing ones are full,
-// unmapped when all 8 exit) at a random free address of the process's kernel map region. That region is 64 GiB
-// (ams::svc::AddressMemoryRegionSmall39Size), placed at random inside the ASLR region when the process is created,
-// apart from the heap, alias and stack regions (Atmosphere kern_k_page_table_base.cpp: GetRegionAddress(ThreadLocal),
-// MapPages, FindFreeArea). No svcGetInfo reports it, so libnx's virtmemFindAslr can put the guest window inside it,
-// and the kernel knows nothing of virtmem reservations: every uncommitted chunk of the window is free memory to it.
-// A thread-local page placed there makes the later commit of that chunk fail (svcMapProcessMemory 0xd401) and the
-// game aborts with "out of guest virtual memory". Every thread-local page lies inside the region, so the region lies
-// within kKernelMapSize of them all; the window is placed outside that range.
+// unmapped when all 8 exit) at a random free address of the process's kernel map region (Atmosphere
+// kern_k_page_table_base.cpp: GetRegionAddress(ThreadLocal), MapPages, FindFreeArea). No svcGetInfo reports that
+// region, so libnx's virtmemFindAslr can put the guest window inside it, and the kernel knows nothing of virtmem
+// reservations: every uncommitted chunk of the window is free memory to it. A thread-local page placed there makes the
+// later commit of that chunk fail (svcMapProcessMemory 0xd401) and the game aborts with "out of guest virtual memory".
+// Where the region is depends on the address space the title running hbloader was created with (InitializeForProcess):
+// - 36-bit (ASLR region 0x8000000-0x1000000000, 64 GiB): the code region, the small map 0x8000000-0x80000000
+//   (AddressSmallMap36Start/End). Fixed, 2 GiB.
+// - 39-bit (ASLR region 512 GiB): 64 GiB (AddressMemoryRegionSmall39Size) at a random place, apart from the heap, alias
+//   and stack regions. Every thread-local page lies inside it, so it lies within kKernelMapSize of them all.
+// The window is placed outside that range.
 constexpr uint64_t kKernelMapSize = 64ull << 30;
+constexpr uintptr_t kSmallMap36Start = 0x8000000;
+constexpr uintptr_t kSmallMap36End = 0x80000000;
+constexpr uint64_t kAddressSpace36End = 1ull << 36;
 
 PlacementInfo s_placement{};
 
@@ -356,8 +362,21 @@ uint8_t* Allocate()
     }
     // The main thread has one, so there is always a page to go by.
     FindThreadLocalPages(placement);
-    if (placement.tlsPages != 0)
+    if (placement.aslrEnd != 0 && placement.aslrEnd <= kAddressSpace36End)
     {
+        placement.addressBits = 36;
+        placement.avoidStart = kSmallMap36Start;
+        placement.avoidEnd = kSmallMap36End;
+        // A thread-local page outside it would mean another layout: keep those out too.
+        if (placement.tlsPages != 0)
+        {
+            placement.avoidStart = std::min<uintptr_t>(placement.avoidStart, placement.tlsLow);
+            placement.avoidEnd = std::max<uintptr_t>(placement.avoidEnd, placement.tlsHigh);
+        }
+    }
+    else if (placement.tlsPages != 0)
+    {
+        placement.addressBits = 39;
         placement.avoidStart = std::min<uintptr_t>(placement.tlsLow,
             placement.tlsHigh > kKernelMapSize ? placement.tlsHigh - kKernelMapSize : 0);
         placement.avoidEnd = std::max<uintptr_t>(placement.tlsHigh, placement.tlsLow + kKernelMapSize);
