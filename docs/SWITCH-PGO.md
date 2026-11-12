@@ -170,6 +170,11 @@ A code change after step 3 is safe, but the functions it touches lose their gain
   the cold start, so every landing pad is off by the hot part's size. v1.1.0 and v1.1.0A had 1,213 and 1,178 such
   tables. A throw caught normally in v1.0.6 looped instead: menu_assets' `Check` jumped into `Le16`, which threw
   again, until GPU CmdProc's 128 KiB stack overflowed. `tools/switch/check_eh_tables.py` finds them in an ELF.
+- **A USE build can fail in the assembler** with `invalid operands (.text.unlikely.X and .text.hot.X sections) for '-'`.
+  GCC 15.2 on AArch64 moved a switch's case into the function's `.cold` part, but the jump table holds 2-byte offsets
+  from a label in the hot part, and an offset between two sections can't be assembled. Which function it hits depends
+  on the profile: the 1.2.1 profile (town and battle) hit `sub_82319330` in `ppc_recomp.5.cpp`. Add the file to
+  `LO_SWITCH_PGO_NO_PARTITION` (`cmake/LoSwitchPgo.cmake`): it keeps its profile and loses only the hot/cold split.
 - Compare speed at the stock clocks only, and train at any.
 
 ## Hidden symbols
