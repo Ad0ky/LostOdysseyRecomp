@@ -70,6 +70,12 @@ set(LO_SWITCH_DXC_IDENTITY "dxc-1.8" CACHE STRING "DXC identity of PC-made Vulka
 # Code generation options (same experiments as UnleashedRecomp-NX).
 option(LO_SWITCH_RECOMP_O2 "Compile the recompiled game code with -O2 instead of -O3" OFF)
 option(LO_SWITCH_FP_CONTRACT_OFF "Compile the recompiled game code with -ffp-contract=on instead of fast (A/B tests, #4)" OFF)
+# fmadds and friends rounded once in single precision, as the Xenon does (LostOdysseyRecomp/cpu/guest_fmadds.h,
+# tools/switch/ppc_fmadds.py). ON compiles the old double form in the recompiled code and the natives, for A/B runs.
+option(LO_SWITCH_FMADDS_DOUBLE "Compute the recompiled fmadds family in double, rounded twice (A/B tests)" OFF)
+if(LO_SWITCH_FMADDS_DOUBLE)
+    add_compile_definitions(LO_FMADDS_DOUBLE_ROUNDING)
+endif()
 # Diagnostics build (os/switch/heap_census.cpp): newlib's allocator goes through the census wrappers, which
 # LO_HEAP_CENSUS=1 in env.txt starts. Off: the default build has neither the wrappers nor the census code.
 option(LO_SWITCH_HEAP_CENSUS "Link the heap census (allocation counts by size and call site, LO_HEAP_CENSUS)" OFF)

@@ -627,3 +627,40 @@ stayed on in both modes. The +3.6% is `LO_CP_WPTR_LOCKFREE`, `LO_HOST_INPUT_REUS
 `LO_DEKO3D_FB_DEDUPE` alone; the other three haven't been measured. Results that compare builds, such as the
 milestones, are unaffected: each build ran with its own defaults. (The six `LO_DEKO3D_<NAME>` lines had a different
 bug, fixed in #34: each one fell back to the Debug page's value.)
+
+## Single-precision fused multiply-adds (2026-11-12)
+
+XenonRecomp writes `fmadds`, `fmsubs`, `fnmadds` and `fnmsubs` (32,026 in the game) as `double(float(a * c + b))`. GCC
+fuses that in double and rounds to single afterwards: two roundings where the Xenon has one, one ulp off when the
+double result lands halfway between two floats. It also keeps every single-precision chain that contains one in double
+registers, with an `fcvt` on each side. `tools/switch/ppc_fmadds.py` (run by `build-switch.sh`) rewrites them as
+`LoFmadds(a, c, b)` and the like (`LostOdysseyRecomp/cpu/guest_fmadds.h`): one `fmadd s` when the three inputs are
+exact floats, otherwise the double form as before (NaNs whose bits don't survive the round trip, doubles in a float
+register). GCC folds the exactness test away wherever it sees where an input came from. The natives that mirror
+`fmadds` (math leaves, collision, animation nodes, reverb, and `ppc2native.py`) use the same functions, so their check
+modes still compare equal. `LO_SWITCH_FMADDS_DOUBLE=ON` builds the old form.
+
+`tools/switch/check_fmadds.py` compares the four functions with the exact result rounded once (fractions, ties to even,
+subnormals and overflow) on 270,080 float operand sets, and 41,512 sets with NaNs, infinities or doubles against the
+old form's bits: no differences. One constructed set shows the old form one ulp off.
+
+Code, release ELF, before and after: fused double `fmadd`/`fmsub`/`fnmadd`/`fnmsub` 34,195 to 6,124; fused single
+14,631 to 46,010; `fcvt` to single 61,220 to 37,760; `fcvt` to double 141,399 to 101,588; 28,007 fewer instructions.
+Exception tables 0 problems, the same 39 self-looping functions.
+
+ABBA on the test console, 1.2.1 against 1.2.1 with this change, each with its own profile trained the same day the same
+way (clean, town 240 s, battle 240 s). Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows; four blocks per scene
+(base, new, new, base), 1 warm-up + 2 counted runs each, so 4 runs per arm:
+
+| | Town, 60 FPS cap: base | new | First battle: base | new |
+|---|---:|---:|---:|---:|
+| FPS | 40.22 ± 0.03 | 40.25 ± 0.03 | 28.42 ± 0.13 | 28.44 ± 0.03 |
+| 1% low | 38.66 | 38.70 | 24.96 ± 0.72 | 24.97 ± 0.19 |
+| Frame p99 | 25.87 ms | 25.84 ms | 40.09 ms | 40.05 ms |
+| GPU busy | 21.16 ms (85.1%) | 21.15 ms | 32.61 ms (92.7%) | 32.62 ms |
+| All threads, % of a core | 263.8 | 259.3 (-1.7%) | 219.5 | 216.3 (-1.5%) |
+| `Guest_Main` | 73.2% | 72.7% | 81.7% | 80.4% |
+| `GPU_CmdProc` | 79.5% | 78.4% | 61.6% | 61.0% |
+
+The frame rate doesn't move: both scenes are GPU-bound. The CPU threads do the same work in about 1.5% less time, which
+is headroom for scenes where the CPU sets the frame. The change is kept for its accuracy.
