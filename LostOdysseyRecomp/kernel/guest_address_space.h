@@ -43,6 +43,8 @@ struct FailureInfo
     uintptr_t processHandle;
     uintptr_t backingHandle;
     FailureMemoryStatus memory;
+    // Switch: the kernel's memory blocks at the failed mapping (destination and source), and what was undone.
+    char detail[448];
 };
 FailureInfo GetFailureInfo();
 const char* FailureOperationName(FailureOperation operation);
@@ -57,6 +59,17 @@ void Release(uint8_t* base);
 // its C and E aliases). Returns false when the console is out of memory.
 bool Commit(uint32_t address, uint32_t size);
 size_t CommittedBytes();
+// Where Allocate() put the window, and the address range it kept clear of the kernel's thread-local pages.
+struct PlacementInfo
+{
+    uintptr_t base;           // the window (0: not allocated)
+    uint32_t tlsPages;        // thread-local pages seen at Allocate()
+    uintptr_t tlsLow, tlsHigh;          // their lowest address and highest end
+    uintptr_t avoidStart, avoidEnd;     // kept out of the window (0, 0: nothing)
+    bool avoided;             // false: the window was placed without the exclusion (it did not fit)
+    uintptr_t aslrStart, aslrEnd;       // the ASLR region the window was found in
+};
+PlacementInfo Placement();
 // For a guest pointer the game reads although nothing was allocated there
 // (the desktop builds read zeros from such pages; the Switch would fault):
 // backs [address, address + size) with zeroed memory. C and E addresses are

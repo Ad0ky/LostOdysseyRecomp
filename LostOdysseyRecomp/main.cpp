@@ -248,6 +248,21 @@ static int RunGuest(uint32_t entry)
     os::heap_census::Start(); // LO_SWITCH_HEAP_CENSUS builds: LO_HEAP_CENSUS=1
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
+    {
+        // The kernel puts thread-local pages anywhere free in its hidden 64 GiB kernel map region; the window is kept
+        // out of the range that region can cover (guest_address_space_switch.cpp).
+        const auto placement = GuestAddressSpace::Placement();
+        if (placement.avoided)
+            LOG_INFO("switch: guest window {:#x}-{:#x}, clear of the kernel map range {:#x}-{:#x} ({} thread-local pages "
+                     "{:#x}-{:#x}; ASLR {:#x}-{:#x})", placement.base, placement.base + 0x100000000ull, placement.avoidStart,
+                     placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh, placement.aslrStart,
+                     placement.aslrEnd);
+        else
+            LOG_WARNING("switch: guest window {:#x}-{:#x} may overlap the kernel map range {:#x}-{:#x} ({} thread-local "
+                        "pages; ASLR {:#x}-{:#x}): a new thread can take guest addresses", placement.base,
+                        placement.base + 0x100000000ull, placement.avoidStart, placement.avoidEnd, placement.tlsPages,
+                        placement.aslrStart, placement.aslrEnd);
+    }
     // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
     // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
     // LO_LOAD_PROFILE=1 adds thread dumps at 8, 20, 45 and 90 s of a load.
