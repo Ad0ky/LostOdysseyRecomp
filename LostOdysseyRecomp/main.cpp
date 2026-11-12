@@ -254,7 +254,7 @@ static int RunGuest(uint32_t entry)
         const auto placement = GuestAddressSpace::Placement();
         const uint64_t windowEnd = placement.base + 0x100000000ull;
         const bool overlaps = placement.base < placement.avoidEnd && windowEnd > placement.avoidStart;
-        LOG_INFO("switch: guest window {:#x}-{:#x} ({}-bit address space), {} the kernel map range {:#x}-{:#x} ({} "
+        LOG_NOTICE("switch: guest window {:#x}-{:#x} ({}-bit address space), {} the kernel map range {:#x}-{:#x} ({} "
                  "thread-local pages {:#x}-{:#x}; ASLR {:#x}-{:#x})", placement.base, windowEnd, placement.addressBits,
                  placement.avoided ? "clear of" : overlaps ? "placed without avoiding (overlaps)" : "placed without avoiding (clear of)",
                  placement.avoidStart, placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh,
