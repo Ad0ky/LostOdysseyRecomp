@@ -68,6 +68,7 @@ struct PlacementInfo
     uintptr_t avoidStart, avoidEnd;     // kept out of the window (0, 0: nothing)
     bool avoided;             // false: the window was placed without the exclusion (it did not fit)
     uintptr_t aslrStart, aslrEnd;       // the ASLR region the window was found in
+    uint32_t addressBits;     // the process's address space (36 or 39; 0: unknown), which sets where the region is
 };
 PlacementInfo Placement();
 // For a guest pointer the game reads although nothing was allocated there

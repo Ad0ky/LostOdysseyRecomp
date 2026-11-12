@@ -614,7 +614,7 @@ instructions per call, so it shifts little time.
 |---|---|
 | Toolchain | devkitA64 GCC, libnx (`cmake/toolchains/switch-devkitA64.cmake`); `LO_PLATFORM_SWITCH` in `os/platform.h` |
 | Recompiled code | Same XenonRecomp output; GCC replacements for Clang builtins in `ppc_context.h` (`tools/patches/XenonRecomp-switch.patch`) |
-| Guest memory | 4 GiB `virtmem` reservation, placed clear of the kernel's 64 GiB kernel map region (which holds thread-local pages and is invisible to `virtmem`); pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
+| Guest memory | 4 GiB `virtmem` reservation, placed clear of the kernel map region, which holds thread-local pages and is invisible to `virtmem` (0x8000000-0x80000000 in a 36-bit process, 64 GiB at a random place in a 39-bit one); pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
 | Threads | Guest code threads get 4 MiB stacks (libnx defaults to 128 KiB) |
 | Graphics | plume Vulkan on statically linked Mesa NVK, `VK_NN_vi_surface` on the libnx window (`tools/patches/plume-switch.patch`, `volk-switch.patch`) |
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
