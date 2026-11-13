@@ -10,6 +10,11 @@
 #ifdef LO_GPU_PLUME
 #include <plume_render_interface.h>
 #include <plume_render_interface_builders.h>
+#if defined(LO_SWITCH_DEKO3D)
+#include <plume_deko3d_api.h>
+#include "video.h"
+#endif
+#include <cstdlib>
 #include "shader/smaa_pipeline.h"
 namespace gpu
 {
@@ -102,6 +107,26 @@ struct Presentation::Impl
     bool rampActive = false, curveActive = false;
     // Null keeps the current curve.
     RenderBuffer *UpdateGammaRamp(const PresentationOptions *curve);
+    // The same tables as 256x1 RGBA32F textures, for the final passes compiled with kRampTextureDefine: they read the
+    // two entries a channel needs with one gather instead of two indexed constant buffer loads. On the Tegra X1 those
+    // six loads a pixel were 2.8 ms of the 3.3 ms a 1280x720 final pass took in Uhra (docs/SWITCH-GPU.md); the image
+    // is the same bit for bit. deko3d only, LO_PRESENT_RAMP_TEXTURE=0 turns it off. A texture is filled from its
+    // constant buffer the first time a pass uses it after that buffer changed.
+    bool rampTexture = false;
+    std::unique_ptr<RenderTexture> rampTextures[3];
+    bool rampTextureStale[3] = {true, true, true};
+    RenderTexture *RampTexture(RenderCommandList *commands);
+    bool UsesRampTexture(const RenderPipeline *pipeline) const;
+    std::string finalSource;  // the final passes' source: Init's, behind kRampTextureDefine when rampTexture
+    // LO_PRESENT_RAMP_CHECK=1 (with rampTexture): every final pass that applies a table is made twice into
+    // intermediates, with the constant buffer and with the texture, and a comparison pass presents it: magenta
+    // where the two differ. Its second draw keeps only the differing pixels, its third only the equal ones, so with
+    // LO_GPU_PASS_TRACE and LO_GPU_PASS_COUNTERS the samples passed of the stretches noted "rampcheck" and
+    // "rampcheck-same" count them and add up to the pass's pixels. =2: the two intermediates are RGBA32F, so the
+    // floats are compared before the store to the swapchain's 8 bits (deko3d pipelines do not depend on the format).
+    bool rampCheck = false, rampCheckFloat = false;
+    std::unique_ptr<RenderShader> rampBufferPs, rampCheckPs;
+    std::unique_ptr<RenderPipeline> rampBufferPipeline, rampCheckPipeline;
     bool InitCompute(const char *pixelSource);
     bool EnsureUiPipelines();
     bool EnsureOverlayPipeline();
@@ -125,6 +150,7 @@ RenderBuffer *Presentation::Impl::UpdateGammaRamp(const PresentationOptions *cur
                 mapped[4 * i + 3] = std::pow(std::clamp((float(i) / 255.0f - black) / (1.0f - black), 0.0f, 1.0f), exponent);
             }
             rampBuffers[next]->unmap();
+            rampTextureStale[next] = true;
             rampIndex = next;
             rampGeneration = generation;
             curveBrightness = brightness;
@@ -134,6 +160,30 @@ RenderBuffer *Presentation::Impl::UpdateGammaRamp(const PresentationOptions *cur
         }
     }
     return rampBuffers[rampIndex].get();
+}
+// What the final passes' source starts with when they read the tables from the texture (tools/switch/gen-builtin-spirv.py
+// compiles the same text for the Switch).
+static const char kRampTextureDefine[] = "#define LO_RAMP_TEXTURE 1\n";
+RenderTexture *Presentation::Impl::RampTexture(RenderCommandList *commands)
+{
+    auto *texture = rampTextures[rampIndex].get();
+    if (texture && rampTextureStale[rampIndex]) {
+        // The constant buffer's 256 float4, as they are: the texture's texels are the same floats.
+        commands->barriers(RenderBarrierStage::COPY, RenderTextureBarrier(texture, RenderTextureLayout::COPY_DEST));
+        commands->copyTextureRegion(RenderTextureCopyLocation::Subresource(texture),
+            RenderTextureCopyLocation::PlacedFootprint(rampBuffers[rampIndex].get(), RenderFormat::R32G32B32A32_FLOAT, 256, 1, 1, 256),
+            0, 0, 0, nullptr);
+        commands->barriers(RenderBarrierStage::GRAPHICS, RenderTextureBarrier(texture, RenderTextureLayout::SHADER_READ));
+        rampTextureStale[rampIndex] = false;
+    }
+    return texture;
+}
+bool Presentation::Impl::UsesRampTexture(const RenderPipeline *pipeline) const
+{
+    if (!rampTexture || !pipeline) return false;
+    for (const auto &final : finalPipelines) if (pipeline == final.get()) return true;
+    for (const auto &entry : fsrPipelines) for (const auto &fsr : entry) if (pipeline == fsr.get()) return true;
+    return false;
 }
 RenderFramebuffer *Presentation::Impl::FramebufferFor(const RenderTexture *texture, uint32_t width, uint32_t height)
 {
@@ -222,6 +272,21 @@ bool Presentation::Init(RenderDevice *device, RenderFormat swapchainFormat, bool
     for (auto &entry : p.fsrPipelines) for (auto &pipeline : entry) pipeline.reset();
     for (auto &shader : p.fsrPs) shader.reset();
     for (auto &entry : p.fsrFailed) entry[0] = entry[1] = false;
+    p.rampBufferPipeline.reset();
+    p.rampCheckPipeline.reset();
+    p.rampBufferPs.reset();
+    p.rampCheckPs.reset();
+    for (auto &texture : p.rampTextures) texture.reset();
+    for (bool &stale : p.rampTextureStale) stale = true;
+    p.rampTexture = p.rampCheck = p.rampCheckFloat = false;
+#if defined(LO_SWITCH_DEKO3D)
+    if (video::IsDeko3d()) {
+        const char *off = std::getenv("LO_PRESENT_RAMP_TEXTURE"), *check = std::getenv("LO_PRESENT_RAMP_CHECK");
+        p.rampTexture = !(off && off[0] == '0');
+        p.rampCheck = p.rampTexture && check && check[0] && check[0] != '0';
+        p.rampCheckFloat = p.rampCheck && check[0] == '2';
+    }
+#endif
     const auto binaryFormat = p.vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil;
     const auto renderFormat = p.vulkan ? RenderShaderFormat::SPIRV : RenderShaderFormat::DXIL;
     const char *source = R"(
@@ -256,6 +321,36 @@ cbuffer Parameters : register(b0) { float2 origin; float2 extent; float2 imageSi
 [[vk::binding(3,0)]]
 #endif
 cbuffer GammaRamp : register(b1) { float4 gammaRamp[256]; };
+#ifdef LO_RAMP_TEXTURE
+// The final passes without a calibration view get the table as a 256x1 RGBA32F texture in calibrationScene's place
+// (Presentation::Impl::RampTexture): the same floats, read with one gather per channel. A gather whose position is
+// the border between texels i and i+1 returns both, .w texel i and .z texel i+1 (the row is the only one, so .x and
+// .y repeat them), unfiltered. The arithmetic after the loads is the constant buffer version's.
+float3 applyGammaRamp(float3 color) {
+    float3 f=saturate(color)*255.0;
+    uint3 i=min(uint3(f),254u);
+    float3 t=f-float3(i);
+    float3 u=(float3(i)+1.0)*(1.0/256.0);
+    float4 r=calibrationScene.GatherRed(linearClamp,float2(u.r,0.5));
+    float4 g=calibrationScene.GatherGreen(linearClamp,float2(u.g,0.5));
+    float4 b=calibrationScene.GatherBlue(linearClamp,float2(u.b,0.5));
+    float3 lo=float3(r.w,g.w,b.w);
+    float3 hi=float3(r.z,g.z,b.z);
+    return lerp(lo,hi,t)+max(color-1.0,0.0);
+}
+float3 applyUserCurve(float3 color) {
+    float3 f=saturate(color)*255.0;
+    uint3 i=min(uint3(f),254u);
+    float3 t=f-float3(i);
+    float3 u=(float3(i)+1.0)*(1.0/256.0);
+    float4 r=calibrationScene.GatherAlpha(linearClamp,float2(u.r,0.5));
+    float4 g=calibrationScene.GatherAlpha(linearClamp,float2(u.g,0.5));
+    float4 b=calibrationScene.GatherAlpha(linearClamp,float2(u.b,0.5));
+    float3 lo=float3(r.w,g.w,b.w);
+    float3 hi=float3(r.z,g.z,b.z);
+    return lerp(lo,hi,t)+max(color-1.0,0.0);
+}
+#else
 float3 applyGammaRamp(float3 color) {
     float3 f=saturate(color)*255.0;
     uint3 i=min(uint3(f),254u);
@@ -275,6 +370,7 @@ float3 applyUserCurve(float3 color) {
     float3 hi=float3(gammaRamp[i.r+1].w,gammaRamp[i.g+1].w,gammaRamp[i.b+1].w);
     return lerp(lo,hi,t)+max(color-1.0,0.0);
 }
+#endif
 // Brightness test pattern in display signal values: a smooth ramp, ten grey
 // steps and eight near-black patches on black.
 float3 brightnessPattern(float2 tile) {
@@ -487,6 +583,16 @@ float4 pixelLinear(float4 position : SV_Position) : SV_Target {
 float4 pixelCubic(float4 position : SV_Position) : SV_Target {
     return finishFrameAs(resampleAs(sourcePixel(position.xy),2),true);
 }
+// LO_PRESENT_RAMP_CHECK: frame and calibrationScene are one final pass made twice, with the tables in the constant
+// buffer and in the texture. aa 0: frame's pixel, or magenta where the two differ. aa 1: only the differing pixels are
+// written, aa 2: only the equal ones (the samples passed of these draws count them).
+float4 rampCheckPixel(float4 position : SV_Position) : SV_Target {
+    float4 a=frame.Load(int3(position.xy,0));
+    float4 b=calibrationScene.Load(int3(position.xy,0));
+    bool same=all(a==b);
+    if ((aa==1 && same) || (aa==2 && !same)) discard;
+    return same ? a : float4(1,0,1,1);
+}
 // Highlight gain: frame = final SDR output, calibrationScene = pre-upscale
 // extended-gamma scene (valid imageSize inside a calibrationRect.xy allocation).
 float4 gainPixel(float4 position : SV_Position) : SV_Target {
@@ -562,10 +668,24 @@ float4 gainPixel(float4 position : SV_Position) : SV_Target {
     p.initialized = bool(p.pipeline) && bool(p.presentPipeline) && bool(p.hdrPipeline) && bool(p.gainPipeline) &&
         p.smaa[0].Init(device, p.vs.get(), p.sampler.get(), p.vulkan) &&
         p.smaa[1].Init(device, p.vs.get(), p.sampler.get(), p.vulkan);
+    p.finalSource = p.rampTexture ? std::string(kRampTextureDefine) + source : std::string(source);
+    if (p.rampTexture) {
+        for (auto &texture : p.rampTextures) {
+            texture = device->createTexture(RenderTextureDesc::Texture2D(256, 1, 1, RenderFormat::R32G32B32A32_FLOAT));
+            if (!texture) p.rampTexture = false;
+        }
+        if (!p.rampTexture) {
+            for (auto &texture : p.rampTextures) texture.reset();
+            p.finalSource = source;
+            LOG_WARNING("presentation: no gamma ramp textures; the final passes read the constant buffer");
+        }
+    }
+    p.rampCheck = p.rampCheck && p.rampTexture;
+    p.rampCheckFloat = p.rampCheckFloat && p.rampCheck;
     // Optional: without them pixel() serves every final pass.
     const char *finalEntries[] = {"pixelLinear", "pixelCubic"};
     for (size_t i = 0; p.initialized && i < 2; ++i) {
-        auto shader = xenos::CompileCachedHlsl(source, finalEntries[i], "ps_6_0", binaryFormat);
+        auto shader = xenos::CompileCachedHlsl(p.finalSource.c_str(), finalEntries[i], "ps_6_0", binaryFormat);
         if (shader.ok)
             p.finalPs[i] = device->createShader(shader.bytecode.data(), shader.bytecode.size(), finalEntries[i], renderFormat);
         else
@@ -573,6 +693,30 @@ float4 gainPixel(float4 position : SV_Position) : SV_Target {
         desc.pixelShader = p.finalPs[i].get();
         if (p.finalPs[i]) p.finalPipelines[i] = device->createGraphicsPipeline(desc);
     }
+    if (p.initialized && p.rampTexture && !p.finalPipelines[0]) {
+        // pixel() has no texture version: without the dedicated pass the tables stay in the constant buffer.
+        p.rampTexture = p.rampCheck = false;
+        p.finalSource = source;
+        for (auto &pipeline : p.finalPipelines) pipeline.reset();
+        for (auto &shader : p.finalPs) shader.reset();
+    }
+    if (p.initialized && p.rampCheck) {
+        auto buffer = xenos::CompileCachedHlsl(source, "pixelLinear", "ps_6_0", binaryFormat);
+        auto check = xenos::CompileCachedHlsl(source, "rampCheckPixel", "ps_6_0", binaryFormat);
+        if (buffer.ok && check.ok) {
+            p.rampBufferPs = device->createShader(buffer.bytecode.data(), buffer.bytecode.size(), "pixelLinear", renderFormat);
+            p.rampCheckPs = device->createShader(check.bytecode.data(), check.bytecode.size(), "rampCheckPixel", renderFormat);
+            desc.pixelShader = p.rampBufferPs.get();
+            if (p.rampBufferPs) p.rampBufferPipeline = device->createGraphicsPipeline(desc);
+            desc.pixelShader = p.rampCheckPs.get();
+            if (p.rampCheckPs) p.rampCheckPipeline = device->createGraphicsPipeline(desc);
+        }
+        p.rampCheck = p.rampBufferPipeline && p.rampCheckPipeline;
+        if (!p.rampCheck) LOG_WARNING("presentation: LO_PRESENT_RAMP_CHECK has no shaders: {} {}", buffer.errors, check.errors);
+    }
+    LOG_NOTICE("presentation: gamma ramp and player curve read from {}{}", p.rampTexture ? "a texture (LO_PRESENT_RAMP_TEXTURE)" : "the constant buffer",
+        p.rampCheck ? (p.rampCheckFloat ? ", checked against the constant buffer every frame as RGBA32F (LO_PRESENT_RAMP_CHECK=2)"
+                                        : ", checked against the constant buffer every frame (LO_PRESENT_RAMP_CHECK)") : "");
     // Optional: without it the fragment pass serves every target.
     if (p.initialized && storageSwapchain && device->getCapabilities().shaderFormat == RenderShaderFormat::SPIRV &&
         swapchainFormat == RenderFormat::R8G8B8A8_UNORM)
@@ -646,7 +790,7 @@ RenderPipeline *Presentation::Impl::FsrPipeline(uint32_t entry, bool swapchainTa
     if (pipeline || failed || !initialized) return pipeline.get();
     static const char *const entries[] = {"easuPixel", "rcasPixel"};
     if (!fsrPs[entry]) {
-        auto shader = xenos::CompileCachedHlsl(std::string(shaderSource) + fsr1::Shader, entries[entry], "ps_6_0",
+        auto shader = xenos::CompileCachedHlsl(finalSource + fsr1::Shader, entries[entry], "ps_6_0",
             vulkan ? xenos::ShaderBinaryFormat::Spirv : xenos::ShaderBinaryFormat::Dxil);
         if (shader.ok)
             fsrPs[entry] = device->createShader(shader.bytecode.data(), shader.bytecode.size(), entries[entry],
@@ -1088,7 +1232,8 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
     if (!sw || !sh || !ow || !oh) return;
     // Off-screen scene processing keeps FP16 regardless of the output transform.
     const bool hdrScene = options.hdrScene && bool(p.hdrPipeline) && (p.output.linear || !toSwapchain);
-    const auto intermediateFormat = hdrScene ? RenderFormat::R16G16B16A16_FLOAT : RenderFormat::R8G8B8A8_UNORM;
+    // Not const: LO_PRESENT_RAMP_CHECK=2 renders its two intermediates as RGBA32F.
+    auto intermediateFormat = hdrScene ? RenderFormat::R16G16B16A16_FLOAT : RenderFormat::R8G8B8A8_UNORM;
     auto* intermediatePipeline = hdrScene ? p.hdrPipeline.get() : p.pipeline.get();
     RenderTexture *original = source;
     const float scale = std::min(float(ow) / sw, float(oh) / sh);
@@ -1158,8 +1303,10 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
         else framebuffer=p.FramebufferFor(output,tw,th);
         pass.descriptors->setTexture(0,input,RenderTextureLayout::SHADER_READ);
         auto* calibration = options.calibrationScene ? options.calibrationScene : input;
-        pass.descriptors->setTexture(2,calibration,RenderTextureLayout::SHADER_READ);
-        if (calibration != input)
+        // A final pass compiled for it reads the tables from their texture there (never with a calibration view).
+        auto* tables = p.UsesRampTexture(pipe) ? p.RampTexture(commands) : nullptr;
+        pass.descriptors->setTexture(2,tables ? tables : calibration,RenderTextureLayout::SHADER_READ);
+        if (calibration != input && !tables)
             commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(calibration,RenderTextureLayout::SHADER_READ));
         commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(input,RenderTextureLayout::SHADER_READ));
         commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(output,RenderTextureLayout::COLOR_WRITE));
@@ -1292,6 +1439,56 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
                 (what&3)==1 ? "pixelLinear" : (what&3)==2 ? "pixelCubic" : "pixel",sw,sh,ow,oh,width,height,
                 (what&4) ? "on" : "off",(what&8) ? "on" : "off",(what&16) ? "on" : "off");
         }
+    }
+    if(p.rampCheck && toSwapchain && finalPipeline==p.finalPipelines[0].get() &&
+       ((options.displayGammaRamp && p.rampActive) || (options.displayAdjust && p.curveActive))) {
+        // LO_PRESENT_RAMP_CHECK: this pass with the tables in the constant buffer and in the texture, compared.
+        const uint32_t expand=options.expandRgbRange ? 1u : 0u;
+        const auto checkedFormat=intermediateFormat;
+        if(p.rampCheckFloat) intermediateFormat=RenderFormat::R32G32B32A32_FLOAT;
+        auto *fromBuffer=render(source,nullptr,sw,sh,ow,oh,x,y,width,height,0,0,expand,true,p.rampBufferPipeline.get());
+        auto *fromTexture=render(source,nullptr,sw,sh,ow,oh,x,y,width,height,0,0,expand,true,finalPipeline);
+        intermediateFormat=checkedFormat;
+        if(passIndex==passes.size()) passes.emplace_back();
+        auto &pass=passes[passIndex++];
+        if(!pass.descriptors) {
+            RenderDescriptorSetBuilder set;
+            set.begin();set.addTexture(0);set.addSampler(p.vulkan ? 1 : 0);set.addTexture(p.vulkan ? 2 : 1);
+            set.addConstantBuffer(p.vulkan ? 3 : 1);set.end();
+            pass.descriptors=set.create(p.device);pass.descriptors->setSampler(1,p.sampler.get());
+        }
+        pass.descriptors->setBuffer(3,ramp,Impl::kRampBytes);
+        pass.descriptors->setTexture(0,fromBuffer,RenderTextureLayout::SHADER_READ);
+        pass.descriptors->setTexture(2,fromTexture,RenderTextureLayout::SHADER_READ);
+        commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(fromBuffer,RenderTextureLayout::SHADER_READ));
+        commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(fromTexture,RenderTextureLayout::SHADER_READ));
+        commands->barriers(RenderBarrierStage::GRAPHICS,RenderTextureBarrier(target,RenderTextureLayout::COLOR_WRITE));
+        commands->setFramebuffer(p.FramebufferFor(target,ow,oh));
+        RenderViewport viewport(0,0,float(ow),float(oh));RenderRect scissor(0,0,ow,oh);
+        commands->setViewports(&viewport,1);commands->setScissors(&scissor,1);
+        commands->setGraphicsPipelineLayout(p.layout.get());commands->setPipeline(p.rampCheckPipeline.get());
+        commands->setGraphicsDescriptorSet(pass.descriptors.get(),0);
+        auto constants=parameters(0,0,float(ow),float(oh),ow,oh,0,0,0,false,false);
+        commands->setGraphicsPushConstants(0,&constants);
+        commands->drawInstanced(3,1,0,0);
+#if defined(LO_SWITCH_DEKO3D)
+        plume::Deko3DPassTraceNote(commands,"rampcheck");
+#endif
+        constants.aa=1;
+        commands->setGraphicsPushConstants(0,&constants);
+        commands->drawInstanced(3,1,0,0);
+#if defined(LO_SWITCH_DEKO3D)
+        plume::Deko3DPassTraceNote(commands,"rampcheck-same");
+#endif
+        // The control: the equal pixels, written again with the same values (the image does not change).
+        constants.aa=2;
+        commands->setGraphicsPushConstants(0,&constants);
+        commands->drawInstanced(3,1,0,0);
+#if defined(LO_SWITCH_DEKO3D)
+        plume::Deko3DPassTraceNote(commands,nullptr);
+#endif
+        commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));
+        return;
     }
     render(source,target,sw,sh,ow,oh,x,y,width,height,0,uint32_t(options.scalingFilter),
            options.expandRgbRange ? 1u : 0u,true,finalPipeline);
