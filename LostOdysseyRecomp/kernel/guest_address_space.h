@@ -69,8 +69,12 @@ struct PlacementInfo
     bool avoided;             // false: the window was placed without the exclusion (it did not fit)
     uintptr_t aslrStart, aslrEnd;       // the ASLR region the window was found in
     uint32_t addressBits;     // the process's address space (36 or 39; 0: unknown), which sets where the region is
+    bool blocks;              // 2 MiB-aligned window and backing (LO_GUEST_BLOCKS, default on)
 };
 PlacementInfo Placement();
+// Logs (through emit) the cost of a TLB miss in each guest view and the NRO's code: tells 2 MiB blocks from 4 KiB pages.
+// Takes a few milliseconds and the commit lock (LO_TLB_TEST).
+void LatencyTest(void (*emit)(const char*));
 // For a guest pointer the game reads although nothing was allocated there
 // (the desktop builds read zeros from such pages; the Switch would fault):
 // backs [address, address + size) with zeroed memory. C and E addresses are

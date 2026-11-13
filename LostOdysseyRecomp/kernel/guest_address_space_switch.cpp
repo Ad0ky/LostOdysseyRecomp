@@ -49,6 +49,10 @@ size_t s_committedBytes = 0;
 // Code-memory source of each committed chunk (under s_mutex), to map a view again (EnsureBacked).
 uintptr_t s_source[kChunkCount]{};
 RepairInfo s_repair{};
+// The window on a 2 MiB boundary and full chunks backed 2 MiB aligned, so the kernel maps the virtual, A and C views
+// with 2 MiB blocks (one TLB entry each) instead of 512 4 KiB pages. LO_GUEST_BLOCKS=0 (env.txt, applied before the
+// static constructors) puts back the 4 KiB layout. The E view is the A view one 4 KiB page later: never a block.
+bool s_blocks = true;
 
 bool ProcessMemorySyscallsAvailable()
 {
@@ -149,7 +153,10 @@ void AppendBlocks(const char* label, uintptr_t address, size_t size, bool* allFr
 bool MapChunkOnce(size_t offset, size_t size, uintptr_t& sourceOut, int round, bool& retry)
 {
     retry = false;
-    void* backing = memalign(kPage, size);
+    // A block needs the backing's physical pages 2 MiB aligned. The heap is mapped with blocks where it can, at
+    // addresses congruent to their physical ones modulo 2 MiB, so 2 MiB virtual alignment gives that.
+    const bool block = s_blocks && size == kChunk && (offset & (kChunk - 1)) == 0;
+    void* backing = memalign(block ? kChunk : kPage, size);
     if (!backing)
     {
         RecordFailure(FailureOperation::CreateBacking, 0, -1, nullptr, size, offset);
@@ -382,16 +389,26 @@ uint8_t* Allocate()
         placement.avoidEnd = std::max<uintptr_t>(placement.tlsHigh, placement.tlsLow + kKernelMapSize);
     }
 
+    if (const char* blocks = getenv("LO_GUEST_BLOCKS"); blocks && std::strcmp(blocks, "0") == 0)
+        s_blocks = false;
+    placement.blocks = s_blocks;
+    // virtmemFindAslr's second argument is a guard, not an alignment: ask for 2 MiB more and round the base up.
+    const size_t search = s_blocks ? kSize + kChunk : kSize;
+    auto find = [&] {
+        const uintptr_t found = uintptr_t(virtmemFindAslr(search, kChunk));
+        return reinterpret_cast<uint8_t*>(found && s_blocks ? (found + kChunk - 1) & ~uintptr_t(kChunk - 1) : found);
+    };
+
     virtmemLock();
     VirtmemReservation* avoid = placement.avoidEnd > placement.avoidStart
         ? virtmemAddReservation(reinterpret_cast<void*>(placement.avoidStart), placement.avoidEnd - placement.avoidStart)
         : nullptr;
-    s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk));
+    s_base = find();
     placement.avoided = s_base && avoid;
     if (avoid)
         virtmemRemoveReservation(avoid);
     if (!s_base)
-        s_base = static_cast<uint8_t*>(virtmemFindAslr(kSize, kChunk)); // logged: placement.avoided is false
+        s_base = find(); // logged: placement.avoided is false
     if (s_base)
         s_reservation = virtmemAddReservation(s_base, kSize);
     virtmemUnlock();
@@ -559,6 +576,205 @@ Backing EnsureBacked(uint32_t address, uint32_t size)
         result = Backing::Repaired;
     }
     return result;
+}
+
+namespace
+{
+// LatencyTest: the cost of a TLB miss, measured on the console. The same number of cache lines is read in a random
+// order twice: one line per page over thousands of pages (each load needs its own translation), then 64 lines per page
+// over a few pages (translations hit). Both sets fit the 2 MiB L2 cache, so the difference is the page walk. A walk
+// over 4 KiB pages misses far more often than one over 2 MiB blocks, which one TLB entry covers. svcQueryMemory does
+// not report the page size, so this is how to tell which one the kernel used.
+constexpr size_t kChaseLines = 2048;
+
+// Which 64-byte line of the n-th page. It must look random: physically contiguous pages index the L2's sets with
+// address bits 6-16, and a regular pattern piles the lines into a few sets that then miss the cache.
+size_t LineOfPage(size_t n)
+{
+    return size_t((uint64_t(n + 1) * 0x9E3779B97F4A7C15ull) >> 58);
+}
+
+void Shuffle(uintptr_t* items, size_t count)
+{
+    uint64_t x = 0x2545F4914F6CDD1Dull;
+    for (size_t i = count; i > 1; --i)
+    {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        std::swap(items[i - 1], items[x % i]);
+    }
+}
+
+// Nanoseconds per load, best of 8 passes after a warm-up. Each address depends on the previous load's value, so the
+// loads cannot overlap.
+double LoadNs(const uintptr_t* addresses, size_t count)
+{
+    uint64_t best = UINT64_MAX;
+    uint64_t chain = 0;
+    for (int pass = 0; pass < 9; ++pass)
+    {
+        const uint64_t start = armGetSystemTick();
+        for (size_t i = 0; i < count; ++i)
+        {
+            uint64_t value;
+            __asm__ volatile("ldr %[v], [%[a], %[c]]\n\tand %[c], %[v], xzr"
+                : [v] "=&r"(value), [c] "+r"(chain) : [a] "r"(addresses[i]) : "memory");
+        }
+        const uint64_t ticks = armGetSystemTick() - start;
+        if (pass > 0 && ticks < best)
+            best = ticks;
+    }
+    return double(armTicksToNs(best)) / double(count);
+}
+
+// The same for instruction fetches: each address is a ret, so the call only fetches it.
+double FetchNs(const uintptr_t* addresses, size_t count)
+{
+    uint64_t best = UINT64_MAX;
+    for (int pass = 0; pass < 9; ++pass)
+    {
+        const uint64_t start = armGetSystemTick();
+        for (size_t i = 0; i < count; ++i)
+            reinterpret_cast<void (*)()>(addresses[i])();
+        const uint64_t ticks = armGetSystemTick() - start;
+        if (pass > 0 && ticks < best)
+            best = ticks;
+    }
+    return double(armTicksToNs(best)) / double(count);
+}
+
+void EmitPair(void (*emit)(const char*), const char* what, double scattered, double grouped, size_t pages)
+{
+    char line[192];
+    std::snprintf(line, sizeof(line), "tlb: %s: %.1f ns a load over %zu pages, %.1f ns over 32 pages: +%.1f ns a miss",
+        what, scattered, pages, grouped, scattered - grouped);
+    emit(line);
+}
+
+bool Readable(uintptr_t address, uintptr_t& blockEnd)
+{
+    MemoryInfo info{};
+    u32 pageInfo = 0;
+    if (R_FAILED(svcQueryMemory(&info, &pageInfo, address)) || info.size == 0)
+    {
+        blockEnd = address + kPage;
+        return false;
+    }
+    blockEnd = info.addr + info.size;
+    return (info.type & MemState_Type) != MemType_Unmapped && (info.perm & Perm_R) != 0 &&
+        (info.attr & MemAttr_IsIpcMapped) == 0;
+}
+
+// A ret in the 64-byte line at address, or 0.
+uintptr_t RetInLine(uintptr_t line)
+{
+    constexpr uint32_t kRet = 0xD65F03C0;
+    for (uintptr_t at = line; at < line + 64; at += 4)
+        if (*reinterpret_cast<const uint32_t*>(at) == kRet)
+            return at;
+    return 0;
+}
+
+void CodeTest(void (*emit)(const char*), const MemoryInfo& block, const char* what, bool fetch)
+{
+    static uintptr_t scattered[kChaseLines], grouped[kChaseLines];
+    size_t ns = 0, ng = 0;
+    const size_t pages = block.size / kPage;
+    if (pages < 2 * 32)
+        return;
+    const size_t stride = std::max<size_t>(1, pages / kChaseLines);
+    for (size_t i = 0; i < kChaseLines && i * stride < pages; ++i)
+    {
+        const uintptr_t page = block.addr + i * stride * kPage;
+        const uintptr_t line = page + LineOfPage(i) * 64;
+        if (!fetch)
+            scattered[ns++] = line;
+        else
+            for (uintptr_t at = line; at < page + kPage; at += 64)
+                if (const uintptr_t ret = RetInLine(at)) { scattered[ns++] = ret; break; }
+    }
+    const uintptr_t middle = block.addr + (pages / 2) * kPage;
+    for (uintptr_t line = middle; line < middle + 32 * kPage && ng < kChaseLines; line += 64)
+    {
+        if (!fetch)
+            grouped[ng++] = line;
+        else if (const uintptr_t ret = RetInLine(line))
+            grouped[ng++] = ret;
+    }
+    if (ns < kChaseLines / 2 || ng < 256)
+        return;
+    Shuffle(scattered, ns);
+    Shuffle(grouped, ng);
+    const double far = fetch ? FetchNs(scattered, ns) : LoadNs(scattered, ns);
+    const double near = fetch ? FetchNs(grouped, ng) : LoadNs(grouped, ng);
+    EmitPair(emit, what, far, near, ns);
+}
+}
+
+void LatencyTest(void (*emit)(const char*))
+{
+    char line[192];
+    std::snprintf(line, sizeof(line), "tlb: window at %p, %s a 2 MiB boundary, blocks %s", s_base,
+        (uintptr_t(s_base) & (kChunk - 1)) ? "not on" : "on", s_blocks ? "on" : "off (LO_GUEST_BLOCKS=0)");
+    emit(line);
+    if (!s_base)
+        return;
+    static uintptr_t scattered[kChaseLines], grouped[kChaseLines];
+    static const char* const kNames[] = { "guest virtual view", "guest A view", "guest C view (A alias)",
+        "guest E view (A + 4 KiB)" };
+    for (int view = 0; view < 4; ++view)
+    {
+        size_t ns = 0, ng = 0;
+        double far = 0, near = 0;
+        {
+            // Committed chunks stay mapped; the lock only keeps the commit state still while it is read.
+            std::lock_guard lock(s_mutex);
+            const size_t viewEnd = view == 0 ? kStarts[1] : kStarts[view] + kSizes[view];
+            for (size_t w = kStarts[view]; w < viewEnd && ns < kChaseLines; w += kPage)
+            {
+                size_t backingOffset = w;
+                if (view == 2)
+                    backingOffset = w - kStarts[2] + kStarts[1];
+                else if (view == 3)
+                    backingOffset = w - kStarts[3] + kStarts[1] + kPage;
+                if (backingOffset < kPage) // the guest null page
+                    continue;
+                if (backingOffset >= kStarts[2]) // E's last page: past the end of A
+                    break;
+                if (!s_committed[backingOffset / kChunk])
+                {
+                    w += kChunk - backingOffset % kChunk - kPage; // to where the next chunk starts
+                    continue;
+                }
+                uintptr_t blockEnd = 0;
+                if (!Readable(uintptr_t(s_base + w), blockEnd))
+                    continue;
+                const uintptr_t page = uintptr_t(s_base + w);
+                scattered[ns] = page + LineOfPage(ns) * 64;
+                ++ns;
+                for (size_t l = 0; l < 64 && ng < kChaseLines; ++l)
+                    grouped[ng++] = page + l * 64;
+            }
+            if (ns < kChaseLines)
+                continue; // too little of this view is in use
+            Shuffle(scattered, ns);
+            Shuffle(grouped, ng);
+            far = LoadNs(scattered, ns);
+            near = LoadNs(grouped, ng);
+        }
+        EmitPair(emit, kNames[view], far, near, ns);
+    }
+
+    // The NRO's code and read-only data (hbloader maps them with 4 KiB pages unless they line up).
+    MemoryInfo text{}, rodata{};
+    u32 pageInfo = 0;
+    if (R_FAILED(svcQueryMemory(&text, &pageInfo, uintptr_t(&LatencyTest))))
+        return;
+    CodeTest(emit, text, "NRO code, read", false);
+    CodeTest(emit, text, "NRO code, run", true);
+    if (R_SUCCEEDED(svcQueryMemory(&rodata, &pageInfo, text.addr + text.size)) && (rodata.perm & Perm_R))
+        CodeTest(emit, rodata, "NRO read-only data", false);
 }
 
 RepairInfo LastRepair()
