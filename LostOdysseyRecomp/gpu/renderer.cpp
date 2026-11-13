@@ -1221,11 +1221,12 @@ namespace gpu::renderer
                 bool shareValid = false;
                 void Invalidate() { ConsecutiveCopies::Invalidate(); shareValid = false; }
             } consecutiveResolveCopies;
-            // LO_RESOLVE_SHARE=1: a full resolve that repeats the previous one (same source, unchanged since, same size
-            // and host format) shows the previous slot's image instead of writing its own.
+            // LO_RESOLVE_SHARE (on by default on deko3d, =0 off): a full resolve that repeats the previous one (same
+            // source, unchanged since, same size and host format) shows the previous slot's image instead of writing
+            // its own. One full-target resolve a frame in town and in the first battle (docs/SWITCH-BENCHMARKS.md).
             const bool resolveShare = [] {
                 const char* value = getenv("LO_RESOLVE_SHARE");
-                return video::IsDeko3d() && value && value[0] == '1';
+                return video::IsDeko3d() && !(value && value[0] == '0');
             }();
             // LO_RESOLVE_FOLD_TRANSFER=1: the EDRAM ownership transfer a resolve's read triggers is owed (transferDebt),
             // and the resolve draws the transfer straight into its destination.

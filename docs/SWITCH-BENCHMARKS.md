@@ -627,3 +627,97 @@ stayed on in both modes. The +3.6% is `LO_CP_WPTR_LOCKFREE`, `LO_HOST_INPUT_REUS
 `LO_DEKO3D_FB_DEDUPE` alone; the other three haven't been measured. Results that compare builds, such as the
 milestones, are unaffected: each build ran with its own defaults. (The six `LO_DEKO3D_<NAME>` lines had a different
 bug, fixed in #34: each one fell back to the Debug page's value.)
+
+## Single-precision fused multiply-adds (2026-11-12)
+
+XenonRecomp writes `fmadds`, `fmsubs`, `fnmadds` and `fnmsubs` (32,026 in the game) as `double(float(a * c + b))`. GCC
+fuses that in double and rounds to single afterwards: two roundings where the Xenon has one, one ulp off when the
+double result lands halfway between two floats. It also keeps every single-precision chain that contains one in double
+registers, with an `fcvt` on each side. `tools/switch/ppc_fmadds.py` (run by `build-switch.sh`) rewrites them as
+`LoFmadds(a, c, b)` and the like (`LostOdysseyRecomp/cpu/guest_fmadds.h`): one `fmadd s` when the three inputs are
+exact floats, otherwise the double form as before (NaNs whose bits don't survive the round trip, doubles in a float
+register). GCC folds the exactness test away wherever it sees where an input came from. The natives that mirror
+`fmadds` (math leaves, collision, animation nodes, reverb, and `ppc2native.py`) use the same functions, so their check
+modes still compare equal: on the console (town and first battle, one run each, all four at 2) 5,242,880 calls of
+`sub_822C73E8` in each scene, 3,145,728 of `sub_822B3688` and 24,576 of `sub_82CCA0B0` in town, with 0 differences, and no
+collision difference (fewer than 65,536 calls, the first count it logs). `LO_SWITCH_FMADDS_DOUBLE=ON` builds the old form.
+
+`tools/switch/check_fmadds.py` compares the four functions with the exact result rounded once (fractions, ties to even,
+subnormals and overflow) on 270,080 float operand sets, and 41,512 sets with NaNs, infinities or doubles against the
+old form's bits: no differences. One constructed set shows the old form one ulp off.
+
+Code, release ELF, before and after: fused double `fmadd`/`fmsub`/`fnmadd`/`fnmsub` 34,195 to 6,124; fused single
+14,631 to 46,010; `fcvt` to single 61,220 to 37,760; `fcvt` to double 141,399 to 101,588; 28,007 fewer instructions.
+Exception tables 0 problems, the same 39 self-looping functions.
+
+ABBA on the test console, 1.2.1 against 1.2.1 with this change, each with its own profile trained the same day the same
+way (clean, town 240 s, battle 240 s). Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows; four blocks per scene
+(base, new, new, base), 1 warm-up + 2 counted runs each, so 4 runs per arm:
+
+| | Town, 60 FPS cap: base | new | First battle: base | new |
+|---|---:|---:|---:|---:|
+| FPS | 40.22 ± 0.03 | 40.25 ± 0.03 | 28.42 ± 0.13 | 28.44 ± 0.03 |
+| 1% low | 38.66 | 38.70 | 24.96 ± 0.72 | 24.97 ± 0.19 |
+| Frame p99 | 25.87 ms | 25.84 ms | 40.09 ms | 40.05 ms |
+| GPU busy | 21.16 ms (85.1%) | 21.15 ms | 32.61 ms (92.7%) | 32.62 ms |
+| All threads, % of a core | 263.8 | 259.3 (-1.7%) | 219.5 | 216.3 (-1.5%) |
+| `Guest_Main` | 73.2% | 72.7% | 81.7% | 80.4% |
+| `GPU_CmdProc` | 79.5% | 78.4% | 61.6% | 61.0% |
+
+The frame rate doesn't move: both scenes are GPU-bound. The CPU threads do the same work in about 1.5% less time, which
+is headroom for scenes where the CPU sets the frame. The change is kept for its accuracy.
+
+## Resolve share and transfer fold (2026-11-13)
+
+Two switches in the renderer that cut resolve passes, measured on the test console with the 1.2.1 release candidate
+(`f23f4005`, PGO profile `out/pgo-v121`). Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows, the release
+`env.txt`. One binary, the switch set per run in `env.txt`; four blocks per scene (off, on, on, off), 1 warm-up + 2
+counted runs each, so 4 runs per arm. Ranges are min-max of the counted runs.
+
+`LO_RESOLVE_SHARE`: a full resolve that repeats the previous one (same source, nothing drawn, cleared or transferred
+since, same size and host format) shows the previous slot's image instead of drawing the same pixels again. A traced
+frame (`LO_DRAW_TRACE`) in each scene: the 1280x720 8888 resolve into `0xb0d9000` comes straight after the same
+source's resolve into `0xaac000`, so it is shared. The counter says 300 shares in every 300 frames in both scenes.
+
+| | Town, 60 FPS cap: off | on | First battle: off | on |
+|---|---:|---:|---:|---:|
+| FPS | 40.24 (40.23-40.25) | **40.83** (40.82-40.85), +1.5% | 28.42 (28.32-28.54) | **28.62** (28.54-28.69), +0.7% |
+| 1% low | 38.67 (38.58-38.80) | 39.22 (39.19-39.29) | 25.05 (24.55-25.61) | 25.38 (24.85-25.73) |
+| Frame p99 | 25.86 ms | 25.50 ms | 39.92 ms | 39.41 ms |
+| GPU busy | 21.14 ms (21.13-21.15), 85.1% | **20.82 ms** (20.80-20.82), 85.0% | 32.63 ms (32.52-32.77), 92.7% | **32.35 ms** (32.18-32.43), 92.6% |
+| All threads, % of a core | 251.8 | 253.5 | 208.3 | 209.0 |
+| `GPU_CmdProc` | 80.2% | 80.6% | 62.4% | 62.2% |
+
+GPU busy ranges don't overlap in either scene: -0.32 ms in town, -0.28 ms in the battle. Share is on by default on
+deko3d from this change (`LO_RESOLVE_SHARE=0` turns it off).
+
+`LO_RESOLVE_FOLD_TRANSFER=1`, on top of share in both arms, first battle only (town has no transfer to fold): it folds
+two EDRAM ownership transfers a frame into the resolve that triggers them, but one of the two is drawn again later
+(600 folded in 300 frames, 300 of them drawn later, 300 never drawn).
+
+| First battle, share on | fold off | fold on |
+|---|---:|---:|
+| FPS | **28.59** (28.54-28.63) | 28.40 (28.36-28.46) |
+| 1% low | 25.16 | 24.72 |
+| Frame p99 | 39.75 ms | 40.46 ms |
+| GPU busy | **32.37 ms** (32.24-32.44) | 32.68 ms (32.60-32.72) |
+
+Fold costs 0.31 ms of GPU, so it stays off.
+
+Same image: share shows an image another slot wrote from the same source pixels with the same pass, so it is
+identical by construction; every draw, clear, transfer, target allocation, present or guest write in between ends the
+record. The bench screenshots agree:
+
+- Town at the 60 FPS cap, 6 shots per arm: the pixels that differ only across arms are the waving banners, the floating
+  particles and the banners' sway. The shot is taken after a fixed number of frames and the arms run at different frame
+  rates, so the animation is at another phase; the architecture, foliage and HUD match.
+- Town at a 30 FPS cap, where both arms hold 30.00 FPS and the timeline is the same (blocks off, on, on, off, 2 runs
+  each): outside the motion of the arm's own shots (grown by 2 px), every one of the 16 cross-arm pairs differs in the
+  same 30 pixels, by 1 in one channel, all 3-6 px from a moving banner. GPU busy 20.62 ms off, 20.23 ms on.
+- First battle: the camera and the spell effects move between any two shots; the frames look the same.
+
+The default-on build (`2c5895f9`, PGO USE build at the profile's training path) against the release candidate with
+`LO_RESOLVE_SHARE=1` in `env.txt`, blocks env, new, new, env, one 900-frame run each, every NRO read back from the card
+before its run: town 40.81 / 40.86 FPS (env) and 40.84 / 40.85 (new), GPU busy 20.82 / 20.81 and 20.81 / 20.81 ms; first
+battle 28.31 / 28.27 and 28.26 / 28.42 FPS, GPU busy 32.79 / 32.80 and 32.82 / 32.67 ms. With the debug log, the new
+build shows 300 shares in every 300 frames by default and none with `LO_RESOLVE_SHARE=0` (40.81 against 40.26 FPS).

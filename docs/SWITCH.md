@@ -255,6 +255,8 @@ A release is a profile-guided build, about 6% faster than this one. See
 CMake options (`cmake/LoSwitch.cmake`): `LO_SWITCH_RECOMP_O2`,
 `LO_SWITCH_LTO`, `LO_SWITCH_DATA_ROOT`, `LO_SWITCH_APP_TITLE`.
 `LO_SWITCH_FP_CONTRACT_OFF` (off) builds the game code with `-ffp-contract=on` instead of GCC's `fast`, for A/B tests only (#4).
+`LO_SWITCH_FMADDS_DOUBLE` (off) computes the game's `fmadds` family in double, rounded twice, as before
+`tools/switch/ppc_fmadds.py`, for A/B tests only (see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md#single-precision-fused-multiply-adds)).
 
 ### Without a console toolchain
 
@@ -301,6 +303,8 @@ Switch-specific options and diagnostics:
 
 | Variable | Default | Effect |
 |---|---|---|
+| `LO_GUEST_BLOCKS` | `1` | `0` maps guest memory with 4 KiB pages, the old layout: the window off a 2 MiB boundary and its backing 4 KiB aligned. On, the virtual, A and C views are 2 MiB blocks (the E view, one 4 KiB page off A, never is). The log's `guest window` line says which |
+| `LO_TLB_TEST` | off | `N`: N seconds after start, logs what a TLB miss costs in each guest view and in the NRO's code and read-only data (`switch: tlb:` lines; a few ms, holds the commit lock). Tells 2 MiB blocks (a few ns) from 4 KiB pages; `svcQueryMemory` does not show the page size |
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, handheld uses 540 and docked uses 720 |
 | `LO_DYNAMIC_RESOLUTION` | Graphics menu (off) | `0` or `1` wins over Graphics → Dynamic resolution. `1`: the scene height follows the GPU's time per frame, in steps of 36 rows from the configured height (540 or 720) down to `LO_DYNAMIC_RESOLUTION_MIN` (default 80% of it: 432 or 576); the final pass scales it to the output as usual. The runtime log's `dynamic resolution:` lines show each change |
@@ -614,7 +618,7 @@ instructions per call, so it shifts little time.
 |---|---|
 | Toolchain | devkitA64 GCC, libnx (`cmake/toolchains/switch-devkitA64.cmake`); `LO_PLATFORM_SWITCH` in `os/platform.h` |
 | Recompiled code | Same XenonRecomp output; GCC replacements for Clang builtins in `ppc_context.h` (`tools/patches/XenonRecomp-switch.patch`) |
-| Guest memory | 4 GiB `virtmem` reservation; pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
+| Guest memory | 4 GiB `virtmem` reservation, placed clear of the kernel map region, which holds thread-local pages and is invisible to `virtmem` (0x8000000-0x80000000 in a 36-bit process, 64 GiB at a random place in a 39-bit one); pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
 | Threads | Guest code threads get 4 MiB stacks (libnx defaults to 128 KiB) |
 | Graphics | plume Vulkan on statically linked Mesa NVK, `VK_NN_vi_surface` on the libnx window (`tools/patches/plume-switch.patch`, `volk-switch.patch`) |
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
@@ -721,7 +725,8 @@ In the renderer, on deko3d (`LostOdysseyRecomp/gpu`):
 |---|---|---|
 | The game's EDRAM restore draws skipped when the target still holds the image | `LO_SKIP_RESTORE` | GPU 38.4 to 36.2 ms |
 | Same-format resolves through the blit shader, not the copy engine | `LO_RESOLVE_BLIT` | +4.1% FPS, GPU 37.0 to 35.3 ms |
-| Fewer resolve passes, off by default | `LO_RESOLVE_FOLD_TRANSFER=1`, `LO_RESOLVE_SHARE=1` | not measured yet |
+| A full resolve that repeats the previous one shows that image instead of drawing it again | `LO_RESOLVE_SHARE` (`=0` off) | GPU -0.32 ms in town (+1.5% FPS at the 60 FPS cap), -0.28 ms in the first battle (+0.7%); same image |
+| Ownership transfers folded into the resolve that triggers them, off by default | `LO_RESOLVE_FOLD_TRANSFER=1` | slower: GPU +0.31 ms in the first battle, nothing to fold in town |
 | Render targets reused for consecutive draws | `LO_RT_REUSE` | small |
 | Scene renderer's occlusion reads answered at once while counts are made up | `LO_EARLY_QUERY_ANSWER` | +6.9% in a busy street |
 | Constant runs in one pass, lock-free write pointer, wide upload copies | `LO_CP_FUSED_PLAIN_RUN`, `LO_CP_WPTR_LOCKFREE`, `LO_UPLOAD_VECTOR_COPY` | part of +3.6% in a busy street, but not `LO_CP_FUSED_PLAIN_RUN`: its `=0` did nothing in that A/B |

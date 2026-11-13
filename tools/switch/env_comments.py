@@ -22,6 +22,8 @@ DESCRIPTIONS = {
     "LO_SWITCH_UI_NATIVE": "1: text, HUD and menus at the output's size while the scene stays smaller",
     "LO_NATIVE_MOVIES": "Cutscene video decoded natively with FFmpeg (faster, smoother); 0 uses the game's decoder",
     "LO_GUEST_AFFINITY": "Spread the game's threads across the Switch's three CPU cores",
+    "LO_GUEST_BLOCKS": "0: guest memory on 4 KiB pages (the old layout) instead of 2 MiB blocks",
+    "LO_TLB_TEST": "N: N seconds in, log what a TLB miss costs in guest memory and the NRO (tlb: lines)",
     "LO_ZPD_MODE": "xenia: made-up occlusion query counts (faster) instead of host queries",
     "LO_PIPELINE_PREBUILD": "Prepare known graphics states in the background at start (all)",
     "LO_SWITCH_BUTTONS": "position: the physical A/B/X/Y layout instead of the letters",
@@ -88,7 +90,7 @@ DESCRIPTIONS = {
     "LO_EARLY_QUERY_ANSWER": "The scene renderer's occlusion reads answered at once while counts are made up",
     "LO_RESOLVE_BLIT": "Same-format resolves through the blit shader, not the copy engine",
     "LO_RESOLVE_FOLD_TRANSFER": "1: fewer resolve passes (fold transfers)",
-    "LO_RESOLVE_SHARE": "1: fewer resolve passes (share resolves)",
+    "LO_RESOLVE_SHARE": "A repeated full resolve shows the previous one's image; 0 writes it again",
     "LO_RESIZE_FIX": "Dynamic resolution without flicker after a size change; 0 turns it off",
     # Benchmark runs (tools/switch/bench.py, docs/SWITCH-BENCHMARKS.md)
     "LO_BENCH": "Benchmark run: its name; the run presses the scenario's buttons, measures and reports",
