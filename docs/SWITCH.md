@@ -725,7 +725,8 @@ In the renderer, on deko3d (`LostOdysseyRecomp/gpu`):
 |---|---|---|
 | The game's EDRAM restore draws skipped when the target still holds the image | `LO_SKIP_RESTORE` | GPU 38.4 to 36.2 ms |
 | Same-format resolves through the blit shader, not the copy engine | `LO_RESOLVE_BLIT` | +4.1% FPS, GPU 37.0 to 35.3 ms |
-| Fewer resolve passes, off by default | `LO_RESOLVE_FOLD_TRANSFER=1`, `LO_RESOLVE_SHARE=1` | not measured yet |
+| A full resolve that repeats the previous one shows that image instead of drawing it again | `LO_RESOLVE_SHARE` (`=0` off) | GPU -0.32 ms in town (+1.5% FPS at the 60 FPS cap), -0.28 ms in the first battle (+0.7%); same image |
+| Ownership transfers folded into the resolve that triggers them, off by default | `LO_RESOLVE_FOLD_TRANSFER=1` | slower: GPU +0.31 ms in the first battle, nothing to fold in town |
 | Render targets reused for consecutive draws | `LO_RT_REUSE` | small |
 | Scene renderer's occlusion reads answered at once while counts are made up | `LO_EARLY_QUERY_ANSWER` | +6.9% in a busy street |
 | Constant runs in one pass, lock-free write pointer, wide upload copies | `LO_CP_FUSED_PLAIN_RUN`, `LO_CP_WPTR_LOCKFREE`, `LO_UPLOAD_VECTOR_COPY` | part of +3.6% in a busy street, but not `LO_CP_FUSED_PLAIN_RUN`: its `=0` did nothing in that A/B |
