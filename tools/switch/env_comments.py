@@ -86,6 +86,7 @@ DESCRIPTIONS = {
     "LO_UPLOAD_VECTOR_COPY": "Wide upload copies",
     "LO_DRAW_REUSE": "1: a draw reuses the previous frame's lookups for its position; 2 checks them",
     "LO_EARLY_QUERY_ANSWER": "The scene renderer's occlusion reads answered at once while counts are made up",
+    "LO_RESOLVE_REUSE_BARRIER": "1: a repeated blit resolve still records the copy-stage layouts (a full barrier on deko3d)",
     "LO_RESOLVE_BLIT": "Same-format resolves through the blit shader, not the copy engine",
     "LO_RESOLVE_FOLD_TRANSFER": "1: fewer resolve passes (fold transfers)",
     "LO_RESOLVE_SHARE": "1: fewer resolve passes (share resolves)",

@@ -627,3 +627,33 @@ stayed on in both modes. The +3.6% is `LO_CP_WPTR_LOCKFREE`, `LO_HOST_INPUT_REUS
 `LO_DEKO3D_FB_DEDUPE` alone; the other three haven't been measured. Results that compare builds, such as the
 milestones, are unaffected: each build ran with its own defaults. (The six `LO_DEKO3D_<NAME>` lines had a different
 bug, fixed in #34: each one fell back to the Debug page's value.)
+
+## Repeated resolves without copy-stage layouts (2026-11-13)
+
+A resolve that repeats the previous one exactly (same source and destination allocations, rectangle and format, nothing
+written to either since: `copy_reused`) copies nothing, but still moved the source to `COPY_SOURCE` and the image to
+`COPY_DEST`. On deko3d any copy-stage layout turns the barrier plume merges at that point into `DkBarrier_Full`. With
+`LO_RESOLVE_BLIT` (the default) the copy it skips would have been a blit, and the only reader of `COPY_SOURCE` (the
+restore skip) also accepts `unwrittenSinceResolve`, which the earlier blit set and the reuse record keeps; so the
+reused resolve now records no transitions. `LO_RESOLVE_REUSE_BARRIER=1` brings them back; `LO_RESOLVE_BLIT=0` is
+unchanged.
+
+ABBA on the test console, one binary (PGO USE, 1.2.1's profile), `LO_RESOLVE_REUSE_BARRIER=1` (off) against `0` (on).
+Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows; blocks off, on, on, off, 1 warm-up + 2 counted runs each, so
+4 runs per arm. Mean (min to max):
+
+| | Town, 60 FPS cap: off | on | First battle: off | on |
+|---|---:|---:|---:|---:|
+| FPS | 40.23 (40.21-40.27) | 40.27 (40.23-40.29) | 28.37 (28.27-28.44) | 28.45 (28.32-28.54) |
+| 1% low | 38.77 (38.71-38.82) | 38.78 (38.72-38.82) | 24.44 (23.72-24.94) | 24.98 (24.38-25.35) |
+| Frame p99 | 25.79 ms (25.76-25.83) | 25.78 ms (25.76-25.82) | 40.94 ms (40.10-42.15) | 40.04 ms (39.45-41.02) |
+| GPU busy (`gpu_ms`) | 21.16 ms (21.14-21.18) | 21.14 ms (21.13-21.15) | 32.67 ms (32.59-32.80) | 32.62 ms (32.54-32.73) |
+| Full barriers a frame | 6.00 | 5.00 | 6.07 | 5.05 |
+| Other barriers a frame | 31.00 | 32.00 | 37.80 | 38.80 |
+
+The full barrier goes, as expected, but a fragment barrier takes its place: the next transitions merged at the same
+point still need one. What is saved is the difference between the two, 0.03 ms of GPU time in town and 0.06 ms in battle, not the 0.6 to
+0.7 ms the whole barrier took in the trace. The battle's 1% low and p99 move more than that but within their spread.
+No warning (a reuse from a target not marked unwritten since a resolve) in any run. Screenshots: bench shots differ run
+to run, so they were compared in pairs: town, off-off median 56,150 differing pixels, on-on 53,892, off-on 56,085;
+battle 347,646, 340,504, 359,271. The arms differ no more than runs of one arm do.
