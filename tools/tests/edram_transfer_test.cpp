@@ -1,8 +1,9 @@
 // The per-pair EDRAM transfer shaders (gpu/edram_transfer.h kTransferPairHlsl) against the general one
 // (kTransferHlsl), through their CPU twins, for every input that can reach them:
-//   - Float32To7e3 old (branches) == new (selects) for every one of the 65,536 FP16 bit patterns as the
-//     shader reads them from the RGBA16F source (negatives, infinities and NaNs included), and for every
-//     one of the 2^32 FP32 bit patterns besides;
+//   - Float32To7e3 old (branches, as the console's compiler runs it: NaN gives 0x3FF, see edram_transfer.h)
+//     == new (selects) for every one of the 65,536 FP16 bit patterns as the shader reads them from the
+//     RGBA16F source (negatives, infinities and NaNs included), and for every one of the 2^32 FP32 bit
+//     patterns besides; the source's own NaN rule (NaN gives 0) is counted apart and differs only for NaN;
 //   - Float7e3To32 old == new, bit for bit, for all 1,024 codes;
 //   - the unorm and alpha quantisers: saturate(x) * scale + 0.5 gives the same integer with and without a
 //     fused multiply-add for every FP16 input (the product is exact), so a GPU compiler's contraction
@@ -58,13 +59,17 @@ int main()
 
     // Float32To7e3 over every FP16 input, then over every FP32 bit pattern.
     {
-        uint32_t diff = 0, nan = 0, inf = 0, negative = 0, saturated = 0, denormalPath = 0;
+        uint32_t diff = 0, nan = 0, inf = 0, negative = 0, saturated = 0, denormalPath = 0, sourceRule = 0, sourceNan = 0;
         for (uint32_t h = 0; h < 0x10000u; ++h) {
             const float f = et::HalfToFloat(uint16_t(h));
-            const uint32_t a = et::Float32To7e3(f), b = et::Float32To7e3Select(f);
+            const uint32_t a = et::Float32To7e3Compiled(f), b = et::Float32To7e3Select(f);
             if (a != b) {
                 if (diff < 8) std::printf("  Float32To7e3 half %04x: %03x vs %03x\n", h, a, b);
                 ++diff;
+            }
+            if (et::Float32To7e3(f) != b) {
+                ++sourceRule;
+                sourceNan += f != f;
             }
             nan += f != f;
             inf += (h & 0x7FFFu) == 0x7C00u;
@@ -72,20 +77,27 @@ int main()
             saturated += a == 0x3FFu;
             denormalPath += f > 0.0f && Bits(f) < 0x3E800000u;
         }
-        std::printf("Float32To7e3, 65536 FP16 inputs (%u NaN, %u infinities, %u with the sign bit, %u saturate to 0x3FF, "
-                    "%u through the 7e3 denormal path): %u differ\n", nan, inf, negative, saturated, denormalPath, diff);
-        failures += diff;
-        uint64_t diff32 = 0;
+        std::printf("Float32To7e3 as compiled, 65536 FP16 inputs (%u NaN, %u infinities, %u with the sign bit, %u saturate "
+                    "to 0x3FF, %u through the 7e3 denormal path): %u differ\n", nan, inf, negative, saturated, denormalPath, diff);
+        std::printf("  the source's NaN rule instead: %u differ, %u of them NaN\n", sourceRule, sourceNan);
+        failures += diff + (sourceRule - sourceNan);
+        uint64_t diff32 = 0, sourceRule32 = 0, sourceNan32 = 0;
         uint32_t u = 0;
         do {
             const float f = std::bit_cast<float>(u);
-            if (et::Float32To7e3(f) != et::Float32To7e3Select(f)) {
+            const uint32_t b = et::Float32To7e3Select(f);
+            if (et::Float32To7e3Compiled(f) != b) {
                 if (diff32 < 8) std::printf("  Float32To7e3 fp32 %08x differs\n", u);
                 ++diff32;
             }
+            if (et::Float32To7e3(f) != b) {
+                ++sourceRule32;
+                sourceNan32 += f != f;
+            }
         } while (++u != 0);
-        std::printf("Float32To7e3, all 4294967296 FP32 bit patterns: %" PRIu64 " differ\n", diff32);
-        failures += diff32;
+        std::printf("Float32To7e3 as compiled, all 4294967296 FP32 bit patterns: %" PRIu64 " differ\n", diff32);
+        std::printf("  the source's NaN rule instead: %" PRIu64 " differ, %" PRIu64 " of them NaN\n", sourceRule32, sourceNan32);
+        failures += diff32 + (sourceRule32 - sourceNan32);
     }
 
     // Float7e3To32 over all 1,024 codes (and the masking of the bits above them).

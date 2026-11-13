@@ -21,9 +21,19 @@
 // classes, fixed at compile time (TransferPairSource), with the 7e3
 // conversions written without branches: the integer steps of Float32To7e3 and
 // Float7e3To32 for every lane, the choices made by select. Every intermediate
-// and the result are the same bits as the general shader's (checked for every
-// FP16 input by tools/tests/edram_transfer_test.cpp against the CPU twins
-// below, and on the GPU by the renderer's LO_TRANSFER_CHECK).
+// and the result are the same bits as the general shader's as the console runs
+// it (checked for every FP16 input by tools/tests/edram_transfer_test.cpp
+// against the CPU twins below, and on the GPU by the renderer's
+// LO_TRANSFER_CHECK self-test).
+//
+// NaN: the general shader's `if (!(f > 0.0)) return 0u;` sends NaN to 0 as
+// written, but the Switch's shader compiler (uam) emits it as the ordered
+// `0.0 >= f` (IR `set ftz ge f32 0.0, f`), false for NaN, so on the console NaN
+// goes on to `u >= 0x41FF73FF` and becomes 0x3FF, whatever its sign. The pair
+// shader writes that test as `f <= 0.0`, which means the same in the source
+// and in the compiled code; Float32To7e3Compiled is the general shader's twin
+// as compiled. The two differ only for NaN, and only on GPUs whose compiler
+// keeps the source's NaN rule (the pair shaders are on by default on deko3d only).
 namespace gpu::edram_transfer {
 
 // The renderer's bindings for the transfer shaders (CompileTransferShader).
@@ -99,7 +109,7 @@ inline constexpr const char* kTransferPairHlsl =
     "  uint3 x = select(u < uint3(0x3E800000u, 0x3E800000u, 0x3E800000u), den, u + 0xC2000000u);\n"
     "  uint3 r = ((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16) & 0x3FFu;\n"
     "  r = select(u >= uint3(0x41FF73FFu, 0x41FF73FFu, 0x41FF73FFu), uint3(0x3FFu, 0x3FFu, 0x3FFu), r);\n"
-    "  return select(f > float3(0.0, 0.0, 0.0), r, uint3(0u, 0u, 0u));\n"
+    "  return select(f <= float3(0.0, 0.0, 0.0), uint3(0u, 0u, 0u), r);\n"
     "}\n"
     "float4 main(float4 pos : SV_Position) : SV_Target {\n"
     "  float4 v = src.Load(int3(int2(pos.x * asfloat(xeTransfer.z), pos.y * asfloat(xeTransfer.w)), 0));\n"
@@ -208,6 +218,14 @@ inline uint32_t Float32To7e3(float f)
     return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;
 }
 
+// The general shader's Float32To7e3 as the console's compiler runs it: the
+// early-out is the ordered `0.0 >= f` (see the NaN note at the top), so NaN
+// reaches the saturation test and gives 0x3FF.
+inline uint32_t Float32To7e3Compiled(float f)
+{
+    return f != f ? 0x3FFu : Float32To7e3(f);
+}
+
 // kTransferPairHlsl's branch-free helpers, one lane, step for step: both
 // sides of every choice are computed, then one is selected.
 inline float Float7e3To32Select(uint32_t f10)
@@ -233,7 +251,7 @@ inline uint32_t Float32To7e3Select(float f)
     const uint32_t x = u < 0x3E800000u ? den : u + 0xC2000000u;
     uint32_t r = ((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16) & 0x3FFu;
     r = u >= 0x41FF73FFu ? 0x3FFu : r;
-    return f > 0.0f ? r : 0u;
+    return f <= 0.0f ? 0u : r;
 }
 
 // saturate(x) * scale + 0.5 to uint; fused: as one multiply-add, which a GPU compiler may emit.
