@@ -318,6 +318,8 @@ Switch-specific options and diagnostics:
 | `LO_DEKO3D_PRESENT_THREAD` | `1` | The compositor's buffer-queue calls (queue the finished image, dequeue the next) run on a worker instead of `GPU CmdProc`; `0` makes them there. Street at 540 output: present 2.4 to 0.8 ms on `GPU CmdProc`, 28.77 to 29.1 FPS; the busiest street spot (about 2,030 draws): 24.02 to 24.67 FPS |
 | `LO_DRAW_REUSE` | `0` | `1`: a draw takes the shader, pipeline and texture lookups the draw at its position made in the previous frame. Street: 28.97 against 29.0 FPS, no gain measured. `2` still looks everything up and logs every result that differs |
 | `LO_SKIP_RESTORE` | on | `0` draws the game's EDRAM restores instead of skipping them (deko3d) |
+| `LO_TRANSFER_PAIR_SHADERS` | on (deko3d) | EDRAM transfers (a target's tiles read by another 32-bit format class) are drawn with a shader made for their pair of classes, without branches (`gpu/edram_transfer.h`, `kTransferPairHlsl`): the same bits as the general shader as the console runs it. First battle: the three transfers of a frame 2.41 to 1.40 ms, +2.5% FPS (`SWITCH-BENCHMARKS.md`). `0` draws them with the general shader, which reads both classes from constants and branches per fragment. A pair whose shader or pipeline can't be made falls back to the general one; the log's `EDRAM transfers with` line says which is used |
+| `LO_TRANSFER_CHECK` | off | `1` (the first 64) or `N`: the first N transfers drawn with a pair's shader are drawn again with the general shader and both images compared after the frame (`transfer check` lines, a total every 16); the first also runs every pair over all 65,536 FP16 values per channel (`transfer self-test`). Costs GPU time and 8 MB per check: diagnostics only |
 | `LO_MAIN_CORE` | `-1` | core Guest Main stays on, `-1` leaves it free to move. Pinning gains 2% in battle but can stall the game: see `SWITCH-BENCHMARKS.md`, Milestone 4 |
 | `LO_RT32` | off | Set to `1` to use 32-bit formats for the two 10-bit render-target classes; on Switch the 7e3 class uses `R11G11B10_FLOAT`, so its 2-bit alpha is read as 1 |
 | `LO_GUEST_AFFINITY` | off | Set to `1` to map Xbox guest thread affinity onto the Switch's three cores |
@@ -726,6 +728,7 @@ In the renderer, on deko3d (`LostOdysseyRecomp/gpu`):
 | The game's EDRAM restore draws skipped when the target still holds the image | `LO_SKIP_RESTORE` | GPU 38.4 to 36.2 ms |
 | Same-format resolves through the blit shader, not the copy engine | `LO_RESOLVE_BLIT` | +4.1% FPS, GPU 37.0 to 35.3 ms |
 | Fewer resolve passes, off by default | `LO_RESOLVE_FOLD_TRANSFER=1`, `LO_RESOLVE_SHARE=1` | not measured yet |
+| EDRAM transfers with a shader per pair of classes, without branches | `LO_TRANSFER_PAIR_SHADERS` (`LO_TRANSFER_CHECK` compares) | first battle +2.5% FPS (28.41 to 29.13), GPU 32.65 to 31.50 ms |
 | Render targets reused for consecutive draws | `LO_RT_REUSE` | small |
 | Scene renderer's occlusion reads answered at once while counts are made up | `LO_EARLY_QUERY_ANSWER` | +6.9% in a busy street |
 | Constant runs in one pass, lock-free write pointer, wide upload copies | `LO_CP_FUSED_PLAIN_RUN`, `LO_CP_WPTR_LOCKFREE`, `LO_UPLOAD_VECTOR_COPY` | part of +3.6% in a busy street, but not `LO_CP_FUSED_PLAIN_RUN`: its `=0` did nothing in that A/B |

@@ -666,3 +666,51 @@ way (clean, town 240 s, battle 240 s). Handheld, CPU 1020 / GPU 461 / memory 133
 
 The frame rate doesn't move: both scenes are GPU-bound. The CPU threads do the same work in about 1.5% less time, which
 is headroom for scenes where the CPU sets the frame. The change is kept for its accuracy.
+
+## EDRAM transfers with a shader per pair of classes (2026-11-14)
+
+When a render target's tiles are read by another 32-bit format class (8:8:8:8, 2:10:10:10, 7e3), the renderer draws an
+EDRAM transfer: each texel packed into the guest word and unpacked the way the new class reads it. The first battle
+draws three a frame, each over the whole 960x552 target (2 -> 1, 0 -> 1, 1 -> 2). The general shader read both classes
+from constants and branched per fragment: 304 IR instructions with 14 branches and 23 phis in uam, 320 DKSH
+instructions. `kTransferPairHlsl` is one shader per pair (six), the class tests resolved by the preprocessor and the 7e3
+conversions written with `select`: no control flow (only `exit`), 160 DKSH instructions for the 7e3 pairs, 96 for the
+others. They are in `builtin_spirv.inc` (six entries added, the 31 release entries unchanged) and on by default with
+deko3d; `LO_TRANSFER_PAIR_SHADERS=0` draws the general shader. A pair without a working pipeline falls back to it.
+
+The same bits, checked three ways:
+
+- `tools/tests/edram_transfer_test.cpp` (`LoEdramTransferTest`) runs the CPU twins of both shaders over every FP16 input
+  of each conversion, all 2^32 FP32 inputs of `Float32To7e3`, and each of the nine class pairs on 65,536 texels whose
+  channels each take every FP16 value: 0 differ. The quantisers give the same integer fused and unfused (the products are
+  exact), so a compiler's choice to fuse can't tell the shaders apart.
+- On the console, `LO_TRANSFER_CHECK=600` drew the first 600 transfers of the first battle with both shaders and compared
+  them after the frame's fence: 317,952,000 pixels, 0 differ.
+- The same switch's GPU self-test runs every pair over all 65,536 FP16 values per channel. Its first run found 6,008
+  texels differing for 2 -> 0 and 2 -> 1: every texel with a NaN in red, green or blue. uam compiles the general shader's
+  `if (!(f > 0.0)) return 0u;` as the ordered `0.0 >= f` (`set ftz ge f32`), false for NaN, so on the console NaN goes
+  on to the saturation test and becomes 0x3FF; the pair shader's `select(f > 0.0, r, 0)` kept the source's rule and gave
+  0. The pair shader now writes `f <= 0.0`, which compiles to the same instruction, and the host test compares it with
+  the general shader as compiled. Second run: all six pairs 0 differ. The game's own transfers in the first battle hold
+  no NaN (600 transfers equal in both runs).
+
+ABBA on the test console, one build (`a1b3d3ec`, PGO USE with the 1.2.1 profile), `LO_TRANSFER_PAIR_SHADERS` 0 against 1.
+Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows; first battle in four blocks (off, on, on, off), 1 warm-up + 2
+counted runs each, so 4 runs per arm; town one block per arm (2 runs each) as the control, since it draws no transfer:
+
+| | First battle: general shader | pair shaders | Town, 60 FPS cap: general | pairs |
+|---|---:|---:|---:|---:|
+| FPS | 28.41 ± 0.05 | 29.13 ± 0.05 (+2.5%) | 40.22 ± 0.03 | 40.25 ± 0.01 |
+| 1% low | 24.80 ± 0.55 | 25.66 ± 0.44 | 38.65 | 38.78 |
+| Frame p99 | 40.33 ms | 38.99 ms | 25.88 ms | 25.79 ms |
+| GPU busy | 32.65 ms (92.8%) | 31.50 ms (91.7%) | 21.15 ms | 21.14 ms |
+
+Blocks: off 28.41 / on 29.10 / on 29.16 / off 28.41 FPS, no drift. The battle's arms don't overlap (28.35-28.48 against
+29.06-29.16 FPS). A per-draw GPU trace (`LO_GPU_PASS_TRACE`, a scratch build with the tracer, 36 frames per arm) puts the
+transfers at 2.41 ms a frame with the general shader (0 -> 1 428 us, 1 -> 2 971 us, 2 -> 1 1,010 us) and 1.40 ms with
+the pairs (274, 548, 576 us), in line with the 1.15 ms of GPU time the ABBA measured.
+
+Screenshots (`LO_BENCH_SHOT`, taken at the end of the 450-frame window) show the same picture in both arms, but they
+can't compare bits: the game steps by time, the pair arm reaches the shot 0.4 s sooner, and the camera is elsewhere in
+its move (even two blocks of the same arm differ in 14,000-35,000 of the pixels that hold still within one block). The
+check mode above is the proof of identical output.
