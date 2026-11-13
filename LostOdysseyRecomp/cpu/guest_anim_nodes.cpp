@@ -8,6 +8,7 @@
 #include <stdafx.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <cpu/guest_fmadds.h>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -74,7 +75,8 @@ namespace
     };
 
     // sub_822B3688 for the child at `child` (node r3, index r4, weight f1, a double): fmuls, then fmadds, as the
-    // recompiled code computes them (in double, rounded to single). The guest reads the child array and the child again
+    // recompiled code computes them (the fmuls in double, rounded to single; the fmadds as cpu/guest_fmadds.h does:
+    // single precision when the weight is a float, else in double). The guest reads the child array and the child again
     // after its first store; nothing it stores is one of those fields.
     ChildWeights ComputeChildWeights(uint8_t* base, uint32_t child, double weight, bool store)
     {
@@ -85,7 +87,7 @@ namespace
             StoreFloat(base, child + kChildTotalWeight, result.total);
 
         result.anim = LoadU32(base, child + kChildAnim);
-        result.nodeTotal = float(std::fma(double(childWeight), weight, double(LoadFloat(base, result.anim + kNodeTotalWeight))));
+        result.nodeTotal = float(LoFmadds(double(childWeight), weight, double(LoadFloat(base, result.anim + kNodeTotalWeight))));
         if (store)
             StoreFloat(base, result.anim + kNodeTotalWeight, result.nodeTotal);
         return result;
