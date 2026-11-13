@@ -2441,7 +2441,7 @@ namespace plume {
             if (targets.size() <= id)
                 targets.resize(id + 1);
             const Deko3DTexture *t = static_cast<const Deko3DTexture *>(texture);
-            targets[id] = t && (t->desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET)) ? t : nullptr;
+            targets[id] = t;
         }
         Deko3DDescriptorSet::setTexture(descriptorIndex, texture, textureLayout, textureView);
     }

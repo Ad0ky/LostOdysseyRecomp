@@ -63,7 +63,11 @@ namespace gpu::gpu_trace
         for (const auto& s : segments) {
             traceNs += s.gpuNs;
             sampled.clear();
-            for (uint32_t i = 0; i < s.sampledCount; ++i) sampled += (i ? "," : "") + name(s.sampled[i]);
+            for (uint32_t i = 0; i < s.sampledCount; ++i) {
+                // The game's own textures say nothing here: only targets, resolved surfaces and their copies are named.
+                const std::string n = name(s.sampled[i]);
+                if (n != "tex") sampled += (sampled.empty() ? "" : ",") + n;
+            }
             if (sampled.empty()) sampled = "-";
             LOG_NOTICE("gpass: f={} l={} b={} i={} k={} us={:.1f} t={}x{} c={} d={} dr={} cl={} bar={}/{}/{} inv={} pb={} sb={} dw={} "
                 "sp={} fr={} vt={} n={} rc={} rd={} src={}x{}:{}:{} by={} in={} el={} vs={:016x} ps={:016x} st={:x}",

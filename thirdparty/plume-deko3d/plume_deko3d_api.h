@@ -110,8 +110,9 @@ namespace plume {
         // variant at all, 10 blending on target 0, 12-15 the colour write mask of target 0, 16 stencil writes
         // possible (an operation other than keep), 20-23 the stencil reference test (front, DkCompareOp).
         uint32_t state = 0;
-        // The render targets its draws sample (those their shaders have a binding for), the first six.
-        const RenderTexture *sampled[6] = {};
+        // The textures its draws sample (those their shaders have a binding for): render targets first, then plain
+        // textures, ten in all.
+        const RenderTexture *sampled[10] = {};
         uint32_t sampledCount = 0;
         // The back end's work recorded in the stretch (Deko3DCounters' differences).
         uint32_t barriersFull = 0, barriersFragments = 0, barriersPrimitives = 0, barriersImageInvalidate = 0;

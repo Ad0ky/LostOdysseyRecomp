@@ -78,7 +78,7 @@ def group_of(s):
         what = s["c"] if s["c"] != "-" else s["d"]
         return f"clear {s['w']}x{s['h']} {what} [{s['rc'] if s['c'] != '-' else s['rd']}]"
     src = s["src"].split(":")
-    return f"{s['k']} {s['w']}x{s['h']} {src[2] if len(src) > 2 else '?'}->{s['c']} [{':'.join(src[3:]) or '-'} -> {s['rc']}]"
+    return f"{s['k']} {s['w']}x{s['h']} {src[1] if len(src) > 1 else '?'}->{s['c']} [{':'.join(src[2:]) or '-'} -> {s['rc']}]"
 
 
 def category_of(s):
@@ -164,7 +164,8 @@ def resolve_report(frames):
             for later in segs[i + 1:]:
                 if later["rc"] == name and later is not s:
                     break
-                if name in later["in"].split(","):
+                # A reader samples it in a draw, or is a copy from it.
+                if name in later["in"].split(",") or later["src"].split(":", 2)[-1] == name:
                     readers.append(later)
             t = totals[name]
             t[0] += 1; t[2] += s["us"]
@@ -188,7 +189,7 @@ def resolve_report(frames):
             who[f"{r['l']}{r['i']}:{r['w']}x{r['h']}>{r['rc']}"] += r["dr"]
         text = ", ".join(f"{k} ({v} draws)" for k, v in list(who.items())[:4]) + (" ..." if len(who) > 4 else "")
         out.append([f"{s['l']}{s['i']}", s["k"], f"{s['us'] / 1000:.3f}", f"{s['w']}x{s['h']}", s["rc"],
-                    s["in"] if s["k"] == "draws" else s["src"].split(":", 3)[-1], text or "nobody"])
+                    s["in"] if s["k"] == "draws" else s["src"].split(":", 2)[-1], text or "nobody"])
     table(out, ["at", "kind", "ms", "size", "writes", "from", "read by (until its next write)"], "llrllll")
 
 
@@ -267,6 +268,69 @@ def shader_report(frames, n, spv_dir, top):
     table(rows, ["pixel shader", "ms (pixels)", "%", "ms (its draws)", "draws", "fragments k", "samples k", "ns/fragment"], "lrrrrrrr")
 
 
+COMPARE = {0: "-", 1: "never", 2: "<", 3: "==", 4: "<=", 5: ">", 6: "!=", 7: ">=", 8: "always"}
+
+
+def state_text(st):
+    """A draw's st= field (Deko3DPassSegment::state) in words."""
+    if not st & 1:
+        depth = "no depth test"
+    else:
+        depth = f"depth {COMPARE.get((st >> 4) & 15, '?')}{' write' if st & 2 else ''}"
+    stencil = ""
+    if st & 4:
+        stencil = f", stencil {COMPARE.get((st >> 20) & 15, '?')}{' write' if st & 0x10000 else ''}"
+    return f"{depth}{stencil}{', blend' if st & 0x400 else ''}{', no colour' if not (st >> 12) & 15 else ''}"
+
+
+def early_class(st):
+    """Whether the depth and stencil tests of a draw in this state could run before its pixel shader with the same
+    image, whatever the shader discards: they can when a fragment the shader would discard leaves nothing behind
+    (no depth write and no stencil write), or writes what is already there (depth compared for equality)."""
+    if st & 0x100:
+        return "early already"
+    if not st & 1 and not st & 4:
+        return "no test"
+    if st & 0x10000:
+        return "no: stencil write"
+    if st & 2 and st & 1 and (st >> 4) & 15 != 3:
+        return "no: depth write"
+    return "exact" if not st & 2 else "exact (== writes the same depth)"
+
+
+def rejected_report(frames, n, spv_dir, top):
+    """Per-draw stretches by pixel shader and state: the fragments shaded against the samples that passed the depth
+    and stencil tests. The saving is the draws' time by the share of fragments that fail, an upper bound (a draw's
+    time includes its vertices)."""
+    names = shader_names(spv_dir)
+    none = "0" * 16
+    draws = [s for e in frames.values() for s in e["segs"] if s["l"] == "S" and s["k"] == "draws" and s["dr"] == 1
+             and s["ps"] != none]
+    if not draws:
+        print("\nno per-draw stretches (LO_GPU_PASS_DRAWS=1)")
+        return
+    groups = defaultdict(lambda: defaultdict(float))
+    classes = defaultdict(lambda: defaultdict(float))
+    for s in draws:
+        lost = s["us"] * (1 - s["sp"] / s["fr"]) if s["fr"] > s["sp"] else 0.0
+        for g in (groups[(s["ps"], s["st"])], classes[early_class(s["st"])]):
+            g["us"] += s["us"]; g["fr"] += s["fr"]; g["sp"] += s["sp"]; g["n"] += 1; g["lost"] += lost
+    print()
+    print(f"Colour draws by what an early depth and stencil test would be, per traced frame ({n} frames)")
+    table([[c, f"{g['n'] / n:.0f}", f"{g['us'] / n / 1000:.3f}", f"{g['fr'] / n / 1000:.1f}", f"{g['sp'] / n / 1000:.1f}",
+            f"{g['lost'] / n / 1000:.3f}"] for c, g in sorted(classes.items(), key=lambda kv: -kv[1]["lost"])],
+          ["early test", "draws", "ms", "fragments k", "samples k", "ms in rejected fragments"], "lrrrrr")
+    print()
+    print("By pixel shader and state, by the time in rejected fragments")
+    rows = []
+    for (ps, st), g in sorted(groups.items(), key=lambda kv: -kv[1]["lost"])[:top]:
+        if g["lost"] / n < 5:
+            break
+        rows.append([names.get(ps, ps), f"{g['n'] / n:.0f}", f"{g['us'] / n / 1000:.3f}", f"{g['fr'] / n / 1000:.1f}",
+                     f"{g['sp'] / n / 1000:.1f}", f"{g['lost'] / n / 1000:.3f}", early_class(st), state_text(st)])
+    table(rows, ["pixel shader", "draws", "ms", "fragments k", "samples k", "ms rejected", "early test", "state"], "lrrrrrll")
+
+
 def table(rows, headers, aligns):
     widths = [max(len(str(r[i])) for r in [headers] + rows) for i in range(len(headers))]
     def fmt(r):
@@ -289,6 +353,9 @@ def main():
                     help="every write of a resolved surface and the stretches that sample it before its next write")
     ap.add_argument("--shaders", action="store_true",
                     help="with LO_GPU_PASS_DRAWS=1 lines: the cost per vertex and pixel shader")
+    ap.add_argument("--rejected", action="store_true",
+                    help="with LO_GPU_PASS_DRAWS=1 lines: fragments shaded and then rejected by the depth or stencil "
+                    "test, by pixel shader and state, and whether the test could run early with the same image")
     ap.add_argument("--spv-dir", help="the pack's shaders as tools/deko3d/extract_spirv.py wrote them (vs_*.spv, ps_*.spv): "
                     "names the shaders of --shaders by file")
     args = ap.parse_args()
@@ -394,6 +461,8 @@ def main():
 
     if args.shaders:
         shader_report(frames, n, args.spv_dir, args.top)
+    if args.rejected:
+        rejected_report(frames, n, args.spv_dir, args.top)
     if args.resolves:
         resolve_report(frames)
 

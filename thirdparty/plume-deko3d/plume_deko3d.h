@@ -260,10 +260,10 @@ namespace plume {
     void Deko3DRecordWaitSet(const Deko3DDescriptorSet &set, Deko3DRecordWait why);
 
     // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE): the descriptor set the device makes while a trace is asked for
-    // (as Deko3DTracedCommandList). It remembers which of its image descriptors hold a render target, so a traced
-    // stretch can say which targets its draws sample.
+    // (as Deko3DTracedCommandList). It remembers the texture of each image descriptor, so a traced stretch can say what
+    // its draws sample: render targets first, then plain textures (the cropped copies of resolved surfaces are plain).
     struct Deko3DTracedDescriptorSet : Deko3DDescriptorSet {
-        std::vector<const Deko3DTexture *> targets;  // by image id (descriptor index - imageFirst); null: not a target
+        std::vector<const Deko3DTexture *> targets;  // by image id (descriptor index - imageFirst)
         Deko3DTracedDescriptorSet(Deko3DDevice *device, const RenderDescriptorSetDesc &desc);
         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
     };

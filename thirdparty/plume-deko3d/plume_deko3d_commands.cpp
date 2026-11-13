@@ -2694,28 +2694,32 @@ namespace plume {
         cl.descriptorEpoch = epoch;
     }
 
-    // The render targets the draw about to be recorded samples: the image descriptors its shaders have a binding for
-    // (the pipeline's textureSources), in the sets bound now.
+    // The textures the draw about to be recorded samples: the image descriptors its shaders have a binding for
+    // (the pipeline's textureSources), in the sets bound now. Render targets first, so plain textures never take
+    // their places in the list.
     void Deko3DTracedCommandList::passSampled() {
         const Deko3DGraphicsPipeline *p = graphicsPipeline;
         if (!p || !p->valid)
             return;
         Deko3DPassSegment &s = openSegment;
-        for (int st = 0; st < 3; st++) {
-            for (const Deko3DSpirvTexture &src : p->textureSources[st]) {
-                const Deko3DDescriptorSet *set = src.imageSet < 8 ? graphicsSets[src.imageSet] : nullptr;
-                if (!set || !set->traced || src.imageIndex < set->imageFirst)
-                    continue;
-                const auto &targets = static_cast<const Deko3DTracedDescriptorSet *>(set)->targets;
-                const uint32_t id = src.imageIndex - set->imageFirst;
-                const Deko3DTexture *t = id < targets.size() ? targets[id] : nullptr;
-                if (!t)
-                    continue;
-                bool known = false;
-                for (uint32_t i = 0; i < s.sampledCount; i++)
-                    known = known || s.sampled[i] == t;
-                if (!known && s.sampledCount < 6)
-                    s.sampled[s.sampledCount++] = t;
+        const uint32_t limit = uint32_t(std::size(s.sampled));
+        for (int plain = 0; plain < 2; plain++) {
+            for (int st = 0; st < 3; st++) {
+                for (const Deko3DSpirvTexture &src : p->textureSources[st]) {
+                    const Deko3DDescriptorSet *set = src.imageSet < 8 ? graphicsSets[src.imageSet] : nullptr;
+                    if (!set || !set->traced || src.imageIndex < set->imageFirst)
+                        continue;
+                    const auto &targets = static_cast<const Deko3DTracedDescriptorSet *>(set)->targets;
+                    const uint32_t id = src.imageIndex - set->imageFirst;
+                    const Deko3DTexture *t = id < targets.size() ? targets[id] : nullptr;
+                    if (!t || int(!(t->desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET))) != plain)
+                        continue;
+                    bool known = false;
+                    for (uint32_t i = 0; i < s.sampledCount; i++)
+                        known = known || s.sampled[i] == t;
+                    if (!known && s.sampledCount < limit)
+                        s.sampled[s.sampledCount++] = t;
+                }
             }
         }
     }
