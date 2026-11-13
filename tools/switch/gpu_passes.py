@@ -371,6 +371,8 @@ def main():
     ap.add_argument("--sequence", nargs="?", const=-1, type=int, default=None, help="print one frame's stretches in order")
     ap.add_argument("--merge", action="store_true", help="in --sequence, merge neighbours of the same group")
     ap.add_argument("--top", type=int, default=60, help="groups shown")
+    ap.add_argument("--min-batch-ms", type=float, default=0.0,
+                    help="only frames whose renderer batch took at least this long on the GPU (leaves out menus and loading)")
     ap.add_argument("--resolves", action="store_true",
                     help="every write of a resolved surface and the stretches that sample it before its next write")
     ap.add_argument("--shaders", action="store_true",
@@ -384,6 +386,10 @@ def main():
 
     frames = parse(args.log, args.from_frame, args.to_frame)
     frames = OrderedDict((f, e) for f, e in frames.items() if e["segs"] and e["ends"])
+    if args.min_batch_ms:
+        # A run's trace starts in the menus and the loading screens: keep the scene's frames by their renderer batch.
+        frames = OrderedDict((f, e) for f, e in frames.items()
+                             if sum(x["batch_us"] for x in e["ends"] if x["l"] == "S") >= 1000 * args.min_batch_ms)
     if not frames:
         sys.exit("no gpass: lines (LO_GPU_PASS_TRACE=N) in the range")
     n = len(frames)

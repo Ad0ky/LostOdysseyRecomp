@@ -178,10 +178,23 @@ Hottest by the time of their draws, town (6 frames) and battle (5 frames):
 | `ps_30731f7aad7cb542` | town | 5 | 126,000 | 1.03 ms | 8.2 ns a fragment |
 | `ps_7c260eacff1d681d` (blur, 360x360) | both | 1 | 57,400 | 0.62 to 0.66 ms | 11 ns a fragment |
 
-Fragments shaded and then rejected by the depth test, all pixel shaders: up to 1.27 ms a frame in town and 3.17
-ms in battle (an upper bound: a draw's time includes its vertices). The early depth test is only used for
-shaders that cannot discard (`!ps->mayDiscard`) on draws without alpha test; which of these draws could take it
-without changing the image depends on their depth and stencil writes, which the trace now records (`st=`).
+Fragments shaded and then rejected by the depth test (`gpu_passes.py --rejected`, per-draw trace with each
+draw's state, 6 battle and 8 town frames; the times are upper bounds, a draw's time includes its vertices):
+
+| Draws, by what an early test would be | Battle: draws | ms | ms in rejected fragments | Town: draws | ms | ms in rejected fragments |
+|---|---:|---:|---:|---:|---:|---:|
+| already tested early | 572 | 17.56 | 0 | 406 | 12.28 | 0 |
+| no depth or stencil test (full-screen passes) | 18 | 5.65 | 0 | 13 | 3.88 | 0 |
+| not exact: the draw writes depth and its shader can discard | 164 | 3.49 | **2.80** | 200 | 2.21 | **1.15** |
+| exact: tests without depth or stencil writes | 112 | 1.56 | 0.27 | 38 | 0.41 | 0.06 |
+| not exact: stencil writes | 0 | | | 13 | 0.08 | 0.02 |
+
+The loss is in the opaque pass's masked materials (`ps_3e26f1f33692de6e`, `ps_c1ee5034271b3a4a` and others with
+a guest `clip()`): depth test `>=` with depth write. Tested before the shader, a fragment the shader then
+discards would already have written its depth, and whatever is drawn behind the hole afterwards would fail the
+test: not the same image. Only the draws that write neither depth nor stencil could take the early test exactly
+(blended draws under a stencil mask here), and they hold 0.27 ms in battle and 0.06 ms in town at most. That is
+within the noise of an ABBA: not worth a change.
 
 Vertex shaders: the prepass's skinned shader `vs_31bde3e2770db187` (355 instructions, 48 of them indexed constant
 loads for the bone rows) takes 4.0 ns a vertex over 354,000 vertices a frame. That is the instruction count at
@@ -213,19 +226,38 @@ CPU. Estimated from the 8-bit pair's rate: 0.3 to 0.45 ms off each 7e3 transfer.
 whether the owed transfer into the target is then ever drawn decides if that is a gain in battle (step 3 takes the
 tiles over from the 8-bit class before anything reads the 10-bit target).
 
+## The clears around the bloom chain
+
+The Xbox 360's `Clear()` is a rectangle drawn through one view of the EDRAM tiles; every other view of those tiles
+is a texture of its own here, so the renderer repeats the rectangle in each of them at once (`colour clear rect
+... replayed into base=0x2d0 pitch=1280 960x68 rows`, and the depth fill that wipes every colour view). Tile base
+720 has eight such views (pitches 1280, 880, 640, 480, 240 in up to three classes), and the bloom chain clears its
+small targets twice a frame: each time the other views are bound one after another, the whole clear each still
+owed is carried out (0.01 to 0.05 ms each) and the rectangle is drawn into it. Per-draw trace (6 battle and 8
+town frames): 18 draws a frame with the clear's shaders (`vs_760aacf6212e632c`, `ps_63c971f5e9d59913`, a few rows
+each) take 0.075 ms in battle and 16 take 0.062 ms in town, and the whole clears carried out right before them,
+14 and 13 a frame, take 0.33 and 0.40 ms: 0.41 and 0.46 ms a frame, mostly for views that are cleared again
+before anything reads them.
+Kept as owed clears (the renderer already owes whole and rectangle clears per target, `pending_clear`), they would
+cost nothing until a view is drawn to or read, and an owed whole clear replaces what was owed before it. That
+needs the rectangle's colour on the CPU. The clear's pixel shader writes its interpolated vertex colour, so the
+colour is in the rectangle's vertices, and only a colour of all zeros is certain to come out of the interpolation
+and the conversion to the target's format as the same bits a clear writes; an owed rectangle of the value a view's
+owed whole clear already has costs nothing at all. Anything else keeps the replay.
+
 ## Ranked candidates
 
 | # | Change | Saves (ms a frame) | Basis | Risk to the image | How to prove it |
 |---|---|---|---|---|---|
 | 1 | Gamma ramp from a texture | town about 2.3, battle about 1.2 | estimated from the measured 2.8 ms and the pass without the ramp (0.52 ms) plus three gathers | none if the gather returns the two texels in the order expected: same floats, same arithmetic | `LO_PRESENT_RAMP_CHECK=1` with the pass trace's counters: the `rampcheck` stretch's samples are the differing pixels |
-| 2 | Early depth test on discarding draws that write neither depth nor stencil | battle up to 3.2, town up to 1.3 (upper bounds) | measured: fragments shaded against samples passed per pixel shader | none where nothing is written before the shader decides; to be settled per draw state | the per-draw trace's `st=`; then a check that counts samples passed with and without |
+| 2 | Early depth test on discarding draws that write neither depth nor stencil | battle 0.27, town 0.06 at most: **no-go** | measured with each draw's state: 2.80 / 1.15 ms of the rejected fragments are on draws that write depth, where the early test changes the image | none for the 0.27 / 0.06 ms part | not pursued |
 | 3 | Scene resolves nobody reads | town 1.09, battle 0.84 | measured: two of three writes of `9fa0000` have no reader before the next write | none if a write is dropped only once the next whole write is recorded and no read came between | a check mode that fills a dropped resolve with magenta instead |
 | 4 | The repeated resolve's copy-stage transitions | 0.6 to 0.7 in both scenes | measured, and named by the barrier trace | none: no copy follows them | ABBA; the barrier count per frame drops from 6 to 5 |
 | 5 | `LO_RESOLVE_SHARE`, `LO_RESOLVE_FOLD_TRANSFER` on by default | 0.43 in town (together); in battle the first transfer's resolve is 0.39 | measured once in town | exact by design | each alone and both, ABBA; screenshots |
 | 5b | A transfer shader per pair of classes, without branches | battle 0.6 to 0.9; town none (it has no transfers) | estimated from the measured rates of the three transfers and uam's code sizes | none: the same integer arithmetic, checked for every half-float input on the CPU | the exhaustive CPU check; ABBA in battle; screenshots |
 | 6 | Swapchain images without compression | 0.3 to 0.4 in both scenes | the gap after the presentation, measured; the saving is estimated | none: compression is lossless either way | ABBA |
 | 7 | Cropped copies of resolved surfaces through the blit shader instead of the copy engine | about 0.2 | three copies of 321x182 with a full barrier each take 0.08 to 0.11 ms; a 59,000-pixel draw takes 0.03 | none: the same texels (as `LO_RESOLVE_BLIT`) | ABBA; screenshots |
-| 8 | Clears of the small views at EDRAM base 720 that only receive 4 to 8 pixels | up to 0.3 | measured (640x640, 660x648 `RGBA16F` clears, 0.04 to 0.05 ms each, eight a frame) | needs care: a view may be read later | not started |
+| 8 | Colour clears replayed into the other views of the same tiles, as owed clears | battle up to 0.41, town up to 0.46 | measured: the clear-shader draws and the whole clears carried out before them (see above); how many have a zero colour is not known yet | none for a colour of all zeros with no alpha test and a full write mask; anything else keeps the replay | a check mode that does both and counts differing pixels; ABBA |
 | 9 | 32-bit colour targets for the 10-bit classes (`LO_RT32`) | resolves and post passes at half the bandwidth: perhaps 2 to 3 | estimated; an earlier test at 38 ms a frame found none | changes rounding (10-bit unorm instead of FP16) and the 2-bit alpha: **not** the same image | not a candidate under the no-trade-off rule |
 
 Ruled out, with data: skipping the cache invalidation before draws (0.10 to 0.14 ms), turning colour compression
@@ -242,10 +274,8 @@ keeps a depth-only image (the nearest fragment wins in any order: prepass and sh
 battle's 1.31 M vertices) but not provably a colour draw's, and the work is on the CPU, at load.
 
 Battle needs 1.85 ms off the GPU to hold 30 FPS (35.17 ms to 33.3). Candidates 1, 3, 4 and 6 add up to about 3.1
-ms there before the early depth test is counted.
+ms there, and 5b and 8 to about another 1.
 
 ## Still to measure
 
-- The depth and stencil state of the draws whose fragments are rejected after shading (`st=` in the per-draw
-  trace), for candidate 2.
-- The cropped views in the resolve report (the tool follows render-target textures only).
+- The colours of the replayed clear rectangles (candidate 8).
