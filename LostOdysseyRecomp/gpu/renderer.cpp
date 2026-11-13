@@ -3652,7 +3652,7 @@ namespace gpu::renderer
                 transferPairShaders = made != 0;
                 if (const char* check = getenv("LO_TRANSFER_CHECK"); check && check[0] && std::strcmp(check, "0") != 0 && transferPairShaders)
                     transferChecksLeft = std::max(1, std::atoi(check)) == 1 ? 64u : uint32_t(std::atoi(check));
-                LOG_INFO("renderer: EDRAM transfers with {}{}", transferPairShaders ?
+                LOG_NOTICE("renderer: EDRAM transfers with {}{}", transferPairShaders ?
                     fmt::format("a shader per pair of classes ({} of 6; LO_TRANSFER_PAIR_SHADERS=0 for the general one)", made) :
                     std::string("the general shader"),
                     transferChecksLeft ? fmt::format(", the first {} checked against the general shader (LO_TRANSFER_CHECK)", transferChecksLeft) : std::string());
@@ -3744,7 +3744,7 @@ namespace gpu::renderer
                 }
                 HostTexture& scratch = *transferCheckScratch;
                 if (scratch.format != dst.format || x0 + w > scratch.width || y0 + h > scratch.height) {
-                    LOG_INFO("transfer check: {} -> {} {}x{} at {},{} format {} skipped (scratch {}x{} format {})", srcClass, dstClass,
+                    LOG_NOTICE("transfer check: {} -> {} {}x{} at {},{} format {} skipped (scratch {}x{} format {})", srcClass, dstClass,
                         w, h, x0, y0, uint32_t(dst.format), scratch.width, scratch.height, uint32_t(scratch.format));
                     return;
                 }
@@ -3904,18 +3904,18 @@ namespace gpu::renderer
                     check.buffer->unmap();
                     const uint64_t pixels = uint64_t(check.width) * check.height;
                     if (check.selfTest) {
-                        LOG_INFO("transfer self-test {} -> {}: {} texels, {} differ from the general shader{}; CPU twins ({} texels without NaN) "
+                        LOG_NOTICE("transfer self-test {} -> {}: {} texels, {} differ from the general shader{}; CPU twins ({} texels without NaN) "
                             "differ in {} rounding toward zero, {} to nearest even, {} to nearest away", check.srcClass, check.dstClass, pixels, diffs,
                             diffs ? fmt::format(" (first at {},{}: pair {:016x}, general {:016x})", firstX, firstY, firstPair, firstGeneral) : std::string(),
                             cpuCompared, cpuDiffs[0], cpuDiffs[1], cpuDiffs[2]);
                     } else {
                         transferCheckPixels += pixels;
                         transferCheckDiffs += diffs;
-                        LOG_INFO("transfer check {} frame {}: {} -> {} {}x{}, {} pixels differ{}", check.index, check.frame, check.srcClass,
+                        LOG_NOTICE("transfer check {} frame {}: {} -> {} {}x{}, {} pixels differ{}", check.index, check.frame, check.srcClass,
                             check.dstClass, check.width, check.height, diffs,
                             diffs ? fmt::format(" (first at {},{}: pair {:016x}, general {:016x})", firstX, firstY, firstPair, firstGeneral) : std::string());
                         if ((check.index + 1) % 16 == 0 || (!transferChecksLeft && check.index + 1 == transferChecksMade))
-                            LOG_INFO("transfer check: {} transfers, {} pixels, {} differ", check.index + 1, transferCheckPixels, transferCheckDiffs);
+                            LOG_NOTICE("transfer check: {} transfers, {} pixels, {} differ", check.index + 1, transferCheckPixels, transferCheckDiffs);
                     }
                 }
                 slot.transferChecks.clear();
