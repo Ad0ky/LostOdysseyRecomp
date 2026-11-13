@@ -1,7 +1,7 @@
 // Native versions of small, hot math functions of the game: particle distribution lookups, a bone's world matrix and
 // some of the collision tests. Each one gives the same results as the recompiled code as GCC builds it for the Switch,
 // bit for bit: the guest's loads, stores and order of operations, single precision, its fmadds/fmsubs/fnmsubs as one
-// fused double operation rounded to single (as the recompiled code computes them), negations where the guest has them,
+// fused single-precision operation (as the recompiled code computes them, cpu/guest_fmadds.h), negations where the guest has them,
 // and its comparisons, NaN cases included. The one difference left is which payload comes out when two different NaNs
 // meet in a fused operation (GCC picks the operand order there). The bone matrix's VMX dot products run in
 // flush-to-zero mode like the recompiled VMX code.
@@ -14,6 +14,7 @@
 #include <stdafx.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <cpu/guest_fmadds.h>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -109,13 +110,12 @@ namespace
         return value;
     }
 
-    // The fused PowerPC operations as the recompiled code computes them on the Switch, operands in the guest's order
-    // (fmadds d,a,c,b is a * c + b, fnmsubs is -(a * c - b)): one fused double operation (the product of two singles is exact in double),
-    // rounded to single. That rounds twice, so it can differ from the Xbox's single rounding by an ulp in rare ties;
-    // these match the recompiled code instead. The negating ones negate the double result, as it does.
-    float Madd(float a, float c, float b) { return float(std::fma(double(a), double(c), double(b))); }
-    float Msub(float a, float c, float b) { return float(std::fma(double(a), double(c), -double(b))); }
-    float Nmsub(float a, float c, float b) { return float(Negate(std::fma(double(a), double(c), -double(b)))); }
+    // The fused PowerPC operations as the recompiled code computes them (cpu/guest_fmadds.h), operands in the guest's
+    // order (fmadds d,a,c,b is a * c + b, fnmsubs is -(a * c - b)): with float inputs, one single-precision fused
+    // operation, the Xenon's single rounding. The negating one negates the rounded result, as the recompiled code does.
+    float Madd(float a, float c, float b) { return float(LoFmadds(a, c, b)); }
+    float Msub(float a, float c, float b) { return float(LoFmsubs(a, c, b)); }
+    float Nmsub(float a, float c, float b) { return Negate(float(LoFmsubs(a, c, b))); }
 
     bool Overlaps(uint32_t a, uint32_t aSize, uint32_t b, uint32_t bSize)
     {
