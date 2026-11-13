@@ -60,6 +60,14 @@ class ServerError(Exception):
     pass
 
 
+class ConnectionLost(ConnectionError):
+    """The console closed a connection in the middle of a command: the game quit, restarted or crashed (bench.py's
+    last restart is not waited for, so the old session can answer 'info' and then exit during an upload).
+
+    Not a BrokenPipeError: main() reads a BrokenPipeError as stdout going to a pipe that closed (head, grep -m) and
+    exits 0, so a socket's EPIPE must never reach it as one (it made 'deploy' exit 0 with nothing uploaded)."""
+
+
 def default_host() -> str | None:
     if os.environ.get(ENV_HOST):
         return os.environ[ENV_HOST]
@@ -84,10 +92,22 @@ class Conn:
     def close(self) -> None:
         self.sock.close()
 
+    def send(self, data: bytes, what: str) -> None:
+        """sendall; a connection the console closed raises ConnectionLost (what: the command, for the message)."""
+        try:
+            self.sock.sendall(data)
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            raise ConnectionLost(f"the console closed the connection during '{what}' ({e.strerror or e}): the game "
+                                 "quit, restarted or crashed") from e
+
     def _fill(self) -> None:
-        data = self.sock.recv(1 << 16)
+        try:
+            data = self.sock.recv(1 << 16)
+        except (ConnectionResetError, ConnectionAbortedError) as e:
+            raise ConnectionLost(f"the console reset the connection ({e.strerror or e}): the game quit, restarted or "
+                                 "crashed") from e
         if not data:
-            raise ConnectionError("the console closed the connection")
+            raise ConnectionLost("the console closed the connection")
         self.buf += data
 
     def _line(self) -> str:
@@ -119,9 +139,22 @@ class Conn:
         """Sends a command; its reply (bytes, or written to out). Raises ServerError on 'err'."""
         if timeout is not None:
             self.sock.settimeout(timeout)
-        self.sock.sendall((" ".join(quote(str(a)) for a in args) + "\n").encode())
-        if payload is not None:
-            self.sock.sendall(payload)
+        what = str(args[0]) if args else ""
+        try:
+            self.send((" ".join(quote(str(a)) for a in args) + "\n").encode(), what)
+            if payload is not None:
+                self.send(payload, what)
+        except ConnectionLost as lost:
+            # A server that refused the connection ("too many connections") replied before it closed: its reason.
+            try:
+                self.sock.settimeout(2.0)
+                ok, size = self.header()
+                text = self._exact(size).decode(errors="replace")
+            except (OSError, ValueError):
+                raise lost
+            if not ok:
+                raise ServerError(text) from lost
+            raise
         ok, size = self.header()
         if not ok:
             raise ServerError(self._exact(size).decode(errors="replace"))
@@ -134,7 +167,7 @@ class LogStream(threading.Thread):
     def __init__(self, host: str, port: int, path: Path, everything: bool = True):
         super().__init__(daemon=True)
         self.conn = Conn(host, port)
-        self.conn.sock.sendall(b"log all\n" if everything else b"log\n")
+        self.conn.send(b"log all\n" if everything else b"log\n", "log")
         ok, _ = self.conn.header()
         if not ok:
             raise ServerError("the server refused the log stream")
@@ -303,7 +336,7 @@ def show(text: str) -> None:
 
 def cmd_log(args) -> None:
     c = console(args).connect()
-    c.sock.sendall(b"log all\n" if args.all else b"log\n")
+    c.send(b"log all\n" if args.all else b"log\n", "log")
     ok, _ = c.header()
     if not ok:
         sys.exit("the server refused the log stream")
@@ -328,6 +361,8 @@ def cmd_log(args) -> None:
                 data = c.sock.recv(1 << 16)
             except socket.timeout:
                 continue
+            except (ConnectionResetError, ConnectionAbortedError):
+                data = b""
             if not data:
                 print("[debug client] the console closed the stream", file=sys.stderr)
                 break
@@ -439,12 +474,31 @@ def nro_path(arg: str | None) -> Path:
     sys.exit("no NRO built (tools/switch/build-switch.sh); pass its path")
 
 
+DEPLOY_TRIES = 3
+
+
 def cmd_deploy(args) -> None:
     nro = nro_path(args.nro)
     if not nro.exists():
         sys.exit(f"{nro} does not exist")
+    data = nro.read_bytes()
     con = console(args)
-    con.put_bytes(nro.read_bytes(), args.remote)
+    # Right after bench.py (its last restart is not waited for) the old session answers 'info' and then quits during
+    # the upload: the game restarting. The upload goes again once a server answers; it is done only on its crc32 line
+    # (put_bytes), anything else exits non-zero.
+    for attempt in range(1, DEPLOY_TRIES + 1):
+        try:
+            con.put_bytes(data, args.remote)
+            break
+        except ConnectionLost as e:
+            if attempt == DEPLOY_TRIES:
+                sys.exit(f"deploy: {nro.name} NOT uploaded ({DEPLOY_TRIES} tries): {e}")
+            print(f"deploy: upload {attempt} of {nro.name} broke off: {e}; waiting for the debug server, then again",
+                  file=sys.stderr, flush=True)
+            time.sleep(5.0)  # the old session's last seconds: let it go before asking again
+            if not con.wait(180.0):
+                sys.exit(f"deploy: {nro.name} NOT uploaded: the debug server did not answer again within 180 s")
+            con.check_game()
     if args.no_restart:
         return
     try:
@@ -543,7 +597,7 @@ def main() -> None:
              "crashes": cmd_crashes, "env": cmd_env}[args.cmd](args)
     except ServerError as e:
         sys.exit(f"console: {e}")
-    except BrokenPipeError:  # (the output went to a pipe that closed: head, grep -m)
+    except BrokenPipeError:  # (the output went to a pipe that closed: head, grep -m; sockets raise ConnectionLost)
         os._exit(0)
     except (ConnectionError, socket.timeout) as e:
         sys.exit(f"connection: {e}")

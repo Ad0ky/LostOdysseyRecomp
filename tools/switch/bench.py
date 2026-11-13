@@ -53,6 +53,8 @@ PINNED_RENDERING = (("LO_SWITCH_RENDER_HEIGHT", "540"), ("LO_DYNAMIC_RESOLUTION"
 DEFAULT_OUT = REPO_ROOT / "out/bench"
 DATA_ROOT = "sdmc:/switch/LostOdysseyRecomp"
 NETLOG_PORT = 28780
+# How long restore_env waits for the old session to quit after its restart (0.7-0.9 s on the test console).
+RESTART_GONE_SECONDS = 60.0
 
 RESULT_RE = re.compile(r"bench result: (.*)$")
 DONE_RE = re.compile(r"bench done: name=(\S+) status=(\S+)")
@@ -448,11 +450,23 @@ def restore_env(con, original: bytes | None) -> None:
     except (OSError, lo_debug.ServerError) as e:
         print(f"bench: could not restore env.txt ({e}); put it back by hand: {DATA_ROOT}/env.txt", file=sys.stderr)
         return
-    # Not waited for: the console's own env.txt may leave the debug server off.
+    # The new session is not waited for: the console's own env.txt may leave the debug server off. The old one is: it
+    # answers for about a second after the reply and then quits, so a client started right after this script (an A/B's
+    # lo_debug.py deploy) would otherwise pass its 'info' check on a game about to exit and lose its upload.
+    before = con.session()
     try:
         print(con.text("restart", timeout=10.0))
     except (OSError, lo_debug.ServerError) as e:
         print(f"not restarted ({e}): start the game again to use its own env.txt")
+        return
+    t0 = time.time()
+    while before and time.time() - t0 < RESTART_GONE_SECONDS and con.session() == before:
+        time.sleep(0.5)
+    if before and con.session() == before:
+        print(f"bench: the old session {before} still answers {RESTART_GONE_SECONDS:.0f} s after the restart",
+              file=sys.stderr)
+    else:
+        print(f"the old session quit after {time.time() - t0:.1f} s")
 
 
 # ---------------------------------------------------------------- logs

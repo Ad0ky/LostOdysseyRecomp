@@ -411,7 +411,7 @@ The client is `tools/switch/lo_debug.py`. Give it the console's address with
 | `get`, `put`, `ls`, `rm`, `mkdir` | files; paths are relative to `sdmc:/switch/LostOdysseyRecomp`, or start with `/` for the card's root (read only: writes stay in the app folder; `put` writes `<path>.part`, then renames it) |
 | `env [KEY=VALUE ...] [--unset KEY] [--restart]` | show or change env.txt |
 | `crashes [--fetch DIR]` | `crash.log`, `hang.log`, the kept `crash-*.log` and Atmosphère's reports |
-| `deploy [NRO] [--no-restart]` | uploads `out/switch/LostOdysseyRecomp.nro`, checks its CRC32, restarts the game and waits for the new session |
+| `deploy [NRO] [--no-restart]` | uploads `out/switch/LostOdysseyRecomp.nro`, checks its CRC32, restarts the game and waits for the new session; an upload the console cuts off (the game quitting or restarting under it) goes again once the server answers, up to 3 tries, and anything short of the CRC32 line exits non-zero |
 | `restart [--force]`, `wait`, `ping`, `help`, `raw CMD ...` | |
 
 Button names are the game's (Xbox 360) buttons, as in `tools/scenario.py`:
