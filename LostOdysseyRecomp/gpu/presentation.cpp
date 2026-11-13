@@ -1280,6 +1280,19 @@ void Presentation::Draw(RenderCommandList *commands, RenderTexture *source, Rend
         auto *dedicated=p.finalPipelines[options.scalingFilter==ScalingFilter::Bicubic && scale!=1.0f ? 1 : 0].get();
         if(dedicated) finalPipeline=dedicated;
     }
+    if(toSwapchain) {
+        // What the frame's last pass is, logged when it changes (the GPU analysis reads it: docs/SWITCH-GPU.md).
+        const uint32_t what=(finalPipeline==p.finalPipelines[0].get() ? 1u : finalPipeline==p.finalPipelines[1].get() ? 2u : 0u) |
+            (options.displayGammaRamp && p.rampActive ? 4u : 0u) | (options.displayAdjust && p.curveActive ? 8u : 0u) |
+            (options.expandRgbRange ? 16u : 0u) | (sw << 8) | (uint32_t(ow) << 20);
+        static uint32_t logged=~0u;
+        if(what!=logged) {
+            logged=what;
+            LOG_NOTICE("presentation: final pass {} {}x{} to {}x{} (viewport {:.1f}x{:.1f}), gamma ramp {}, player curve {}, RGB range expansion {}",
+                (what&3)==1 ? "pixelLinear" : (what&3)==2 ? "pixelCubic" : "pixel",sw,sh,ow,oh,width,height,
+                (what&4) ? "on" : "off",(what&8) ? "on" : "off",(what&16) ? "on" : "off");
+        }
+    }
     render(source,target,sw,sh,ow,oh,x,y,width,height,0,uint32_t(options.scalingFilter),
            options.expandRgbRange ? 1u : 0u,true,finalPipeline);
     commands->barriers(RenderBarrierStage::COPY,RenderTextureBarrier(original,RenderTextureLayout::COPY_SOURCE));

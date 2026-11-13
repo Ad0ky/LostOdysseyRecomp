@@ -77,4 +77,60 @@ namespace plume {
     // LO_DEKO3D_BARRIER_TRACE: while on, every barrier that reaches the GPU is logged with what it waits for, its
     // textures, the draws recorded so far in the list and the caller (LostOdysseyRecomp, 2026-10-30).
     void Deko3DBarrierTrace(bool on);
+
+    // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE / LO_GPU_TIMELINE; gpu/gpu_trace.h, docs/SWITCH-GPU.md). While
+    // either is set in the environment when a command list is made, the list can be traced: it writes a timestamp
+    // report at the bottom of the pipe where the trace begins and ends and, in the modes that record them, at the end
+    // of each stretch of its work (with counters: also the samples passed and the fragment and vertex shader
+    // invocations so far). A stretch is the draws into one framebuffer, one clear call, one copy / resolve / blit /
+    // upload, or one dispatch; a new note also ends one. The time of a stretch is the time between its report and
+    // the one before: when its work left the pipe, not its share of a pipe it had to itself (the next stretch's
+    // vertices are already under way). A copy's stretch ends after the barrier recorded behind it, which waits for
+    // the copy engine. The reports add no wait. Nothing is traced with the record thread (LO_DEKO3D_RECORD_THREAD),
+    // and the calls below do nothing for a list made without the traces.
+    struct Deko3DPassSegment {
+        enum Kind : uint8_t { Draws, Clear, CopyImage, Upload, Readback, CopyBuffer, Resolve, Blit, Compute };
+        uint8_t kind = Draws;
+        uint8_t colorCount = 0;
+        bool hasDepth = false;
+        uint32_t width = 0, height = 0;        // the framebuffer; a copy's rectangle
+        uint32_t sourceWidth = 0, sourceHeight = 0;
+        RenderFormat colorFormat = RenderFormat::UNKNOWN, depthFormat = RenderFormat::UNKNOWN, sourceFormat = RenderFormat::UNKNOWN;
+        // The textures (colour attachment 0 or a copy's destination, the depth attachment, a copy's source), for the
+        // caller to name: only compare them, they may be gone.
+        const RenderTexture *color = nullptr, *depth = nullptr, *source = nullptr;
+        uint32_t draws = 0, clears = 0;
+        uint64_t bytes = 0;                    // a buffer copy's
+        // Its draws' vertices or indices (count x instances), and the vertex and pixel shader of its last draw (a hash
+        // of the shader as the pipeline was given it: its SPIR-V words, FNV-1a 64).
+        uint64_t elements = 0;
+        uint64_t vertexShader = 0, pixelShader = 0;
+        // The render targets its draws sample (those their shaders have a binding for), the first six.
+        const RenderTexture *sampled[6] = {};
+        uint32_t sampledCount = 0;
+        // The back end's work recorded in the stretch (Deko3DCounters' differences).
+        uint32_t barriersFull = 0, barriersFragments = 0, barriersPrimitives = 0, barriersImageInvalidate = 0;
+        uint32_t pipelineBinds = 0, stateBinds = 0, descriptorWrites = 0;
+        char note[40] = {};
+        // From the reports (Deko3DPassTraceRead): the GPU's clock at the end, the time since the report before, and
+        // the counters' growth over the stretch (0 without counters).
+        uint64_t endNs = 0, gpuNs = 0;
+        uint64_t samples = 0, fragments = 0, vertices = 0;
+    };
+    // Whether command lists are made traceable (LO_GPU_PASS_TRACE or LO_GPU_TIMELINE set, and no record thread).
+    bool Deko3DPassTraceAvailable();
+    // Starts tracing an open list (after begin()). mode 0: the list's begin and end only; 1: every stretch; 2: with
+    // the counters; 3: with the counters and every draw a stretch of its own. False: not traced.
+    bool Deko3DPassTraceBegin(RenderCommandList *list, uint32_t mode);
+    // Names the work recorded from here on (at most 39 characters; nullptr: no name). Ends the stretch under way.
+    void Deko3DPassTraceNote(RenderCommandList *list, const char *note);
+    // Ends the trace, before end().
+    void Deko3DPassTraceEnd(RenderCommandList *list);
+    // The list's last trace, once its submission's fence has signalled: the GPU's clock where it began and ended,
+    // and its stretches. truncated: the list had more stretches than the trace holds. False: the list was not traced
+    // (or was read already).
+    bool Deko3DPassTraceRead(RenderCommandList *list, std::vector<Deko3DPassSegment> &segments, uint64_t &beginNs,
+                             uint64_t &endNs, bool &truncated);
+    // The GPU's clock now, in the nanoseconds of timestamp queries (0: unavailable). A kernel call.
+    uint64_t Deko3DGpuClockNs(RenderDevice *device);
 }

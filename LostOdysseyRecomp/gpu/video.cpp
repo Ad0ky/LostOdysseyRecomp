@@ -85,6 +85,7 @@
 #include <debug/battle_menu.h>
 #include <debug/menu_overlay.h>
 #include "gpu_busy.h"
+#include "gpu_trace.h"
 #include <host_ui/host_ui.h>
 #include <host_ui/rasterizer.h>
 
@@ -101,6 +102,7 @@
 #include <plume_vulkan.h>
 #if defined(LO_SWITCH_DEKO3D)
 #include <plume_deko3d_api.h>
+#include "gpu_pass_trace.h"
 #include "deko3d_shader_cache.h"
 #include <debug/debug_options.h>
 #include <malloc.h>
@@ -1105,6 +1107,79 @@ namespace gpu::video
         }
 #endif
 
+#if defined(LO_SWITCH_DEKO3D)
+    // LO_GPU_PASS_TRACE / LO_GPU_TIMELINE (gpu_trace.h). Every command list of the renderer and the presentation goes
+    // through BeginGpuCommands, EndGpuCommands, a Submit...Batch and WaitForGpuFence, once each: the traces hook
+    // there. A submission is remembered by its fence until that fence has been waited for, when the GPU's reports of
+    // its lists can be read.
+        struct TracedSubmission {
+            char kind = 'S';
+            uint64_t id = 0, frame = 0;
+            std::vector<plume::RenderCommandList*> lists;
+        };
+        std::mutex g_traceMutex;
+        std::unordered_map<const plume::RenderCommandFence*, TracedSubmission> g_tracedSubmissions;
+        uint64_t g_traceBatches = 0;
+
+        bool TraceOn()
+        {
+            static const bool on = g_deko3d && plume::Deko3DPassTraceAvailable();
+            return on;
+        }
+
+        void TraceListBegin(plume::RenderCommandList* list)
+        {
+            if (!TraceOn()) return;
+            const bool passes = gpu::gpu_trace::PassFrame(gpu::gpu_trace::Frame());
+            if (passes || gpu::gpu_trace::Timeline())
+                plume::Deko3DPassTraceBegin(list, !passes ? 0u : gpu::gpu_trace::PassDraws() ? 3u :
+                    gpu::gpu_trace::PassCounters() ? 2u : 1u);
+        }
+
+        void TraceSubmitted(char kind, const plume::RenderCommandList* const* lists, uint32_t count,
+            const plume::RenderCommandFence* fence, uint64_t startUs)
+        {
+            if (!TraceOn() || !fence) return;
+            TracedSubmission submission;
+            submission.kind = kind;
+            submission.frame = gpu::gpu_trace::Frame();
+            for (uint32_t i = 0; i < count; ++i)
+                submission.lists.push_back(const_cast<plume::RenderCommandList*>(lists[i]));
+            const std::scoped_lock lock(g_traceMutex);
+            submission.id = gpu::gpu_trace::Timeline()
+                ? gpu::gpu_trace::Submitted(kind, startUs, gpu::gpu_trace::NowUs(), submission.frame) : ++g_traceBatches;
+            g_tracedSubmissions[fence] = std::move(submission);
+        }
+
+        void TraceFenceDone(const plume::RenderCommandFence* fence)
+        {
+            if (!TraceOn()) return;
+            TracedSubmission submission;
+            {
+                const std::scoped_lock lock(g_traceMutex);
+                const auto it = g_tracedSubmissions.find(fence);
+                if (it == g_tracedSubmissions.end()) return;
+                submission = std::move(it->second);
+                g_tracedSubmissions.erase(it);
+            }
+            std::vector<plume::Deko3DPassSegment> segments;
+            for (plume::RenderCommandList* list : submission.lists) {
+                uint64_t beginNs = 0, endNs = 0;
+                bool truncated = false;
+                if (!plume::Deko3DPassTraceRead(list, segments, beginNs, endNs, truncated)) continue;
+                if (gpu::gpu_trace::Timeline()) gpu::gpu_trace::GpuTimes(submission.id, beginNs, endNs);
+                if (segments.empty()) continue;
+                gpu::gpu_trace::LogPasses(segments, submission.kind, submission.frame, submission.id,
+                    endNs > beginNs ? endNs - beginNs : 0, truncated, [](const plume::RenderTexture* texture) -> std::string {
+                        if (texture && g_swapChain)
+                            for (uint32_t i = 0; i < g_swapChain->getTextureCount(); ++i)
+                                if (g_swapChain->getTexture(i) == texture) return "swap";
+                        return renderer::TraceTextureName(texture);
+                    });
+            }
+        }
+#endif
+
         bool SubmitPresentationBatch(const plume::RenderCommandList* const* lists, uint32_t count,
             plume::RenderCommandSemaphore* const* waits, uint32_t waitCount,
             plume::RenderCommandSemaphore* const* signals, uint32_t signalCount,
@@ -1113,6 +1188,16 @@ namespace gpu::video
             PresentScope progress(g_presentProgress, PresentStage::Submit);
             uint64_t acceptedSerial = 0;
             const auto submit = [&] {
+#if defined(LO_SWITCH_DEKO3D)
+                if (PortablePlume() && TraceOn()) {
+                    progress.Set(PresentStage::SubmitNative);
+                    const uint64_t startUs = gpu::gpu_trace::NowUs();
+                    const bool submitted = SubmitMetal(lists, count, waits, waitCount, signals, signalCount,
+                        fence, &acceptedSerial, rawResult);
+                    if (submitted) TraceSubmitted('P', lists, count, fence, startUs);
+                    return submitted;
+                }
+#endif
 #if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
                 if (PortablePlume()) {
                     progress.Set(PresentStage::SubmitNative);
@@ -1841,6 +1926,9 @@ namespace gpu::video
     bool BeginGpuCommands(plume::RenderCommandList* list) {
         if (GpuWorkStopped()) return false;
         if (!list) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
+#if defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume()) { list->begin(); TraceListBegin(list); return true; }
+#endif
 #if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         // Metal command encoding reports no errors at record time.
         if (PortablePlume()) { list->begin(); return true; }
@@ -1869,6 +1957,9 @@ namespace gpu::video
     bool EndGpuCommands(plume::RenderCommandList* list) {
         if (GpuWorkStopped()) return false;
         if (!list) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
+#if defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume() && TraceOn()) plume::Deko3DPassTraceEnd(list);
+#endif
 #if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         if (PortablePlume()) { list->end(); return true; }
 #endif
@@ -1898,7 +1989,13 @@ namespace gpu::video
         if (!queueHolder || !fence) { StopGpuWork(submission::VulkanState::InvalidState); return false; }
 #if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         if (PortablePlume()) {
-            ConsumeMetalFenceSignals(queueHolder, fence);
+            {
+                const gpu::gpu_trace::ScopedWait traceWait(fence == g_fence.get() ? 'Q' : 'F'); // LO_GPU_TIMELINE
+                ConsumeMetalFenceSignals(queueHolder, fence);
+            }
+#if defined(LO_SWITCH_DEKO3D)
+            TraceFenceDone(fence);
+#endif
             const bool complete = g_submissionState.WaitSubmitted([] { return submission::VulkanState::Success; });
             if (complete && fence == g_fence.get()) g_presentProgress.Completed();
             return complete;
@@ -2059,6 +2156,15 @@ namespace gpu::video
         plume::RenderCommandFence* fence, uint64_t& submissionSerial, int32_t& rawResult,
         bool* executionMayBeInFlight)
     {
+#if defined(LO_SWITCH_DEKO3D)
+        if (PortablePlume() && TraceOn()) {
+            if (executionMayBeInFlight) *executionMayBeInFlight = false;
+            const uint64_t startUs = gpu::gpu_trace::NowUs();
+            const bool submitted = SubmitMetal(lists, count, nullptr, 0, nullptr, 0, fence, &submissionSerial, &rawResult);
+            if (submitted) TraceSubmitted('S', lists, count, fence, startUs);
+            return submitted;
+        }
+#endif
 #if LO_PLATFORM_MACOS || defined(LO_SWITCH_DEKO3D)
         if (PortablePlume()) {
             if (executionMayBeInFlight) *executionMayBeInFlight = false;
@@ -5113,6 +5219,7 @@ namespace gpu::video
     static bool AcquirePresentTexture(uint32_t* index)
     {
         PresentScope progress(g_presentProgress, PresentStage::Acquire);
+        const gpu::gpu_trace::ScopedWait traceWait('A'); // LO_GPU_TIMELINE
         g_presentProgress.Image(presentation_progress::NoImage);
         if (!loading::Active() || !g_vulkan) {
             const bool acquired = g_swapChain->acquireTexture(g_acquireSemaphore.get(), index);
@@ -5138,6 +5245,15 @@ namespace gpu::video
     static bool PresentSwapchainImage(uint32_t imageIndex, plume::RenderCommandSemaphore** waits, uint32_t waitCount)
     {
         PresentScope progress(g_presentProgress, PresentStage::QueuePresent);
+        const gpu::gpu_trace::ScopedWait traceWait('X'); // LO_GPU_TIMELINE
+#if defined(LO_SWITCH_DEKO3D)
+        if (g_deko3d && gpu::gpu_trace::ClockDue()) {
+            // The GPU's clock against the CPU's, twice a second.
+            const uint64_t before = gpu::gpu_trace::NowUs();
+            const uint64_t gpuNs = plume::Deko3DGpuClockNs(g_device.get());
+            gpu::gpu_trace::Clock(before, gpu::gpu_trace::NowUs(), gpuNs);
+        }
+#endif
         return g_swapChain->present(imageIndex, waits, waitCount);
     }
 
@@ -5448,8 +5564,8 @@ namespace gpu::video
         // Guest frames get the display gamma ramp the game wrote (#179) and the
         // saved brightness and gamma; host menus and status screens use the
         // default options without them.
-        presentationOptions.displayGammaRamp = true;
-        presentationOptions.displayAdjust = true;
+        presentationOptions.displayGammaRamp = !(gpu::gpu_trace::Experiment() & 1);
+        presentationOptions.displayAdjust = !(gpu::gpu_trace::Experiment() & 2);
         presentationOptions.displayBrightness = presentationConfig.displayBrightness;
         presentationOptions.displayGamma = presentationConfig.displayGamma;
         // Debug / test trigger: auto-open overlay after N frames if LO_AUTO_OVERLAY is set

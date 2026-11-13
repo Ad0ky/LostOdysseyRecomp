@@ -325,6 +325,9 @@ Switch-specific options and diagnostics:
 | `LO_THREAD_CORES` | off | With `LO_THREAD_PLACEMENT=1`: `name=core:hexmask,...` sets the ideal core and allowed mask of a thread of that name once a report finds it above 50% CPU, for placement experiments |
 | `LO_DEKO3D_HEAP_STATS` | off | `1`: deko3d's heap blocks are counted. The memory lines (`info`, every 30 s in the log) add `deko3d heap <KiB> in <n> blocks, control chunks <made> made <freed> freed (self-check <a> then <b>), heap uordblks <bytes>`. A steady scene makes no control chunks. The self-check at device creation clears a 3-chunk list 99 times: `then 0` means `clear()` keeps the chunks (fixed), `then 198` means it loses them (stock deko3d) |
 | `LO_DEKO3D_BARRIER_TRACE` | off | Set to `<n>`: every barrier of one frame in n goes to the log (`barrier trace:`), with what it waits for, its textures and the caller's address relative to `Deko3DBarrierTrace` |
+| `LO_GPU_PASS_TRACE` | off | `N`: every Nth presented frame, one `gpass:` log line per stretch of GPU work (the draws into one framebuffer, a clear, a copy) with its GPU time, targets and sampled targets. `LO_GPU_PASS_COUNTERS=1` adds samples passed and shader invocations, `LO_GPU_PASS_DRAWS=1` makes every draw a stretch. `tools/switch/gpu_passes.py` adds them up; see [SWITCH-GPU.md](SWITCH-GPU.md) (deko3d) |
+| `LO_GPU_TIMELINE` | off | `1`: one `gtl:` log line per frame with the render thread's submissions and waits and the GPU's begin and end of each list; `tools/switch/gpu_timeline.py` gives the GPU's busy and idle time (deko3d) |
+| `LO_GPU_EXPERIMENT` | off | Diagnostic bits for sizing single costs, never for playing: `1` no display gamma ramp, `2` no player curve (both change the image), `16` / `32` the cache invalidation before draws skipped / descriptors only (traced lists only). See [SWITCH-GPU.md](SWITCH-GPU.md) |
 | `LO_SWITCH_BUTTONS` | letter layout | Set to `position` to use the physical positional A/B/X/Y layout |
 | `LO_SWITCH_AUTO_SLEEP` | `1` | `0`: auto-sleep stays off for the whole session, as before: the console never sleeps while the game runs, though the screen still dims (benchmarks; `bench.py` writes it). `1`: the system's settings, with the screen kept on during movies, cutscenes, loads and the preparation screen (see [Clocks, sleep and the HOME menu](#clocks-sleep-and-the-home-menu)) |
 | `LO_SWITCH_IDLE_SECONDS` | off | Test only: `<dim>,<sleep>` seconds replace the system's dimming and sleep times for this session (`0,0` keeps them); with either, debug-server clients do not keep the screen on, so idle behaviour can be measured through the debug server (`screen`) |
@@ -718,6 +721,7 @@ In the back end (`thirdparty/plume-deko3d`):
 | Commands recorded on a second thread, off by default | `LO_DEKO3D_RECORD_THREAD=1` | lowers `GPU CmdProc` time, but measured slower overall |
 | Hardware occlusion queries, in testing | `LO_DEKO3D_OCCLUSION` | real culling in towns |
 | Barrier trace | `LO_DEKO3D_BARRIER_TRACE` | diagnostics |
+| GPU pass trace and CPU/GPU timeline: each stretch of a frame's work timed on the GPU's clock (with counters, per draw), and when the render thread submitted, the GPU ran and the render thread waited | `LO_GPU_PASS_TRACE=N`, `LO_GPU_PASS_COUNTERS`, `LO_GPU_PASS_DRAWS`, `LO_GPU_TIMELINE`, `LO_GPU_EXPERIMENT` | diagnostics, off by default; read by `tools/switch/gpu_passes.py` and `gpu_timeline.py`; see [SWITCH-GPU.md](SWITCH-GPU.md) |
 
 In the renderer, on deko3d (`LostOdysseyRecomp/gpu`):
 

@@ -2174,6 +2174,27 @@ namespace plume {
         const Deko3DShader *stages[3] = {static_cast<const Deko3DShader *>(desc.vertexShader),
                                          static_cast<const Deko3DShader *>(desc.geometryShader),
                                          static_cast<const Deko3DShader *>(desc.pixelShader)};
+        // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE): what each stage's shader is, for the trace's lines: the
+        // FNV-1a 64 of its SPIR-V words as given (tools/switch/gpu_passes.py names the pack's shaders by it), or of
+        // its GLSL text.
+        if (Deko3DPassTraceAvailable()) {
+            for (int i = 0; i < 3; i++) {
+                if (!stages[i])
+                    continue;
+                uint64_t h = 0xcbf29ce484222325ull;
+                const auto add = [&h](const uint8_t *bytes, size_t n) {
+                    for (size_t k = 0; k < n; k++) {
+                        h ^= bytes[k];
+                        h *= 0x100000001b3ull;
+                    }
+                };
+                if (!stages[i]->spirv.empty())
+                    add(reinterpret_cast<const uint8_t *>(stages[i]->spirv.data()), stages[i]->spirv.size() * 4);
+                else
+                    add(reinterpret_cast<const uint8_t *>(stages[i]->glsl.data()), stages[i]->glsl.size());
+                p->traceShader[i] = h;
+            }
+        }
         static const DkStage dkStages[3] = {DkStage_Vertex, DkStage_Geometry, DkStage_Fragment};
         // LostOdysseyRecomp (2026-10-27): SPIR-V shaders as GLSL for this layout.
         bool translatedOk = true;
@@ -2404,7 +2425,25 @@ namespace plume {
     // ---- the rest of the device
 
     std::unique_ptr<RenderDescriptorSet> Deko3DDevice::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
+        // LostOdysseyRecomp (2026-11-13): a set that remembers its render targets only while a trace is asked for.
+        if (Deko3DPassTraceAvailable())
+            return std::make_unique<Deko3DTracedDescriptorSet>(this, desc);
         return std::make_unique<Deko3DDescriptorSet>(this, desc);
+    }
+
+    Deko3DTracedDescriptorSet::Deko3DTracedDescriptorSet(Deko3DDevice *device, const RenderDescriptorSetDesc &desc) : Deko3DDescriptorSet(device, desc) {
+        traced = true;
+    }
+
+    void Deko3DTracedDescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
+        if (imageHeapBase != UINT32_MAX && descriptorIndex >= imageFirst && descriptorIndex - imageFirst < imageCount) {
+            const uint32_t id = descriptorIndex - imageFirst;
+            if (targets.size() <= id)
+                targets.resize(id + 1);
+            const Deko3DTexture *t = static_cast<const Deko3DTexture *>(texture);
+            targets[id] = t && (t->desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET)) ? t : nullptr;
+        }
+        Deko3DDescriptorSet::setTexture(descriptorIndex, texture, textureLayout, textureView);
     }
 
     std::unique_ptr<RenderCommandQueue> Deko3DDevice::createCommandQueue(RenderCommandListType type) {
@@ -2441,6 +2480,7 @@ namespace plume {
             fb->colors[i] = v ? v->view : t->defaultView();
             fb->srgb[i] = isSrgbFormat(fb->colors[i].format != DkImageFormat_None ? fb->colors[i].format : t->format);
             if (i == 0) {
+                fb->colorTexture = t;
                 // The view's level (mip chains rendered level by level).
                 fb->width = std::max<uint32_t>(t->desc.width >> fb->colors[i].mipLevelOffset, 1);
                 fb->height = std::max<uint32_t>(t->desc.height >> fb->colors[i].mipLevelOffset, 1);
@@ -2451,6 +2491,7 @@ namespace plume {
             const Deko3DTextureView *v = static_cast<const Deko3DTextureView *>(desc.depthAttachmentView);
             fb->depth = v ? v->view : t->defaultView();
             fb->hasDepth = true;
+            fb->depthTexture = t;
             if (fb->colorCount == 0) {
                 fb->width = t->desc.width;
                 fb->height = t->desc.height;
@@ -2532,5 +2573,11 @@ namespace plume {
     bool Deko3DDeviceLost(RenderDevice *device) {
         Deko3DDevice *d = static_cast<Deko3DDevice *>(device);
         return d && d->queue && dkQueueIsInErrorState(d->queue);
+    }
+
+    // LostOdysseyRecomp (2026-11-13, LO_GPU_TIMELINE): the clock of the GPU's timestamp reports, read now.
+    uint64_t Deko3DGpuClockNs(RenderDevice *device) {
+        Deko3DDevice *d = static_cast<Deko3DDevice *>(device);
+        return d && d->dk ? dkDeviceGetCurrentTimestampInNs(d->dk) : 0;
     }
 };

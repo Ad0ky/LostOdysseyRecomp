@@ -2,6 +2,7 @@
 #include "perf_stats.h"
 #include <debug/map_info.h>
 #include <gpu/gpu_busy.h>
+#include <gpu/gpu_trace.h>
 #include <gpu/video.h>
 #include <os/detach_thread.h>
 #include <os/logger.h>
@@ -525,6 +526,13 @@ void StepBench(BenchRun& run, const PresentSample& sample, float intervalMs, boo
 
 void Present(const PresentSample& sample)
 {
+    // LO_GPU_TIMELINE / LO_GPU_PASS_TRACE (gpu/gpu_trace.h): the frame's pacing sleep, which ended where the present
+    // began, and the end of the frame. Here, not in the command processor: its packet loop keeps its PGO profile.
+    if (gpu::gpu_trace::Timeline() && sample.sleepNs) {
+        const uint64_t presentStart = gpu::gpu_trace::NowUs() - sample.presentNs / 1000;
+        gpu::gpu_trace::Wait('Z', presentStart - sample.sleepNs / 1000, presentStart);
+    }
+    gpu::gpu_trace::Swap(sample.swap);
     const Config& config = GetConfig();
     const bool bench = !GetBench().name.empty();
     const bool perf = config.intervalSeconds > 0;
@@ -613,6 +621,10 @@ void Present(const PresentSample& sample)
 
 void CpIdle(uint64_t ns)
 {
+    if (gpu::gpu_trace::Timeline()) {
+        const uint64_t now = gpu::gpu_trace::NowUs();
+        gpu::gpu_trace::Wait('I', now - ns / 1000, now);
+    }
     g_cpIdleNs.fetch_add(ns, std::memory_order_relaxed);
 }
 
