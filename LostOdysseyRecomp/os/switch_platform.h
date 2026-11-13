@@ -111,5 +111,7 @@ namespace os::switch_platform
     // teardown): quitting through std::_Exit unmounted the SD card while game
     // threads were still reading it, and one faulted in lseek.
     [[noreturn]] void ExitNow();
+    // What os/switch/code_blocks.cpp did with the NRO's code at start-up (one line for the log).
+    const char* CodeBlocksStatus();
 }
 #endif

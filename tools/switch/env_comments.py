@@ -23,6 +23,8 @@ DESCRIPTIONS = {
     "LO_NATIVE_MOVIES": "Cutscene video decoded natively with FFmpeg (faster, smoother); 0 uses the game's decoder",
     "LO_GUEST_AFFINITY": "Spread the game's threads across the Switch's three CPU cores",
     "LO_GUEST_BLOCKS": "0: guest memory on 4 KiB pages (the old layout) instead of 2 MiB blocks",
+    "LO_CODE_BLOCKS": "0: the NRO's code and read-only data stay on 4 KiB pages (no copy on 2 MiB blocks)",
+    "LO_CODE_BLOCKS_TEST": "1: at start, swap the loader's code back and forth once to test the exit path (code blocks: line)",
     "LO_TLB_TEST": "N: N seconds in, log what a TLB miss costs in guest memory and the NRO (tlb: lines)",
     "LO_ZPD_MODE": "xenia: made-up occlusion query counts (faster) instead of host queries",
     "LO_PIPELINE_PREBUILD": "Prepare known graphics states in the background at start (all)",

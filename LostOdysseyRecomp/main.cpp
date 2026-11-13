@@ -259,6 +259,7 @@ static int RunGuest(uint32_t entry)
                  placement.avoided ? "clear of" : overlaps ? "placed without avoiding (overlaps)" : "placed without avoiding (clear of)",
                  placement.avoidStart, placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh,
                  placement.aslrStart, placement.aslrEnd, placement.blocks ? "on" : "off (LO_GUEST_BLOCKS=0)");
+        LOG_NOTICE("switch: {}", os::switch_platform::CodeBlocksStatus());
         // LO_TLB_TEST=N: N seconds in, log what a TLB miss costs in guest memory and the NRO's code (a few ms).
         if (const char* tlb = getenv("LO_TLB_TEST"); tlb && std::atoi(tlb) > 0)
         {

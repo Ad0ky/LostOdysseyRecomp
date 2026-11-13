@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <vector>
 
 // Nintendo Switch backend (Horizon OS, libnx). Ported from UnleashedRecomp-NX
 // (kernel/memory.cpp) and extended with the Xbox 360 physical aliases.
@@ -676,34 +677,74 @@ uintptr_t RetInLine(uintptr_t line)
     return 0;
 }
 
+void EmitSkip(void (*emit)(const char*), const char* what, const char* why, size_t have)
+{
+    char line[192];
+    std::snprintf(line, sizeof(line), "tlb: %s: not measured, %s (%zu)", what, why, have);
+    emit(line);
+}
+
 void CodeTest(void (*emit)(const char*), const MemoryInfo& block, const char* what, bool fetch)
 {
     static uintptr_t scattered[kChaseLines], grouped[kChaseLines];
     size_t ns = 0, ng = 0;
     const size_t pages = block.size / kPage;
     if (pages < 2 * 32)
-        return;
-    const size_t stride = std::max<size_t>(1, pages / kChaseLines);
-    for (size_t i = 0; i < kChaseLines && i * stride < pages; ++i)
+        return EmitSkip(emit, what, "too few pages", pages);
+    if (!fetch)
     {
-        const uintptr_t page = block.addr + i * stride * kPage;
-        const uintptr_t line = page + LineOfPage(i) * 64;
-        if (!fetch)
-            scattered[ns++] = line;
-        else
-            for (uintptr_t at = line; at < page + kPage; at += 64)
-                if (const uintptr_t ret = RetInLine(at)) { scattered[ns++] = ret; break; }
-    }
-    const uintptr_t middle = block.addr + (pages / 2) * kPage;
-    for (uintptr_t line = middle; line < middle + 32 * kPage && ng < kChaseLines; line += 64)
-    {
-        if (!fetch)
+        const size_t stride = std::max<size_t>(1, pages / kChaseLines);
+        for (size_t i = 0; i < kChaseLines && i * stride < pages; ++i)
+            scattered[ns++] = block.addr + i * stride * kPage + LineOfPage(i) * 64;
+        const uintptr_t middle = block.addr + (pages / 2) * kPage;
+        for (uintptr_t line = middle; line < middle + 32 * kPage && ng < kChaseLines; line += 64)
             grouped[ng++] = line;
-        else if (const uintptr_t ret = RetInLine(line))
-            grouped[ng++] = ret;
     }
-    if (ns < kChaseLines / 2 || ng < 256)
-        return;
+    else
+    {
+        // Calls to ret instructions. Recompiled guest functions are long and end in tail calls, so most pages of the
+        // code have no ret at all: the scattered set takes one from each page that has one, spread over the code,
+        // and the grouped set every line with a ret in the 32 consecutive pages that have the most.
+        std::vector<uint8_t> lines(pages); // lines with a ret, per page
+        size_t withRet = 0;
+        for (size_t p = 0; p < pages; ++p)
+        {
+            for (uintptr_t line = block.addr + p * kPage; line < block.addr + (p + 1) * kPage; line += 64)
+                lines[p] += RetInLine(line) != 0;
+            withRet += lines[p] != 0;
+        }
+        if (withRet < kChaseLines / 2)
+            return EmitSkip(emit, what, "too few pages with a ret", withRet);
+        const size_t stride = std::max<size_t>(1, withRet / kChaseLines);
+        for (size_t p = 0, seen = 0; p < pages && ns < kChaseLines; ++p)
+        {
+            if (!lines[p] || seen++ % stride != 0)
+                continue;
+            size_t pick = LineOfPage(ns) % lines[p]; // one of the page's ret lines
+            for (uintptr_t line = block.addr + p * kPage;; line += 64)
+                if (const uintptr_t ret = RetInLine(line); ret && pick-- == 0)
+                {
+                    scattered[ns++] = ret;
+                    break;
+                }
+        }
+        size_t best = 0, bestSum = 0, sum = 0;
+        for (size_t p = 0; p < pages; ++p)
+        {
+            sum += lines[p];
+            if (p >= 32)
+                sum -= lines[p - 32];
+            if (p >= 31 && sum > bestSum)
+                bestSum = sum, best = p - 31;
+        }
+        for (uintptr_t line = block.addr + best * kPage; line < block.addr + (best + 32) * kPage && ng < kChaseLines;
+             line += 64)
+            if (const uintptr_t ret = RetInLine(line))
+                grouped[ng++] = ret;
+    }
+    if (ns < kChaseLines / 2 || ng < 128)
+        return EmitSkip(emit, what, ns < kChaseLines / 2 ? "too few scattered lines" : "too few grouped lines",
+            ns < kChaseLines / 2 ? ns : ng);
     Shuffle(scattered, ns);
     Shuffle(grouped, ng);
     const double far = fetch ? FetchNs(scattered, ns) : LoadNs(scattered, ns);
