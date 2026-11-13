@@ -27,10 +27,10 @@ void LogBackingFailure(const char* what, uint32_t address)
         return;
     const auto failure = GuestAddressSpace::GetFailureInfo();
     LOG_ERROR("guest memory: sub_82B6E908 {} {:#x} is unallocated and could not be backed ({} failed: error {:#x}, "
-              "address {:#x}, size {:#x}, offset {:#x}, view {}); skipping the function. committed {} MiB, {}",
+              "address {:#x}, size {:#x}, offset {:#x}, view {}); skipping the function. committed {} MiB, {}{}{}",
         what, address, GuestAddressSpace::FailureOperationName(failure.operation), failure.error, failure.address,
         failure.size, failure.offset, failure.viewIndex, GuestAddressSpace::CommittedBytes() >> 20,
-        os::switch_platform::MemorySummary());
+        os::switch_platform::MemorySummary(), failure.detail[0] ? "; " : "", failure.detail);
     if (GuestAddressSpace::LastRepair().count != 0)
         GuestAddressSpace::LogRepair("sub_82B6E908 (failed repair)");
 }

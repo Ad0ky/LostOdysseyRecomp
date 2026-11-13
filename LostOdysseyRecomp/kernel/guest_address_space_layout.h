@@ -19,4 +19,10 @@ void ClearFailure();
 void RecordFailure(FailureOperation operation, uint32_t error, int32_t viewIndex,
                    const void* address, size_t size, size_t offset = 0,
                    uint32_t preferredReservationError = 0, uintptr_t backingHandle = 0);
+// Appends to the recorded failure's detail text (cleared by RecordFailure).
+#if defined(__GNUC__) || defined(__clang__)
+void AppendFailureDetail(const char* format, ...) __attribute__((format(printf, 1, 2)));
+#else
+void AppendFailureDetail(const char* format, ...);
+#endif
 }

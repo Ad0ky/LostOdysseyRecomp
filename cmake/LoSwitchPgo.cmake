@@ -15,6 +15,11 @@ set(LO_SWITCH_PGO "OFF" CACHE STRING "Switch: profile-guided optimisation: OFF, 
 set_property(CACHE LO_SWITCH_PGO PROPERTY STRINGS OFF GEN USE)
 set(LO_SWITCH_PGO_DIR "${CMAKE_SOURCE_DIR}/out/pgo" CACHE PATH "LO_SWITCH_PGO=USE: the folder with the .gcda files from the console")
 set(LO_SWITCH_PGO_USE_FLAGS "" CACHE STRING "LO_SWITCH_PGO=USE: extra compiler flags for the profiled code")
+# Game files compiled with the profile but without -freorder-blocks-and-partition. GCC 15.2 on AArch64 can move a
+# switch's case into the .cold part while its jump table holds offsets from the hot part, and the assembler rejects
+# the difference ("invalid operands (.text.unlikely.X and .text.hot.X sections) for `-'"). Which function hits it
+# depends on the profile: list a file here when a USE build fails that way (docs/SWITCH-PGO.md, traps).
+set(LO_SWITCH_PGO_NO_PARTITION "ppc_recomp.5.cpp" CACHE STRING "LO_SWITCH_PGO=USE: game files not partitioned (GCC jump-table bug)")
 
 if(NOT LO_SWITCH_PGO MATCHES "^(OFF|GEN|USE)$")
     message(FATAL_ERROR "LO_SWITCH_PGO must be OFF, GEN or USE")
@@ -60,9 +65,19 @@ function(lo_switch_pgo_sources)
         return()
     endif()
     string(REPLACE ";" " " _text "${LO_SWITCH_PGO_FLAGS}")
+    set(_unpartitioned "")
     foreach(_file IN LISTS ARGN)
         set_property(SOURCE "${_file}" APPEND_STRING PROPERTY COMPILE_FLAGS " ${_text}")
+        get_filename_component(_name "${_file}" NAME)
+        if(LO_SWITCH_PGO STREQUAL "USE" AND _name IN_LIST LO_SWITCH_PGO_NO_PARTITION)
+            # After the PGO flags, so it wins over their -freorder-blocks-and-partition.
+            set_property(SOURCE "${_file}" APPEND_STRING PROPERTY COMPILE_FLAGS " -fno-reorder-blocks-and-partition")
+            list(APPEND _unpartitioned "${_name}")
+        endif()
     endforeach()
     list(LENGTH ARGN _count)
     message(STATUS "LO_SWITCH_PGO=${LO_SWITCH_PGO}: ${_count} game files")
+    if(_unpartitioned)
+        message(STATUS "LO_SWITCH_PGO=USE: not partitioned: ${_unpartitioned}")
+    endif()
 endfunction()

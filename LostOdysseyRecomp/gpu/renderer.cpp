@@ -729,6 +729,14 @@ namespace gpu::renderer
             };
 #endif
             using SamplerPalette = sampling::Palette<RenderSampler, RenderDescriptorSet>;
+            // LO_TRANSFER_CHECK: one transfer drawn with its pair shader and with the general shader, both read back
+            // into `buffer` (the pair's image, then the general one's), compared when the slot's fence has passed.
+            struct TransferCheck {
+                std::unique_ptr<RenderBuffer> buffer;
+                uint32_t width = 0, height = 0, rowPitch = 0, bpp = 0, srcClass = 0, dstClass = 0, index = 0;
+                uint64_t frame = 0;
+                bool selfTest = false;
+            };
             struct GpuSlot {
                 std::unique_ptr<RenderCommandList> list;
                 // The prefix is list. An NGX recording error must never place
@@ -770,6 +778,7 @@ namespace gpu::renderer
                 TextureSetCache textureSetCache[3];
                 std::vector<SamplerPalette::Lease> samplerVersions;
                 std::vector<std::unique_ptr<HostTexture>> retiredTextures;
+                std::vector<TransferCheck> transferChecks; // LO_TRANSFER_CHECK
                 // Reused only after this slot's fence completes. Each draw gets
                 // a distinct output while commands in the slot remain in flight.
                 std::vector<std::unique_ptr<HostTexture>> bloomPrefilterTextures;
@@ -3605,24 +3614,22 @@ namespace gpu::renderer
 
             // Reinterprets one EDRAM class as another: pack the source value into the
             // guest's 32-bit word, then unpack it the way the new class reads it.
+            // transferPs is the general shader (both classes from the shared constants, xeTransfer);
+            // transferPairPs[s][d] is the same transfer for one pair of classes, fixed at compile time and
+            // without branches (edram_transfer.h kTransferPairHlsl): the same bits, in less time.
+            // LO_TRANSFER_PAIR_SHADERS=0 draws every transfer with the general shader (default on with
+            // deko3d, where it was proved; elsewhere =1 turns it on). A pair whose shader or pipeline could not be
+            // made is drawn with the general shader; only the general one is needed to start.
+            static constexpr uint32_t kTransferClasses = edram_transfer::kLastClass + 1;
             std::unique_ptr<RenderShader> transferPs;
+            std::unique_ptr<RenderShader> transferPairPs[kTransferClasses][kTransferClasses];
+            bool transferPairShaders = false;
+            // Key: target format << 4 | 0 for the general shader, 1 + s * 3 + d for a pair's.
             std::map<uint32_t, std::unique_ptr<RenderPipeline>> transferPipelines;
 
             void CompileTransferShader()
             {
-                const char* bindings =
-                    "Texture2D<float4> src : register(t0, space1);\n"
-                    "#ifdef __spirv__\n"
-                    "struct XePushConstants { uint64_t vs; uint64_t sharedAddress; uint64_t ps; };\n"
-                    "[[vk::push_constant]] ConstantBuffer<XePushConstants> xePush;\n"
-                    "#define xeTransfer vk::RawBufferLoad<uint4>(xePush.sharedAddress + 240)\n"
-                    "#else\n"
-                    "cbuffer XeShared : register(b1, space0) {\n"
-                    "  uint4 pad0[2]; uint4 pad1[8]; float4 pad2; float4 pad3; float4 pad4;\n"
-                    "  float4 pad5; float4 xeColorMax; uint4 xeTransfer;\n"
-                    "};\n"
-                    "#endif\n";
-                const std::string psSrc = std::string(bindings) + gpu::edram_transfer::kTransferHlsl;
+                const std::string psSrc = edram_transfer::TransferSource();
                 xenos::CompiledShader f = xenos::CompileCachedHlsl(psSrc, "main", "ps_6_0", binaryFormat);
                 if (!f.ok)
                 {
@@ -3630,19 +3637,50 @@ namespace gpu::renderer
                     return;
                 }
                 transferPs = device->createShader(f.bytecode.data(), f.bytecode.size(), "main", renderFormat);
+                const char* pairSetting = getenv("LO_TRANSFER_PAIR_SHADERS");
+                const bool pairsWanted = pairSetting ? std::strcmp(pairSetting, "0") != 0 : video::IsDeko3d();
+                uint32_t made = 0;
+                if (pairsWanted && transferPs)
+                    for (uint32_t s = 0; s < kTransferClasses; ++s)
+                        for (uint32_t d = 0; d < kTransferClasses; ++d) {
+                            if (s == d) continue;
+                            xenos::CompiledShader p = xenos::CompileCachedHlsl(edram_transfer::TransferPairSource(s, d), "main", "ps_6_0", binaryFormat);
+                            if (p.ok) transferPairPs[s][d] = device->createShader(p.bytecode.data(), p.bytecode.size(), "main", renderFormat);
+                            if (transferPairPs[s][d]) ++made;
+                            else LOG_WARNING("renderer: transfer shader {} -> {} unavailable, the general shader draws it: {}", s, d, p.errors);
+                        }
+                transferPairShaders = made != 0;
+                if (const char* check = getenv("LO_TRANSFER_CHECK"); check && check[0] && std::strcmp(check, "0") != 0 && transferPairShaders)
+                    transferChecksLeft = std::max(1, std::atoi(check)) == 1 ? 64u : uint32_t(std::atoi(check));
+                LOG_NOTICE("renderer: EDRAM transfers with {}{}", transferPairShaders ?
+                    fmt::format("a shader per pair of classes ({} of 6; LO_TRANSFER_PAIR_SHADERS=0 for the general one)", made) :
+                    std::string("the general shader"),
+                    transferChecksLeft ? fmt::format(", the first {} checked against the general shader (LO_TRANSFER_CHECK)", transferChecksLeft) : std::string());
             }
 
-            RenderPipeline* GetTransferPipeline(RenderFormat targetFormat)
+            // The pipeline that draws a transfer from srcClass to dstClass into a target of targetFormat: the pair's
+            // shader when it has one (and `general` is false), else the general shader.
+            RenderPipeline* GetTransferPipeline(RenderFormat targetFormat, uint32_t srcClass, uint32_t dstClass, bool general = false)
             {
-                auto it = transferPipelines.find(uint32_t(targetFormat));
-                if (it != transferPipelines.end())
-                    return it->second.get();
-                if (!blitVs || !transferPs)
+                RenderShader* ps = transferPs.get();
+                uint32_t variant = 0;
+                if (!general && transferPairShaders && srcClass < kTransferClasses && dstClass < kTransferClasses &&
+                    transferPairPs[srcClass][dstClass]) {
+                    ps = transferPairPs[srcClass][dstClass].get();
+                    variant = 1 + srcClass * kTransferClasses + dstClass;
+                }
+                const uint32_t key = (uint32_t(targetFormat) << 4) | variant;
+                auto it = transferPipelines.find(key);
+                if (it != transferPipelines.end()) {
+                    if (it->second || !variant) return it->second.get();
+                    return GetTransferPipeline(targetFormat, srcClass, dstClass, true);
+                }
+                if (!blitVs || !ps)
                     return nullptr;
                 RenderGraphicsPipelineDesc desc;
                 desc.pipelineLayout = pipelineLayout.get();
                 desc.vertexShader = blitVs.get();
-                desc.pixelShader = transferPs.get();
+                desc.pixelShader = ps;
                 desc.depthEnabled = false;
                 desc.depthWriteEnabled = false;
                 desc.depthFunction = RenderComparisonFunction::ALWAYS;
@@ -3654,9 +3692,233 @@ namespace gpu::renderer
                 desc.cullMode = RenderCullMode::NONE;
                 desc.primitiveTopology = RenderPrimitiveTopology::TRIANGLE_LIST;
                 auto pipeline = device->createGraphicsPipeline(desc);
+#if defined(LO_SWITCH_DEKO3D)
+                // deko3d skips the draws of a pipeline whose shaders did not compile: a pair's falls back.
+                if (variant && pipeline && video::IsDeko3d() && !plume::Deko3DPipelineValid(pipeline.get())) pipeline.reset();
+#endif
+                if (variant && !pipeline) {
+                    LOG_WARNING("renderer: transfer pipeline {} -> {} (format {}) unavailable, the general shader draws it",
+                        srcClass, dstClass, uint32_t(targetFormat));
+                    transferPipelines.emplace(key, nullptr);
+                    return GetTransferPipeline(targetFormat, srcClass, dstClass, true);
+                }
                 RenderPipeline* result = pipeline.get();
-                transferPipelines.emplace(uint32_t(targetFormat), std::move(pipeline));
+                transferPipelines.emplace(key, std::move(pipeline));
                 return result;
+            }
+
+            // ---- LO_TRANSFER_CHECK ----------------------------------------------------------------------------
+            // =1 (or =N): each of the first 64 (N) transfers drawn with a pair's shader is drawn again with the
+            // general shader into a scratch target; both images are read back and compared bit for bit once the
+            // slot's fence has passed ("transfer check" lines, a total every 16 checks and at the last). The first
+            // check also runs a self-test: every pair over a 256x256 RGBA16F source in which each channel holds each
+            // of the 65,536 FP16 values once, against the general shader and against the CPU twins. Diagnostics
+            // only: each check costs a second transfer, two copies and 8 MB of read-back memory for a frame.
+            uint32_t transferChecksLeft = 0, transferChecksMade = 0;
+            uint64_t transferCheckPixels = 0, transferCheckDiffs = 0;
+            std::unique_ptr<HostTexture> transferCheckScratch, transferCheckSource;
+
+            static void TransferSelfTestTexel(uint32_t i, uint16_t h[4])
+            {
+                // Four bijections of i: each channel takes every FP16 pattern once (tools/tests/edram_transfer_test.cpp).
+                h[0] = uint16_t(i); h[1] = uint16_t(i * 40503u + 7u); h[2] = uint16_t(~i); h[3] = uint16_t((i << 8) | (i >> 8));
+            }
+
+            // The general shader's image of src over (x0, y0, w, h) into the scratch target, then both images to a
+            // read-back buffer; the comparison waits for the fence (FinishTransferChecks).
+            void CheckTransfer(HostTexture& src, HostTexture& dst, uint32_t srcClass, uint32_t dstClass, uint64_t constants,
+                uint32_t x0, uint32_t y0, uint32_t w, uint32_t h, bool selfTest)
+            {
+                const uint32_t bpp = dst.format == RenderFormat::R16G16B16A16_FLOAT ? 8 : dst.format == RenderFormat::R8G8B8A8_UNORM ? 4 : 0;
+                RenderPipeline* general = GetTransferPipeline(dst.format, srcClass, dstClass, true);
+                if (!bpp || !general || !w || !h) return;
+                if (!transferCheckScratch) {
+                    auto tex = std::make_unique<HostTexture>();
+                    tex->allocationSerial = ++nextTargetAllocation;
+                    tex->format = dst.format;
+                    tex->width = std::max(x0 + w, 1024u); tex->height = std::max(y0 + h, 1024u);
+                    tex->guestWidth = tex->width; tex->guestHeight = tex->height;
+                    tex->texture = device->createTexture(RenderTextureDesc::Texture2D(tex->width, tex->height, 1, tex->format, RenderTextureFlag::RENDER_TARGET));
+                    if (!tex->texture) { LOG_WARNING("transfer check: no scratch target"); transferChecksLeft = 0; return; }
+                    transferCheckScratch = std::move(tex);
+                }
+                HostTexture& scratch = *transferCheckScratch;
+                if (scratch.format != dst.format || x0 + w > scratch.width || y0 + h > scratch.height) {
+                    LOG_NOTICE("transfer check: {} -> {} {}x{} at {},{} format {} skipped (scratch {}x{} format {})", srcClass, dstClass,
+                        w, h, x0, y0, uint32_t(dst.format), scratch.width, scratch.height, uint32_t(scratch.format));
+                    return;
+                }
+                const uint32_t rowPitch = (w * bpp + 255u) & ~255u;
+                TransferCheck check;
+                check.buffer = device->createBuffer(RenderBufferDesc::ReadbackBuffer(uint64_t(rowPitch) * h * 2));
+                if (!check.buffer) { LOG_WARNING("transfer check: no read-back buffer"); return; }
+                check.width = w; check.height = h; check.rowPitch = rowPitch; check.bpp = bpp;
+                check.srcClass = srcClass; check.dstClass = dstClass; check.frame = frame; check.selfTest = selfTest;
+                check.index = selfTest ? 0 : transferChecksMade++;
+                Transition(src, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                Transition(scratch, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                RenderDescriptorSet* set1 = AcquireSet(1);
+                set1->setTexture(0, src.texture.get(), RenderTextureLayout::SHADER_READ);
+                BindTargets(&scratch, nullptr);
+                RenderViewport viewport(static_cast<float>(x0), static_cast<float>(y0), static_cast<float>(w), static_cast<float>(h));
+                commandList->setViewports(&viewport, 1);
+                RenderRect scissor{ int32_t(x0), int32_t(y0), int32_t(x0 + w), int32_t(y0 + h) };
+                commandList->setScissors(&scissor, 1);
+                commandList->setPipeline(general);
+                commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                SetConstantBuffer(constants, 0);
+                SetConstantBuffer(constants, 1);
+                SetConstantBuffer(constants, 2);
+                commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                commandList->setGraphicsDescriptorSet(set1, 1);
+                commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
+                commandList->drawInstanced(3, 1, 0, 0);
+                Transition(dst, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+                Transition(scratch, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
+                const RenderBox box(int32_t(x0), int32_t(y0), int32_t(x0 + w), int32_t(y0 + h));
+                commandList->copyTextureRegion(
+                    RenderTextureCopyLocation::PlacedFootprint(check.buffer.get(), dst.format, w, h, 1, rowPitch / bpp, 0),
+                    RenderTextureCopyLocation::Subresource(dst.texture.get(), 0), 0, 0, 0, &box);
+                commandList->copyTextureRegion(
+                    RenderTextureCopyLocation::PlacedFootprint(check.buffer.get(), dst.format, w, h, 1, rowPitch / bpp, uint64_t(rowPitch) * h),
+                    RenderTextureCopyLocation::Subresource(scratch.texture.get(), 0), 0, 0, 0, &box);
+                Gpu().transferChecks.push_back(std::move(check));
+            }
+
+            // The self-test: every pair's shader over every FP16 value per channel, into a 256x256 target of its own.
+            void TransferSelfTest()
+            {
+                constexpr uint32_t kSide = 256;
+                std::vector<uint16_t> texels(size_t(kSide) * kSide * 4);
+                for (uint32_t i = 0; i < kSide * kSide; ++i) TransferSelfTestTexel(i, &texels[size_t(i) * 4]);
+                auto source = std::make_unique<HostTexture>();
+                source->allocationSerial = ++nextTargetAllocation;
+                source->format = RenderFormat::R16G16B16A16_FLOAT;
+                source->width = source->height = source->guestWidth = source->guestHeight = kSide;
+                source->texture = device->createTexture(RenderTextureDesc::Texture2D(kSide, kSide, 1, source->format));
+                if (!source->texture) { LOG_WARNING("transfer self-test: no source texture"); return; }
+                if (!Begin()) return;
+                const uint64_t data = Upload(texels.data(), texels.size() * sizeof(uint16_t), 512);
+                if (data == UINT64_MAX) return;
+                Transition(*source, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
+                commandList->copyTextureRegion(
+                    RenderTextureCopyLocation::Subresource(source->texture.get(), 0),
+                    RenderTextureCopyLocation::PlacedFootprint(uploadRing, source->format, kSide, kSide, 1, kSide, data));
+                transferCheckSource = std::move(source);
+                for (uint32_t s = 0; s < kTransferClasses; ++s)
+                    for (uint32_t d = 0; d < kTransferClasses; ++d) {
+                        if (s == d || !transferPairPs[s][d]) continue;
+                        // Each pair into its own 256x256 corner of a target: the target of the class's host format.
+                        auto target = std::make_unique<HostTexture>();
+                        target->allocationSerial = ++nextTargetAllocation;
+                        target->format = RenderFormat::R16G16B16A16_FLOAT;
+                        target->width = target->height = target->guestWidth = target->guestHeight = kSide;
+                        target->texture = device->createTexture(RenderTextureDesc::Texture2D(kSide, kSide, 1, target->format, RenderTextureFlag::RENDER_TARGET));
+                        RenderPipeline* pipeline = GetTransferPipeline(target->format, s, d);
+                        if (!target->texture || !pipeline) continue;
+                        SharedConstants constants{};
+                        constants.transfer[0] = s;
+                        constants.transfer[1] = d;
+                        constants.transfer[2] = constants.transfer[3] = std::bit_cast<uint32_t>(1.0f);
+                        const uint64_t offset = Upload(&constants, sizeof(constants));
+                        if (offset == UINT64_MAX || !Begin()) return;
+                        HostTexture& src = *transferCheckSource;
+                        Transition(src, RenderTextureLayout::SHADER_READ, RenderBarrierStage::GRAPHICS);
+                        Transition(*target, RenderTextureLayout::COLOR_WRITE, RenderBarrierStage::GRAPHICS);
+                        RenderDescriptorSet* set1 = AcquireSet(1);
+                        set1->setTexture(0, src.texture.get(), RenderTextureLayout::SHADER_READ);
+                        BindTargets(target.get(), nullptr);
+                        RenderViewport viewport(0.0f, 0.0f, float(kSide), float(kSide));
+                        commandList->setViewports(&viewport, 1);
+                        RenderRect scissor{ 0, 0, int32_t(kSide), int32_t(kSide) };
+                        commandList->setScissors(&scissor, 1);
+                        commandList->setPipeline(pipeline);
+                        commandList->setGraphicsPipelineLayout(pipelineLayout.get());
+                        SetConstantBuffer(offset, 0);
+                        SetConstantBuffer(offset, 1);
+                        SetConstantBuffer(offset, 2);
+                        commandList->setGraphicsDescriptorSet(staticSet0.get(), 0);
+                        commandList->setGraphicsDescriptorSet(set1, 1);
+                        commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
+                        commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
+                        if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
+                        commandList->drawInstanced(3, 1, 0, 0);
+                        CheckTransfer(src, *target, s, d, offset, 0, 0, kSide, kSide, true);
+                        Gpu().retiredTextures.push_back(std::move(target));
+                    }
+                Gpu().retiredTextures.push_back(std::move(transferCheckSource));
+            }
+
+            void FinishTransferChecks(GpuSlot& slot)
+            {
+                for (TransferCheck& check : slot.transferChecks) {
+                    const uint8_t* bytes = static_cast<const uint8_t*>(check.buffer->map());
+                    if (!bytes) continue;
+                    const uint8_t* general = bytes + size_t(check.rowPitch) * check.height;
+                    uint64_t diffs = 0, cpuDiffs[3] = {}, cpuCompared = 0;
+                    uint32_t firstX = 0, firstY = 0;
+                    uint64_t firstPair = 0, firstGeneral = 0;
+                    for (uint32_t y = 0; y < check.height; ++y)
+                        for (uint32_t x = 0; x < check.width; ++x) {
+                            const size_t at = size_t(y) * check.rowPitch + size_t(x) * check.bpp;
+                            if (std::memcmp(bytes + at, general + at, check.bpp) != 0) {
+                                if (!diffs++) {
+                                    firstX = x; firstY = y;
+                                    std::memcpy(&firstPair, bytes + at, check.bpp);
+                                    std::memcpy(&firstGeneral, general + at, check.bpp);
+                                }
+                            }
+                            if (!check.selfTest || check.bpp != 8) continue;
+                            // The CPU twins (the pair shader's arithmetic), with each FP16 rounding of the output.
+                            uint16_t h[4];
+                            TransferSelfTestTexel(y * check.width + x, h);
+                            float v[4], out[4];
+                            bool nan = false;
+                            for (int c = 0; c < 4; ++c) { v[c] = edram_transfer::HalfToFloat(h[c]); nan = nan || v[c] != v[c]; }
+                            if (nan) continue; // saturate(NaN) is the GPU's to define
+                            ++cpuCompared;
+                            uint32_t word = 0;
+                            if (check.srcClass == 0) for (int c = 0; c < 4; ++c) word |= edram_transfer::Quantize(v[c], 255.0f, false) << (8 * c);
+                            else {
+                                word = edram_transfer::Quantize(v[3], 3.0f, false) << 30;
+                                for (int c = 0; c < 3; ++c) word |= (check.srcClass == 1 ? edram_transfer::Quantize(v[c], 1023.0f, false) :
+                                    edram_transfer::Float32To7e3Select(v[c])) << (10 * c);
+                            }
+                            if (check.dstClass == 0) for (int c = 0; c < 4; ++c) out[c] = float((word >> (8 * c)) & 0xFFu) * float(1.0 / 255.0);
+                            else {
+                                out[3] = float(word >> 30) * float(1.0 / 3.0);
+                                for (int c = 0; c < 3; ++c) {
+                                    const uint32_t code = (word >> (10 * c)) & 0x3FFu;
+                                    out[c] = check.dstClass == 1 ? float(code) * float(1.0 / 1023.0) : edram_transfer::Float7e3To32Select(code);
+                                }
+                            }
+                            constexpr edram_transfer::Round kModes[] = { edram_transfer::Round::TowardZero, edram_transfer::Round::NearestEven, edram_transfer::Round::NearestAway };
+                            for (int m = 0; m < 3; ++m) {
+                                uint16_t expected[4];
+                                for (int c = 0; c < 4; ++c) expected[c] = edram_transfer::FloatToHalf(out[c], kModes[m]);
+                                if (std::memcmp(expected, bytes + at, 8) != 0) ++cpuDiffs[m];
+                            }
+                        }
+                    check.buffer->unmap();
+                    const uint64_t pixels = uint64_t(check.width) * check.height;
+                    if (check.selfTest) {
+                        LOG_NOTICE("transfer self-test {} -> {}: {} texels, {} differ from the general shader{}; CPU twins ({} texels without NaN) "
+                            "differ in {} rounding toward zero, {} to nearest even, {} to nearest away", check.srcClass, check.dstClass, pixels, diffs,
+                            diffs ? fmt::format(" (first at {},{}: pair {:016x}, general {:016x})", firstX, firstY, firstPair, firstGeneral) : std::string(),
+                            cpuCompared, cpuDiffs[0], cpuDiffs[1], cpuDiffs[2]);
+                    } else {
+                        transferCheckPixels += pixels;
+                        transferCheckDiffs += diffs;
+                        LOG_NOTICE("transfer check {} frame {}: {} -> {} {}x{}, {} pixels differ{}", check.index, check.frame, check.srcClass,
+                            check.dstClass, check.width, check.height, diffs,
+                            diffs ? fmt::format(" (first at {},{}: pair {:016x}, general {:016x})", firstX, firstY, firstPair, firstGeneral) : std::string());
+                        if ((check.index + 1) % 16 == 0 || (!transferChecksLeft && check.index + 1 == transferChecksMade))
+                            LOG_NOTICE("transfer check: {} transfers, {} pixels, {} differ", check.index + 1, transferCheckPixels, transferCheckDiffs);
+                    }
+                }
+                slot.transferChecks.clear();
             }
 
             void TransferRegion(HostTexture& src, HostTexture& dst, uint32_t srcClass, uint32_t dstClass)
@@ -3694,7 +3956,7 @@ namespace gpu::renderer
                         return;
                     }
                 }
-                RenderPipeline* pipeline = GetTransferPipeline(dst.format);
+                RenderPipeline* pipeline = GetTransferPipeline(dst.format, srcClass, dstClass);
                 if (!pipeline)
                     return;
                 SharedConstants transferConstants{};
@@ -3729,10 +3991,26 @@ namespace gpu::renderer
                 commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
                 if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
                 commandList->drawInstanced(3, 1, 0, 0);
+                if (transferChecksLeft) CheckTransferDraw(src, dst, srcClass, dstClass, offset, 0, 0, w, h);
 #if defined(LO_GPU_PLUME)
                 HandleFsrAlphaRgbWriter(dst, "tile_owner_transfer");
 #endif
                 transfers++;
+            }
+
+            // LO_TRANSFER_CHECK after a transfer drawn with a pair's shader (the self-test first).
+            void CheckTransferDraw(HostTexture& src, HostTexture& dst, uint32_t srcClass, uint32_t dstClass, uint64_t constants,
+                uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+            {
+                if (GetTransferPipeline(dst.format, srcClass, dstClass) == GetTransferPipeline(dst.format, srcClass, dstClass, true))
+                    return;
+                --transferChecksLeft;
+                if (!transferChecksMade && !transferCheckScratch) {
+                    CheckTransfer(src, dst, srcClass, dstClass, constants, x0, y0, w, h, false);
+                    TransferSelfTest();
+                    return;
+                }
+                CheckTransfer(src, dst, srcClass, dstClass, constants, x0, y0, w, h, false);
             }
             uint32_t transfers = 0;
 
@@ -3753,7 +4031,7 @@ namespace gpu::renderer
                         edram_transfer::ConstantTransfer(owed.color, srcClass, dstClass, value))
                         return false;
                 }
-                return GetTransferPipeline(dst.format) != nullptr;
+                return GetTransferPipeline(dst.format, srcClass, dstClass) != nullptr;
             }
 
             // Owes TransferRegion(src, dst) instead of drawing it. The bookkeeping that describes dst's contents happens
@@ -3823,7 +4101,7 @@ namespace gpu::renderer
             {
                 const TransferDebt debt = transferDebt;
                 HostTexture& src = *debt.source;
-                RenderPipeline* pipeline = GetTransferPipeline(dst.format);
+                RenderPipeline* pipeline = GetTransferPipeline(dst.format, debt.srcClass, debt.dstClass);
                 if (!pipeline)
                     return false;
                 SharedConstants transferConstants{};
@@ -3856,6 +4134,7 @@ namespace gpu::renderer
                 commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
                 if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
                 commandList->drawInstanced(3, 1, 0, 0);
+                if (transferChecksLeft) CheckTransferDraw(src, dst, debt.srcClass, debt.dstClass, offset, x0, y0, w, h);
                 return true;
             }
 
@@ -5693,6 +5972,7 @@ void main()
                 }
                 s.submitted = false;
                 CompleteOcclusionQueries(s);
+                if (!s.transferChecks.empty()) FinishTransferChecks(s);
 #if defined(LO_GPU_PLUME)
                 for (auto& p : s.fgCompositeResolves) {
                     p->resolveCompleted = true;

@@ -22,6 +22,8 @@ DESCRIPTIONS = {
     "LO_SWITCH_UI_NATIVE": "1: text, HUD and menus at the output's size while the scene stays smaller",
     "LO_NATIVE_MOVIES": "Cutscene video decoded natively with FFmpeg (faster, smoother); 0 uses the game's decoder",
     "LO_GUEST_AFFINITY": "Spread the game's threads across the Switch's three CPU cores",
+    "LO_GUEST_BLOCKS": "0: guest memory on 4 KiB pages (the old layout) instead of 2 MiB blocks",
+    "LO_TLB_TEST": "N: N seconds in, log what a TLB miss costs in guest memory and the NRO (tlb: lines)",
     "LO_ZPD_MODE": "xenia: made-up occlusion query counts (faster) instead of host queries",
     "LO_PIPELINE_PREBUILD": "Prepare known graphics states in the background at start (all)",
     "LO_SWITCH_BUTTONS": "position: the physical A/B/X/Y layout instead of the letters",
