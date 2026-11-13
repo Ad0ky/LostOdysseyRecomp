@@ -2728,6 +2728,15 @@ namespace plume {
             s.elements += uint64_t(count) * std::max<uint32_t>(instances, 1);
             s.vertexShader = p->traceShader[0];
             s.pixelShader = p->traceShader[2];
+            const DkDepthStencilState &ds = p->depthStencil;
+            const bool stencilWrites = ds.stencilTestEnable && p->stencilWriteMask &&
+                (ds.stencilFrontFailOp != DkStencilOp_Keep || ds.stencilFrontPassOp != DkStencilOp_Keep ||
+                 ds.stencilFrontDepthFailOp != DkStencilOp_Keep || ds.stencilBackFailOp != DkStencilOp_Keep ||
+                 ds.stencilBackPassOp != DkStencilOp_Keep || ds.stencilBackDepthFailOp != DkStencilOp_Keep);
+            s.state = uint32_t(ds.depthTestEnable) | uint32_t(ds.depthWriteEnable) << 1 | uint32_t(ds.stencilTestEnable) << 2 |
+                uint32_t(ds.depthCompareOp) << 4 | uint32_t(cl.earlyFragmentTests && p->earlyFragment) << 8 |
+                uint32_t(p->earlyFragment != nullptr) << 9 | uint32_t(p->color.blendEnableMask & 1) << 10 |
+                (p->colorWrite.masks & 0xF) << 12 | uint32_t(stencilWrites) << 16 | uint32_t(ds.stencilFrontCompareOp) << 20;
         }
     }
 

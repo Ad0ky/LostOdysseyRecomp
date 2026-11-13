@@ -66,14 +66,14 @@ namespace gpu::gpu_trace
             for (uint32_t i = 0; i < s.sampledCount; ++i) sampled += (i ? "," : "") + name(s.sampled[i]);
             if (sampled.empty()) sampled = "-";
             LOG_NOTICE("gpass: f={} l={} b={} i={} k={} us={:.1f} t={}x{} c={} d={} dr={} cl={} bar={}/{}/{} inv={} pb={} sb={} dw={} "
-                "sp={} fr={} vt={} n={} rc={} rd={} src={}x{}:{}:{} by={} in={} el={} vs={:016x} ps={:016x}",
+                "sp={} fr={} vt={} n={} rc={} rd={} src={}x{}:{}:{} by={} in={} el={} vs={:016x} ps={:016x} st={:x}",
                 frame, listKind, batch, index++, KindName(s.kind), double(s.gpuNs) / 1000.0, s.width, s.height,
                 s.colorCount || s.kind != plume::Deko3DPassSegment::Draws ? FormatName(s.colorFormat) : "-",
                 s.hasDepth ? FormatName(s.depthFormat) : "-", s.draws, s.clears, s.barriersFull, s.barriersFragments,
                 s.barriersPrimitives, s.barriersImageInvalidate, s.pipelineBinds, s.stateBinds, s.descriptorWrites,
                 s.samples, s.fragments, s.vertices, s.note[0] ? s.note : "-", name(s.color), name(s.depth),
                 s.sourceWidth, s.sourceHeight, FormatName(s.sourceFormat), name(s.source), s.bytes, sampled, s.elements,
-                s.vertexShader, s.pixelShader);
+                s.vertexShader, s.pixelShader, s.state);
         }
         LOG_NOTICE("gpass end: f={} l={} b={} segs={} trace_us={:.1f} batch_us={:.1f} truncated={} counters={}",
             frame, listKind, batch, segments.size(), double(traceNs) / 1000.0, double(batchNs) / 1000.0, truncated ? 1 : 0,

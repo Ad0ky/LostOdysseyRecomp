@@ -105,6 +105,11 @@ namespace plume {
         // of the shader as the pipeline was given it: its SPIR-V words, FNV-1a 64).
         uint64_t elements = 0;
         uint64_t vertexShader = 0, pixelShader = 0;
+        // Its last draw's depth, stencil and colour state: bit 0 depth test, 1 depth write, 2 stencil test, 4-7 the
+        // depth comparison (DkCompareOp), 8 the draw ran with early fragment tests, 9 its pipeline has an early
+        // variant at all, 10 blending on target 0, 12-15 the colour write mask of target 0, 16 stencil writes
+        // possible (an operation other than keep), 20-23 the stencil reference test (front, DkCompareOp).
+        uint32_t state = 0;
         // The render targets its draws sample (those their shaders have a binding for), the first six.
         const RenderTexture *sampled[6] = {};
         uint32_t sampledCount = 0;

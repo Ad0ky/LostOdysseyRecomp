@@ -53,7 +53,7 @@ def parse(path, first, last):
                 "sb": int(fields["sb"]), "dw": int(fields["dw"]), "sp": int(fields["sp"]), "fr": int(fields["fr"]),
                 "vt": int(fields["vt"]), "n": fields["n"], "rc": fields["rc"], "rd": fields["rd"], "src": fields["src"],
                 "by": int(fields.get("by", 0)), "in": fields.get("in", "-"), "el": int(fields.get("el", 0)),
-                "vs": fields.get("vs", "0" * 16), "ps": fields.get("ps", "0" * 16),
+                "vs": fields.get("vs", "0" * 16), "ps": fields.get("ps", "0" * 16), "st": int(fields.get("st", "0"), 16),
             })
     for entry in frames.values():
         entry["segs"].sort(key=lambda s: (s["l"] == "P", s["b"], s["i"]))
@@ -143,6 +143,53 @@ def phases_of(segs):
             phase = "post-processing: full-screen passes"
         out.append(phase)
     return out
+
+
+def resolve_report(frames):
+    """Who reads each resolve. A stretch writes a resolved surface when the surface is its colour target (a resolve
+    drawn with the blit shader, a transfer) or its copy's destination; a stretch reads it when one of its draws has a
+    shader binding for it. A write nobody reads before the next write of the same surface, or before the frame ends,
+    did nothing for this frame's picture (the presentation's read of the frontbuffer is in list P)."""
+    totals = defaultdict(lambda: [0, 0, 0.0, 0.0])   # surface -> writes, unread writes, ms, unread ms
+    count = len(frames)
+    example = None
+    for frame, e in frames.items():
+        segs = e["segs"]
+        rows = []
+        for i, s in enumerate(segs):
+            name = s["rc"]
+            if not name.startswith(("rs:", "rsview:")):
+                continue
+            readers = []
+            for later in segs[i + 1:]:
+                if later["rc"] == name and later is not s:
+                    break
+                if name in later["in"].split(","):
+                    readers.append(later)
+            t = totals[name]
+            t[0] += 1; t[2] += s["us"]
+            if not readers:
+                t[1] += 1; t[3] += s["us"]
+            rows.append((s, readers))
+        if example is None:
+            example = (frame, rows)
+    print()
+    print(f"Resolved surfaces, per traced frame ({count} frames)")
+    table([[name, f"{t[0] / count:.1f}", f"{t[2] / count / 1000:.3f}", f"{t[1] / count:.1f}", f"{t[3] / count / 1000:.3f}"]
+           for name, t in sorted(totals.items(), key=lambda kv: -kv[1][2])],
+          ["surface", "writes", "ms", "writes nobody reads", "ms"], "lrrrr")
+    frame, rows = example
+    print()
+    print(f"Frame {frame}: each write and its readers")
+    out = []
+    for s, readers in rows:
+        who = defaultdict(int)
+        for r in readers:
+            who[f"{r['l']}{r['i']}:{r['w']}x{r['h']}>{r['rc']}"] += r["dr"]
+        text = ", ".join(f"{k} ({v} draws)" for k, v in list(who.items())[:4]) + (" ..." if len(who) > 4 else "")
+        out.append([f"{s['l']}{s['i']}", s["k"], f"{s['us'] / 1000:.3f}", f"{s['w']}x{s['h']}", s["rc"],
+                    s["in"] if s["k"] == "draws" else s["src"].split(":", 3)[-1], text or "nobody"])
+    table(out, ["at", "kind", "ms", "size", "writes", "from", "read by (until its next write)"], "llrllll")
 
 
 def fnv1a64(data):
@@ -238,6 +285,8 @@ def main():
     ap.add_argument("--sequence", nargs="?", const=-1, type=int, default=None, help="print one frame's stretches in order")
     ap.add_argument("--merge", action="store_true", help="in --sequence, merge neighbours of the same group")
     ap.add_argument("--top", type=int, default=60, help="groups shown")
+    ap.add_argument("--resolves", action="store_true",
+                    help="every write of a resolved surface and the stretches that sample it before its next write")
     ap.add_argument("--shaders", action="store_true",
                     help="with LO_GPU_PASS_DRAWS=1 lines: the cost per vertex and pixel shader")
     ap.add_argument("--spv-dir", help="the pack's shaders as tools/deko3d/extract_spirv.py wrote them (vs_*.spv, ps_*.spv): "
@@ -345,6 +394,8 @@ def main():
 
     if args.shaders:
         shader_report(frames, n, args.spv_dir, args.top)
+    if args.resolves:
+        resolve_report(frames)
 
     if args.sequence is not None:
         if args.sequence > 0 and args.sequence in frames:
