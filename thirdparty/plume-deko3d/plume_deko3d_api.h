@@ -47,6 +47,10 @@ namespace plume {
     // aren't shaded. Stays until changed.
     void Deko3DSetEarlyFragmentTests(RenderCommandList *list, bool allowed);
 
+    // LostOdysseyRecomp (2026-11-13): whether a pipeline's shaders were all translated and compiled. A draw with an
+    // invalid pipeline is skipped, so a caller with another pipeline for the same work checks this first.
+    bool Deko3DPipelineValid(const RenderPipeline *pipeline);
+
     // LostOdysseyRecomp (2026-11-04): the CPU's copy of the uniform buffer at GPU 'address' (the draw's shared
     // constants), where bound textures read their sampler words; nullptr when the draw is done (plume_deko3d.h).
     bool Deko3DSetSharedWords(RenderCommandList *commandList, const void *cpu, uint32_t size, uint64_t address);

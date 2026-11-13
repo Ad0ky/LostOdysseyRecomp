@@ -786,6 +786,11 @@ add_executable(LoPendingClearTest EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/tes
 target_include_directories(LoPendingClearTest PRIVATE ${LO_RUNTIME_ROOT})
 target_compile_features(LoPendingClearTest PRIVATE cxx_std_20)
 
+# The per-pair EDRAM transfer shaders' CPU twins against the general shader's, for every FP16 input.
+add_executable(LoEdramTransferTest EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/tests/edram_transfer_test.cpp)
+target_include_directories(LoEdramTransferTest PRIVATE ${LO_RUNTIME_ROOT})
+target_compile_features(LoEdramTransferTest PRIVATE cxx_std_20)
+
 # Host-only fixtures do not require guest generation or the runtime PCH.
 add_executable(LoRegisterSnapshotTest EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/tools/tests/register_snapshot_test.cpp)
 target_include_directories(LoRegisterSnapshotTest PRIVATE ${LO_RUNTIME_ROOT})

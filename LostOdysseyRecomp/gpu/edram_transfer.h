@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iterator>
+#include <string>
 
 // EDRAM tile-owner transfers (renderer TransferRegion): a colour view of one
 // class reads the 32-bit guest words that another class wrote. The pixel
@@ -15,7 +16,29 @@
 // class, source/destination scale as float bits). ConstantTransfer is its CPU
 // twin for a source that holds one value everywhere (one whole pending clear),
 // so the renderer can clear the destination instead of drawing.
+//
+// kTransferPairHlsl is the same transfer for one (source, destination) pair of
+// classes, fixed at compile time (TransferPairSource), with the 7e3
+// conversions written without branches: the integer steps of Float32To7e3 and
+// Float7e3To32 for every lane, the choices made by select. Every intermediate
+// and the result are the same bits as the general shader's (checked for every
+// FP16 input by tools/tests/edram_transfer_test.cpp against the CPU twins
+// below, and on the GPU by the renderer's LO_TRANSFER_CHECK).
 namespace gpu::edram_transfer {
+
+// The renderer's bindings for the transfer shaders (CompileTransferShader).
+inline constexpr const char* kTransferBindings =
+    "Texture2D<float4> src : register(t0, space1);\n"
+    "#ifdef __spirv__\n"
+    "struct XePushConstants { uint64_t vs; uint64_t sharedAddress; uint64_t ps; };\n"
+    "[[vk::push_constant]] ConstantBuffer<XePushConstants> xePush;\n"
+    "#define xeTransfer vk::RawBufferLoad<uint4>(xePush.sharedAddress + 240)\n"
+    "#else\n"
+    "cbuffer XeShared : register(b1, space0) {\n"
+    "  uint4 pad0[2]; uint4 pad1[8]; float4 pad2; float4 pad3; float4 pad4;\n"
+    "  float4 pad5; float4 xeColorMax; uint4 xeTransfer;\n"
+    "};\n"
+    "#endif\n";
 
 inline constexpr const char* kTransferHlsl =
     "float Float7e3To32(uint f10) {\n"
@@ -55,8 +78,67 @@ inline constexpr const char* kTransferHlsl =
     "  return UnpackGuest(PackGuest(v, xeTransfer.x), xeTransfer.y);\n"
     "}\n";
 
+// One pair of classes: XE_TRANSFER_SRC and XE_TRANSFER_DST are defined before
+// the bindings (TransferPairSource). The packing and unpacking are the general
+// shader's statements with the class tests resolved by the preprocessor.
+inline constexpr const char* kTransferPairHlsl =
+    "float3 Float7e3To32x3(uint3 f10) {\n"
+    "  f10 &= 0x3FFu;\n"
+    "  uint3 mantissa = f10 & 0x7Fu, exponent = f10 >> 7;\n"
+    "  uint3 shift = uint3(7u, 7u, 7u) - firstbithigh(mantissa);\n"
+    "  bool3 den = exponent == uint3(0u, 0u, 0u);\n"
+    "  exponent = select(den, uint3(int3(1, 1, 1) - int3(shift)), exponent);\n"
+    "  mantissa = select(den, (mantissa << shift) & 0x7Fu, mantissa);\n"
+    "  float3 r = asfloat(((exponent + 124u) << 23) | (mantissa << 16));\n"
+    "  return select(f10 == uint3(0u, 0u, 0u), float3(0.0, 0.0, 0.0), r);\n"
+    "}\n"
+    "uint3 Float32To7e3x3(float3 f) {\n"
+    "  uint3 u = asuint(f);\n"
+    "  uint3 shift = min(uint3(125u, 125u, 125u) - (u >> 23), uint3(24u, 24u, 24u));\n"
+    "  uint3 den = (0x800000u | (u & 0x7FFFFFu)) >> shift;\n"
+    "  uint3 x = select(u < uint3(0x3E800000u, 0x3E800000u, 0x3E800000u), den, u + 0xC2000000u);\n"
+    "  uint3 r = ((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16) & 0x3FFu;\n"
+    "  r = select(u >= uint3(0x41FF73FFu, 0x41FF73FFu, 0x41FF73FFu), uint3(0x3FFu, 0x3FFu, 0x3FFu), r);\n"
+    "  return select(f > float3(0.0, 0.0, 0.0), r, uint3(0u, 0u, 0u));\n"
+    "}\n"
+    "float4 main(float4 pos : SV_Position) : SV_Target {\n"
+    "  float4 v = src.Load(int3(int2(pos.x * asfloat(xeTransfer.z), pos.y * asfloat(xeTransfer.w)), 0));\n"
+    "#if XE_TRANSFER_SRC == 0\n"
+    "  uint4 s = uint4(saturate(v) * 255.0 + 0.5);\n"
+    "  uint w = s.r | (s.g << 8) | (s.b << 16) | (s.a << 24);\n"
+    "#else\n"
+    "  uint a = uint(saturate(v.a) * 3.0 + 0.5);\n"
+    "#if XE_TRANSFER_SRC == 1\n"
+    "  uint3 c = uint3(saturate(v.rgb) * 1023.0 + 0.5);\n"
+    "#else\n"
+    "  uint3 c = Float32To7e3x3(v.rgb);\n"
+    "#endif\n"
+    "  uint w = c.r | (c.g << 10) | (c.b << 20) | (a << 30);\n"
+    "#endif\n"
+    "#if XE_TRANSFER_DST == 0\n"
+    "  return float4(uint4(w, w >> 8, w >> 16, w >> 24) & 0xFFu) * (1.0 / 255.0);\n"
+    "#else\n"
+    "  float alpha = float(w >> 30) * (1.0 / 3.0);\n"
+    "  uint3 d = uint3(w, w >> 10, w >> 20) & 0x3FFu;\n"
+    "#if XE_TRANSFER_DST == 1\n"
+    "  return float4(float3(d) * (1.0 / 1023.0), alpha);\n"
+    "#else\n"
+    "  return float4(Float7e3To32x3(d), alpha);\n"
+    "#endif\n"
+    "#endif\n"
+    "}\n";
+
 // Classes the transfer handles (the renderer's kClass8888, kClass2101010, kClass7e3).
 inline constexpr uint32_t kLastClass = 2;
+
+// The transfer shaders' HLSL as the renderer compiles them (and
+// tools/switch/gen-builtin-spirv.py harvests them for the Switch's table).
+inline std::string TransferSource() { return std::string(kTransferBindings) + kTransferHlsl; }
+inline std::string TransferPairSource(uint32_t srcClass, uint32_t dstClass)
+{
+    return "#define XE_TRANSFER_SRC " + std::to_string(srcClass) + "\n#define XE_TRANSFER_DST " +
+        std::to_string(dstClass) + "\n" + kTransferBindings + kTransferPairHlsl;
+}
 
 // FP32 -> FP16 bits. GPUs differ in how they round shader outputs and clear
 // values into FP16 targets (NVIDIA and AMD round shader outputs toward zero).
@@ -124,6 +206,34 @@ inline uint32_t Float32To7e3(float f)
     } else
         u += 0xC2000000u;
     return ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16) & 0x3FFu;
+}
+
+// kTransferPairHlsl's branch-free helpers, one lane, step for step: both
+// sides of every choice are computed, then one is selected.
+inline float Float7e3To32Select(uint32_t f10)
+{
+    f10 &= 0x3FFu;
+    uint32_t mantissa = f10 & 0x7Fu, exponent = f10 >> 7;
+    // firstbithigh(0) is ~0u: shift 8, which only the non-denormal side or the zero result ever sees.
+    const uint32_t msb = mantissa ? uint32_t(std::bit_width(mantissa) - 1) : ~0u;
+    const uint32_t shift = 7u - msb;
+    const bool den = exponent == 0u;
+    const uint32_t denExponent = uint32_t(int32_t(1) - int32_t(shift)), denMantissa = (mantissa << (shift & 31u)) & 0x7Fu;
+    exponent = den ? denExponent : exponent;
+    mantissa = den ? denMantissa : mantissa;
+    const float r = std::bit_cast<float>(((exponent + 124u) << 23) | (mantissa << 16));
+    return f10 == 0u ? 0.0f : r;
+}
+
+inline uint32_t Float32To7e3Select(float f)
+{
+    const uint32_t u = std::bit_cast<uint32_t>(f);
+    const uint32_t shift = std::min(125u - (u >> 23), 24u);
+    const uint32_t den = (0x800000u | (u & 0x7FFFFFu)) >> shift;
+    const uint32_t x = u < 0x3E800000u ? den : u + 0xC2000000u;
+    uint32_t r = ((x + 0x7FFFu + ((x >> 16) & 1u)) >> 16) & 0x3FFu;
+    r = u >= 0x41FF73FFu ? 0x3FFu : r;
+    return f > 0.0f ? r : 0u;
 }
 
 // saturate(x) * scale + 0.5 to uint; fused: as one multiply-add, which a GPU compiler may emit.

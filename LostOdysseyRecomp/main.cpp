@@ -36,6 +36,8 @@
 #include <cstring>
 #include <ctime>
 #include <chrono>
+#include <thread>
+#include <os/debug_server.h>
 #include "settings/first_run.h"
 #include "settings/config.h"
 #if LO_PLATFORM_SWITCH
@@ -220,6 +222,16 @@ static int RunGuest(uint32_t entry)
 {
     if (!gpu::g_commandProcessor.Init()) {
         LOG_ERROR("graphics initialization failed; guest not started (see backend selection errors above)");
+#if LO_PLATFORM_SWITCH
+        // With the debug server on, the program stays up: a PC can still read the log and deploy another NRO
+        // (lo_debug.py deploy restarts the program from the server's own thread). A test build whose graphics did
+        // not start used to exit here, and a console nobody sits at stayed unreachable (2026-11-13).
+        if (os::debug_server::Running()) {
+            LOG_ERROR("debug server: still listening after the failed start; deploy an NRO, or close the game from the HOME menu");
+            while (os::debug_server::Running())
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+#endif
         return 1;
     }
     XexLoader::StartTimeStampThread();

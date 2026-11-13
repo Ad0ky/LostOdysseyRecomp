@@ -1222,6 +1222,13 @@ namespace plume {
         }
     }
 
+    bool Deko3DPipelineValid(const RenderPipeline *pipeline) {
+        const Deko3DPipeline *p = static_cast<const Deko3DPipeline *>(pipeline);
+        if (!p) return false;
+        return p->type == Deko3DPipeline::Type::Graphics ? static_cast<const Deko3DGraphicsPipeline *>(p)->valid
+                                                         : static_cast<const Deko3DComputePipeline *>(p)->valid;
+    }
+
     void Deko3DSetEarlyFragmentTests(RenderCommandList *list, bool allowed) {
         Deko3DCommandList *cl = static_cast<Deko3DCommandList *>(list);
         if (deferred(*cl))
