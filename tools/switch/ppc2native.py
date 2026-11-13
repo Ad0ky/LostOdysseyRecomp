@@ -4,7 +4,7 @@
 Differences from XenonRecomp's output:
 - the function's private stack slots (N(r1) with N < SLOT_LIMIT, or at/above the frame size) are C++ locals;
 - single-precision fadds/fsubs/fmuls run in float (double rounding through double is innocuous for them);
-  fmadds/fmsubs are computed in double, then rounded to float, as the recompiled code does.
+  fmadds/fmsubs are computed as the recompiled code computes them (LoFmadds / LoFmsubs, cpu/guest_fmadds.h).
 Usage: ppc2native.py LISTING START_ADDRESS FRAME_SIZE FUNC_NAME > out.inc
 LISTING: the '// insn' comment lines and 'loc_XXXXXXXX:' labels of the recompiled function, in order.
 """
@@ -430,8 +430,8 @@ for kind, a, t in items:
         emit(f'{args[0]} = {args[1]} {sym} {args[2]}; {c}'); continue
     if op in ('fmadds', 'fmsubs'):
         d, fa, fc, fb = args
-        sign = '' if op == 'fmadds' else '-'
-        emit(f'{d} = float(std::fma(double({fa}), double({fc}), {sign}double({fb}))); {c}'); continue
+        fn = 'LoFmadds' if op == 'fmadds' else 'LoFmsubs'
+        emit(f'{d} = float({fn}({fa}, {fc}, {fb})); {c}'); continue
     # VMX, per element only here: lanes kept in guest element order (each word byte-swapped), flushing on.
     if op in ('lvx128', 'stvx128'):
         v, ra, rb = args

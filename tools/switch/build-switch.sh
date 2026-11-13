@@ -118,8 +118,13 @@ if [ ! -f "$root/LostOdysseyRecompLib/ppc/ppc_func_mapping.cpp" ]; then
     python3 -B tools/switch/ppc_elide.py --in LostOdysseyRecompLib/ppc --out LostOdysseyRecompLib/ppc \
         --runtime LostOdysseyRecomp --toml LostOdysseyRecompLib/config/LostOdysseyRecomp.toml
 fi
-# The generated ppc_context.h must carry the Switch (GCC) shims.
-cp tools/XenonRecomp/XenonUtils/ppc_context.h LostOdysseyRecompLib/ppc/ppc_context.h
+# fmadds and friends rounded once in single precision, as the Xenon does (LostOdysseyRecomp/cpu/guest_fmadds.h). Runs on
+# every build so code generated before this step gets it too; it only writes the files it changes (none once done).
+python3 -B tools/switch/ppc_fmadds.py --ppc LostOdysseyRecompLib/ppc
+# The generated ppc_context.h must carry the Switch (GCC) shims. Copied only when it differs: every ppc_recomp.*.cpp
+# includes it, so a fresh mtime alone recompiles all of them (~450 objects) on every build.
+cmp -s tools/XenonRecomp/XenonUtils/ppc_context.h LostOdysseyRecompLib/ppc/ppc_context.h ||
+    cp tools/XenonRecomp/XenonUtils/ppc_context.h LostOdysseyRecompLib/ppc/ppc_context.h
 
 # ---------------------------------------------------------------- build
 if [ "$PGO" = USE ] && ! find "$PGO_DIR" -name '*.gcda' -print -quit 2>/dev/null | grep -q .; then
