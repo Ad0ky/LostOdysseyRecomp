@@ -638,7 +638,9 @@ registers, with an `fcvt` on each side. `tools/switch/ppc_fmadds.py` (run by `bu
 exact floats, otherwise the double form as before (NaNs whose bits don't survive the round trip, doubles in a float
 register). GCC folds the exactness test away wherever it sees where an input came from. The natives that mirror
 `fmadds` (math leaves, collision, animation nodes, reverb, and `ppc2native.py`) use the same functions, so their check
-modes still compare equal. `LO_SWITCH_FMADDS_DOUBLE=ON` builds the old form.
+modes still compare equal: on the console (town and first battle, one run each, all four at 2) 5,242,880 calls of
+`sub_822C73E8` in each scene, 3,145,728 of `sub_822B3688` and 24,576 of `sub_82CCA0B0` in town, with 0 differences, and no
+collision difference (fewer than 65,536 calls, the first count it logs). `LO_SWITCH_FMADDS_DOUBLE=ON` builds the old form.
 
 `tools/switch/check_fmadds.py` compares the four functions with the exact result rounded once (fractions, ties to even,
 subnormals and overflow) on 270,080 float operand sets, and 41,512 sets with NaNs, infinities or doubles against the
