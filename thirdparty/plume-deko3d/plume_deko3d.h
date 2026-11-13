@@ -245,6 +245,9 @@ namespace plume {
         // a write or destruction before then waits for it (Deko3DRecordWaitSet). 0: never bound by a recorded list.
         mutable std::atomic<uint64_t> recordTicket{0};
 
+        // LostOdysseyRecomp (2026-11-13): a Deko3DTracedDescriptorSet.
+        bool traced = false;
+
         Deko3DDescriptorSet(Deko3DDevice *device, const RenderDescriptorSetDesc &desc);
         ~Deko3DDescriptorSet() override;
         void setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) override;
@@ -255,6 +258,18 @@ namespace plume {
     };
     // Before the set changes or goes: the worker done with the recorded list that bound it, if that list is still open.
     void Deko3DRecordWaitSet(const Deko3DDescriptorSet &set, Deko3DRecordWait why);
+
+    // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE): the descriptor set the device makes while a trace is asked for
+    // (as Deko3DTracedCommandList). It remembers the texture of each image descriptor, so a traced stretch can say what
+    // its draws sample: render targets first, then plain textures (the cropped copies of resolved surfaces are plain).
+    struct Deko3DTracedDescriptorSet : Deko3DDescriptorSet {
+        std::vector<const Deko3DTexture *> targets;  // by image id (descriptor index - imageFirst)
+        // Whether each was a render or depth target when it was set: passSampled only compares the pointers, never
+        // reads through them (a descriptor no draw uses any more may hold a texture that is gone).
+        std::vector<uint8_t> isTarget;
+        Deko3DTracedDescriptorSet(Deko3DDevice *device, const RenderDescriptorSetDesc &desc);
+        void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
+    };
 
     struct Deko3DPipeline : RenderPipeline {
         enum class Type { Graphics, Compute };
@@ -305,6 +320,8 @@ namespace plume {
         // after a pipeline of other state sends only the groups that differ (kStateGroups, Deko3DCommandList).
         const DkShader *stageShaders[3] = {};
         const DkShader *earlyFragment = nullptr;  // stageShaders[2] with early fragment tests (LostOdysseyRecomp)
+        // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE): a hash of each stage's source shader (0 when not traced).
+        uint64_t traceShader[3] = {};
         uint64_t groupHash[9] = {};
         // LostOdysseyRecomp (2026-11-03): a recorded setPipeline may still point at it (here, not in the base: its
         // members are gone by the base's destructor).
@@ -335,6 +352,8 @@ namespace plume {
         bool srgb[8] = {};
         // LostOdysseyRecomp (2026-11-04): unique per framebuffer made, so a new one at a freed one's address differs.
         uint64_t serial = 0;
+        // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE): colour attachment 0 and the depth attachment.
+        const Deko3DTexture *colorTexture = nullptr, *depthTexture = nullptr;
         // LostOdysseyRecomp (2026-11-03): a recorded setFramebuffer may still point at it.
         ~Deko3DFramebuffer() override { Deko3DRecordDrain(Deko3DRecordWait::FramebufferDestroyed); }
         uint32_t getWidth() const override { return width; }
@@ -534,6 +553,52 @@ namespace plume {
         void bindGraphicsBuffers();
         void bindTextures();
         void restoreScissors();
+        // LostOdysseyRecomp (2026-11-13): a Deko3DTracedCommandList.
+        bool traceable = false;
+    };
+
+    // LostOdysseyRecomp (2026-11-13, LO_GPU_PASS_TRACE / LO_GPU_TIMELINE; plume_deko3d_api.h): the command list the
+    // queue makes while either is set in the environment. Its overrides put the trace's marks around the base
+    // class's calls. Without the traces the lists are plain Deko3DCommandList and none of this runs: the functions a
+    // PGO profile was made from keep their flow graphs, so the profile still fits them.
+    // A mark is the reports written at one point of the list (mark 0 where the trace began); stretch i ends at mark
+    // i + 1, and the trace's end adds a last mark.
+    struct Deko3DTracedCommandList : Deko3DCommandList {
+        DkMemBlock traceBlock = nullptr;   // PassReportsPerMark reports of 16 bytes per mark
+        uint32_t marks = 0;
+        bool tracing = false;              // between Deko3DPassTraceBegin and Deko3DPassTraceEnd
+        bool armed = false;                // stretches are recorded (not only the list's begin and end)
+        bool perDraw = false;              // every draw is a stretch of its own
+        bool counters = false, truncated = false;
+        bool afterCopy = false;            // the open stretch is a copy: it ends after the barrier recorded behind it
+        bool inOperation = false;          // inside an override that calls the base class
+        Deko3DPassSegment openSegment;     // the stretch being recorded
+        uint64_t openDraws = 0;            // statDraws when it began
+        Deko3DCounters openCounters;       // the back end's totals when it began
+        std::vector<Deko3DPassSegment> segments;
+
+        Deko3DTracedCommandList(Deko3DCommandQueue *queue);
+        ~Deko3DTracedCommandList() override;
+        void passMark();
+        void passClose();
+        void passTarget(const Deko3DFramebuffer *f);
+        void passOperation(uint8_t kind, const Deko3DTexture *dst, const Deko3DTexture *src, uint32_t width, uint32_t height, uint64_t bytes);
+        void passCancel();
+        void passSampled();
+
+        void begin() override;
+        void drawInstanced(uint32_t vertexCountPerInstance, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation) override;
+        void drawIndexedInstanced(uint32_t indexCountPerInstance, uint32_t instanceCount, uint32_t startIndexLocation, int32_t baseVertexLocation, uint32_t startInstanceLocation) override;
+        void dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) override;
+        void setFramebuffer(const RenderFramebuffer *framebuffer) override;
+        void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
+        void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override;
+        void copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) override;
+        void copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) override;
+        void copyBuffer(const RenderBuffer *dstBuffer, const RenderBuffer *srcBuffer) override;
+        void copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override;
+        void resolveTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override;
+        void resolveTextureRegion(const RenderTexture *dstTexture, uint32_t dstX, uint32_t dstY, const RenderTexture *srcTexture, const RenderRect *srcRect, RenderResolveMode resolveMode) override;
     };
 
     struct Deko3DCommandQueue : RenderCommandQueue {

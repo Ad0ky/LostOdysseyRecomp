@@ -11,7 +11,7 @@
 // In a busy street these two were about 3% of Guest Main by themselves.
 // Here the traversal, the flag tests (sub_822ADB48, sub_822D7BB8), the child bounds and the next-child choice run
 // natively, in the guest's order, with its loads, stores and single-precision arithmetic (sums and products rounded
-// to single, fmadds as one fused double operation rounded to single). The calls to other game code are the guest's,
+// to single, fmadds as cpu/guest_fmadds.h computes it). The calls to other game code are the guest's,
 // with its arguments and stack: the virtual calls (+324, +364, +380), the box test sub_826C8FC0, the memory stack
 // sub_824E8530 and the copy sub_82B7A0B0. Each level has its guest frame (back chain, result and box test inputs at
 // the guest's offsets), so callees and stack walks see the same stack; the line check's child bounds, which only the
@@ -24,6 +24,7 @@
 #include <stdafx.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <cpu/guest_fmadds.h>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -127,7 +128,7 @@ namespace
     // fadds, fmuls, fmadds as the recompiled code computes them.
     double AddSingle(double a, double b) { return double(float(a + b)); }
     double MulSingle(double a, double b) { return double(float(a * b)); }
-    double MaddSingle(double a, double c, double b) { return double(float(std::fma(a, c, b))); }
+    double MaddSingle(double a, double c, double b) { return LoFmadds(a, c, b); }
 
     // Mode 2 records the tags the native code set, to undo them before the guest's run.
     struct TagUndo

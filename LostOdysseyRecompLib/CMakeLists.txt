@@ -23,15 +23,20 @@ if(LO_TARGET_PLATFORM STREQUAL "switch" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
     # UnleashedRecomp-NX.
     target_compile_options(LostOdysseyRecompLib PRIVATE
         -frounding-math -fno-math-errno -fno-trapping-math -fomit-frame-pointer)
+    # The single-precision fused multiply-adds, which tools/switch/ppc_fmadds.py writes as LoFmadds(...) and friends.
+    # SHELL: keeps CMake from merging this -include with the one below.
+    target_compile_options(LostOdysseyRecompLib PRIVATE
+        "SHELL:-include \"${CMAKE_SOURCE_DIR}/LostOdysseyRecomp/cpu/guest_fmadds.h\"")
     if(LO_SWITCH_RECOMP_O2)
         target_compile_options(LostOdysseyRecompLib PRIVATE -O2)
     endif()
-    # FP contraction stays at GCC's default (-ffp-contract=fast). PowerPC fmadd/fmadds
-    # are fused, and XenonRecomp writes each one as one expression (a * b + c), so
-    # contraction keeps them fused; -ffp-contract=off would split about 32,000 of them
-    # into two roundings. Only separate double fmul + fadd pairs fuse beyond that, and
-    # they are few (about 1,000 fmul); fmuls + fadds round to float in between, which
-    # blocks fusion. #17 ruled it out as that bug's cause. See #4.
+    # FP contraction stays at GCC's default (-ffp-contract=fast). PowerPC fmadd is
+    # fused, and XenonRecomp writes each one as one expression (a * b + c), so
+    # contraction keeps it fused. The single-precision fmadds family (about 32,000)
+    # no longer depends on it: ppc_fmadds.py makes each one an explicit fused call.
+    # Only separate double fmul + fadd pairs fuse beyond that, and they are few
+    # (about 1,000 fmul); fmuls + fadds round to float in between, which blocks
+    # fusion. #17 ruled it out as that bug's cause. See #4.
     # LO_SWITCH_FP_CONTRACT_OFF is for A/B tests: -ffp-contract=on (GCC 15) still fuses
     # within one expression, so fmadd stays fused and only those pairs split.
     if(LO_SWITCH_FP_CONTRACT_OFF)

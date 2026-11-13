@@ -2503,7 +2503,452 @@ namespace plume {
 #endif
     }
 
+    // ---- LO_GPU_PASS_TRACE / LO_GPU_TIMELINE (LostOdysseyRecomp, 2026-11-13; plume_deko3d_api.h)
+
+    // The reports of a mark: the timestamp, then (with counters) the samples passed and the fragment and vertex shader
+    // invocations so far. A report is the 64-bit counter, then the GPU's clock when it was written.
+    static constexpr uint32_t PassReportsPerMark = 4;
+    static constexpr uint32_t PassMaxMarks = 4096;
+
+    bool Deko3DPassTraceAvailable() {
+        static const bool wanted = envInt("LO_GPU_PASS_TRACE", 0) != 0 || envInt("LO_GPU_TIMELINE", 0) != 0;
+        return wanted && !g_recorder;
+    }
+
+    static uint64_t passCopies() {
+        const Deko3DStats &st = GetDeko3DStats();
+        const auto r = [](const std::atomic<uint64_t> &v) { return v.load(std::memory_order_relaxed); };
+        return r(st.copyBuffer) + r(st.copyUpload) + r(st.copyReadback) + r(st.copyImage) + r(st.copyResolve) + r(st.copyBlit);
+    }
+
+    Deko3DTracedCommandList::Deko3DTracedCommandList(Deko3DCommandQueue *queue) : Deko3DCommandList(queue) {
+        traceable = true;
+        traceBlock = device->makeBlock(alignUp(PassMaxMarks * PassReportsPerMark * 16, DK_MEMBLOCK_ALIGNMENT),
+            DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "pass trace");
+        segments.reserve(256);
+    }
+
+    Deko3DTracedCommandList::~Deko3DTracedCommandList() {
+        if (device->queue)
+            dkQueueWaitIdle(device->queue);  // the reports of its last submission are written
+        if (traceBlock)
+            device->destroyBlock(traceBlock);
+    }
+
+    void Deko3DTracedCommandList::passMark() {
+        const DkGpuAddr at = dkMemBlockGetGpuAddr(traceBlock) + uint64_t(marks) * PassReportsPerMark * 16;
+        dkCmdBufReportCounter(cmd, DkCounter_Timestamp, at);
+        if (counters) {
+            dkCmdBufReportCounter(cmd, DkCounter_SamplesPassed, at + 16);
+            dkCmdBufReportCounter(cmd, DkCounter_FragmentShaderInvocations, at + 32);
+            dkCmdBufReportCounter(cmd, DkCounter_VertexShaderInvocations, at + 48);
+        }
+        marks++;
+    }
+
+    // Ends the open stretch if it did any work; the next one starts with the same targets and note.
+    void Deko3DTracedCommandList::passClose() {
+        if (!armed)
+            return;
+        Deko3DPassSegment &s = openSegment;
+        s.draws = uint32_t(statDraws - openDraws);
+        if (!s.draws && !s.clears && s.kind == Deko3DPassSegment::Draws)
+            return;
+        if (marks + 2 > PassMaxMarks) {  // room for the trace's last mark
+            truncated = true;
+            armed = false;
+            return;
+        }
+        // A copy: the barrier the caller recorded behind it (still held when barriers are merged) waits for the copy
+        // engine, so it belongs to the copy. It would go out before the next work anyway.
+        if (afterCopy)
+            flushBarriers();
+        const Deko3DCounters now = Deko3DReadCounters();
+        const Deko3DCounters &was = openCounters;
+        s.barriersFull = uint32_t(now.barriersFull - was.barriersFull);
+        s.barriersFragments = uint32_t(now.barriersFragments - was.barriersFragments);
+        s.barriersPrimitives = uint32_t(now.barriersPrimitives - was.barriersPrimitives);
+        s.barriersImageInvalidate = uint32_t(now.barriersImageInvalidate - was.barriersImageInvalidate);
+        s.pipelineBinds = uint32_t(now.pipelineBinds - was.pipelineBinds);
+        s.stateBinds = uint32_t(now.stateBinds - was.stateBinds);
+        s.descriptorWrites = uint32_t(now.descriptorWrites - was.descriptorWrites);
+        passMark();
+        segments.push_back(s);
+        if (afterCopy)
+            passCancel();  // the framebuffer bound before the copy is this stretch's no longer
+        s.kind = Deko3DPassSegment::Draws;
+        s.draws = s.clears = 0;
+        s.bytes = 0;
+        s.elements = 0;
+        s.vertexShader = s.pixelShader = 0;
+        s.sampledCount = 0;
+        openDraws = statDraws;
+        openCounters = now;
+    }
+
+    // The open stretch has no targets until the next setFramebuffer names them (passOperation made sure it binds).
+    void Deko3DTracedCommandList::passCancel() {
+        char note[sizeof(openSegment.note)];
+        memcpy(note, openSegment.note, sizeof(note));
+        openSegment = Deko3DPassSegment();
+        memcpy(openSegment.note, note, sizeof(note));
+        afterCopy = false;
+    }
+
+    void Deko3DTracedCommandList::passTarget(const Deko3DFramebuffer *f) {
+        passClose();
+        Deko3DPassSegment &s = openSegment;
+        s.width = f->width;
+        s.height = f->height;
+        s.colorCount = uint8_t(f->colorCount);
+        s.hasDepth = f->hasDepth;
+        s.color = f->colorTexture;
+        s.depth = f->depthTexture;
+        s.colorFormat = f->colorTexture ? f->colorTexture->desc.format : RenderFormat::UNKNOWN;
+        s.depthFormat = f->depthTexture ? f->depthTexture->desc.format : RenderFormat::UNKNOWN;
+        s.source = nullptr;
+        s.sourceWidth = s.sourceHeight = 0;
+        s.sourceFormat = RenderFormat::UNKNOWN;
+    }
+
+    // A copy-engine or 2D-engine operation about to be recorded: a stretch of its own.
+    void Deko3DTracedCommandList::passOperation(uint8_t kind, const Deko3DTexture *dst, const Deko3DTexture *src, uint32_t width, uint32_t height, uint64_t bytes) {
+        passClose();
+        Deko3DPassSegment &s = openSegment;
+        s.kind = kind;
+        s.width = width;
+        s.height = height;
+        s.colorCount = 0;
+        s.hasDepth = false;
+        s.color = dst;
+        s.depth = nullptr;
+        s.colorFormat = dst ? dst->desc.format : RenderFormat::UNKNOWN;
+        s.depthFormat = RenderFormat::UNKNOWN;
+        s.source = src;
+        s.sourceWidth = src ? src->desc.width : 0;
+        s.sourceHeight = src ? src->desc.height : 0;
+        s.sourceFormat = src ? src->desc.format : RenderFormat::UNKNOWN;
+        s.bytes = bytes;
+        afterCopy = true;
+        framebufferSerial = 0;  // the next setFramebuffer binds (and names the targets) even if it is the same one
+    }
+
+    namespace {
+        // Around a base-class copy: its stretch, dropped again if the base class copied nothing (bad arguments, an
+        // empty rectangle).
+        struct PassOperation {
+            Deko3DTracedCommandList &cl;
+            const bool active;
+            uint64_t before = 0;
+            PassOperation(Deko3DTracedCommandList &cl, uint8_t kind, const RenderTexture *dst, const RenderTexture *src, uint32_t width,
+                          uint32_t height, uint64_t bytes = 0) : cl(cl), active(cl.armed && !cl.inOperation) {
+                if (!active)
+                    return;
+                cl.passOperation(kind, static_cast<const Deko3DTexture *>(dst), static_cast<const Deko3DTexture *>(src), width, height, bytes);
+                cl.inOperation = true;
+                before = passCopies();
+            }
+            ~PassOperation() {
+                if (!active)
+                    return;
+                cl.inOperation = false;
+                if (passCopies() == before)
+                    cl.passCancel();
+            }
+        };
+    }
+
+    void Deko3DTracedCommandList::begin() {
+        Deko3DCommandList::begin();
+        tracing = armed = inOperation = false;  // a trace is of one recording of the list
+        marks = 0;
+    }
+
+    void Deko3DTracedCommandList::setFramebuffer(const RenderFramebuffer *fb) {
+        const Deko3DFramebuffer *f = static_cast<const Deko3DFramebuffer *>(fb);
+        // Where the base class binds (not a repeat of the framebuffer bound): the draws into the targets before end.
+        if (armed && f && !(f == framebuffer && f->serial == framebufferSerial))
+            passTarget(f);
+        Deko3DCommandList::setFramebuffer(fb);
+    }
+
+    // LO_GPU_EXPERIMENT (gpu/gpu_trace.h), bits 16 and 32: what the invalidation before a draw costs the GPU. The base
+    // class drops the descriptor and shader caches before the first draw after any descriptor was written or shader
+    // code loaded (flushDescriptorInvalidate). 16: never (stale descriptors possible: diagnostic only). 32: the
+    // descriptor caches without the shader caches.
+    static int passExperiment() {
+        static const int bits = envInt("LO_GPU_EXPERIMENT", 0);
+        return bits;
+    }
+    static void passExperimentInvalidate(Deko3DTracedCommandList &cl) {
+        const int bits = passExperiment();
+        if (!(bits & 48))
+            return;
+        const uint64_t epoch = cl.currentEpoch();
+        if (epoch == cl.descriptorEpoch)
+            return;
+        if (bits & 32) {
+            cl.flushBarriers();
+            dkCmdBufBarrier(cl.cmd, DkBarrier_None, DkInvalidateFlags_Descriptors);
+        }
+        cl.descriptorEpoch = epoch;
+    }
+
+    // The textures the draw about to be recorded samples: the image descriptors its shaders have a binding for
+    // (the pipeline's textureSources), in the sets bound now. Render targets first, so plain textures never take
+    // their places in the list.
+    void Deko3DTracedCommandList::passSampled() {
+        const Deko3DGraphicsPipeline *p = graphicsPipeline;
+        if (!p || !p->valid)
+            return;
+        Deko3DPassSegment &s = openSegment;
+        const uint32_t limit = uint32_t(std::size(s.sampled));
+        for (int plain = 0; plain < 2; plain++) {
+            for (int st = 0; st < 3; st++) {
+                for (const Deko3DSpirvTexture &src : p->textureSources[st]) {
+                    const Deko3DDescriptorSet *set = src.imageSet < 8 ? graphicsSets[src.imageSet] : nullptr;
+                    if (!set || !set->traced || src.imageIndex < set->imageFirst)
+                        continue;
+                    const auto *traced = static_cast<const Deko3DTracedDescriptorSet *>(set);
+                    const uint32_t id = src.imageIndex - set->imageFirst;
+                    const Deko3DTexture *t = id < traced->targets.size() ? traced->targets[id] : nullptr;
+                    if (!t || int(!traced->isTarget[id]) != plain)
+                        continue;
+                    bool known = false;
+                    for (uint32_t i = 0; i < s.sampledCount; i++)
+                        known = known || s.sampled[i] == t;
+                    if (!known && s.sampledCount < limit)
+                        s.sampled[s.sampledCount++] = t;
+                }
+            }
+        }
+    }
+
+    // A draw about to be recorded: what it samples, its size and its shaders, into the open stretch.
+    static void passDraw(Deko3DTracedCommandList &cl, uint32_t count, uint32_t instances) {
+        cl.passSampled();
+        Deko3DPassSegment &s = cl.openSegment;
+        if (const Deko3DGraphicsPipeline *p = cl.graphicsPipeline; p && p->valid) {
+            s.elements += uint64_t(count) * std::max<uint32_t>(instances, 1);
+            s.vertexShader = p->traceShader[0];
+            s.pixelShader = p->traceShader[2];
+            const DkDepthStencilState &ds = p->depthStencil;
+            const bool stencilWrites = ds.stencilTestEnable && p->stencilWriteMask &&
+                (ds.stencilFrontFailOp != DkStencilOp_Keep || ds.stencilFrontPassOp != DkStencilOp_Keep ||
+                 ds.stencilFrontDepthFailOp != DkStencilOp_Keep || ds.stencilBackFailOp != DkStencilOp_Keep ||
+                 ds.stencilBackPassOp != DkStencilOp_Keep || ds.stencilBackDepthFailOp != DkStencilOp_Keep);
+            s.state = uint32_t(ds.depthTestEnable) | uint32_t(ds.depthWriteEnable) << 1 | uint32_t(ds.stencilTestEnable) << 2 |
+                uint32_t(ds.depthCompareOp) << 4 | uint32_t(cl.earlyFragmentTests && p->earlyFragment) << 8 |
+                uint32_t(p->earlyFragment != nullptr) << 9 | uint32_t(p->color.blendEnableMask & 1) << 10 |
+                (p->colorWrite.masks & 0xF) << 12 | uint32_t(stencilWrites) << 16 | uint32_t(ds.stencilFrontCompareOp) << 20;
+        }
+    }
+
+    void Deko3DTracedCommandList::drawInstanced(uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance) {
+        if (armed)
+            passDraw(*this, vertexCount, instanceCount);
+        passExperimentInvalidate(*this);
+        Deko3DCommandList::drawInstanced(vertexCount, instanceCount, startVertex, startInstance);
+        if (armed && perDraw)
+            passClose();
+    }
+
+    void Deko3DTracedCommandList::drawIndexedInstanced(uint32_t indexCount, uint32_t instanceCount, uint32_t startIndex, int32_t baseVertex, uint32_t startInstance) {
+        if (armed)
+            passDraw(*this, indexCount, instanceCount);
+        passExperimentInvalidate(*this);
+        Deko3DCommandList::drawIndexedInstanced(indexCount, instanceCount, startIndex, baseVertex, startInstance);
+        if (armed && perDraw)
+            passClose();
+    }
+
+    void Deko3DTracedCommandList::dispatch(uint32_t x, uint32_t y, uint32_t z) {
+        const bool stretch = armed && !inOperation && computePipeline && computePipeline->valid;
+        if (stretch) {
+            passClose();
+            passCancel();
+            openSegment.kind = Deko3DPassSegment::Compute;
+            openSegment.width = x;
+            openSegment.height = y;
+            framebufferSerial = 0;
+        }
+        Deko3DCommandList::dispatch(x, y, z);
+        if (stretch) {
+            passClose();
+            passCancel();
+        }
+    }
+
+    void Deko3DTracedCommandList::clearColor(uint32_t attachmentIndex, RenderColor color, const RenderRect *rects, uint32_t rectsCount) {
+        const bool stretch = armed && !inOperation;  // a clear call is a stretch of its own
+        if (stretch) {
+            passClose();
+            openSegment.kind = Deko3DPassSegment::Clear;
+            openSegment.clears = std::max<uint32_t>(rectsCount, 1);
+        }
+        Deko3DCommandList::clearColor(attachmentIndex, color, rects, rectsCount);
+        if (stretch)
+            passClose();
+    }
+
+    void Deko3DTracedCommandList::clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *rects, uint32_t rectsCount) {
+        const bool stretch = armed && !inOperation;
+        if (stretch) {
+            passClose();
+            openSegment.kind = Deko3DPassSegment::Clear;
+            openSegment.clears = std::max<uint32_t>(rectsCount, 1);
+        }
+        Deko3DCommandList::clearDepthStencil(clearDepth, clearStencil, depthValue, stencilValue, rects, rectsCount);
+        if (stretch)
+            passClose();
+    }
+
+    void Deko3DTracedCommandList::copyBufferRegion(RenderBufferReference dst, RenderBufferReference src, uint64_t size) {
+        PassOperation operation(*this, Deko3DPassSegment::CopyBuffer, nullptr, nullptr, 0, 0, size);
+        Deko3DCommandList::copyBufferRegion(dst, src, size);
+    }
+
+    void Deko3DTracedCommandList::copyTextureRegion(const RenderTextureCopyLocation &dstLoc, const RenderTextureCopyLocation &srcLoc, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) {
+        uint8_t kind = Deko3DPassSegment::CopyImage;
+        const RenderTexture *dst = nullptr, *src = nullptr;
+        uint32_t width = 0, height = 0;
+        uint64_t bytes = 0;
+        if (dstLoc.type == RenderTextureCopyType::SUBRESOURCE && srcLoc.type == RenderTextureCopyType::PLACED_FOOTPRINT) {
+            kind = Deko3DPassSegment::Upload;
+            dst = dstLoc.texture;
+            width = srcLoc.placedFootprint.width;
+            height = srcLoc.placedFootprint.height;
+            bytes = uint64_t(srcLoc.placedFootprint.rowWidth) * srcLoc.placedFootprint.height;  // texels
+        }
+        else if (dstLoc.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLoc.type == RenderTextureCopyType::SUBRESOURCE) {
+            kind = Deko3DPassSegment::Readback;
+            src = srcLoc.texture;
+            width = srcBox ? uint32_t(srcBox->right - srcBox->left) : dstLoc.placedFootprint.width;
+            height = srcBox ? uint32_t(srcBox->bottom - srcBox->top) : dstLoc.placedFootprint.height;
+        }
+        else {
+            dst = dstLoc.texture;
+            src = srcLoc.texture;
+            const Deko3DTexture *st = static_cast<const Deko3DTexture *>(src);
+            width = srcBox ? uint32_t(srcBox->right - srcBox->left) : st ? st->desc.width : 0;
+            height = srcBox ? uint32_t(srcBox->bottom - srcBox->top) : st ? st->desc.height : 0;
+        }
+        PassOperation operation(*this, kind, dst, src, width, height, bytes);
+        Deko3DCommandList::copyTextureRegion(dstLoc, srcLoc, dstX, dstY, dstZ, srcBox);
+    }
+
+    void Deko3DTracedCommandList::copyBuffer(const RenderBuffer *dst, const RenderBuffer *src) {
+        PassOperation operation(*this, Deko3DPassSegment::CopyBuffer, nullptr, nullptr, 0, 0);
+        Deko3DCommandList::copyBuffer(dst, src);
+    }
+
+    void Deko3DTracedCommandList::copyTexture(const RenderTexture *dst, const RenderTexture *src) {
+        const Deko3DTexture *st = static_cast<const Deko3DTexture *>(src);
+        PassOperation operation(*this, Deko3DPassSegment::CopyImage, dst, src, st ? st->desc.width : 0, st ? st->desc.height : 0);
+        Deko3DCommandList::copyTexture(dst, src);
+    }
+
+    void Deko3DTracedCommandList::resolveTexture(const RenderTexture *dst, const RenderTexture *src) {
+        const Deko3DTexture *st = static_cast<const Deko3DTexture *>(src);
+        PassOperation operation(*this, Deko3DPassSegment::Resolve, dst, src, st ? st->desc.width : 0, st ? st->desc.height : 0);
+        Deko3DCommandList::resolveTexture(dst, src);
+    }
+
+    void Deko3DTracedCommandList::resolveTextureRegion(const RenderTexture *dst, uint32_t dstX, uint32_t dstY, const RenderTexture *src, const RenderRect *srcRect, RenderResolveMode resolveMode) {
+        const Deko3DTexture *st = static_cast<const Deko3DTexture *>(src);
+        PassOperation operation(*this, Deko3DPassSegment::Blit, dst, src, srcRect ? uint32_t(srcRect->right - srcRect->left) : st ? st->desc.width : 0,
+            srcRect ? uint32_t(srcRect->bottom - srcRect->top) : st ? st->desc.height : 0);
+        Deko3DCommandList::resolveTextureRegion(dst, dstX, dstY, src, srcRect, resolveMode);
+    }
+
+    static Deko3DTracedCommandList *tracedList(RenderCommandList *list) {
+        Deko3DCommandList *cl = static_cast<Deko3DCommandList *>(list);
+        return cl && cl->traceable ? static_cast<Deko3DTracedCommandList *>(cl) : nullptr;
+    }
+
+    bool Deko3DPassTraceBegin(RenderCommandList *list, uint32_t mode) {
+        Deko3DTracedCommandList *cl = tracedList(list);
+        if (!cl || !cl->open || !cl->traceBlock)
+            return false;
+        cl->marks = 0;
+        cl->segments.clear();
+        cl->tracing = true;
+        cl->armed = mode >= 1;
+        cl->counters = mode >= 2;
+        cl->perDraw = mode >= 3;
+        cl->truncated = false;
+        cl->afterCopy = cl->inOperation = false;
+        cl->openSegment = Deko3DPassSegment();
+        cl->openDraws = cl->statDraws;
+        cl->openCounters = Deko3DReadCounters();
+        if (cl->armed && cl->framebuffer)
+            cl->passTarget(cl->framebuffer);
+        cl->passMark();
+        return true;
+    }
+
+    void Deko3DPassTraceNote(RenderCommandList *list, const char *note) {
+        Deko3DTracedCommandList *cl = tracedList(list);
+        if (!cl || !cl->armed)
+            return;
+        cl->passClose();
+        char *to = cl->openSegment.note;
+        memset(to, 0, sizeof(Deko3DPassSegment::note));
+        if (note)
+            strncpy(to, note, sizeof(Deko3DPassSegment::note) - 1);
+    }
+
+    void Deko3DPassTraceEnd(RenderCommandList *list) {
+        Deko3DTracedCommandList *cl = tracedList(list);
+        if (!cl || !cl->tracing)
+            return;
+        cl->passClose();
+        cl->armed = cl->tracing = false;
+        // The last mark, behind any barrier still held (end() would emit it next): the list's end.
+        cl->flushBarriers();
+        cl->passMark();
+    }
+
+    // Samples passed between two reports (plume_deko3d.cpp's samplesBetween: the count's two layouts).
+    static uint64_t passSamples(uint64_t begin, uint64_t end) {
+        if (uint32_t(begin) != uint32_t(end))
+            return end - begin;
+        return uint32_t(uint32_t(end >> 32) - uint32_t(begin >> 32));
+    }
+
+    bool Deko3DPassTraceRead(RenderCommandList *list, std::vector<Deko3DPassSegment> &out, uint64_t &beginNs, uint64_t &endNs, bool &wasTruncated) {
+        Deko3DTracedCommandList *cl = tracedList(list);
+        out.clear();
+        if (!cl || cl->tracing || cl->marks < 2)
+            return false;
+        const volatile uint64_t *reports = static_cast<const volatile uint64_t *>(dkMemBlockGetCpuAddr(cl->traceBlock));
+        const uint32_t per = PassReportsPerMark * 2;
+        beginNs = dkTimestampToNs(reports[1]);
+        endNs = dkTimestampToNs(reports[size_t(cl->marks - 1) * per + 1]);
+        wasTruncated = cl->truncated;
+        uint64_t before[4] = {reports[1], reports[2], reports[4], reports[6]};
+        for (uint32_t i = 0; i < cl->segments.size() && i + 2 < cl->marks; i++) {
+            const volatile uint64_t *r = reports + size_t(i + 1) * per;
+            const uint64_t now[4] = {r[1], r[2], r[4], r[6]};
+            Deko3DPassSegment s = cl->segments[i];
+            s.endNs = dkTimestampToNs(now[0]);
+            s.gpuNs = now[0] >= before[0] ? dkTimestampToNs(now[0]) - dkTimestampToNs(before[0]) : 0;
+            if (cl->counters) {
+                s.samples = passSamples(before[1], now[1]);
+                s.fragments = now[2] - before[2];
+                s.vertices = now[3] - before[3];
+            }
+            out.push_back(s);
+            memcpy(before, now, sizeof(before));
+        }
+        cl->marks = 0;  // read once
+        return true;
+    }
+
     std::unique_ptr<RenderCommandList> Deko3DCommandQueue::createCommandList() {
+        // LostOdysseyRecomp (2026-11-13): a traceable list only while a trace is asked for (plume_deko3d.h).
+        if (Deko3DPassTraceAvailable())
+            return std::make_unique<Deko3DTracedCommandList>(this);
         return std::make_unique<Deko3DCommandList>(this);
     }
 

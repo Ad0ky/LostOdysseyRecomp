@@ -255,6 +255,8 @@ A release is a profile-guided build, about 6% faster than this one. See
 CMake options (`cmake/LoSwitch.cmake`): `LO_SWITCH_RECOMP_O2`,
 `LO_SWITCH_LTO`, `LO_SWITCH_DATA_ROOT`, `LO_SWITCH_APP_TITLE`.
 `LO_SWITCH_FP_CONTRACT_OFF` (off) builds the game code with `-ffp-contract=on` instead of GCC's `fast`, for A/B tests only (#4).
+`LO_SWITCH_FMADDS_DOUBLE` (off) computes the game's `fmadds` family in double, rounded twice, as before
+`tools/switch/ppc_fmadds.py`, for A/B tests only (see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md#single-precision-fused-multiply-adds)).
 
 ### Without a console toolchain
 
@@ -301,6 +303,8 @@ Switch-specific options and diagnostics:
 
 | Variable | Default | Effect |
 |---|---|---|
+| `LO_GUEST_BLOCKS` | `1` | `0` maps guest memory with 4 KiB pages, the old layout: the window off a 2 MiB boundary and its backing 4 KiB aligned. On, the virtual, A and C views are 2 MiB blocks (the E view, one 4 KiB page off A, never is). The log's `guest window` line says which |
+| `LO_TLB_TEST` | off | `N`: N seconds after start, logs what a TLB miss costs in each guest view and in the NRO's code and read-only data (`switch: tlb:` lines; a few ms, holds the commit lock). Tells 2 MiB blocks (a few ns) from 4 KiB pages; `svcQueryMemory` does not show the page size |
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, handheld uses 540 and docked uses 720 |
 | `LO_DYNAMIC_RESOLUTION` | Graphics menu (off) | `0` or `1` wins over Graphics → Dynamic resolution. `1`: the scene height follows the GPU's time per frame, in steps of 36 rows from the configured height (540 or 720) down to `LO_DYNAMIC_RESOLUTION_MIN` (default 80% of it: 432 or 576); the final pass scales it to the output as usual. The runtime log's `dynamic resolution:` lines show each change |
@@ -321,6 +325,9 @@ Switch-specific options and diagnostics:
 | `LO_THREAD_CORES` | off | With `LO_THREAD_PLACEMENT=1`: `name=core:hexmask,...` sets the ideal core and allowed mask of a thread of that name once a report finds it above 50% CPU, for placement experiments |
 | `LO_DEKO3D_HEAP_STATS` | off | `1`: deko3d's heap blocks are counted. The memory lines (`info`, every 30 s in the log) add `deko3d heap <KiB> in <n> blocks, control chunks <made> made <freed> freed (self-check <a> then <b>), heap uordblks <bytes>`. A steady scene makes no control chunks. The self-check at device creation clears a 3-chunk list 99 times: `then 0` means `clear()` keeps the chunks (fixed), `then 198` means it loses them (stock deko3d) |
 | `LO_DEKO3D_BARRIER_TRACE` | off | Set to `<n>`: every barrier of one frame in n goes to the log (`barrier trace:`), with what it waits for, its textures and the caller's address relative to `Deko3DBarrierTrace` |
+| `LO_GPU_PASS_TRACE` | off | `N`: every Nth presented frame, one `gpass:` log line per stretch of GPU work (the draws into one framebuffer, a clear, a copy) with its GPU time, targets and sampled targets. `LO_GPU_PASS_COUNTERS=1` adds samples passed and shader invocations, `LO_GPU_PASS_DRAWS=1` makes every draw a stretch. `tools/switch/gpu_passes.py` adds them up; see [SWITCH-GPU.md](SWITCH-GPU.md) (deko3d) |
+| `LO_GPU_TIMELINE` | off | `1`: one `gtl:` log line per frame with the render thread's submissions and waits and the GPU's begin and end of each list; `tools/switch/gpu_timeline.py` gives the GPU's busy and idle time (deko3d) |
+| `LO_GPU_EXPERIMENT` | off | Diagnostic bits for sizing single costs, never for playing: `1` no display gamma ramp, `2` no player curve (both change the image), `16` / `32` the cache invalidation before draws skipped / descriptors only (traced lists only). See [SWITCH-GPU.md](SWITCH-GPU.md) |
 | `LO_SWITCH_BUTTONS` | letter layout | Set to `position` to use the physical positional A/B/X/Y layout |
 | `LO_SWITCH_AUTO_SLEEP` | `1` | `0`: auto-sleep stays off for the whole session, as before: the console never sleeps while the game runs, though the screen still dims (benchmarks; `bench.py` writes it). `1`: the system's settings, with the screen kept on during movies, cutscenes, loads and the preparation screen (see [Clocks, sleep and the HOME menu](#clocks-sleep-and-the-home-menu)) |
 | `LO_SWITCH_IDLE_SECONDS` | off | Test only: `<dim>,<sleep>` seconds replace the system's dimming and sleep times for this session (`0,0` keeps them); with either, debug-server clients do not keep the screen on, so idle behaviour can be measured through the debug server (`screen`) |
@@ -614,7 +621,7 @@ instructions per call, so it shifts little time.
 |---|---|
 | Toolchain | devkitA64 GCC, libnx (`cmake/toolchains/switch-devkitA64.cmake`); `LO_PLATFORM_SWITCH` in `os/platform.h` |
 | Recompiled code | Same XenonRecomp output; GCC replacements for Clang builtins in `ppc_context.h` (`tools/patches/XenonRecomp-switch.patch`) |
-| Guest memory | 4 GiB `virtmem` reservation; pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
+| Guest memory | 4 GiB `virtmem` reservation, placed clear of the kernel map region, which holds thread-local pages and is invisible to `virtmem` (0x8000000-0x80000000 in a 36-bit process, 64 GiB at a random place in a 39-bit one); pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
 | Threads | Guest code threads get 4 MiB stacks (libnx defaults to 128 KiB) |
 | Graphics | plume Vulkan on statically linked Mesa NVK, `VK_NN_vi_surface` on the libnx window (`tools/patches/plume-switch.patch`, `volk-switch.patch`) |
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |
@@ -714,6 +721,7 @@ In the back end (`thirdparty/plume-deko3d`):
 | Commands recorded on a second thread, off by default | `LO_DEKO3D_RECORD_THREAD=1` | lowers `GPU CmdProc` time, but measured slower overall |
 | Hardware occlusion queries, in testing | `LO_DEKO3D_OCCLUSION` | real culling in towns |
 | Barrier trace | `LO_DEKO3D_BARRIER_TRACE` | diagnostics |
+| GPU pass trace and CPU/GPU timeline: each stretch of a frame's work timed on the GPU's clock (with counters, per draw), and when the render thread submitted, the GPU ran and the render thread waited | `LO_GPU_PASS_TRACE=N`, `LO_GPU_PASS_COUNTERS`, `LO_GPU_PASS_DRAWS`, `LO_GPU_TIMELINE`, `LO_GPU_EXPERIMENT` | diagnostics, off by default; read by `tools/switch/gpu_passes.py` and `gpu_timeline.py`; see [SWITCH-GPU.md](SWITCH-GPU.md) |
 
 In the renderer, on deko3d (`LostOdysseyRecomp/gpu`):
 

@@ -101,6 +101,8 @@ namespace gpu::renderer
     void PreparePresent(uint32_t physicalAddress);
     // A failed allocation epoch must not fall through to stale CPU frontbuffer data.
     bool SuppressPresent();
+    // LO_GPU_PASS_TRACE (gpu_trace.h): what a texture of a traced stretch is to the renderer ("-" for none, "?" unknown).
+    std::string TraceTextureName(const plume::RenderTexture* texture);
 
     // Guest memory range was written by the GPU (resolve) or is known dirty.
     void InvalidateGuestRange(uint32_t physicalAddress, uint32_t size);

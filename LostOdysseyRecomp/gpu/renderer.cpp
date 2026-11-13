@@ -5672,6 +5672,33 @@ void main()
                     std::chrono::steady_clock::now() - start).count());
             }
 
+#if defined(LO_SWITCH_DEKO3D)
+            // LO_GPU_PASS_TRACE (gpu_trace.h): what a texture of a traced stretch is. A render target: its EDRAM tile
+            // base, Xenos format, pitch and height in pixels, c or d. A resolve's destination: its guest address and
+            // destination format. Looked up when the trace is logged, so a target replaced since reads "?".
+            std::string TraceTextureName(const RenderTexture* texture)
+            {
+                if (!texture) return "-";
+                for (const auto& [key, target] : renderTargets)
+                    if (target && target->texture.get() == texture)
+                        return fmt::format("rt:{}:{}:{}x{}:{}{}", key.base, key.format, key.pitch, key.height,
+                            key.depth ? 'd' : 'c', target->shadowMap ? ":shadow" : "");
+                for (const auto& [base, list] : resolved)
+                    for (const auto& rs : list) {
+                        if ((rs.tex && rs.tex->texture.get() == texture) || (rs.own && rs.own->texture.get() == texture))
+                            return fmt::format("rs:{:x}:{}", base, rs.destFormat);
+                        if (rs.hdrTex && rs.hdrTex->texture.get() == texture) return fmt::format("rshdr:{:x}", base);
+                        for (const auto& [viewKey, view] : rs.fetchViews)
+                            if (view && view->texture.get() == texture) return fmt::format("rsview:{:x}:{}", base, rs.destFormat);
+                    }
+                for (const auto& slot : gpuSlots)
+                    for (const auto& bloom : slot.bloomPrefilterTextures)
+                        if (bloom && bloom->texture.get() == texture) return "bloomprefilter";
+                for (const auto& [key, tex] : textures)
+                    if (tex && tex->texture.get() == texture) return "tex";
+                return "?";
+            }
+#endif
             bool RecycleSlot(uint32_t i)
             {
                 auto& s = gpuSlots[i];
@@ -16570,6 +16597,14 @@ void main()
         return g_renderer && g_renderer->PlanSuppressed();
     }
 
+    std::string TraceTextureName(const plume::RenderTexture* texture)
+    {
+#if defined(LO_SWITCH_DEKO3D)
+        if (g_renderer) return g_renderer->TraceTextureName(texture);
+#endif
+        return texture ? "?" : "-";
+    }
+
     bool DrainForFrameGenerationReconfigure()
     {
         return !g_renderer || (g_renderer->Flush() && g_renderer->WaitForGpu());
@@ -17282,6 +17317,7 @@ void main()
     void Flush() {}
     void PreparePresent(uint32_t) {}
     bool SuppressPresent() { return false; }
+    std::string TraceTextureName(const plume::RenderTexture* texture) { return texture ? "?" : "-"; }
     void InvalidateGuestRange(uint32_t, uint32_t) {}
     bool SceneAAApplied(uint32_t) { return false; }
     plume::RenderTexture* AcquireResolvedSurface(uint32_t, uint32_t&, uint32_t&, uint32_t&,
