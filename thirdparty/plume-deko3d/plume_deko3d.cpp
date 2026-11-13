@@ -2438,10 +2438,13 @@ namespace plume {
     void Deko3DTracedDescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
         if (imageHeapBase != UINT32_MAX && descriptorIndex >= imageFirst && descriptorIndex - imageFirst < imageCount) {
             const uint32_t id = descriptorIndex - imageFirst;
-            if (targets.size() <= id)
+            if (targets.size() <= id) {
                 targets.resize(id + 1);
+                isTarget.resize(id + 1);
+            }
             const Deko3DTexture *t = static_cast<const Deko3DTexture *>(texture);
             targets[id] = t;
+            isTarget[id] = t && (t->desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET)) ? 1 : 0;
         }
         Deko3DDescriptorSet::setTexture(descriptorIndex, texture, textureLayout, textureView);
     }

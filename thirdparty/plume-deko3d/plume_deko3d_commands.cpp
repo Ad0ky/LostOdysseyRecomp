@@ -2709,10 +2709,10 @@ namespace plume {
                     const Deko3DDescriptorSet *set = src.imageSet < 8 ? graphicsSets[src.imageSet] : nullptr;
                     if (!set || !set->traced || src.imageIndex < set->imageFirst)
                         continue;
-                    const auto &targets = static_cast<const Deko3DTracedDescriptorSet *>(set)->targets;
+                    const auto *traced = static_cast<const Deko3DTracedDescriptorSet *>(set);
                     const uint32_t id = src.imageIndex - set->imageFirst;
-                    const Deko3DTexture *t = id < targets.size() ? targets[id] : nullptr;
-                    if (!t || int(!(t->desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET))) != plain)
+                    const Deko3DTexture *t = id < traced->targets.size() ? traced->targets[id] : nullptr;
+                    if (!t || int(!traced->isTarget[id]) != plain)
                         continue;
                     bool known = false;
                     for (uint32_t i = 0; i < s.sampledCount; i++)

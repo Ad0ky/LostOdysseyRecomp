@@ -52,24 +52,22 @@ different paths measured this, not the change.
 
 ## Is the GPU ever idle?
 
-| GPU per frame | Town, ms | Battle, ms |
-|---|---:|---:|
-| renderer batch (what `gpu_ms` reports) | 20.95 | 32.77 |
-| presentation list | 3.31 | 2.10 |
-| after the presentation, before the next batch starts (swapchain decompression, fence) | 0.10 to 0.31 | 0.36 |
-| waiting for the render thread | 0.9 (see below) | 0.08 |
-| frame | 25.3 | 35.4 |
+No. Both scenes are limited by the GPU (build made at the profile's path, traces off: town 40.28 and 40.24 FPS,
+the release's 40.25; `gpu_timeline.py` over 888 town and 440 battle frames):
 
-Battle: the GPU is never idle (0.08 ms of 35.4). The render thread waits 6.4 ms a frame for the presentation's
-fence, so the CPU has room; every millisecond off the GPU is a millisecond off the frame.
+| GPU per frame | Town, ms | % | Battle, ms | % |
+|---|---:|---:|---:|---:|
+| renderer batch (what `gpu_ms` reports) | 21.11 | 85.0 | 32.56 | 92.6 |
+| presentation list | 3.32 | 13.4 | 2.11 | 6.0 |
+| after the presentation, before the next batch starts (swapchain decompression, fence) | 0.31 | 1.3 | 0.37 | 1.1 |
+| other gaps with the next list already submitted | 0.04 | 0.2 | 0.10 | 0.3 |
+| waiting for the render thread | 0.04 | 0.15 | 0.03 | 0.07 |
+| frame | 24.83 | | 35.17 | |
 
-Town: these town numbers are from a build made at the wrong path (above), whose render thread needed 25 ms a
-frame and so limited the frame itself: the 0.9 ms the GPU waited was for the render thread recording commands,
-not for the present path. The release build's render thread needs about 20 ms (81% of 24.85 ms) and waits 3.9 ms
-in the present, which is the GPU-bound pattern of the battle. Still to do with a build made at the right path:
-the same timeline, to show the wait is the presentation's fence.
-
-Neither scene shows a wait for the swapchain image or between the batch and the presentation (0.02 ms).
+The render thread is never what the GPU waits for: it waits itself, 3.1 ms a frame in town and 10.2 ms in battle,
+for the fence of the previous presentation. Nothing waits for the swapchain image, and the present call is 0.06
+ms. So there are no bubbles to remove from the submission path: every millisecond taken off the GPU's work is a
+millisecond off the frame, in both scenes.
 
 ## A frame, phase by phase
 
@@ -120,39 +118,134 @@ game's display gamma ramp: per channel two entries of a 256-entry constant buffe
 uam that is six constant buffer loads with a register index (`ld c1[%r+off]`) among about 80 instructions. Without
 the ramp the pass has 30 instructions and takes 0.52 ms for 921,600 pixels; with it, 3.3 ms. Fifty more
 instructions at the same rate would be 0.8 ms: the six indexed loads cost about 2 ms, some twenty times an
-arithmetic instruction each. (The battle's skinned vertex shaders index their bone matrices the same way,
-`XeConstants.c[5 + k]`: whether those loads are as slow there is not known. The prepass's 7.7 ns a vertex fits
-the instruction count alone, which suggests not; the per-draw trace can settle it.)
+arithmetic instruction each.
 
 The same table as a 256x1 `RGBA32F` texture can be read with one gather per channel: a gather whose position is the
 border between texels i and i+1 returns both, unfiltered. uam compiles it to three `texgather` and the same
 `sub` / `mad` as before (`out/shader-lab` translates and compiles host shaders on the PC with `UAM_IR_DEBUG=1`).
+The battle's skinned vertex shaders index their bone rows the same way (48 to 57 indexed loads among 355 to 549
+instructions), but there the loads cost no more than any instruction (see Shaders below).
+
 That change is a pull request of its own, stacked on the one that brings these tools.
+
+## The resolves: who reads them
+
+`gpu_passes.py --resolves` lists every write of a resolved surface and the stretches whose shaders sample it before
+its next write (60 town frames, 30 battle frames; the same picture in every frame):
+
+| Surface | Writes a frame | ms (town / battle) | Writes nobody reads | ms |
+|---|---:|---:|---:|---:|
+| `9fa0000`, scene colour, 960x540 `RGBA16F` | 3 | 1.66 / 1.20 | 2 | **1.09 / 0.84** |
+| `b0d9000`, light attenuation and UI source, `RGBA8` | 2 / 3 | 0.53 / 0.51 | 0 | |
+| `aac000`, `RGBA8`, written once before the UI | 1 | 0.35 / 0.25 | 1 (not read in the next frame either) | 0.35 / 0.25 |
+| shadow map and depth to `R32F` | 3 / 2.6 | 0.74 / 0.52 | 0 | |
+| `714000`, the frontbuffer | 1 | 0.43 / 0.33 | 0 (the presentation reads it) | |
+
+Two of the three scene colour resolves are overwritten before anything samples them: the one after the opaque
+pass and the one before the translucent pass. The game makes them because on the Xbox 360 the EDRAM is about to be
+reused (the light attenuation buffer shares the scene colour's tiles) and it draws the copy back afterwards; here
+the target keeps its image and that restore draw is skipped (`LO_SKIP_RESTORE`), so its source is never read. A
+scene with refraction or heat haze would read them, so they can only be dropped after the fact: when the next
+whole write of the same surface arrives in the same command list and nothing has read the surface in between.
+
+(The cropped copies, `rsview`, and the small blur surfaces they come from read as unread in the tool: it only
+follows render-target textures, and the cropped views are plain textures. They are read.)
+
+## The full barrier before the bloom chain
+
+One stretch in each frame is 0.6 to 0.7 ms longer than its work: in the per-target trace it is a single depth draw
+(0.68 / 0.73 ms where the same draw elsewhere takes 0.03 to 0.14), in other runs the first cropped copy. The
+barrier trace names it: a full barrier (wait for idle, no prefetch, texture cache dropped) made of
+`960x552 -> COPY_SOURCE` and `960x540 -> COPY_DEST` from `Transition`. It is the fourth scene resolve of the frame,
+a repeat of the third that `ResolveOnGpu` recognises (`consecutiveResolveCopies.CanReuse`, "copy_reused") and
+does not copy: but its two copy-stage transitions are still recorded, for a copy that never happens. With
+`LO_RESOLVE_BLIT` (the default) nothing in that branch needs them.
+
+A town frame has six full barriers: that one, three for the cropped copies, one at the end of the renderer's batch
+(the frontbuffer to `COPY_SOURCE` for the presentation) and one at the end of the presentation list.
+
+## Shaders (per-draw trace, `gpu_passes.py --shaders`)
+
+Hottest by the time of their draws, town (6 frames) and battle (5 frames):
+
+| Shader | Scene | Draws | Fragments | Time | |
+|---|---|---:|---:|---:|---|
+| the resolve blit (host) | town / battle | 13 / 15 | 5.8M / 6.5M | 3.81 / 3.26 ms | 0.5 to 0.7 ns a fragment: bandwidth, 16 bytes read and written per `RGBA16F` pixel |
+| the EDRAM transfer (host) | battle | 3 | 1.6M | 2.42 ms | three whole-target format conversions a frame; `LO_RESOLVE_FOLD_TRANSFER` is aimed at these |
+| `ps_3e26f1f33692de6e` | battle | 54 | 70,700 shaded, 4,500 pass depth | 1.49 ms | 17 ns a fragment, 94% of them rejected after shading |
+| `ps_c1ee5034271b3a4a` | town | 10 | 337,000 shaded, 75,000 pass | 1.21 ms | 78% rejected after shading |
+| `ps_f708ca5d075481ab` | town | 72 | 204,000 | 1.07 ms (pixels) | 5.2 ns a fragment |
+| `ps_30731f7aad7cb542` | town | 5 | 126,000 | 1.03 ms | 8.2 ns a fragment |
+| `ps_7c260eacff1d681d` (blur, 360x360) | both | 1 | 57,400 | 0.62 to 0.66 ms | 11 ns a fragment |
+
+Fragments shaded and then rejected by the depth test, all pixel shaders: up to 1.27 ms a frame in town and 3.17
+ms in battle (an upper bound: a draw's time includes its vertices). The early depth test is only used for
+shaders that cannot discard (`!ps->mayDiscard`) on draws without alpha test; which of these draws could take it
+without changing the image depends on their depth and stencil writes, which the trace now records (`st=`).
+
+Vertex shaders: the prepass's skinned shader `vs_31bde3e2770db187` (355 instructions, 48 of them indexed constant
+loads for the bone rows) takes 4.0 ns a vertex over 354,000 vertices a frame. That is the instruction count at
+the usual rate: indexed constant loads are not slow in the vertex stage, only in the final pass's pixel shader.
+The battle's vertices cost about 1.3M x 4 to 6 ns, 6 to 8 ms.
+
+## The battle's three transfers
+
+The first battle has a full-screen effect the town has not, and it costs 2.4 ms of transfers a frame (per-draw
+trace, six frames, each 960x552):
+
+| Step | What the game does | Here | ms |
+|---|---|---|---:|
+| 1 | sets the scene's tiles to the 10-bit unorm format and resolves them to a `k_2_10_10_10` texture: the 7e3 float bits read as integers | transfer 7e3 to 10-bit into the other class's texture | 1.01 |
+| | | then the resolve | 0.39 |
+| 2 | draws its offsets into an 8-bit target on the same tiles (one small draw in this scene), resolves it | | |
+| 3 | goes back to the 10-bit target and draws the effect over the whole target, from the two textures | transfer 8-bit to 10-bit (the tiles' last owner), which the draw then covers | 0.43 |
+| 4 | goes back to the 7e3 format | transfer 10-bit to 7e3 | 0.98 |
+
+The transfer shader is one program for every pair of classes: it branches on the two classes from a constant
+buffer, and its 7e3 conversions branch three times a channel. Through 7e3 it takes 1.84 to 1.90 ns a fragment
+against 0.81 for the 8-bit to 10-bit pair and 0.5 to 0.7 for a plain blit. Compiled with uam off the console
+(`out/shader-lab`): the general shader is 320 words of code, the 7e3 to 10-bit pair alone 192, and written
+without branches (the same integer arithmetic through selects) 128; the blit is 32. A shader per pair without
+branches is the same arithmetic step for step, and the 65,536 half-float inputs can be checked one by one on the
+CPU. Estimated from the 8-bit pair's rate: 0.3 to 0.45 ms off each 7e3 transfer.
+
+`LO_RESOLVE_FOLD_TRANSFER` draws step 1's transfer straight into the resolved texture (the resolve's 0.39 ms);
+whether the owed transfer into the target is then ever drawn decides if that is a gain in battle (step 3 takes the
+tiles over from the 8-bit class before anything reads the 10-bit target).
 
 ## Ranked candidates
 
 | # | Change | Saves (ms a frame) | Basis | Risk to the image | How to prove it |
 |---|---|---|---|---|---|
 | 1 | Gamma ramp from a texture | town about 2.3, battle about 1.2 | estimated from the measured 2.8 ms and the pass without the ramp (0.52 ms) plus three gathers | none if the gather returns the two texels in the order expected: same floats, same arithmetic | `LO_PRESENT_RAMP_CHECK=1` with the pass trace's counters: the `rampcheck` stretch's samples are the differing pixels |
-| 2 | The full barrier before the bloom chain | 0.6 to 0.7 in both scenes | measured: one depth-only draw (640x640, 230,000 samples) takes 0.68 / 0.73 ms where the same draw elsewhere takes 0.03 to 0.14; it carries a full barrier (wait for idle, no prefetch) | none if the barrier is a copy-stage transition with no copy behind it | `LO_DEKO3D_BARRIER_TRACE` names the caller; then the image is untouched by construction |
-| 3 | `LO_RESOLVE_SHARE`, `LO_RESOLVE_FOLD_TRANSFER` on by default | 0.43 in town (together) | measured once | exact by design (a repeated resolve shows the previous image; a transfer is drawn straight into the resolve's destination) | each alone and both, ABBA; screenshots; a check pass like the ramp's would be stronger |
-| 4 | Swapchain images without compression | 0.36 in battle | the gap after the presentation, measured; the saving is estimated | none: compression is lossless either way | ABBA in battle |
-| 5 | Cropped copies of resolved surfaces through the blit shader instead of the copy engine | about 0.2 | three copies of 321x182 with a full barrier each take 0.08 to 0.11 ms; a 59,000-pixel draw takes 0.03 | none: the same texels (as `LO_RESOLVE_BLIT`) | ABBA; screenshots |
-| 6 | Clears of the small views at EDRAM base 720 that only receive 4 to 8 pixels | up to 0.3 | measured (640x640, 660x648 `RGBA16F` clears, 0.04 to 0.05 ms each, eight a frame) | needs care: a view may be read later | not started |
-| 7 | 32-bit colour targets for the 10-bit classes (`LO_RT32`) | resolves and post passes are about half bandwidth: perhaps 2 to 3 | estimated; an earlier test at 38 ms a frame found none | changes rounding (10-bit unorm instead of FP16) and the 2-bit alpha: **not** the same image | measure it only to know; not a candidate under the no-trade-off rule |
-| 8 | Bone matrices without indexed constant buffer loads | unknown: 0 to several ms in battle | only the pixel-stage measurement above | none if exact | first the per-draw trace: ns per vertex of skinned against unskinned vertex shaders |
+| 2 | Early depth test on discarding draws that write neither depth nor stencil | battle up to 3.2, town up to 1.3 (upper bounds) | measured: fragments shaded against samples passed per pixel shader | none where nothing is written before the shader decides; to be settled per draw state | the per-draw trace's `st=`; then a check that counts samples passed with and without |
+| 3 | Scene resolves nobody reads | town 1.09, battle 0.84 | measured: two of three writes of `9fa0000` have no reader before the next write | none if a write is dropped only once the next whole write is recorded and no read came between | a check mode that fills a dropped resolve with magenta instead |
+| 4 | The repeated resolve's copy-stage transitions | 0.6 to 0.7 in both scenes | measured, and named by the barrier trace | none: no copy follows them | ABBA; the barrier count per frame drops from 6 to 5 |
+| 5 | `LO_RESOLVE_SHARE`, `LO_RESOLVE_FOLD_TRANSFER` on by default | 0.43 in town (together); in battle the first transfer's resolve is 0.39 | measured once in town | exact by design | each alone and both, ABBA; screenshots |
+| 5b | A transfer shader per pair of classes, without branches | battle 0.6 to 0.9; town none (it has no transfers) | estimated from the measured rates of the three transfers and uam's code sizes | none: the same integer arithmetic, checked for every half-float input on the CPU | the exhaustive CPU check; ABBA in battle; screenshots |
+| 6 | Swapchain images without compression | 0.3 to 0.4 in both scenes | the gap after the presentation, measured; the saving is estimated | none: compression is lossless either way | ABBA |
+| 7 | Cropped copies of resolved surfaces through the blit shader instead of the copy engine | about 0.2 | three copies of 321x182 with a full barrier each take 0.08 to 0.11 ms; a 59,000-pixel draw takes 0.03 | none: the same texels (as `LO_RESOLVE_BLIT`) | ABBA; screenshots |
+| 8 | Clears of the small views at EDRAM base 720 that only receive 4 to 8 pixels | up to 0.3 | measured (640x640, 660x648 `RGBA16F` clears, 0.04 to 0.05 ms each, eight a frame) | needs care: a view may be read later | not started |
+| 9 | 32-bit colour targets for the 10-bit classes (`LO_RT32`) | resolves and post passes at half the bandwidth: perhaps 2 to 3 | estimated; an earlier test at 38 ms a frame found none | changes rounding (10-bit unorm instead of FP16) and the 2-bit alpha: **not** the same image | not a candidate under the no-trade-off rule |
 
-Not worth doing, with data: skipping the cache invalidation before draws (0.10 to 0.14 ms), turning colour
-compression off (+4.4 ms).
+Ruled out, with data: skipping the cache invalidation before draws (0.10 to 0.14 ms), turning colour compression
+off (+4.4 ms), bone matrices without indexed constant loads (the loads cost what any instruction costs: 4.0 ns
+a vertex for 355 instructions). Looked for and not found in the 22 hottest pixel shaders of each scene: constant
+buffer loads with a computed index (none), and the per-sample format fix-ups the translator writes after every
+texture read (39 branches a texture in the pack's SPIR-V): every textured draw of both scenes already runs a
+variant specialised for its textures' formats (`texinfo spec ... specialised=100.0%`), where they fold away. The
+full-screen game shaders take 0.6 to 1.9 ns a fragment, in step with their size.
 
-Battle needs 1.45 ms off the GPU to hold 30 FPS (35.4 ms to 33.3). Candidates 1, 2 and 4 add up to about 2.2 ms.
+Not pursued: the GPU shades 0.58 vertices per index in battle and 0.49 in town (a mesh ordered for this GPU's
+vertex cache would be nearer 0.3), and vertices are 6 to 8 ms of the battle frame. Reordering a draw's triangles
+keeps a depth-only image (the nearest fragment wins in any order: prepass and shadow maps, 386,000 of the
+battle's 1.31 M vertices) but not provably a colour draw's, and the work is on the CPU, at load.
+
+Battle needs 1.85 ms off the GPU to hold 30 FPS (35.17 ms to 33.3). Candidates 1, 3, 4 and 6 add up to about 3.1
+ms there before the early depth test is counted.
 
 ## Still to measure
 
-- The town timeline and both pass traces again with a build made at the right path (the GPU numbers above do not
-  depend on it; the render thread's do).
-- The sampled targets per stretch (`in=`): which resolves are read before the next one overwrites them. The battle
-  resolves the scene twice into `9fa0000` around one draw that writes no pixel.
-- The per-draw trace in both scenes: the hottest pixel shaders by ns per fragment and fragments, the vertex shaders
-  by ns per vertex.
-- `LO_DEKO3D_BARRIER_TRACE` for candidate 2.
+- The depth and stencil state of the draws whose fragments are rejected after shading (`st=` in the per-draw
+  trace), for candidate 2.
+- The cropped views in the resolve report (the tool follows render-target textures only).

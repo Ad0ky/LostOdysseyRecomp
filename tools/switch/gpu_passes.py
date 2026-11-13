@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Adds up a log's LO_GPU_PASS_TRACE lines: where a frame's GPU time goes, per render target (docs/SWITCH-GPU.md).
 
-    python3 tools/switch/gpu_passes.py log.txt [--from-frame N] [--to-frame N] [--sequence [FRAME]] [--merge] [--top N] [--shaders [--spv-dir DIR]]
+    python3 tools/switch/gpu_passes.py log.txt [--from-frame N] [--to-frame N] [--sequence [FRAME]] [--min-draws N]
 
 A "gpass:" line is one stretch of a traced command list: the draws into one set of render targets, a clear, a copy.
 Its time (us) is the GPU time between the end of the stretch before and its own end, at the bottom of the pipe. Lists:
@@ -201,15 +201,37 @@ def fnv1a64(data):
 
 
 def shader_names(spv_dir):
-    """hash (as the back end makes it: FNV-1a 64 of the SPIR-V bytes) -> file name without .spv."""
-    import os
+    """hash (as the back end makes it: FNV-1a 64 of the SPIR-V bytes) -> file name without .spv. Hashing a whole pack
+    takes minutes here, so the table is kept beside the files (.gpu_passes_names.json, by name, size and time)."""
+    import json, os
     names = {}
     if not spv_dir:
         return names
+    cache_path = os.path.join(spv_dir, ".gpu_passes_names.json")
+    try:
+        with open(cache_path) as f:
+            cache = json.load(f)
+    except (OSError, ValueError):
+        cache = {}
+    fresh = {}
     for name in os.listdir(spv_dir):
         if name.endswith(".spv"):
-            with open(os.path.join(spv_dir, name), "rb") as f:
-                names[f"{fnv1a64(f.read()):016x}"] = name[:-4]
+            path = os.path.join(spv_dir, name)
+            st = os.stat(path)
+            known = cache.get(name)
+            if known and known[0] == st.st_size and known[1] == st.st_mtime_ns:
+                digest = known[2]
+            else:
+                with open(path, "rb") as f:
+                    digest = f"{fnv1a64(f.read()):016x}"
+            fresh[name] = [st.st_size, st.st_mtime_ns, digest]
+            names[digest] = name[:-4]
+    if fresh != cache:
+        try:
+            with open(cache_path, "w") as f:
+                json.dump(fresh, f)
+        except OSError:
+            pass
     return names
 
 

@@ -264,6 +264,9 @@ namespace plume {
     // its draws sample: render targets first, then plain textures (the cropped copies of resolved surfaces are plain).
     struct Deko3DTracedDescriptorSet : Deko3DDescriptorSet {
         std::vector<const Deko3DTexture *> targets;  // by image id (descriptor index - imageFirst)
+        // Whether each was a render or depth target when it was set: passSampled only compares the pointers, never
+        // reads through them (a descriptor no draw uses any more may hold a texture that is gone).
+        std::vector<uint8_t> isTarget;
         Deko3DTracedDescriptorSet(Deko3DDevice *device, const RenderDescriptorSetDesc &desc);
         void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
     };
