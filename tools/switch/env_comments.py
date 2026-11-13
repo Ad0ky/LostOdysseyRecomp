@@ -90,7 +90,7 @@ DESCRIPTIONS = {
     "LO_EARLY_QUERY_ANSWER": "The scene renderer's occlusion reads answered at once while counts are made up",
     "LO_RESOLVE_BLIT": "Same-format resolves through the blit shader, not the copy engine",
     "LO_RESOLVE_FOLD_TRANSFER": "1: fewer resolve passes (fold transfers)",
-    "LO_RESOLVE_SHARE": "1: fewer resolve passes (share resolves)",
+    "LO_RESOLVE_SHARE": "A repeated full resolve shows the previous one's image; 0 writes it again",
     "LO_RESIZE_FIX": "Dynamic resolution without flicker after a size change; 0 turns it off",
     # Benchmark runs (tools/switch/bench.py, docs/SWITCH-BENCHMARKS.md)
     "LO_BENCH": "Benchmark run: its name; the run presses the scenario's buttons, measures and reports",
