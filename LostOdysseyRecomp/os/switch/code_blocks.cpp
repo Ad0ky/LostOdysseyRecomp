@@ -152,7 +152,7 @@ __asm__(
     "lo_code_swap_end:\n"
     ".popsection\n");
 
-char g_status[256] = "code blocks: did not run";
+char g_status[320] = "code blocks: did not run";
 Handle g_process = INVALID_HANDLE;
 uint64_t g_stub = 0;       // the stub's code page, kept mapped for the exit
 void* g_stubHeap = nullptr;
@@ -201,6 +201,20 @@ void UnmapStub()
     free(g_stubHeap);
     g_stub = 0;
     g_stubHeap = nullptr;
+}
+
+// The swap that undoes forward's segments (those it swapped), in the same order.
+SwapArgs Reverse(const SwapArgs& forward)
+{
+    SwapArgs back{};
+    back.process = forward.process;
+    back.count = forward.done;
+    for (uint32_t i = 0; i < forward.done; ++i)
+    {
+        const Segment& s = forward.seg[i];
+        back.seg[i] = {s.va, s.newSrc, s.oldSrc, s.size, s.perm};
+    }
+    return back;
 }
 
 uint64_t Blocks(uint64_t va, uint64_t size)
@@ -276,15 +290,47 @@ void Apply()
         free(raw);
         return skip("the kernel refused the swap", rc);
     }
+    // LO_CODE_BLOCKS_TEST=1: run the exit's swap here, while one thread exists, and compare the two copies there,
+    // then swap the copy in again. A return to the loader cannot be tried unattended (the console would be left in
+    // the homebrew menu), and this is the same kernel sequence.
+    char test[96] = "";
+    if (const char* setting = getenv("LO_CODE_BLOCKS_TEST"); setting && std::strcmp(setting, "1") == 0 && args.done == 2)
+    {
+        SwapArgs back = Reverse(g_swapped);
+        const uint32_t backRc = reinterpret_cast<SwapFn>(g_stub)(&back);
+        if (back.done == back.count)
+        {
+            // On the loader's copy again: the copy's pages are ordinary heap, readable.
+            const bool same = std::memcmp(reinterpret_cast<const void*>(copy), reinterpret_cast<const void*>(textVa), total) == 0;
+            SwapArgs again = args;
+            again.done = 0;
+            const uint32_t againRc = reinterpret_cast<SwapFn>(g_stub)(&again);
+            g_swapped = again;
+            std::snprintf(test, sizeof(test), "; exit swap tested: back %#x, copies %s, again %#x (%u of 2)", backRc,
+                same ? "identical" : "DIFFER", againRc, again.done);
+        }
+        else
+        {
+            // The segments from back.done on are still on the copy.
+            SwapArgs left{};
+            left.process = process;
+            left.count = left.done = back.count - back.done;
+            for (uint32_t i = 0; i < left.done; ++i)
+                left.seg[i] = g_swapped.seg[back.done + i];
+            g_swapped = left;
+            std::snprintf(test, sizeof(test), "; exit swap tested: FAILED %#x after %u of 2", backRc, back.done);
+        }
+    }
     armICacheInvalidate(reinterpret_cast<void*>(textVa), text.size);
+    const bool both = g_swapped.done == 2;
     std::snprintf(g_status, sizeof(g_status),
         "code blocks: %s on a copy in line with 2 MiB blocks (%llu and %llu blocks; code %#llx-%#llx, copy %#llx, "
-        "%llu MiB more heap)%s",
-        args.done == 2 ? "code and read-only data" : "code only", static_cast<unsigned long long>(Blocks(textVa, text.size)),
-        static_cast<unsigned long long>(args.done == 2 ? Blocks(rodataVa, rodata.size) : 0),
+        "%llu MiB more heap)%s%s",
+        both ? "code and read-only data" : "part of the code", static_cast<unsigned long long>(Blocks(textVa, text.size)),
+        static_cast<unsigned long long>(both ? Blocks(rodataVa, rodata.size) : 0),
         static_cast<unsigned long long>(textVa), static_cast<unsigned long long>(textVa + total),
         static_cast<unsigned long long>(copy), static_cast<unsigned long long>((total + kBlock + kPage) >> 20),
-        args.done == 2 ? "" : ", the read-only data was refused");
+        both ? "" : " (the kernel refused the rest)", test);
 }
 
 __attribute__((constructor(102))) void CodeBlocksInit()
@@ -302,14 +348,7 @@ extern "C" void NX_NORETURN __libnx_exit(int rc)
     __appExit();
     if (g_swapped.done > 0)
     {
-        SwapArgs back{};
-        back.process = g_process;
-        back.count = g_swapped.done;
-        for (uint32_t i = 0; i < g_swapped.done; ++i)
-        {
-            const Segment& s = g_swapped.seg[i];
-            back.seg[i] = {s.va, s.newSrc, s.oldSrc, s.size, s.perm};
-        }
+        SwapArgs back = Reverse(g_swapped);
         reinterpret_cast<SwapFn>(g_stub)(&back);
         // The loader could not take the NRO back: end the process here instead of in the loader's fatal error.
         if (back.done != back.count)
