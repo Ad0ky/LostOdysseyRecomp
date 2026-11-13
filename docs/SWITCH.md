@@ -302,6 +302,7 @@ Switch-specific options and diagnostics:
 | Variable | Default | Effect |
 |---|---|---|
 | `LO_GUEST_BLOCKS` | `1` | `0` maps guest memory with 4 KiB pages, the old layout: the window off a 2 MiB boundary and its backing 4 KiB aligned. On, the virtual, A and C views are 2 MiB blocks (the E view, one 4 KiB page off A, never is). The log's `guest window` line says which |
+| `LO_CODE_BLOCKS` | `1` | `0` leaves the NRO's code and read-only data where hbloader mapped them, on 4 KiB pages. On, a constructor copies them (about 89 MiB of heap) to a range that lines up modulo 2 MiB and maps the copy in place of the loader's (os/switch/code_blocks.cpp); the exit puts the loader's copy back before returning to it. The log's `code blocks:` line says what happened |
 | `LO_TLB_TEST` | off | `N`: N seconds after start, logs what a TLB miss costs in each guest view and in the NRO's code and read-only data (`switch: tlb:` lines; a few ms, holds the commit lock). Tells 2 MiB blocks (a few ns) from 4 KiB pages; `svcQueryMemory` does not show the page size |
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, handheld uses 540 and docked uses 720 |
