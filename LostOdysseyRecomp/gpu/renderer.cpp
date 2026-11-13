@@ -15531,6 +15531,7 @@ void main()
                     // (exact for these formats: each value round-trips through float32). First battle, 3 runs: 26.62 to
                     // 27.72 FPS, GPU 37.01 to 35.34 ms. LO_RESOLVE_BLIT=0 goes back to the copy.
                     static const bool resolveBlit = video::IsDeko3d() && !(getenv("LO_RESOLVE_BLIT") && getenv("LO_RESOLVE_BLIT")[0] == '0');
+                    static const bool resolveReuseBarrier = getenv("LO_RESOLVE_REUSE_BARRIER") && getenv("LO_RESOLVE_REUSE_BARRIER")[0] == '1';
                     const resolve_copy::Copy copy{color.allocationSerial, rs.tex->allocationSerial,
                         color.width, color.height, texW, texH, uint32_t(color.format), x0, y0, w, h};
                     const bool reuse = resolveCopyReuse && consecutiveResolveCopies.CanReuse(copy);
@@ -15541,6 +15542,18 @@ void main()
                         color.unwrittenSinceResolve = true;
                         ++resolveCopiesRecorded;
                         resolveOperation = "blit_resolve";
+                    }
+                    else if (resolveBlit && !resolveReuseBarrier)
+                    {
+                        // A repeat of a blit resolve copies nothing, so it needs no copy-stage layouts: on deko3d those
+                        // two made a full barrier (wait for idle, texture cache dropped) in the middle of the frame. The
+                        // source stays as the blit left it, unwrittenSinceResolve true (the restore skip's proof), and
+                        // the destination keeps the blit's pixels and layout. LO_RESOLVE_REUSE_BARRIER=1 records them.
+                        static bool warned = false;
+                        if (!color.unwrittenSinceResolve && !warned) {
+                            warned = true;
+                            LOG_WARNING("renderer: reused resolve -> {:#x} from a target not marked unwritten since a resolve", destBase);
+                        }
                     }
                     else
                     {
