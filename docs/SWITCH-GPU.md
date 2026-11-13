@@ -126,7 +126,31 @@ border between texels i and i+1 returns both, unfiltered. uam compiles it to thr
 The battle's skinned vertex shaders index their bone rows the same way (48 to 57 indexed loads among 355 to 549
 instructions), but there the loads cost no more than any instruction (see Shaders below).
 
-That change is a pull request of its own, stacked on the one that brings these tools.
+That is what the final pass does now on deko3d (`LO_PRESENT_RAMP_TEXTURE`, on by default, `=0` for the constant
+buffer). Measured on the test console with the build at the profile's path, one binary, `=0` against on:
+
+| | Town | Battle |
+|---|---:|---:|
+| presentation list on the GPU, ms a frame (`LO_GPU_TIMELINE`, 900 / 450 frames) | 3.335 to **1.140** | 2.147 to **0.974** |
+| frame on the GPU, ms | 24.85 to 22.69 | 35.32 to 34.27 |
+| FPS, ABBA off / on / on / off, 1 warm-up + 2 counted runs a block (mean, range) | 40.25 (40.20-40.33) to **44.14** (44.10-44.19) | 28.45 (28.34-28.55) to **29.21** (29.11-29.28) |
+| 1% low FPS | 38.74 to 42.12 | 25.10 to 26.04 |
+| p99 frame, ms | 25.81 to 23.74 | 39.87 to 38.41 |
+| `GPU CmdProc`, % of a core | 79 to 87 | 62 to 63 |
+
+Both scenes were GPU-bound, so the time comes straight off the frame: town 24.8 to 22.7 ms (+9.7% FPS), battle
+35.3 to 34.3 ms (+2.7%). In town the render thread now needs about 21.3 of the 22.7 ms, so the next millisecond off
+the GPU there is worth less. The release v121f in the same session: 40.24 and 40.24 FPS, as the `=0` arm.
+
+The image is the same. `LO_PRESENT_RAMP_CHECK=1` renders the pass both ways every frame and compares them pixel by
+pixel: its second draw keeps only the pixels that differ (`rampcheck` in the pass trace), its third only the equal
+ones (`rampcheck-same`), and the samples passed count them. Over 300 traced town frames and 150 battle frames (every
+third frame of the measurement, `LO_GPU_PASS_TRACE=3`) `rampcheck` counted **0** pixels and `rampcheck-same`
+276,480,000 and 138,240,000, which is 921,600 (1280x720) in every frame: every pixel of those 450 frames was
+compared and was the same. `LO_PRESENT_RAMP_CHECK=2` compares the two as `RGBA32F` before the store to 8 bits: 0
+differing pixels again in 300 town and 150 battle frames, so the floats themselves are equal, not only their
+rounding. The player's curve (`.w`, read with `GatherAlpha`) is off at the default brightness and gamma, so these runs
+check the game's ramp; a check with the curve on is still to run.
 
 ## The resolves: who reads them
 
@@ -249,7 +273,7 @@ owed whole clear already has costs nothing at all. Anything else keeps the repla
 
 | # | Change | Saves (ms a frame) | Basis | Risk to the image | How to prove it |
 |---|---|---|---|---|---|
-| 1 | Gamma ramp from a texture | town about 2.3, battle about 1.2 | estimated from the measured 2.8 ms and the pass without the ramp (0.52 ms) plus three gathers | none if the gather returns the two texels in the order expected: same floats, same arithmetic | `LO_PRESENT_RAMP_CHECK=1` with the pass trace's counters: the `rampcheck` stretch's samples are the differing pixels |
+| 1 | Gamma ramp from a texture: **done** (`LO_PRESENT_RAMP_TEXTURE`) | measured: town 2.20, battle 1.17 | the presentation list's GPU time, one binary, switch off and on | none: 0 differing pixels (and floats) in 450 frames checked | done: `LO_PRESENT_RAMP_CHECK`, ABBA |
 | 2 | Early depth test on discarding draws that write neither depth nor stencil | battle 0.27, town 0.06 at most: **no-go** | measured with each draw's state: 2.80 / 1.15 ms of the rejected fragments are on draws that write depth, where the early test changes the image | none for the 0.27 / 0.06 ms part | not pursued |
 | 3 | Scene resolves nobody reads | town 1.09, battle 0.84 | measured: two of three writes of `9fa0000` have no reader before the next write | none if a write is dropped only once the next whole write is recorded and no read came between | a check mode that fills a dropped resolve with magenta instead |
 | 4 | The repeated resolve's copy-stage transitions | 0.6 to 0.7 in both scenes | measured, and named by the barrier trace | none: no copy follows them | ABBA; the barrier count per frame drops from 6 to 5 |
@@ -273,8 +297,8 @@ vertex cache would be nearer 0.3), and vertices are 6 to 8 ms of the battle fram
 keeps a depth-only image (the nearest fragment wins in any order: prepass and shadow maps, 386,000 of the
 battle's 1.31 M vertices) but not provably a colour draw's, and the work is on the CPU, at load.
 
-Battle needs 1.85 ms off the GPU to hold 30 FPS (35.17 ms to 33.3). Candidates 1, 3, 4 and 6 add up to about 3.1
-ms there, and 5b and 8 to about another 1.
+With candidate 1 done the battle frame is 34.27 ms on the GPU (`LO_GPU_TIMELINE`, 35.32 before) and needs 0.95 ms
+more to hold 30 FPS; candidates 3, 4 and 6 add up to about 1.9 ms there, and 5b and 8 to about another 1.
 
 ## Still to measure
 
