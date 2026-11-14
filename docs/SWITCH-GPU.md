@@ -276,6 +276,85 @@ battle's 1.31 M vertices) but not provably a colour draw's, and the work is on t
 Battle needs 1.85 ms off the GPU to hold 30 FPS (35.17 ms to 33.3). Candidates 1, 3, 4 and 6 add up to about 3.1
 ms there, and 5b and 8 to about another 1.
 
+## What the prototypes measured (2026-11-13)
+
+Each change was measured alone, with an ABBA in one binary on the test console (handheld, 1020 / 461 / 1331 MHz,
+540 rows, 4 counted runs per arm). The arms' ranges don't overlap except where noted. The tables and the image
+evidence are in `docs/SWITCH-BENCHMARKS.md` of each pull request.
+
+| # | Change | Estimate, ms (town / battle) | Measured, ms | FPS, town | FPS, battle | Outcome |
+|---|---|---|---|---|---|---|
+| 1 | Gamma ramp from a texture | 2.3 / 1.2 | 2.20 / 1.17 (presentation list) | 40.25 to 44.14 | 28.45 to 29.21 | PR #51; 0 differing pixels in 300 + 150 checked frames |
+| 3 | Scene resolves nobody reads, dropped | 1.09 / 0.84 | 1.05 / 0.93 (GPU busy) | 40.22 to 42.01 | 28.40 to 29.00 | PR #57; two writes of `9fa0000` dropped a frame, the magenta check shows none read. Uncapped, the arms' shots differ more than runs of one arm (the faster arm reaches the shot's frame sooner); with both arms capped at 20 FPS the difference is gone (town 563 and 423 pixels across arms, 606 and 4,114 between blocks of one arm). Not run in a scene with refraction, water or heat |
+| 4 | Repeated resolve without copy-stage layouts | 0.6 to 0.7 | 0.03 / 0.06 | 40.23 to 40.27 | 28.37 to 28.45 (ranges overlap) | PR #52; the estimate was wrong, see below |
+| 5 | `LO_RESOLVE_SHARE` by default | 0.43 with the fold (town) | 0.32 / 0.28 | 40.24 to 40.83 | 28.42 to 28.62 | PR #53, default on deko3d |
+| 5 | `LO_RESOLVE_FOLD_TRANSFER` | | costs 0.31 in battle on top of the share | | 28.59 to 28.40 | **no-go**: one of the two folded transfers is drawn again later |
+| 5b | A transfer shader per pair of classes, without branches | none / 0.6 to 0.9 | none / 1.15 (GPU busy); 1.01 in the per-draw trace (2.41 to 1.40 for the three transfers) | 40.22 to 40.25 (control: no transfers) | 28.41 to 29.13 | PR #54; 0 differing pixels in 600 checked transfers, and every FP16 value per pair on the GPU |
+| 6 | Swapchain images without compression | 0.3 to 0.4 | 0.32 / 0.34 (frame mean) | 40.24 to 40.78 | 28.38 to 28.66 | PR #55, default |
+
+Candidate 4's estimate took the time the trace showed between the barrier and the next draw as the barrier's
+cost. Without the copy-stage layouts the full barrier is gone (6 to 5 a frame), but the transitions plume merges
+at that point still need a fragment barrier. The saving is the difference between the two barriers. The likely
+reason (not measured): the work the full barrier waited for has to finish before the bloom chain's first draw
+either way, so the gap in the trace was the earlier work draining and not the barrier. Candidate 7 (0.2 ms, the
+same kind of gap after three copies) rests on the same reading and is not worth a prototype.
+
+The measured gains are in different parts of the frame (presentation, the present's decompression, one resolve),
+so they should add: about 2.9 ms in town and 3.0 ms in battle. That is 40.2 to about 45.5 FPS in town, and in
+battle a 35.2 ms frame down to about 32.2: the 30 FPS cap with about 1.1 ms to spare. That sum is arithmetic, not a
+measurement: a build with all of them has not been run.
+
+**Measured together.** The ramp, the share, the pair shaders and the uncompressed swapchain in one build (1.2.1 at
+`1ccaa784`), all four off against the defaults in the same binary:
+
+| | Town off | Town on | Battle off | Battle on |
+|---|---:|---:|---:|---:|
+| FPS | 40.22 | 45.22 | 28.40 | 29.79 |
+| 1% low FPS | 38.69 | 42.56 | 24.96 | 27.31 |
+| Frame p50, ms | 24.78 | 22.06 | 34.99 | 33.34 |
+| Frame p99, ms | 25.85 | 23.50 | 40.08 | 36.62 |
+| GPU busy (batches), ms | 21.13 | 20.76 | 32.66 | 30.98 |
+| Pacing sleep, ms | 0.00 | 0.00 | 0.82 | 6.84 |
+
+Town: 2.72 ms off the median frame, against 2.84 from the separate measurements. Battle: the median frame is now the
+30 FPS cap's 33.3 ms and the frame sleeps in pacing; the frames still over the cap keep the average at 29.79. Town
+has one off block (its first found the game still restarting), battle two; the on arm has two blocks in both. The
+missing town off block, run again afterwards, gave 40.20 FPS and 21.14 ms of GPU time, the same as the other. In
+that binary the ramp check counted 0 differing pixels in 1,523 town and 1,285 battle frames, and the transfer check
+0 in 600 transfers.
+
+**The unread resolves on top.** PR #57 merged over those four (1.2.1 at `37e29a8f`), `LO_RESOLVE_DROP_UNREAD=0`
+against the default in the same binary, two blocks an arm:
+
+| | Town off | Town on | Battle off | Battle on |
+|---|---:|---:|---:|---:|
+| FPS | 45.26 | 46.88 | 29.78 | 29.80 |
+| 1% low FPS | 42.82 | 43.08 | 26.91 | 27.45 |
+| Frame p50, ms | 22.04 | 21.21 | 33.34 | 33.34 |
+| Frame p99, ms | 23.36 | 23.22 | 37.18 | 36.45 |
+| GPU busy (batches), ms | 20.76 | 19.65 | 31.09 | 30.40 |
+| Pacing sleep, ms | 0.00 | 0.00 | 9.59 | 8.04 |
+
+Town gains 1.11 ms of GPU time and 0.83 ms of the median frame: the GPU command thread is at 91% of a core, so the
+CPU side now sets part of the frame. Battle sits on the 30 FPS cap in both arms; its saving shows only as GPU time
+(0.69 ms), and the pacing sleep moves the other way with overlapping ranges, so no frame-time gain is claimed there.
+The off arm repeats the four-change default arm (45.26 against 45.22, 29.78 against 29.79). This is the first run of
+the drops with the resolve share on: still only slot `9fa0000`, one or two drops in every sampled frame, none that
+could not be dropped. `LO_RESOLVE_DROP_CHECK=1` showed 0 magenta pixels in town and battle, `=2` turned 98.5% of the
+town shot magenta. With both arms capped at 20 FPS the pixels stable within an arm but different across arms number
+203 to 2,585 in town and 3,018 to 13,766 in battle; two blocks of one arm give 358 and 1,131, and 5,276 and 13,999.
+The ramp check (1,521 town and 1,281 battle frames) and the transfer check (600 transfers) again counted 0. Still
+not run in a scene with refraction, water or heat.
+
+From the release build's settings to all five on: town 40.22 to 46.88 FPS (24.78 to 21.21 ms median), battle 28.40
+to 29.80 FPS (34.99 to 33.34 ms median, the cap). The two ends come from two binaries; the middle point was measured
+in both and agrees.
+
+The pair shaders' test found that the general transfer shader does not treat NaN on the console as its source
+says: uam compiles `if (!(f > 0.0)) return 0u;` as the ordered `0.0 >= f`, so a NaN becomes 0x3FF there and 0 on a
+compiler that keeps the source's rule. The pair shaders keep the console's result. No NaN reached a transfer in the
+600 checked.
+
 ## Still to measure
 
 - The colours of the replayed clear rectangles (candidate 8).
