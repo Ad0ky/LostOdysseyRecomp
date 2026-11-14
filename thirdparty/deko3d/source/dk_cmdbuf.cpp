@@ -329,6 +329,22 @@ void dkCmdBufReplayCmds(DkCmdBuf obj, const uint32_t* words, uint32_t num_words)
 	w.addRawData(words, num_words*4);
 }
 
+// LostOdysseyRecomp patch 2: as dkCmdBufReplayCmds, returning the words' CPU address in command memory.
+uint32_t* dkCmdBufReplayCmdsAt(DkCmdBuf obj, const uint32_t* words, uint32_t num_words)
+{
+	DK_ENTRYPOINT(obj);
+	DK_DEBUG_NON_NULL_ARRAY(words, num_words);
+	if (!num_words)
+		return nullptr;
+
+	CmdBufWriter w{obj};
+	maxwell::CmdWord* pos = w.reserve(num_words);
+	if (!pos)
+		return nullptr;
+	w.addRawData(words, num_words*4);
+	return reinterpret_cast<uint32_t*>(pos);
+}
+
 void dkCmdBufCallList(DkCmdBuf obj, DkCmdList list)
 {
 	DK_ENTRYPOINT(obj);

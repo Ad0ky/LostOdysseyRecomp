@@ -90,6 +90,8 @@ DESCRIPTIONS = {
     "LO_RESOLVE_FOLD_TRANSFER": "1: fewer resolve passes (fold transfers)",
     "LO_RESOLVE_SHARE": "1: fewer resolve passes (share resolves)",
     "LO_RESIZE_FIX": "Dynamic resolution without flicker after a size change; 0 turns it off",
+    "LO_RESOLVE_DROP_UNREAD": "Resolve writes replaced before anything reads them are left out (0 off, 2 recorded, none left out)",
+    "LO_RESOLVE_DROP_CHECK": "1: a left-out resolve write is replaced by magenta; 2: every whole one is (a test of the mechanism)",
     # Benchmark runs (tools/switch/bench.py, docs/SWITCH-BENCHMARKS.md)
     "LO_BENCH": "Benchmark run: its name; the run presses the scenario's buttons, measures and reports",
     "LO_BENCH_FRAMES": "Benchmark: frames measured",

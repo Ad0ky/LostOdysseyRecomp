@@ -690,6 +690,12 @@ namespace plume {
         mutexUnlock(&t.mutex);
     }
 
+    static uint32_t nextOptionalGeneration() {
+        static std::atomic<uint32_t> generations{0};
+        uint32_t g = generations.fetch_add(1, std::memory_order_relaxed) + 1;
+        return g ? g : generations.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
     void Deko3DCommandList::begin() {
         if (deferred(*this)) {
             // LostOdysseyRecomp (2026-11-03): the recording thread's own state starts over with the list.
@@ -714,6 +720,10 @@ namespace plume {
         transientUsed = 0;
         open = true;
         list = 0;
+        // LostOdysseyRecomp (2026-11-13): handles of the last recording end with it; the generation is unique across
+        // lists, so a handle of another list never matches this one's words.
+        optionalWords.clear();
+        optionalGeneration = nextOptionalGeneration();
 
         graphicsPipeline = nullptr;
         computePipeline = nullptr;
@@ -1209,6 +1219,122 @@ namespace plume {
         flushBarriers();
         dkCmdBufDrawIndexed(cmd, graphicsPipeline->primitive, indexCount, instanceCount, startIndex, baseVertex, startInstance);
         ++statDraws;
+    }
+
+    // ---- LostOdysseyRecomp (2026-11-13): optional draws (plume_deko3d_api.h, Deko3DDrawOptional)
+    //
+    // SET_RENDER_ENABLE_C of the Maxwell 3D class (NVB197, byte offset 0x1558; method 0x556, in the gap deko3d's
+    // engine_3d.def leaves between MultisampleControl and SetTexSamplerPool), mode in bits 2:0: 0 FALSE (the engine
+    // drops draws and clears), 1 TRUE. Written as one increasing method on subchannel 0 (3D), as writeFramebufferSrgb
+    // writes 0x56E; the second word is the mode, which Deko3DSetOptional rewrites. deko3d never writes the render enable
+    // (nor SET_RENDER_ENABLE_OVERRIDE), so outside these commands it is whatever the start-up test left: TRUE.
+    static constexpr uint32_t RenderEnableHeader = (1u << 29) | (1u << 16) | 0x556u;
+    // -1 not tested yet, 0 the test failed (optional draws are then ordinary ones), 1 it passed.
+    static std::atomic<int> g_renderEnableWorks{-1};
+    static uint32_t g_renderEnableGot[3] = {};
+
+    // Weak: a build against devkitPro's libdeko3d.a (LO_SWITCH_DEKO3D_SOURCE=OFF) has no patch 2, and the test fails.
+    extern "C" __attribute__((weak)) uint32_t *dkCmdBufReplayCmdsAt(DkCmdBuf obj, const uint32_t *words, uint32_t num_words);
+
+    static uint32_t *writeRenderEnable(DkCmdBuf cmd, bool on) {
+        const uint32_t words[2] = {RenderEnableHeader, on ? 1u : 0u};
+        if (!dkCmdBufReplayCmdsAt) {
+            if (on) dkCmdBufReplayCmds(cmd, words, 2);
+            return nullptr;
+        }
+        uint32_t *at = dkCmdBufReplayCmdsAt(cmd, words, 2);
+        return at ? at + 1 : nullptr;
+    }
+
+    uint32_t *Deko3DCommandList::renderEnable(bool on) { return writeRenderEnable(cmd, on); }
+
+    uint64_t Deko3DCommandList::optionalHandle(uint32_t *word) {
+        if (!word)
+            return 0;
+        optionalWords.push_back(word);
+        return (uint64_t(optionalGeneration) << 32) | uint64_t(optionalWords.size());
+    }
+
+    // drawInstanced's commands, with the render enable around the draw alone: the held barriers, the descriptor
+    // invalidation and every binding are recorded before it.
+    uint64_t Deko3DCommandList::drawOptional(uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance, bool enabled) {
+        if (!graphicsPipeline || !graphicsPipeline->valid)
+            return 0;
+        flushDescriptorInvalidate();
+        if (graphicsPipeline->hasPushWindows)
+            bindPushWindows();
+        bindGraphicsBuffers();
+        if (graphicsPipeline->boundTextures)
+            bindTextures();
+        bindFragmentVariant();
+        flushBarriers();
+        uint32_t *word = renderEnable(enabled);
+        if (word || enabled) {
+            dkCmdBufDraw(cmd, graphicsPipeline->primitive, vertexCount, instanceCount, startVertex, startInstance);
+            ++statDraws;
+        }
+        if (word)
+            renderEnable(true);
+        return optionalHandle(word);
+    }
+
+    // clearColor's commands for one rectangle, with the render enable around the clear alone.
+    uint64_t Deko3DCommandList::clearColorOptional(uint32_t attachmentIndex, RenderColor color, const RenderRect &r, bool enabled) {
+        const DkScissor s = {uint32_t(std::max(r.left, 0)), uint32_t(std::max(r.top, 0)),
+                             uint32_t(std::max(r.right - r.left, 0)), uint32_t(std::max(r.bottom - r.top, 0))};
+        dkCmdBufSetScissors(cmd, 0, &s, 1);
+        flushBarriers();
+        uint32_t *word = renderEnable(enabled);
+        if (word || enabled)
+            dkCmdBufClearColorFloat(cmd, attachmentIndex, DkColorMask_RGBA, color.r, color.g, color.b, color.a);
+        if (word)
+            renderEnable(true);
+        restoreScissors();
+        return optionalHandle(word);
+    }
+
+    bool Deko3DOptionalAvailable(RenderCommandList *list) {
+        const Deko3DCommandList *cl = static_cast<const Deko3DCommandList *>(list);
+        return cl && cl->open && !deferred(*cl) && g_renderEnableWorks.load(std::memory_order_relaxed) == 1;
+    }
+
+    uint64_t Deko3DDrawOptional(RenderCommandList *list, uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex,
+                                uint32_t startInstance, bool enabled) {
+        Deko3DCommandList *cl = static_cast<Deko3DCommandList *>(list);
+        if (!Deko3DOptionalAvailable(list)) {
+            if (enabled)
+                cl->drawInstanced(vertexCount, instanceCount, startVertex, startInstance);
+            return 0;
+        }
+        return cl->drawOptional(vertexCount, instanceCount, startVertex, startInstance, enabled);
+    }
+
+    uint64_t Deko3DClearColorOptional(RenderCommandList *list, uint32_t attachmentIndex, RenderColor color, const RenderRect &rect,
+                                      bool enabled) {
+        Deko3DCommandList *cl = static_cast<Deko3DCommandList *>(list);
+        if (!Deko3DOptionalAvailable(list)) {
+            if (enabled)
+                cl->clearColor(attachmentIndex, color, &rect, 1);
+            return 0;
+        }
+        return cl->clearColorOptional(attachmentIndex, color, rect, enabled);
+    }
+
+    int Deko3DRenderEnableTest(uint32_t got[3]) {
+        const int result = g_renderEnableWorks.load(std::memory_order_acquire);
+        memcpy(got, g_renderEnableGot, sizeof(g_renderEnableGot));
+        return result;
+    }
+
+    // Until the list ends: after that it may be submitted, and the GPU may be reading the word.
+    bool Deko3DSetOptional(RenderCommandList *list, uint64_t handle, bool enabled) {
+        Deko3DCommandList *cl = static_cast<Deko3DCommandList *>(list);
+        const uint32_t index = uint32_t(handle);
+        if (!cl || !cl->open || !index || uint32_t(handle >> 32) != cl->optionalGeneration || index > cl->optionalWords.size())
+            return false;
+        // Command memory is CPU-uncached: the store is in memory before the list can be submitted.
+        *static_cast<volatile uint32_t *>(cl->optionalWords[index - 1]) = enabled ? 1u : 0u;
+        return true;
     }
 
     void Deko3DCommandList::bindFragmentVariant() {
@@ -2497,10 +2623,91 @@ namespace plume {
         device->destroyBlock(out);
     }
 
+    // LostOdysseyRecomp (2026-11-13): whether the 3D engine drops a clear while the render enable is FALSE, both
+    // recorded so and as a TRUE rewritten to FALSE before the submission (Deko3DSetOptional), and keeps it while TRUE.
+    // A 64x64 RGBA8 target is cleared to A, then cleared to B inside the test's render-enable commands, and read back
+    // through the copy engine. Optional draws (Deko3DDrawOptional) are only made when all three come out right.
+    static void renderEnableSelfTest(Deko3DDevice *device) {
+        int expected = -1;
+        if (!g_renderEnableWorks.compare_exchange_strong(expected, 0))
+            return;
+        DkCmdBufMaker cm;
+        dkCmdBufMakerDefaults(&cm, device->dk);
+        DkCmdBuf cmd = dkCmdBufCreate(&cm);
+        DkMemBlock cmdMem = device->makeBlock(64u << 10, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "render enable test commands");
+        DkMemBlock out = device->makeBlock(64u << 10, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached, "render enable test readback");
+        DkImageLayoutMaker m;
+        dkImageLayoutMakerDefaults(&m, device->dk);
+        m.flags = DkImageFlags_UsageRender | DkImageFlags_Usage2DEngine;
+        m.format = DkImageFormat_RGBA8_Unorm;
+        m.dimensions[0] = 64;
+        m.dimensions[1] = 64;
+        DkImageLayout layout;
+        dkImageLayoutInitialize(&layout, &m);
+        const uint32_t size = uint32_t(dkImageLayoutGetSize(&layout));
+        DkMemBlock imgMem = device->makeBlock(alignUp(size, 1u << 16), DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, "render enable test image");
+        uint32_t got[3] = {};
+        bool ok = cmd && cmdMem && out && imgMem && dkCmdBufReplayCmdsAt;
+        // case 0: FALSE as recorded; 1: TRUE rewritten to FALSE before the submission; 2: TRUE.
+        for (int c = 0; ok && c < 3; c++) {
+            DkImage image;
+            dkImageInitialize(&image, &layout, imgMem, 0);
+            memset(dkMemBlockGetCpuAddr(out), 0x11, 64 * 64 * 4);
+            dkCmdBufClear(cmd);
+            dkCmdBufAddMemory(cmd, cmdMem, 0, 64u << 10);
+            DkImageView view;
+            dkImageViewDefaults(&view, &image);
+            dkCmdBufBindRenderTarget(cmd, &view, nullptr);
+            const DkScissor all = {0, 0, 64, 64};
+            dkCmdBufSetScissors(cmd, 0, &all, 1);
+            // Base and test colours convert to 8 bits exactly (0.5 reads back as 127, not 128).
+            dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 1.0f, 0.0f, 0.0f, 1.0f);
+            uint32_t *word = writeRenderEnable(cmd, c != 0);
+            dkCmdBufClearColorFloat(cmd, 0, DkColorMask_RGBA, 0.0f, 1.0f, 0.0f, 1.0f);
+            writeRenderEnable(cmd, true);
+            dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
+            const DkImageRect rect = {0, 0, 0, 64, 64, 1};
+            const DkCopyBuf dst = {dkMemBlockGetGpuAddr(out), 64 * 4, 64 * 64 * 4};
+            dkCmdBufCopyImageToBuffer(cmd, &view, &rect, &dst, 0);
+            dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);
+            DkFence fence{};
+            dkCmdBufSignalFence(cmd, &fence, true);
+            const DkCmdList list = dkCmdBufFinishList(cmd);
+            if (!word) {
+                ok = false;
+                break;
+            }
+            if (c == 1)
+                *static_cast<volatile uint32_t *>(word) = 0;
+            dkQueueSubmitCommands(device->queue, list);
+            dkQueueFlush(device->queue);
+            const DkResult r = dkFenceWait(&fence, 2'000'000'000ll);
+            memcpy(&got[c], dkMemBlockGetCpuAddr(out), 4);
+            ok = r == DkResult_Success;
+            dkQueueWaitIdle(device->queue);
+        }
+        // RGBA8 little endian: A = (255, 0, 0, 255), B = (0, 255, 0, 255).
+        constexpr uint32_t A = 0xFF0000FFu, B = 0xFF00FF00u;
+        const bool works = ok && got[0] == A && got[1] == A && got[2] == B;
+        logf("render enable test: FALSE kept %08x, TRUE rewritten to FALSE kept %08x, TRUE wrote %08x (expected %08x %08x %08x): "
+             "optional draws %s", got[0], got[1], got[2], A, A, B, works ? "on" : "off");
+        memcpy(g_renderEnableGot, got, sizeof(got));
+        g_renderEnableWorks.store(works ? 1 : 0, std::memory_order_release);
+        if (cmd)
+            dkCmdBufDestroy(cmd);
+        if (imgMem)
+            device->destroyBlock(imgMem);
+        if (cmdMem)
+            device->destroyBlock(cmdMem);
+        if (out)
+            device->destroyBlock(out);
+    }
+
     Deko3DCommandQueue::Deko3DCommandQueue(Deko3DDevice *device, RenderCommandListType type) : device(device), type(type) {
 #if defined(PLUME_DEKO3D_GUARDS)
         readbackSelfTest(device);
 #endif
+        renderEnableSelfTest(device);
     }
 
     std::unique_ptr<RenderCommandList> Deko3DCommandQueue::createCommandList() {

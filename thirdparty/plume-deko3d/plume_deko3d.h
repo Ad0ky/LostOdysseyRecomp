@@ -505,6 +505,14 @@ namespace plume {
         // banjo-nx (2026-10-19, render-thread proposal 13): per-draw counters of this list, added to the totals at end()
         // (no atomic read-modify-write per draw: the A57 has no LSE).
         uint64_t statDraws = 0, statWindowDraws = 0;
+        // LostOdysseyRecomp (2026-11-13, Deko3DDrawOptional): where this recording's optional draws and clears set the
+        // render enable (the words' CPU addresses in command memory), by handle; the generation counts begin() calls.
+        std::vector<uint32_t *> optionalWords;
+        uint32_t optionalGeneration = 0;
+        uint32_t *renderEnable(bool on);
+        uint64_t optionalHandle(uint32_t *word);
+        uint64_t drawOptional(uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex, uint32_t startInstance, bool enabled);
+        uint64_t clearColorOptional(uint32_t attachmentIndex, RenderColor color, const RenderRect &rect, bool enabled);
         void emitBarrier(DkBarrier mode, uint32_t invalidate);
         void flushBarriers() {
             if (pendingBarrier)

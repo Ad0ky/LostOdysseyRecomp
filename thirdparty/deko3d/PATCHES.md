@@ -31,3 +31,11 @@ Every change to upstream files is marked `LostOdysseyRecomp patch N`.
    unfixed upstream at `373bfd4`. `LO_DEKO3D_HEAP_STATS=1` counts the chunks (docs/SWITCH.md). This port's lists
    fit in one chunk, so the game lost none in battle or in a town; the start-up self-check's 3-chunk list lost 2
    per clear before the fix and none after.
+
+2. **`dkCmdBufReplayCmdsAt`** (`include/deko3d.h`, `source/dk_cmdbuf.cpp`; new). `dkCmdBufReplayCmds`, returning the CPU
+   address its words went to in command memory (null without memory), so the application can rewrite them until the
+   list is submitted. plume's deko3d back end writes the 3D engine's render enable (`SET_RENDER_ENABLE_C`, method
+   0x556, which deko3d's `engine_3d.def` does not name) around an optional draw with it, and turns the draw off by
+   rewriting the mode word (`Deko3DDrawOptional`, `LO_RESOLVE_DROP_UNREAD` in docs/SWITCH.md). The back end declares
+   it weak: linked against devkitPro's `libdeko3d.a` (`LO_SWITCH_DEKO3D_SOURCE=OFF`) its start-up test fails and the
+   optional draws are ordinary ones.
