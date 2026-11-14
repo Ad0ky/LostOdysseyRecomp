@@ -666,3 +666,42 @@ way (clean, town 240 s, battle 240 s). Handheld, CPU 1020 / GPU 461 / memory 133
 
 The frame rate doesn't move: both scenes are GPU-bound. The CPU threads do the same work in about 1.5% less time, which
 is headroom for scenes where the CPU sets the frame. The change is kept for its accuracy.
+
+## Swapchain images without compression (2026-11-13)
+
+The swapchain images were made with `DkImageFlags_HwCompression`. A compressed image has to be decompressed before the
+display can read it, so `dkQueuePresentImage` adds a decompression pass over the whole 1280x720 image to every present
+(`decompressSurface`, `thirdparty/deko3d/source/dk_swapchain.cpp`). The final pass writes every pixel of the image once,
+so compression saves it nothing. The GPU trace showed 0.36 ms a frame in the first battle after the presentation and
+before the next frame's batch, and 0.10 to 0.31 ms in town. Since 1.2.1 the images are made without compression;
+`LO_DEKO3D_SWAPCHAIN_COMPRESSION=1` brings the old images back.
+
+ABBA on the test console with one binary (`669634be`, v1.2.1 profile, built at the training path), the switch set in
+`env.txt` (A = `1`, compressed; B = `0`). Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows, 4 blocks per scene,
+1 warm-up + 2 counted runs each, so 4 runs per arm. Mean (lowest to highest run):
+
+| | First battle: compressed | not compressed | Town, 60 FPS target: compressed | not compressed |
+|---|---:|---:|---:|---:|
+| FPS | 28.38 (28.33-28.46) | **28.66** (28.59-28.74) | 40.24 (40.21-40.27) | **40.78** (40.73-40.84) |
+| 1% low FPS | 24.86 (24.23-25.43) | 25.23 (24.74-25.48) | 38.76 (38.67-38.83) | 39.26 (39.17-39.35) |
+| Frame p50 | 35.00 ms (34.98-35.03) | 34.69 ms (34.64-34.72) | 24.79 ms (24.77-24.81) | 24.46 ms (24.43-24.50) |
+| Frame p99 | 40.23 ms (39.33-41.27) | 39.64 ms (39.25-40.42) | 25.80 ms (25.75-25.86) | 25.47 ms (25.41-25.53) |
+| Frame mean | 35.23 ms | 34.88 ms (-0.34) | 24.85 ms | 24.52 ms (-0.32) |
+| Batch GPU time (`gpu_ms`) | 32.66 ms | 32.63 ms | 21.14 ms | 21.14 ms |
+
+The ranges of the two arms don't overlap in either scene. The frame is 0.34 ms shorter in battle and 0.32 ms shorter in
+town. The battle figure matches the trace's 0.36 ms, and the town figure is at the top of its range. The renderer's
+batches take the same time (`gpu_ms` leaves the presentation and the decompression out). Both scenes are GPU-bound, so
+the whole saving shows in the frame. The block order didn't matter: the A blocks before and after the B blocks give the
+same results (battle 28.35 and 28.41, town 40.25 and 40.24).
+
+The `swapchain:` line (Info, `LO_DEBUG_LOG=1`) of a start with each value: `3 images of 1280x720 (format 28), swap
+interval 1, compressed` and `..., not compressed`.
+
+Compression is lossless, so the image can't change, and the screenshots agree. The test reads back the presented
+1280x720 swapchain image (`LO_SCREENSHOT_PRESENTED=1`) at the end of three town runs per arm and compares only the
+pixels that stay the same in every shot of an arm. 737,548 pixels are stable in both arms, and 3,334 of them (0.45%)
+differ between the arms. All of those are in the upper half of the image, where people walk and the sky moves. The same
+test on the 960x540 frontbuffer shots of the ABBA, which this switch can't affect, finds 2,797 of 408,632 (0.68%) in the
+same places, so this is how much the scene changes from one run to the next. Presented battle shots of both arms show
+the same frame. A second run of the town arms gave 40.21 FPS compressed and 40.76 FPS not compressed, the same as the ABBA.
