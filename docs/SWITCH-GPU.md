@@ -150,7 +150,9 @@ third frame of the measurement, `LO_GPU_PASS_TRACE=3`) `rampcheck` counted **0**
 compared and was the same. `LO_PRESENT_RAMP_CHECK=2` compares the two as `RGBA32F` before the store to 8 bits: 0
 differing pixels again in 300 town and 150 battle frames, so the floats themselves are equal, not only their
 rounding. The player's curve (`.w`, read with `GatherAlpha`) is off at the default brightness and gamma, so these runs
-check the game's ramp; a check with the curve on is still to run.
+check the game's ramp. With the curve on as well (brightness 4, gamma 115 in `config/settings.ini`; the log says
+`gamma ramp on, player curve on`): `=2` 0 differing pixels in 300 town and 150 battle frames, `=1` 0 in 299 town
+frames (`rampcheck-same` 921,600 in every one of them).
 
 ## The resolves: who reads them
 
