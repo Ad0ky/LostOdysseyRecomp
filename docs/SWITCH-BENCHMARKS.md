@@ -605,6 +605,59 @@ No change: +0.01 FPS, inside the 0.26 FPS spread of either build. Block 3's firs
 restart the system's `vi` service aborted (Atmosphere report at 23:37:22) and the game with it; the same pair is in
 the reports from 21:25, with the original NRO. The rerun of blocks 3 and 4 had no trouble.
 
+## Resolve writes nobody reads (2026-11-14)
+
+The game resolves the scene colour to slot `0x9fa0000` (960x540 `RGBA16F` here) three times a frame, before each reuse
+of EDRAM, and restores it afterwards. With the restores skipped (`LO_SKIP_RESTORE`), nothing samples, copies or
+presents the first two of those writes before the next whole write of the same image replaces them. Each one is a
+full-screen blit of a 16-bit float image, about 0.5 ms of GPU time.
+
+`LO_RESOLVE_DROP_UNREAD` records every whole resolve write (the blit, or a transfer folded into it) as an optional
+draw: deko3d patch 2 (`dkCmdBufReplayCmdsAt`) writes the 3D engine's `SET_RENDER_ENABLE_C` (method `0x556`) before
+the draw, with a data word the CPU can rewrite until the list is submitted, and `TRUE` after it. Only the draw is
+predicated: its state, bindings and barriers are recorded outside, so turning it off changes nothing after it. When
+the next whole write of the same image arrives in the same frame and command list, and nothing read the image since
+(a draw's texture lookup, presentation, a screenshot, a share copy), the earlier draw's word is set to `FALSE`. Every
+other path that writes the image, or a write that is not whole, ends the record; features that read resolves outside
+the renderer's texture lookup (HDR scene, frame generation, the temporal paths, FSR alpha, captures and dumps) turn
+the drops off. A start-up test (64x64 target: `FALSE`, `TRUE` rewritten to `FALSE`, `TRUE`) checks the render
+enable on the console before any drop: `renderer: LO_RESOLVE_DROP_UNREAD=1 ...; render enable test passed`.
+
+Drops on the console (`renderer: unread resolve dropped`): two writes of `0x9fa0000` a frame in town and in the first
+battle, no other slot. Cost of the mechanism alone (`=2`: optional draws, none dropped): 4 command words per whole
+resolve draw, three a frame; town 40.24 FPS, GPU 21.14 ms, all threads 253.0% against 40.22, 21.17 and 253.8 with it
+off: not measurable.
+
+ABBA on the test console, one binary (PGO USE, 1.2.1's profile), `LO_RESOLVE_DROP_UNREAD=0` (off) against `1` (on).
+Handheld, CPU 1020 / GPU 461 / memory 1331 MHz, 540 rows; blocks off, on, on, off, 1 warm-up + 2 counted runs each, so
+4 runs per arm. Mean (min to max):
+
+| | Town, 60 FPS cap: off | on | First battle: off | on |
+|---|---:|---:|---:|---:|
+| FPS | 40.22 (40.19-40.26) | 42.01 (41.99-42.03) | 28.40 (28.27-28.44) | 29.00 (28.87-29.07) |
+| 1% low | 38.76 (38.68-38.84) | 40.47 (40.40-40.54) | 25.02 (24.76-25.35) | 25.58 (24.82-26.00) |
+| Frame p50 | 24.80 ms | 23.77 ms | 35.05 ms | 34.16 ms |
+| Frame p99 | 25.80 ms (25.74-25.85) | 24.71 ms (24.67-24.75) | 39.98 ms (39.45-40.39) | 39.11 ms (38.46-40.29) |
+| GPU busy (`gpu_ms`) | 21.17 ms (21.15-21.18) | 20.12 ms (20.10-20.14) | 32.64 ms (32.46-32.83) | 31.71 ms (31.66-31.80) |
+| Present | 3.77 ms | 3.14 ms | 12.01 ms | 8.98 ms |
+
+Town +4.5%, first battle +2.1%. The GPU saves 1.05 ms in town and 0.93 ms in battle (the analysis estimated 1.09 and
+0.84 ms).
+
+Image. `LO_RESOLVE_DROP_CHECK=1` records a magenta clear of the image before each optional draw and turns it on
+where the draw is dropped: no magenta in the town or battle screenshots, and no magenta tint against the normal shots
+(the per-pixel magenta shift is at the shot-to-shot noise level). `=2` replaces every whole resolve write with
+magenta: 98.5% of the town shot is magenta, so the check can see the slot. Bench screenshots differ run to run, so the
+arms were compared in pairs. Uncapped, the arms run at different frame rates and the shots differ between arms more
+than within one (mostly 1-level differences around the bright areas); with both arms capped at 20 FPS (2 runs per
+block, same order) that difference goes: pixels equal within two blocks of each arm but different between them,
+town 563 and 423 against 606 and 4,114 for two blocks of the same arm; battle 8,117 and 20,919 against 12,632 and
+9,886. The blit and transfer pipelines write every pixel of the image (copy blend, all channels, no discard), so the
+write that stays makes the image whatever the dropped one held.
+
+No third scene with refraction, water or heat was measured: their scenarios need save slots `user15` to `user18`,
+which neither the console (slots `user00` to `user05`) nor this checkout has.
+
 ## Switches env.txt didn't reach (until 2026-11-11)
 
 Before 2026-11-11 the console applied env.txt in `switch_platform::Initialize`, from `main`, after the static
