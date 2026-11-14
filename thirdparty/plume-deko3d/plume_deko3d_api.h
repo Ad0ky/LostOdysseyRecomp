@@ -47,6 +47,24 @@ namespace plume {
     // aren't shaded. Stays until changed.
     void Deko3DSetEarlyFragmentTests(RenderCommandList *list, bool allowed);
 
+    // LostOdysseyRecomp (2026-11-13): optional draws (LO_RESOLVE_DROP_UNREAD). A draw, or a colour clear of one
+    // rectangle of the bound target, recorded with these can still be cancelled (or enabled) until the list ends: the
+    // 3D engine's render enable (SET_RENDER_ENABLE_C, FALSE or TRUE) is set around the draw or clear command alone, and
+    // Deko3DSetOptional rewrites that one command word in command memory. Everything else the call records (pipeline
+    // and buffer bindings, held barriers, the clear's scissors) is recorded before it and runs either way, so the list's
+    // state is the same whether it is cancelled or not. A handle is good until the list's end() (0: none).
+    // Deko3DOptionalAvailable: the start-up test of the render enable passed and the list records on this thread (not
+    // the record thread). When not available, the calls record an ordinary draw or clear if `enabled` and return 0.
+    bool Deko3DOptionalAvailable(RenderCommandList *list);
+    uint64_t Deko3DDrawOptional(RenderCommandList *list, uint32_t vertexCount, uint32_t instanceCount, uint32_t startVertex,
+                                uint32_t startInstance, bool enabled);
+    uint64_t Deko3DClearColorOptional(RenderCommandList *list, uint32_t attachmentIndex, RenderColor color, const RenderRect &rect,
+                                      bool enabled);
+    bool Deko3DSetOptional(RenderCommandList *list, uint64_t handle, bool enabled);
+    // The start-up test's result: -1 not run, 0 failed, 1 passed; got: the pixel read back after a clear under FALSE, a
+    // TRUE rewritten to FALSE, and TRUE (RGBA8 words; expected A, A, B as the back end's log line says).
+    int Deko3DRenderEnableTest(uint32_t got[3]);
+
     // LostOdysseyRecomp (2026-11-04): the CPU's copy of the uniform buffer at GPU 'address' (the draw's shared
     // constants), where bound textures read their sampler words; nullptr when the draw is done (plume_deko3d.h).
     bool Deko3DSetSharedWords(RenderCommandList *commandList, const void *cpu, uint32_t size, uint64_t address);

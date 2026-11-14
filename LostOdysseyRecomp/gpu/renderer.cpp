@@ -522,6 +522,12 @@ namespace gpu::renderer
             // A blit resolve (LO_RESOLVE_BLIT) read this target and nothing has written it since: the restore skip's
             // proof, as COPY_SOURCE is after a copy.
             bool unwrittenSinceResolve = false;
+            // LO_RESOLVE_DROP_UNREAD (a resolve slot's image): the optional draw of its last whole resolve write while
+            // that can still be left out of the list being recorded (plume::Deko3DDrawOptional; 0: none), the frame of
+            // that write, the check mode's magenta clear under it, and whether anything may have read the image since: a
+            // plain store wherever its pixels can be consumed (GetTexture, NewestResolved, the shared-image copy).
+            bool readSinceWrite = false;
+            uint64_t unreadWrite = 0, unreadWriteFrame = ~0ull, unreadCheck = 0;
             RenderTextureLayout layout = RenderTextureLayout::UNKNOWN;
             RenderFormat format = RenderFormat::UNKNOWN;
             uint32_t width = 0, height = 0;
@@ -1879,6 +1885,8 @@ namespace gpu::renderer
                 for (ResolvedSurface& rs : it->second)
                     if (rs.tex && (!best || rs.frame >= best->frame))
                         best = &rs;
+                // The presentation, screenshots and captures read what it returns (LO_RESOLVE_DROP_UNREAD).
+                if (best) best->tex->readSinceWrite = true;
                 return best;
             }
 
@@ -3855,7 +3863,7 @@ namespace gpu::renderer
                 commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
                 commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
                 if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
-                commandList->drawInstanced(3, 1, 0, 0);
+                DrawResolveWrite(dst, x0, y0, w, h);
                 return true;
             }
 
@@ -5052,6 +5060,117 @@ namespace gpu::renderer
                 return result;
             }
 
+            // ---- LO_RESOLVE_DROP_UNREAD (deko3d) ------------------------------------------------------------------
+            // On the Xbox 360 the game resolves the scene colour before it reuses the EDRAM and draws the copy back
+            // afterwards; here the restore is skipped (LO_SKIP_RESTORE), so some resolves are replaced by the next
+            // resolve of the same slot before anything samples them (town and first battle: two of the three writes of
+            // 0x9fa0000 a frame, 1.09 / 0.84 ms of GPU). Such a write can only be known afterwards, so each whole write of
+            // a resolve image is recorded as an optional draw (plume::Deko3DDrawOptional: the draw alone sits under the
+            // GPU's render enable, which can be turned off until the list ends). At the image's next whole write, in the
+            // same frame and while that list is still being recorded, the earlier one is turned off if nothing may have
+            // read the image since. Reads set readSinceWrite (GetTexture, NewestResolved, the shared-image copy); a
+            // partial write ends the record (it keeps older pixels). The bookkeeping of the dropped write (rs.frame,
+            // sourceSerial, the copy and share records) stays as it was: every later use of it comes after the whole
+            // write that replaced its pixels, which updates them. LO_RESOLVE_DROP_UNREAD=0: off.
+            // LO_RESOLVE_DROP_CHECK=1: a dropped write is replaced by a magenta clear of the image (recorded off under the
+            // draw and turned on when the draw is turned off): any dropped write that were seen would show magenta.
+            // =2 tests the mechanism, not the rule: every whole resolve write is replaced by magenta (the clear runs and
+            // the draw after it does not, or no magenta would show).
+            struct ResolveDropStats
+            {
+                uint64_t frame = ~0ull, total = 0;
+                uint32_t frameDrops = 0, loggedFrames = 0, failed = 0;
+                std::string frameSlots;
+            } resolveDropStats;
+
+            // The features that read resolve images through paths that do not set readSinceWrite, or read them on the
+            // CPU: drops stay off while any of them is on (none is on the Switch by default).
+            bool ResolveDropsAllowed()
+            {
+#if defined(LO_SWITCH_DEKO3D)
+                if (!plume::Deko3DOptionalAvailable(commandList)) return false;
+#else
+                return false;
+#endif
+                if (resolveReadback || hdrSceneEnabled.load(std::memory_order_relaxed) || drawReuseMode ||
+                    activePlan.requestedUpscaler != upscaling::Upscaler::Off || p2Evidence.is_open() || !debugCaptureDir.empty() ||
+                    captureFrame || GetHotCaptureEnvironment().dumpResolveFrame || temporalExperiment || temporalInputProbe ||
+                    dlssSrRequested || nativeFgInputs)
+                    return false;
+#if defined(LO_GPU_PLUME)
+                if (fsrAlphaBridge || fgCompositeEnabled || fgSnapshotRequestedFrame != ~0ull || fgUiRequestedFrame != ~0ull)
+                    return false;
+#endif
+                return true;
+            }
+
+            // Turns the image's last whole write off (it was never read and is about to be replaced whole).
+            void DropUnreadResolveWrite(HostTexture& image, int check)
+            {
+#if defined(LO_SWITCH_DEKO3D)
+                const bool dropped = plume::Deko3DSetOptional(commandList, image.unreadWrite, false);
+                if (dropped && check) plume::Deko3DSetOptional(commandList, image.unreadCheck, true);
+                if (!dropped) { ++resolveDropStats.failed; return; }
+                if (resolveDropStats.frame != frame) {
+                    resolveDropStats.frame = frame;
+                    resolveDropStats.frameDrops = 0;
+                    resolveDropStats.frameSlots.clear();
+                }
+                ++resolveDropStats.frameDrops;
+                ++resolveDropStats.total;
+                // The first frames after 300 with drops, then one a minute: how many, and which slots.
+                if ((frame >= 300 && resolveDropStats.loggedFrames < 6) || frame % 1800 == 0) {
+                    for (const auto& [base, list] : resolved)
+                        for (const ResolvedSurface& rs : list)
+                            if (rs.tex.get() == &image)
+                                resolveDropStats.frameSlots += fmt::format(" {:#x}/{}", base, rs.destFormat);
+                    LOG_NOTICE("renderer: unread resolve dropped frame={} n={} image={}x{} allocation={} slots{} (total {}, not droppable {})",
+                        frame, resolveDropStats.frameDrops, image.width, image.height, image.allocationSerial,
+                        resolveDropStats.frameSlots, resolveDropStats.total, resolveDropStats.failed);
+                    if (frame >= 300 && resolveDropStats.frameDrops == 1) ++resolveDropStats.loggedFrames;
+                }
+#else
+                (void)image; (void)check;
+#endif
+            }
+
+            // The draw of a resolve's write of (x0,y0,w,h) into dst (BlitRegion for a same-format resolve, and the folded
+            // transfer), with the full-target triangle, pipeline, viewport and scissor already bound.
+            void DrawResolveWrite(HostTexture& dst, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+            {
+                // 0 off, 1 on, 2 the optional draws without drops (what the render enable commands cost on their own).
+                static const int dropUnread = [] {
+                    const char* value = getenv("LO_RESOLVE_DROP_UNREAD");
+                    const int mode = !video::IsDeko3d() ? 0 : !value ? 1 : value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
+#if defined(LO_SWITCH_DEKO3D)
+                    uint32_t got[3] = {};
+                    const int test = plume::Deko3DRenderEnableTest(got);
+                    LOG_NOTICE("renderer: LO_RESOLVE_DROP_UNREAD={} ({}); render enable test {} (read back {:08x} {:08x} {:08x}, "
+                        "expected ff0000ff ff0000ff ff00ff00)", mode,
+                        mode == 2 ? "optional resolve draws, none dropped" : mode ? "unread resolves dropped" : "off",
+                        test == 1 ? "passed" : test == 0 ? "FAILED: optional draws off" : "not run", got[0], got[1], got[2]);
+#endif
+                    return mode;
+                }();
+                static const int dropCheck = getenv("LO_RESOLVE_DROP_CHECK") ? std::atoi(getenv("LO_RESOLVE_DROP_CHECK")) : 0;
+                const bool whole = !x0 && !y0 && w >= dst.width && h >= dst.height;
+                if (!dropUnread || !whole || !ResolveDropsAllowed()) {
+                    dst.unreadWrite = 0;
+                    commandList->drawInstanced(3, 1, 0, 0);
+                    return;
+                }
+#if defined(LO_SWITCH_DEKO3D)
+                if (dropUnread == 1 && dropCheck != 2 && dst.unreadWrite && !dst.readSinceWrite && dst.unreadWriteFrame == frame)
+                    DropUnreadResolveWrite(dst, dropCheck);
+                // Check mode: the magenta clear goes first, so that it shows only where the draw after it is off.
+                dst.unreadCheck = dropCheck ? plume::Deko3DClearColorOptional(commandList, 0, RenderColor(1.0f, 0.0f, 1.0f, 1.0f),
+                    RenderRect{0, 0, int32_t(dst.width), int32_t(dst.height)}, dropCheck == 2) : 0;
+                dst.unreadWrite = plume::Deko3DDrawOptional(commandList, 3, 1, 0, 0, dropCheck != 2);
+                dst.unreadWriteFrame = frame;
+                dst.readSinceWrite = false;
+#endif
+            }
+
             // Copies rect (x0,y0,w,h) from src into dst at the same position,
             // converting formats along the way.
             // forResolve: a same-format resolve (ResolveOnGpu, LO_RESOLVE_BLIT), which keeps its own SDR state and copy
@@ -5062,6 +5181,7 @@ namespace gpu::renderer
                 if (!forResolve) {
                     dst.sdrProducerFrame = ~0ull;
                     consecutiveResolveCopies.Invalidate();
+                    dst.unreadWrite = 0; // LO_RESOLVE_DROP_UNREAD: a write that is not optional ends the record
                 }
                 RenderPipeline* pipeline = GetBlitPipeline(dst.format);
                 if (!pipeline)
@@ -5086,7 +5206,8 @@ namespace gpu::renderer
                 commandList->setGraphicsDescriptorSet(AcquireSet(2), 2);
                 commandList->setGraphicsDescriptorSet(AcquireSet(3), 3);
                 if(vulkan) commandList->setGraphicsDescriptorSet(staticSamplerSet.get(),4);
-                commandList->drawInstanced(3, 1, 0, 0);
+                if (forResolve) DrawResolveWrite(dst, x0, y0, w, h);
+                else commandList->drawInstanced(3, 1, 0, 0);
 #if defined(LO_GPU_PLUME)
                 if (!forResolve) HandleFsrAlphaRgbWriter(dst, "blit_region");
 #endif
@@ -9571,6 +9692,7 @@ void main()
                 }
                 if (ResolvedSurface* rs = FindResolved(base, format))
                 {
+                    rs->tex->readSinceWrite = true; // sampled, or copied into a cropped view (LO_RESOLVE_DROP_UNREAD)
                     DescribeBindingTexture(bindingInfo, *rs->tex, binding::TextureKind::Resolved);
                     if (bindingInfo && rs->writeOrdinal) {
                         bindingInfo->resolveFrameAge = binding::RelativeAge(frame, rs->frame);
@@ -15487,6 +15609,7 @@ void main()
                     !(x0 == 0 && y0 == 0 && w >= texW && h >= texH))
                 {
                     consecutiveResolveCopies.Invalidate();
+                    previousImage->readSinceWrite = true; // LO_RESOLVE_DROP_UNREAD: its pixels are copied
                     Transition(*previousImage, RenderTextureLayout::COPY_SOURCE, RenderBarrierStage::COPY);
                     Transition(*rs.tex, RenderTextureLayout::COPY_DEST, RenderBarrierStage::COPY);
                     RenderBox box{ 0, 0, int32_t(texW), int32_t(texH), 0, 1 };

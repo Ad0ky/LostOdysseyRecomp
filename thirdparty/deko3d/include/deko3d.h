@@ -1251,6 +1251,9 @@ void dkCmdBufClear(DkCmdBuf obj);
 void dkCmdBufBeginCaptureCmds(DkCmdBuf obj, uint32_t* storage, uint32_t max_words);
 uint32_t dkCmdBufEndCaptureCmds(DkCmdBuf obj);
 void dkCmdBufReplayCmds(DkCmdBuf obj, const uint32_t* words, uint32_t num_words);
+// LostOdysseyRecomp patch 2: dkCmdBufReplayCmds that returns where the words went in command memory (CPU address),
+// so that the application can rewrite them before the list is submitted. Null if no command memory was available.
+uint32_t* dkCmdBufReplayCmdsAt(DkCmdBuf obj, const uint32_t* words, uint32_t num_words);
 void dkCmdBufCallList(DkCmdBuf obj, DkCmdList list);
 void dkCmdBufWaitFence(DkCmdBuf obj, DkFence* fence);
 void dkCmdBufSignalFence(DkCmdBuf obj, DkFence* fence, bool flush);
