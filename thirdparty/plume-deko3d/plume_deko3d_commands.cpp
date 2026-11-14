@@ -2627,6 +2627,13 @@ namespace plume {
         if (format == DkImageFormat_None)
             format = DkImageFormat_RGBA8_Unorm;
         const uint32_t count = std::max<uint32_t>(desc.textureCount, 2);
+        // LostOdysseyRecomp (2026-11-13): the swapchain images are made without hardware compression;
+        // LO_DEKO3D_SWAPCHAIN_COMPRESSION=1 makes them compressed, as before. deko3d decompresses a compressed image at
+        // every present (dkQueuePresentImage, since the display reads the memory as it is): a pass over the whole image
+        // on the GPU, while the final pass that draws into it writes every pixel once and gains nothing from
+        // compression. Test console, ABBA: first battle 28.38 -> 28.66 FPS, town at a 60 FPS target 40.24 -> 40.78
+        // (docs/SWITCH-BENCHMARKS.md). Read once, at the first resize.
+        static const bool compressed = envInt("LO_DEKO3D_SWAPCHAIN_COMPRESSION", 0) != 0;
         std::vector<const DkImage *> images;
         for (uint32_t i = 0; i < count; i++) {
             auto t = std::make_unique<Deko3DTexture>(device);
@@ -2636,7 +2643,8 @@ namespace plume {
             t->ownsMemory = false;
             DkImageLayoutMaker m;
             dkImageLayoutMakerDefaults(&m, device->dk);
-            m.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_HwCompression | DkImageFlags_Usage2DEngine;
+            m.flags = DkImageFlags_UsageRender | DkImageFlags_UsagePresent | DkImageFlags_Usage2DEngine |
+                      (compressed ? DkImageFlags_HwCompression : 0);
             m.format = format;
             m.dimensions[0] = w;
             m.dimensions[1] = h;
@@ -2658,7 +2666,8 @@ namespace plume {
             return false;
         }
         dkSwapchainSetSwapInterval(swapchain, vsync ? 1 : 0);
-        logf("swapchain: %u images of %ux%u (format %d), swap interval %u", count, w, h, int(format), vsync ? 1u : 0u);
+        logf("swapchain: %u images of %ux%u (format %d), swap interval %u, %s", count, w, h, int(format), vsync ? 1u : 0u,
+             compressed ? "compressed" : "not compressed");
         return true;
     }
 

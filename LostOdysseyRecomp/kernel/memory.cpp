@@ -227,15 +227,16 @@ uint32_t PageAllocator::Alloc(Region& region, uint32_t size, uint32_t alignment,
         // memalign of the chunk, with an rc the code-memory map; "map alias view" a view), and the heap
         // and process memory at that moment: the next failure says its cause.
         const auto failure = GuestAddressSpace::GetFailureInfo();
-        LOG_ERROR("guest memory commit failed: {:#x} + {:#x} ({} rc {:#x}, view {}, chunk offset {:#x}, size {:#x}){}{}",
+        // detail: the kernel's memory blocks at the mapping that failed, "start-end tTYPE aATTR pPERM" (+x: window offset).
+        LOG_ERROR("guest memory commit failed: {:#x} + {:#x} ({} rc {:#x}, view {}, chunk offset {:#x}, size {:#x}){}{}{}{}",
             address, size, GuestAddressSpace::FailureOperationName(failure.operation), failure.error, failure.viewIndex,
             failure.offset, failure.size,
 #if LO_PLATFORM_SWITCH
-            ", ", os::switch_platform::MemorySummary()
+            ", ", os::switch_platform::MemorySummary(),
 #else
-            "", ""
+            "", "",
 #endif
-        );
+            failure.detail[0] ? "; " : "", failure.detail);
         return 0;
     }
     memset(g_memory.Translate(address), 0, size);

@@ -255,6 +255,8 @@ A release is a profile-guided build, about 6% faster than this one. See
 CMake options (`cmake/LoSwitch.cmake`): `LO_SWITCH_RECOMP_O2`,
 `LO_SWITCH_LTO`, `LO_SWITCH_DATA_ROOT`, `LO_SWITCH_APP_TITLE`.
 `LO_SWITCH_FP_CONTRACT_OFF` (off) builds the game code with `-ffp-contract=on` instead of GCC's `fast`, for A/B tests only (#4).
+`LO_SWITCH_FMADDS_DOUBLE` (off) computes the game's `fmadds` family in double, rounded twice, as before
+`tools/switch/ppc_fmadds.py`, for A/B tests only (see [SWITCH-BENCHMARKS.md](SWITCH-BENCHMARKS.md#single-precision-fused-multiply-adds)).
 
 ### Without a console toolchain
 
@@ -301,6 +303,8 @@ Switch-specific options and diagnostics:
 
 | Variable | Default | Effect |
 |---|---|---|
+| `LO_GUEST_BLOCKS` | `1` | `0` maps guest memory with 4 KiB pages, the old layout: the window off a 2 MiB boundary and its backing 4 KiB aligned. On, the virtual, A and C views are 2 MiB blocks (the E view, one 4 KiB page off A, never is). The log's `guest window` line says which |
+| `LO_TLB_TEST` | off | `N`: N seconds after start, logs what a TLB miss costs in each guest view and in the NRO's code and read-only data (`switch: tlb:` lines; a few ms, holds the commit lock). Tells 2 MiB blocks (a few ns) from 4 KiB pages; `svcQueryMemory` does not show the page size |
 | `LO_SWITCH_BACKEND` | NVK | `deko3d` renders with deko3d instead of Mesa NVK (experimental; see "deko3d back end" below) |
 | `LO_SWITCH_RENDER_HEIGHT` | Graphics menu | `540` or `720` (or a dynamic resolution height) forces the scene height over Graphics → Render resolution; without either, handheld uses 540 and docked uses 720 |
 | `LO_DYNAMIC_RESOLUTION` | Graphics menu (off) | `0` or `1` wins over Graphics → Dynamic resolution. `1`: the scene height follows the GPU's time per frame, in steps of 36 rows from the configured height (540 or 720) down to `LO_DYNAMIC_RESOLUTION_MIN` (default 80% of it: 432 or 576); the final pass scales it to the output as usual. The runtime log's `dynamic resolution:` lines show each change |
@@ -312,6 +316,7 @@ Switch-specific options and diagnostics:
 | `LO_SWITCH_RCAS_STOPS` | Graphics menu (`0.25` with `LO_SWITCH_UPSCALER`) | RCAS sharpness for `fsr` and `rcas`, in stops: 0 is the sharpest, each stop halves it (AMD's default is 0.2). Wins over Graphics → FSR sharpness |
 | `LO_SWITCH_UI_NATIVE` | `0` | `1`: text, HUD and menus at the output's size while the scene stays smaller. At the game's scene copy (the finished scene into the display target, before the UI) the scene is upscaled with `LO_SWITCH_UPSCALER` (bilinear when unset; Graphics → FSR does not reach this path) and the display target is swapped for an output-size one, so the UI after it is never scaled. Frames without a scene copy (movies, title) keep the final-pass upscale. Log: `renderer: LO_SWITCH_UI_NATIVE`, plus `restores the scene-size target before the frame ends` when a UI draw needs depth or another target first |
 | `LO_DEKO3D_PRESENT_THREAD` | `1` | The compositor's buffer-queue calls (queue the finished image, dequeue the next) run on a worker instead of `GPU CmdProc`; `0` makes them there. Street at 540 output: present 2.4 to 0.8 ms on `GPU CmdProc`, 28.77 to 29.1 FPS; the busiest street spot (about 2,030 draws): 24.02 to 24.67 FPS |
+| `LO_DEKO3D_SWAPCHAIN_COMPRESSION` | `0` | deko3d: the swapchain images (the final pass's targets) are made without hardware compression; `1` makes them compressed, as before 1.2.1. deko3d decompresses a compressed image at every present, since the display reads the memory as it is: a pass over the whole 1280x720 image on the GPU, while the final pass writes every pixel once and gains nothing from compression. Without it: first battle 28.38 to 28.66 FPS, town at a 60 FPS target 40.24 to 40.78 (`SWITCH-BENCHMARKS.md`, "Swapchain images without compression"). Read once, at the first swapchain; the log's `swapchain:` line (Info) ends in `compressed` or `not compressed`. Lossless either way: the image is the same |
 | `LO_DRAW_REUSE` | `0` | `1`: a draw takes the shader, pipeline and texture lookups the draw at its position made in the previous frame. Street: 28.97 against 29.0 FPS, no gain measured. `2` still looks everything up and logs every result that differs |
 | `LO_SKIP_RESTORE` | on | `0` draws the game's EDRAM restores instead of skipping them (deko3d) |
 | `LO_MAIN_CORE` | `-1` | core Guest Main stays on, `-1` leaves it free to move. Pinning gains 2% in battle but can stall the game: see `SWITCH-BENCHMARKS.md`, Milestone 4 |
@@ -614,7 +619,7 @@ instructions per call, so it shifts little time.
 |---|---|
 | Toolchain | devkitA64 GCC, libnx (`cmake/toolchains/switch-devkitA64.cmake`); `LO_PLATFORM_SWITCH` in `os/platform.h` |
 | Recompiled code | Same XenonRecomp output; GCC replacements for Clang builtins in `ppc_context.h` (`tools/patches/XenonRecomp-switch.patch`) |
-| Guest memory | 4 GiB `virtmem` reservation; pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
+| Guest memory | 4 GiB `virtmem` reservation, placed clear of the kernel map region, which holds thread-local pages and is invisible to `virtmem` (0x8000000-0x80000000 in a 36-bit process, 64 GiB at a random place in a 39-bit one); pages backed on allocation with `svcMapProcessCodeMemory` + `svcMapProcessMemory`; the physical C and E views map the same pages as A (`kernel/guest_address_space_switch.cpp`) |
 | Threads | Guest code threads get 4 MiB stacks (libnx defaults to 128 KiB) |
 | Graphics | plume Vulkan on statically linked Mesa NVK, `VK_NN_vi_surface` on the libnx window (`tools/patches/plume-switch.patch`, `volk-switch.patch`) |
 | Shaders | Prebuilt SPIR-V pack plus the PC's Vulkan shader cache; DXC is not available (`LO_SWITCH_DXC_IDENTITY`). Guest shaders read their constants from dynamic uniform buffers in descriptor set 5 (`gpu/shader/common_hlsl.h`, `cache::UboConstants()`), which NVK keeps in the Maxwell constant banks |

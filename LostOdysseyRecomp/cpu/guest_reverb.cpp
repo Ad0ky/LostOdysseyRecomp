@@ -17,8 +17,8 @@
 // frame's private slots (below r1 + 384, and the caller's r1 + 20) are C++ locals, which the compiler keeps in
 // registers. fadds / fsubs / fmuls run in float: the recompiled code rounds
 // them through double to float, and for +, - and * double rounding through a format of 53 bits is innocuous for
-// 24-bit operands, so the results are the same. fmadds is computed in double and rounded to float, as the recompiled
-// code does (its fused fmadd on doubles). The vector loop keeps lanes in guest element order and uses the same
+// 24-bit operands, so the results are the same. fmadds is one single-precision fused operation, as the recompiled
+// code computes it (cpu/guest_fmadds.h). The vector loop keeps lanes in guest element order and uses the same
 // operations (fmla for vmaddfp, as the recompiled build fuses it), with flushing on as there.
 // Buffers at r1 + 384 and above stay in guest memory: the filters write them.
 //
@@ -27,6 +27,7 @@
 #include <stdafx.h>
 #include <kernel/memory.h>
 #include <os/logger.h>
+#include <cpu/guest_fmadds.h>
 #include <arm_neon.h>
 #include <atomic>
 #include <bit>
@@ -470,39 +471,39 @@ namespace
         f1 = F(PPC_FAST_LOAD_U32(uint32_t(r14 + r11))); // lfsx f1,r14,r11
         f3 = f3 * f11; // fmuls f3,f3,f11
         r14 = s104; // lwz r14,104(r1)
-        f2 = float(std::fma(double(f2), double(f13), double(f1))); // fmadds f2,f2,f13,f1
+        f2 = float(LoFmadds(f2, f13, f1)); // fmadds f2,f2,f13,f1
         f1 = F(PPC_FAST_LOAD_U32(r11)); // lfs f1,0(r11)
         f30 = F(PPC_FAST_LOAD_U32(uint32_t(r10 + r31))); // lfsx f30,r10,r31
         r31 = s172; // lwz r31,172(r1)
         f29 = F(PPC_FAST_LOAD_U32(uint32_t(r10 + r15))); // lfsx f29,r10,r15
         r15 = sp + uint32_t(3504); // addi r15,r1,3504
-        f9 = float(std::fma(double(f30), double(f13), double(f9))); // fmadds f9,f30,f13,f9
-        f4 = float(std::fma(double(f29), double(f10), double(f4))); // fmadds f4,f29,f10,f4
+        f9 = float(LoFmadds(f30, f13, f9)); // fmadds f9,f30,f13,f9
+        f4 = float(LoFmadds(f29, f10, f4)); // fmadds f4,f29,f10,f4
         f31 = F(PPC_FAST_LOAD_U32(uint32_t(r14 + r11))); // lfsx f31,r14,r11
         r14 = s184; // lwz r14,184(r1)
-        f8 = float(std::fma(double(f31), double(f10), double(f8))); // fmadds f8,f31,f10,f8
+        f8 = float(LoFmadds(f31, f10, f8)); // fmadds f8,f31,f10,f8
         f28 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f28,r31,r11
         r31 = s180; // lwz r31,180(r1)
-        f7 = float(std::fma(double(f28), double(f13), double(f7))); // fmadds f7,f28,f13,f7
+        f7 = float(LoFmadds(f28, f13, f7)); // fmadds f7,f28,f13,f7
         f31 = F(PPC_FAST_LOAD_U32(uint32_t(r14 + r11))); // lfsx f31,r14,r11
         r14 = s168; // lwz r14,168(r1)
         f27 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f27,r31,r11
         r31 = s188; // lwz r31,188(r1)
-        f6 = float(std::fma(double(f27), double(f10), double(f6))); // fmadds f6,f27,f10,f6
+        f6 = float(LoFmadds(f27, f10, f6)); // fmadds f6,f27,f10,f6
         f27 = F(PPC_FAST_LOAD_U32(uint32_t(r10 + r15))); // lfsx f27,r10,r15
         r15 = s200; // lwz r15,200(r1)
-        f2 = float(std::fma(double(f12), double(f1), double(f2))); // fmadds f2,f12,f1,f2
+        f2 = float(LoFmadds(f12, f1, f2)); // fmadds f2,f12,f1,f2
         f4 = f4 + f27; // fadds f4,f4,f27
         f29 = F(PPC_FAST_LOAD_U32(uint32_t(r14 + r11))); // lfsx f29,r14,r11
         f8 = f8 + f31; // fadds f8,f8,f31
         f26 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f26,r31,r11
         r31 = s196; // lwz r31,196(r1)
-        f5 = float(std::fma(double(f26), double(f13), double(f5))); // fmadds f5,f26,f13,f5
+        f5 = float(LoFmadds(f26, f13, f5)); // fmadds f5,f26,f13,f5
         r14 = s160; // lwz r14,160(r1)
         f7 = f7 + f29; // fadds f7,f7,f29
         f30 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f30,r31,r11
         r31 = sp + uint32_t(6608); // addi r31,r1,6608
-        f3 = float(std::fma(double(f30), double(f10), double(f3))); // fmadds f3,f30,f10,f3
+        f3 = float(LoFmadds(f30, f10, f3)); // fmadds f3,f30,f10,f3
         f30 = F(PPC_FAST_LOAD_U32(uint32_t(r15 + r11))); // lfsx f30,r15,r11
         r15 = s176; // lwz r15,176(r1)
         f27 = F(PPC_FAST_LOAD_U32(uint32_t(r14 + r11))); // lfsx f27,r14,r11
@@ -556,27 +557,27 @@ namespace
         f2 = F(PPC_FAST_LOAD_U32(uint32_t(r28 + r11))); // lfsx f2,r28,r11
         f1 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f1,r31,r11
         r31 = s124; // lwz r31,124(r1)
-        f9 = float(std::fma(double(f27), double(f13), double(f9))); // fmadds f9,f27,f13,f9
+        f9 = float(LoFmadds(f27, f13, f9)); // fmadds f9,f27,f13,f9
         f26 = F(PPC_FAST_LOAD_U32(uint32_t(r30 + r11))); // lfsx f26,r30,r11
-        f8 = float(std::fma(double(f1), double(f10), double(f8))); // fmadds f8,f1,f10,f8
+        f8 = float(LoFmadds(f1, f10, f8)); // fmadds f8,f1,f10,f8
         f25 = F(PPC_FAST_LOAD_U32(uint32_t(r27 + r11))); // lfsx f25,r27,r11
         f2 = f2 * f11; // fmuls f2,f2,f11
         f23 = F(PPC_FAST_LOAD_U32(uint32_t(r26 + r11))); // lfsx f23,r26,r11
-        f5 = float(std::fma(double(f29), double(f13), double(f5))); // fmadds f5,f29,f13,f5
+        f5 = float(LoFmadds(f29, f13, f5)); // fmadds f5,f29,f13,f5
         f29 = F(PPC_FAST_LOAD_U32(uint32_t(r3 + r11))); // lfsx f29,r3,r11
         f31 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f31,r31,r11
         r31 = s108; // lwz r31,108(r1)
-        f7 = float(std::fma(double(f31), double(f13), double(f7))); // fmadds f7,f31,f13,f7
+        f7 = float(LoFmadds(f31, f13, f7)); // fmadds f7,f31,f13,f7
         f31 = F(PPC_FAST_LOAD_U32(uint32_t(r8 + r11))); // lfsx f31,r8,r11
-        f6 = float(std::fma(double(f30), double(f10), double(f6))); // fmadds f6,f30,f10,f6
+        f6 = float(LoFmadds(f30, f10, f6)); // fmadds f6,f30,f10,f6
         f30 = F(PPC_FAST_LOAD_U32(uint32_t(r6 + r11))); // lfsx f30,r6,r11
-        f4 = float(std::fma(double(f28), double(f10), double(f4))); // fmadds f4,f28,f10,f4
+        f4 = float(LoFmadds(f28, f10, f4)); // fmadds f4,f28,f10,f4
         f28 = F(PPC_FAST_LOAD_U32(uint32_t(r29 + r11))); // lfsx f28,r29,r11
-        f3 = float(std::fma(double(f26), double(f13), double(f3))); // fmadds f3,f26,f13,f3
+        f3 = float(LoFmadds(f26, f13, f3)); // fmadds f3,f26,f13,f3
         f24 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f24,r31,r11
         r31 = s120; // lwz r31,120(r1)
         f9 = f9 + f24; // fadds f9,f9,f24
-        f2 = float(std::fma(double(f25), double(f10), double(f2))); // fmadds f2,f25,f10,f2
+        f2 = float(LoFmadds(f25, f10, f2)); // fmadds f2,f25,f10,f2
         f5 = f5 + f30; // fadds f5,f5,f30
         f27 = F(PPC_FAST_LOAD_U32(uint32_t(r31 + r11))); // lfsx f27,r31,r11
         r31 = s96; // lwz r31,96(r1)
@@ -1084,7 +1085,7 @@ namespace
         r20 = r20 + uint32_t(2); // addi r20,r20,2
         r20 = std::rotl(r20, 2) & 0xfffffffcu; // rlwinm r20,r20,2,0,29
         f9 = F(PPC_FAST_LOAD_U32(uint32_t(r20 + r30))); // lfsx f9,r20,r30
-        f8 = float(std::fma(double(f8), double(f9), double(f15))); // fmadds f8,f8,f9,f15
+        f8 = float(LoFmadds(f8, f9, f15)); // fmadds f8,f8,f9,f15
         f8 = f8 + f13; // fadds f8,f8,f13
         f8 = f8 + f12; // fadds f8,f8,f12
         PPC_FAST_STORE_U32(uint32_t(r18 + r30), U(f8)); // stfsx f8,r18,r30
@@ -1093,7 +1094,7 @@ namespace
         r20 = r20 + uint32_t(1); // addi r20,r20,1
         r20 = r20 & 0x000001ffu; // clrlwi r20,r20,23
         m4 = r20; // stw r20,0(r30) [fixed, written back after the loop]
-        f9 = float(std::fma(double(f14), double(f8), double(f9))); // fmadds f9,f14,f8,f9
+        f9 = float(LoFmadds(f14, f8, f9)); // fmadds f9,f14,f8,f9
         r20 = s132; // lwz r20,132(r1)
         m7 = U(f9); // stfs f9,12(r18) [fixed, written back after the loop]
         r19 = m31; // lwz r19,0(r29) [fixed]
@@ -1109,13 +1110,13 @@ namespace
         r17 = std::rotl(r17, 2) & 0xfffffffcu; // rlwinm r17,r17,2,0,29
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f8 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r29))); // lfsx f8,r17,r29
-        f7 = float(std::fma(double(f15), double(f8), double(f7))); // fmadds f7,f15,f8,f7
+        f7 = float(LoFmadds(f15, f8, f7)); // fmadds f7,f15,f8,f7
         PPC_FAST_STORE_U32(uint32_t(r19 + r29), U(f7)); // stfsx f7,r19,r29
         r19 = m31; // lwz r19,0(r29) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000001ffu; // clrlwi r19,r19,23
         m31 = r19; // stw r19,0(r29) [fixed, written back after the loop]
-        f8 = float(std::fma(double(f7), double(f14), double(f8))); // fmadds f8,f7,f14,f8
+        f8 = float(LoFmadds(f7, f14, f8)); // fmadds f8,f7,f14,f8
         m8 = U(f8); // stfs f8,12(r20) [fixed, written back after the loop]
         r20 = s356; // lwz r20,356(r1)
         r19 = r20 + uint32_t(12); // addi r19,r20,12
@@ -1127,7 +1128,7 @@ namespace
         r17 = std::rotl(r17, 2) & 0xfffffffcu; // rlwinm r17,r17,2,0,29
         f31 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r20))); // lfsx f31,r17,r20
         m38 = U(f7); PPC_FAST_STORE_U32(uint32_t(r19 + 8), m38); // stfs f7,8(r19) [fixed]
-        f8 = float(std::fma(double(f31), double(f8), double(f9))); // fmadds f8,f31,f8,f9
+        f8 = float(LoFmadds(f31, f8, f9)); // fmadds f8,f31,f8,f9
         m37 = U(f9); PPC_FAST_STORE_U32(uint32_t(r19 + 4), m37); // stfs f9,4(r19) [fixed]
         m9 = U(f8); // stfs f8,8(r20) [fixed, written back after the loop]
         r20 = m39; // lwz r20,0(r6) [fixed]
@@ -1142,12 +1143,12 @@ namespace
         f9 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r6))); // lfsx f9,r19,r6
         m44 = U(f15); PPC_FAST_STORE_U32(uint32_t(r20 + 8), m44); // stfs f15,8(r20) [fixed]
         f7 = f7 * f9; // fmuls f7,f7,f9
-        f9 = float(std::fma(double(f8), double(f9), double(f30))); // fmadds f9,f8,f9,f30
+        f9 = float(LoFmadds(f8, f9, f30)); // fmadds f9,f8,f9,f30
         m43 = U(f9); PPC_FAST_STORE_U32(uint32_t(r20 + 4), m43); // stfs f9,4(r20) [fixed]
         r20 = r22 + uint32_t(16); // addi r20,r22,16
         f12 = f13 - f12; // fsubs f12,f13,f12
         f30 = F(PPC_FAST_LOAD_U32(r8)); // lfs f30,0(r8)
-        f9 = float(std::fma(double(f9), double(f31), double(f7))); // fmadds f9,f9,f31,f7
+        f9 = float(LoFmadds(f9, f31, f7)); // fmadds f9,f9,f31,f7
         m10 = U(f9); // stfs f9,16(r6) [fixed, written back after the loop]
         r19 = m45; // lwz r19,0(r22) [fixed]
         f9 = F(m46); // lfs f9,12(r22) [fixed]
@@ -1156,7 +1157,7 @@ namespace
         r19 = r19 + uint32_t(5); // addi r19,r19,5
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f7 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r22))); // lfsx f7,r19,r22
-        f9 = float(std::fma(double(f7), double(f9), double(f29))); // fmadds f9,f7,f9,f29
+        f9 = float(LoFmadds(f7, f9, f29)); // fmadds f9,f7,f9,f29
         m47 = U(f9); PPC_FAST_STORE_U32(uint32_t(r20 + 4), m47); // stfs f9,4(r20) [fixed]
         m48 = U(f8); PPC_FAST_STORE_U32(uint32_t(r20 + 8), m48); // stfs f8,8(r20) [fixed]
         f8 = F(m49); // lfs f8,8(r22) [fixed]
@@ -1218,13 +1219,13 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f13 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r28))); // lfsx f13,r19,r28
-        f12 = float(std::fma(double(f8), double(f13), double(f12))); // fmadds f12,f8,f13,f12
+        f12 = float(LoFmadds(f8, f13, f12)); // fmadds f12,f8,f13,f12
         f12 = f12 + f30; // fadds f12,f12,f30
         PPC_FAST_STORE_U32(uint32_t(r14 + r28), U(f12)); // stfsx f12,r14,r28
         r19 = m59; // lwz r19,0(r28) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000001ffu; // clrlwi r19,r19,23
-        f13 = float(std::fma(double(f12), double(f7), double(f13))); // fmadds f13,f12,f7,f13
+        f13 = float(LoFmadds(f12, f7, f13)); // fmadds f13,f12,f7,f13
         f9 = f22 * f9; // fmuls f9,f22,f9
         m59 = r19; // stw r19,0(r28) [fixed, written back after the loop]
         m14 = U(f13); // stfs f13,12(r20) [fixed, written back after the loop]
@@ -1241,13 +1242,13 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f13 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r27))); // lfsx f13,r19,r27
-        f12 = float(std::fma(double(f12), double(f13), double(f26))); // fmadds f12,f12,f13,f26
+        f12 = float(LoFmadds(f12, f13, f26)); // fmadds f12,f12,f13,f26
         PPC_FAST_STORE_U32(uint32_t(r17 + r27), U(f12)); // stfsx f12,r17,r27
         r19 = m63; // lwz r19,0(r27) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000001ffu; // clrlwi r19,r19,23
         m63 = r19; // stw r19,0(r27) [fixed, written back after the loop]
-        f12 = float(std::fma(double(f12), double(f8), double(f13))); // fmadds f12,f12,f8,f13
+        f12 = float(LoFmadds(f12, f8, f13)); // fmadds f12,f12,f8,f13
         m15 = U(f12); // stfs f12,12(r20) [fixed, written back after the loop]
         r20 = s328; // lwz r20,328(r1)
         f13 = f1 + f25; // fadds f13,f1,f25
@@ -1260,7 +1261,7 @@ namespace
         r17 = std::rotl(r17, 2) & 0xfffffffcu; // rlwinm r17,r17,2,0,29
         f7 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r20))); // lfsx f7,r17,r20
         m69 = U(f13); PPC_FAST_STORE_U32(uint32_t(r19 + 4), m69); // stfs f13,4(r19) [fixed]
-        f12 = float(std::fma(double(f7), double(f12), double(f13))); // fmadds f12,f7,f12,f13
+        f12 = float(LoFmadds(f7, f12, f13)); // fmadds f12,f7,f12,f13
         m70 = U(f8); PPC_FAST_STORE_U32(uint32_t(r19 + 8), m70); // stfs f8,8(r19) [fixed]
         m16 = U(f12); // stfs f12,8(r20) [fixed, written back after the loop]
         r20 = m71; // lwz r20,0(r5) [fixed]
@@ -1273,12 +1274,12 @@ namespace
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f31 = F(m75); // lfs f31,4(r20) [fixed]
         f13 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r5))); // lfsx f13,r19,r5
-        f12 = float(std::fma(double(f12), double(f13), double(f24))); // fmadds f12,f12,f13,f24
+        f12 = float(LoFmadds(f12, f13, f24)); // fmadds f12,f12,f13,f24
         m76 = U(f31); PPC_FAST_STORE_U32(uint32_t(r20 + 8), m76); // stfs f31,8(r20) [fixed]
         m75 = U(f12); PPC_FAST_STORE_U32(uint32_t(r20 + 4), m75); // stfs f12,4(r20) [fixed]
         r20 = r21 + uint32_t(16); // addi r20,r21,16
         f8 = f12 * f8; // fmuls f8,f12,f8
-        f13 = float(std::fma(double(f13), double(f7), double(f8))); // fmadds f13,f13,f7,f8
+        f13 = float(LoFmadds(f13, f7, f8)); // fmadds f13,f13,f7,f8
         m17 = U(f13); // stfs f13,16(r5) [fixed, written back after the loop]
         r19 = m77; // lwz r19,0(r21) [fixed]
         f13 = F(m78); // lfs f13,12(r21) [fixed]
@@ -1287,7 +1288,7 @@ namespace
         r19 = r19 + uint32_t(5); // addi r19,r19,5
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f8 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r21))); // lfsx f8,r19,r21
-        f13 = float(std::fma(double(f8), double(f13), double(f23))); // fmadds f13,f8,f13,f23
+        f13 = float(LoFmadds(f8, f13, f23)); // fmadds f13,f8,f13,f23
         m79 = U(f13); PPC_FAST_STORE_U32(uint32_t(r20 + 4), m79); // stfs f13,4(r20) [fixed]
         m80 = U(f12); PPC_FAST_STORE_U32(uint32_t(r20 + 8), m80); // stfs f12,8(r20) [fixed]
         f12 = F(m81); // lfs f12,8(r21) [fixed]
@@ -1348,7 +1349,7 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f12 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r25))); // lfsx f12,r19,r25
-        f9 = float(std::fma(double(f12), double(f9), double(f6))); // fmadds f9,f12,f9,f6
+        f9 = float(LoFmadds(f12, f9, f6)); // fmadds f9,f12,f9,f6
         f9 = f9 + f2; // fadds f9,f9,f2
         f9 = f9 + f3; // fadds f9,f9,f3
         PPC_FAST_STORE_U32(uint32_t(r14 + r25), U(f9)); // stfsx f9,r14,r25
@@ -1356,7 +1357,7 @@ namespace
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000007ffu; // clrlwi r19,r19,21
         m91 = r19; // stw r19,0(r25) [fixed, written back after the loop]
-        f12 = float(std::fma(double(f9), double(f8), double(f12))); // fmadds f12,f9,f8,f12
+        f12 = float(LoFmadds(f9, f8, f12)); // fmadds f12,f9,f8,f12
         m21 = U(f12); // stfs f12,12(r20) [fixed, written back after the loop]
         r20 = s312; // lwz r20,312(r1)
         r17 = m95; // lwz r17,0(r26) [fixed]
@@ -1373,8 +1374,8 @@ namespace
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f12 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r26))); // lfsx f12,r19,r26
         f9 = f12 * f9; // fmuls f9,f12,f9
-        f9 = float(std::fma(double(f8), double(f13), double(f9))); // fmadds f9,f8,f13,f9
-        f13 = float(std::fma(double(f12), double(f7), double(f13))); // fmadds f13,f12,f7,f13
+        f9 = float(LoFmadds(f8, f13, f9)); // fmadds f9,f8,f13,f9
+        f13 = float(LoFmadds(f12, f7, f13)); // fmadds f13,f12,f7,f13
         PPC_FAST_STORE_U32(uint32_t(r17 + r26), U(f13)); // stfsx f13,r17,r26
         r19 = m95; // lwz r19,0(r26) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
@@ -1395,12 +1396,12 @@ namespace
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f13 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r24))); // lfsx f13,r19,r24
         r19 = std::rotl(r14, 2) & 0xfffffffcu; // rlwinm r19,r14,2,0,29
-        f12 = float(std::fma(double(f13), double(f12), double(f19))); // fmadds f12,f13,f12,f19
+        f12 = float(LoFmadds(f13, f12, f19)); // fmadds f12,f13,f12,f19
         PPC_FAST_STORE_U32(uint32_t(r19 + r24), U(f12)); // stfsx f12,r19,r24
         r19 = m100; // lwz r19,0(r24) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000007ffu; // clrlwi r19,r19,21
-        f13 = float(std::fma(double(f12), double(f9), double(f13))); // fmadds f13,f12,f9,f13
+        f13 = float(LoFmadds(f12, f9, f13)); // fmadds f13,f12,f9,f13
         f9 = F(s80); // lfs f9,80(r1)
         f10 = f10 + f9; // fadds f10,f10,f9
         m100 = r19; // stw r19,0(r24) [fixed, written back after the loop]
@@ -1418,14 +1419,14 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f13 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r23))); // lfsx f13,r19,r23
-        f12 = float(std::fma(double(f13), double(f12), double(f0))); // fmadds f12,f13,f12,f0
+        f12 = float(LoFmadds(f13, f12, f0)); // fmadds f12,f13,f12,f0
         f12 = f12 + f8; // fadds f12,f12,f8
         PPC_FAST_STORE_U32(uint32_t(r14 + r23), U(f12)); // stfsx f12,r14,r23
         r19 = m104; // lwz r19,0(r23) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000003ffu; // clrlwi r19,r19,22
         m104 = r19; // stw r19,0(r23) [fixed, written back after the loop]
-        f13 = float(std::fma(double(f12), double(f9), double(f13))); // fmadds f13,f12,f9,f13
+        f13 = float(LoFmadds(f12, f9, f13)); // fmadds f13,f12,f9,f13
         m24 = U(f13); // stfs f13,12(r20) [fixed, written back after the loop]
         r20 = m108; // lwz r20,0(r9) [fixed]
         r19 = m109; // lwz r19,12(r3) [fixed]
@@ -1467,7 +1468,7 @@ namespace
         f10 = F(m116); // lfs f10,4(r19) [fixed]
         f9 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r20))); // lfsx f9,r17,r20
         m117 = U(f10); PPC_FAST_STORE_U32(uint32_t(r19 + 8), m117); // stfs f10,8(r19) [fixed]
-        f13 = float(std::fma(double(f9), double(f12), double(f13))); // fmadds f13,f9,f12,f13
+        f13 = float(LoFmadds(f9, f12, f13)); // fmadds f13,f9,f12,f13
         m116 = U(f11); PPC_FAST_STORE_U32(uint32_t(r19 + 4), m116); // stfs f11,4(r19) [fixed]
         m3 = U(f13); // stfs f13,4(r20) [fixed, written back after the loop]
         r20 = s104; // lwz r20,104(r1)
@@ -1495,14 +1496,14 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f12 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r20))); // lfsx f12,r19,r20
-        f11 = float(std::fma(double(f12), double(f10), double(f11))); // fmadds f11,f12,f10,f11
+        f11 = float(LoFmadds(f12, f10, f11)); // fmadds f11,f12,f10,f11
         f0 = f11 + f0; // fadds f0,f11,f0
         PPC_FAST_STORE_U32(uint32_t(r14 + r20), U(f0)); // stfsx f0,r14,r20
         r19 = m121; // lwz r19,0(r20) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000007ffu; // clrlwi r19,r19,21
         m121 = r19; // stw r19,0(r20) [fixed, written back after the loop]
-        f0 = float(std::fma(double(f0), double(f9), double(f12))); // fmadds f0,f0,f9,f12
+        f0 = float(LoFmadds(f0, f9, f12)); // fmadds f0,f0,f9,f12
         r20 = s136; // lwz r20,136(r1)
         r19 = s152; // lwz r19,152(r1)
         m26 = U(f0); // stfs f0,12(r20) [fixed, written back after the loop]
@@ -1520,8 +1521,8 @@ namespace
         r17 = std::rotl(r17, 2) & 0xfffffffcu; // rlwinm r17,r17,2,0,29
         f0 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r20))); // lfsx f0,r17,r20
         f12 = f0 * f12; // fmuls f12,f0,f12
-        f0 = float(std::fma(double(f0), double(f10), double(f13))); // fmadds f0,f0,f10,f13
-        f12 = float(std::fma(double(f13), double(f11), double(f12))); // fmadds f12,f13,f11,f12
+        f0 = float(LoFmadds(f0, f10, f13)); // fmadds f0,f0,f10,f13
+        f12 = float(LoFmadds(f13, f11, f12)); // fmadds f12,f13,f11,f12
         f11 = F(s236); // lfs f11,236(r1)
         r14 = s156; // lwz r14,156(r1)
         r14 = std::rotl(r14, 2) & 0xfffffffcu; // rlwinm r14,r14,2,0,29
@@ -1545,13 +1546,13 @@ namespace
         r19 = r19 + uint32_t(2); // addi r19,r19,2
         r19 = std::rotl(r19, 2) & 0xfffffffcu; // rlwinm r19,r19,2,0,29
         f0 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r20))); // lfsx f0,r19,r20
-        f13 = float(std::fma(double(f13), double(f0), double(f11))); // fmadds f13,f13,f0,f11
+        f13 = float(LoFmadds(f13, f0, f11)); // fmadds f13,f13,f0,f11
         PPC_FAST_STORE_U32(uint32_t(r17 + r20), U(f13)); // stfsx f13,r17,r20
         r19 = m130; // lwz r19,0(r20) [fixed]
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000007ffu; // clrlwi r19,r19,21
         m130 = r19; // stw r19,0(r20) [fixed, written back after the loop]
-        f0 = float(std::fma(double(f13), double(f12), double(f0))); // fmadds f0,f13,f12,f0
+        f0 = float(LoFmadds(f13, f12, f0)); // fmadds f0,f13,f12,f0
         r20 = s88; // lwz r20,88(r1)
         r19 = s84; // lwz r19,84(r1)
         m28 = U(f0); // stfs f0,12(r20) [fixed, written back after the loop]
@@ -1577,7 +1578,7 @@ namespace
         s100 = r16; // stw r16,100(r1)
         f0 = F(PPC_FAST_LOAD_U32(uint32_t(r19 + r20))); // lfsx f0,r19,r20
         r16 = s104; // lwz r16,104(r1)
-        f13 = float(std::fma(double(f0), double(f13), double(f6))); // fmadds f13,f0,f13,f6
+        f13 = float(LoFmadds(f0, f13, f6)); // fmadds f13,f0,f13,f6
         r16 = r16 + uint32_t(1); // addi r16,r16,1
         PPC_FAST_STORE_U32(uint32_t(r14 + r8), U(f5)); // stfsx f5,r14,r8
         r14 = s252; // lwz r14,252(r1)
@@ -1590,7 +1591,7 @@ namespace
         r19 = r19 + uint32_t(1); // addi r19,r19,1
         r19 = r19 & 0x000003ffu; // clrlwi r19,r19,22
         m133 = r19; // stw r19,0(r20) [fixed, written back after the loop]
-        f0 = float(std::fma(double(f13), double(f12), double(f0))); // fmadds f0,f13,f12,f0
+        f0 = float(LoFmadds(f13, f12, f0)); // fmadds f0,f13,f12,f0
         r20 = s84; // lwz r20,84(r1)
         r19 = s268; // lwz r19,268(r1)
         m29 = U(f0); // stfs f0,12(r20) [fixed, written back after the loop]
@@ -1636,7 +1637,7 @@ namespace
         f11 = F(m143); // lfs f11,4(r19) [fixed]
         f10 = F(PPC_FAST_LOAD_U32(uint32_t(r17 + r20))); // lfsx f10,r17,r20
         m144 = U(f11); PPC_FAST_STORE_U32(uint32_t(r19 + 8), m144); // stfs f11,8(r19) [fixed]
-        f0 = float(std::fma(double(f10), double(f12), double(f0))); // fmadds f0,f10,f12,f0
+        f0 = float(LoFmadds(f10, f12, f0)); // fmadds f0,f10,f12,f0
         m143 = U(f13); PPC_FAST_STORE_U32(uint32_t(r19 + 4), m143); // stfs f13,4(r19) [fixed]
         m1 = U(f0); // stfs f0,4(r20) [fixed, written back after the loop]
         r20 = r15 + uint32_t(4); // addi r20,r15,4

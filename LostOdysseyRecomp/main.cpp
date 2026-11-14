@@ -248,6 +248,28 @@ static int RunGuest(uint32_t entry)
     os::heap_census::Start(); // LO_SWITCH_HEAP_CENSUS builds: LO_HEAP_CENSUS=1
     LOG_INFO("switch: {} mode, guest memory committed {} MiB, {}", os::switch_platform::IsDocked() ? "docked" : "handheld",
              GuestAddressSpace::CommittedBytes() >> 20, os::switch_platform::MemorySummary());
+    {
+        // The kernel puts thread-local pages anywhere free in its kernel map region (2 GiB fixed in a 36-bit process,
+        // 64 GiB placed at random in a 39-bit one); the window is kept out of it (guest_address_space_switch.cpp).
+        const auto placement = GuestAddressSpace::Placement();
+        const uint64_t windowEnd = placement.base + 0x100000000ull;
+        const bool overlaps = placement.base < placement.avoidEnd && windowEnd > placement.avoidStart;
+        LOG_NOTICE("switch: guest window {:#x}-{:#x} ({}-bit address space), {} the kernel map range {:#x}-{:#x} ({} "
+                 "thread-local pages {:#x}-{:#x}; ASLR {:#x}-{:#x}); 2 MiB blocks {}", placement.base, windowEnd, placement.addressBits,
+                 placement.avoided ? "clear of" : overlaps ? "placed without avoiding (overlaps)" : "placed without avoiding (clear of)",
+                 placement.avoidStart, placement.avoidEnd, placement.tlsPages, placement.tlsLow, placement.tlsHigh,
+                 placement.aslrStart, placement.aslrEnd, placement.blocks ? "on" : "off (LO_GUEST_BLOCKS=0)");
+        // LO_TLB_TEST=N: N seconds in, log what a TLB miss costs in guest memory and the NRO's code (a few ms).
+        if (const char* tlb = getenv("LO_TLB_TEST"); tlb && std::atoi(tlb) > 0)
+        {
+            const int seconds = std::atoi(tlb);
+            os::DetachThread(std::thread([seconds] {
+                os::SetCurrentThreadName("TLB Test");
+                std::this_thread::sleep_for(std::chrono::seconds(seconds));
+                GuestAddressSpace::LatencyTest([](const char* line) { LOG_NOTICE("switch: {}", line); });
+            }));
+        }
+    }
     // Opt-in game file reads every 10 s (LO_IO_PROFILE=1) distinguish slow SD
     // reads from other loading waits. LO_WAIT_PROFILE=1 logs guest waits;
     // LO_LOAD_PROFILE=1 adds thread dumps at 8, 20, 45 and 90 s of a load.
